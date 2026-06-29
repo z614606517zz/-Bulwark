@@ -4,6 +4,8 @@
 
 一个类似磐垒的主机入侵防御(HIPS)软件骨架。核心思路:**监控系统敏感行为 → 规则引擎决策 → 必要时弹窗让用户裁决(允许/阻止/记住)**。
 
+磐垒采用三层协作架构:**内核态驱动(R0)** 负责真正的「行为发生前」拦截,**用户态 Windows 服务(R3)** 承载决策逻辑,**Avalonia 桌面 UI** 负责状态展示、实时日志、行为弹窗与规则管理。驱动 ↔ 服务经 Filter Manager 通信端口对话,服务 ↔ UI 经命名管道对话。无论事件来自哪个事件源,统一由一个 `RuleEngine` 作为决策中心,并由威胁启发式、LOLBin 白利用检测、MITRE ATT&CK 标注、凭据访问检测与多引擎哈希信誉共同增强。
+
 > 当前进度:已打通 `内核驱动(R0) ↔ 用户态服务(R3) ↔ UI` 完整链路,**六个防护里程碑(M1–M6)全部完成**。
 > - **M1+**:服务↔UI 链路、WMI 真实进程观测、Authenticode 签名校验、SHA-256、规则管理、服务安装。
 > - **M2–M6(内核驱动)**:进程拦截、文件防护、注册表防护、自我保护、网络外联拦截。驱动已能编译产出 `Bulwark.sys`,详见 `Bulwark.Driver/README.md`。
@@ -161,9 +163,49 @@ UI 顶部状态点变绿表示已连接服务。现在每当系统有**真实进
   TTL 过期后仍返回上一次已知结论,使断网/查询失败时仍能用「最近已知信誉」富化;新鲜度由后台
   重查负责。信誉全程只加/减分,绝不单独处置,断网不影响实时防护。
 
-## 驱动级防护(M2,已完成)
+## 内核驱动(R0):真正的「行为发生前」拦截
 
-详见 `Bulwark.Driver/README.md`。简要流程:
+`Bulwark.Driver` 是磐垒的内核态组件,让磐垒能在危险动作**发生之前**就拦下来,而不是只做事后观测。全部使用微软**文档化 API**、不做 SSDT Hook,因此 **PatchGuard 友好**。它注册一个 **Minifilter**,既挂接 I/O 回调,又借用 Filter Manager 的**通信端口**(`FltCreateCommunicationPort` / `FltSendMessage`)与用户态服务通信。
+
+五大防护维度:
+
+| 维度 | 内核机制 | 拦截内容 |
+|------|----------|----------|
+| **进程(M2)** | `PsSetCreateProcessNotifyRoutineEx` | 每个进程创建,在其运行前 |
+| **文件(M3)** | Minifilter 预操作 `IRP_MJ_CREATE`(delete-on-close)+ `IRP_MJ_SET_INFORMATION`(改名/删除处置) | 受保护文件的删除与重命名 |
+| **注册表(M4)** | `CmRegisterCallbackEx`(`RegNtPreSetValueKey` / `RegNtPreDeleteValueKey` / `RegNtPreDeleteKey`) | 对受保护键的写值/删值/删键(如启动项) |
+| **自我保护(M5)** | `ObRegisterCallbacks` | 他进程试图以危险权限(结束/写内存/远程线程/挂起)打开磐垒受保护进程时,剥离这些权限 |
+| **网络(M6)** | WFP callout + filter(`FWPM_LAYER_ALE_AUTH_CONNECT_V4`) | 命中黑名单的外发连接 |
+
+**裁决流程**:进程 / 文件 / 注册表事件发往用户态并**同步等待裁决**(最长约 5 秒,可调);自我保护与网络拦截运行在高 IRQL,**不阻塞** —— 直接处置 + 异步记录。裁决为 `Block` 时:进程设 `CreationStatus=STATUS_ACCESS_DENIED`,文件/注册表返回 `STATUS_ACCESS_DENIED`,网络命中黑名单则 `FWP_ACTION_BLOCK`。受保护路径、注册表键、进程 PID、网络黑名单均由用户态经 `FilterSendMessage` 下发。
+
+```
+新进程启动
+   │  (内核回调 PASSIVE_LEVEL)
+   ▼
+ProcessMonitor 组装事件 ──FltSendMessage──▶ 用户态服务 DriverEventSource
+   ▲                                              │
+   │                                       规则引擎评估 / UI 弹窗
+   │                                              ▼
+   └──────FilterReplyMessage(裁决)◀──────── Allow / Block
+   │
+   ▼
+Block → CreationStatus=STATUS_ACCESS_DENIED(进程被拒绝)
+Allow → 进程正常启动
+```
+
+**驱动源文件**(`Bulwark.Driver/`):
+- `Driver.c` — DriverEntry / 卸载 / Minifilter 注册(I/O 回调 + 实例附加)+ 网络设备对象
+- `ProcessMonitor.c` — 进程创建回调与拦截
+- `FileMonitor.c` — 文件删除/重命名拦截 + 受保护项匹配
+- `RegistryMonitor.c` — 注册表写值/删值/删键拦截 + 受保护键管理
+- `SelfProtect.c` — `ObRegisterCallbacks` 句柄回调,剥离对受保护进程的危险权限
+- `NetMonitor.c` — WFP callout/filter + 黑名单管理
+- `ImageMonitor.c` / `ThreadMonitor.c` — 映像加载与远程线程监控
+- `Comms.c` — 通信端口、`FltSendMessage` 等待裁决/异步上报、接收配置消息
+- `Protocol.h` — 内核↔用户态消息结构(C# 侧 `DriverStructs.cs` 与之对应)
+
+简要流程:
 
 ```powershell
 # 1) 编译驱动(本机有 WDK 即可)
@@ -176,7 +218,8 @@ UI 顶部状态点变绿表示已连接服务。现在每当系统有**真实进
 ```
 
 驱动通过 `PsSetCreateProcessNotifyRoutineEx` 在进程启动前拦截,经通信端口把事件交给服务裁决,
-裁决为 Block 时设置 `CreationStatus=STATUS_ACCESS_DENIED`,进程无法启动。
+裁决为 Block 时设置 `CreationStatus=STATUS_ACCESS_DENIED`,进程无法启动。驱动以 `/INTEGRITYCHECK`
+链接(`ObRegisterCallbacks` 自保所需)且镜像须有有效签名;正式发布需 EV 证书 + 微软 WHQL/附件签名。
 
 ## 后续里程碑
 
