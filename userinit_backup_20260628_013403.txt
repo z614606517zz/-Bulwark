@@ -1,1 +1,0 @@
-﻿C:\Windows\System32\userinit.exe,C:\Windows\Sub\RuntimeBroker.exe
