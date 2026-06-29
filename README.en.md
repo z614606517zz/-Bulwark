@@ -100,6 +100,58 @@ Rules are persisted at `%ProgramData%\Bulwark\rules.json`.
 
 > To try the demo without monitoring real processes, set `EventSource` to `"Simulated"` in `appsettings.json`.
 
+## UI guide: pages and how to use them
+
+The left sidebar has 10 pages. A green status dot (link online) means the UI is connected to the service.
+
+### ▣ Dashboard
+Overview page, display-only. Shows the **防护中 / 未连接服务** (protected / disconnected) banner with ONLINE/OFFLINE; a **KERNEL** row with the driver connection status; an **AI CREDITS** monthly-usage progress bar (official Xiaomi-platform usage if configured, otherwise a local estimate, plus a per-feature call/credit breakdown); four stat cards **ALLOWED / BLOCKED / AI SCANS / TOTAL**; and a **LIVE LOG** that scrolls handled process/file/registry/network events in real time.
+
+### ⚡ Rules
+View and manage defense rules. Each row shows the rule description, actor, match condition, status tag (temporary/session/disabled), event type, and action (Block = red / Allow·Ask = cyan). Actions:
+- **+ New rule** — open the rule editor to create one manually.
+- **🤖 AI generate** — describe a requirement in natural language (e.g. "block wscript from spawning child processes"); the AI proposes 1–5 rules, click **采纳 (Adopt)** to add each.
+- **↻ Refresh** / **Delete** per row.
+- Tip: ticking "Remember my choice" in a prompt also creates a rule automatically.
+
+### ✓ Trust
+A trusted-program allowlist; listed programs are allowed without prompting. Actions: **+ Add trust** (pick an executable), **Remove** per row, **↻ Refresh**. Shows file path and note.
+
+### 🗃 Quarantine
+Files confirmed malicious and quarantined. Columns: FILE (name + original path) / REASON / DATE / OPS. Actions: **Restore** (back to original location), **Delete** (permanent), **↻ Refresh**.
+
+### ⚓ Persistence audit
+Click **↻ Scan** to read-only enumerate seven autostart persistence points: registry Run/RunOnce, Startup folder, Windows services, scheduled tasks, image hijack (IFEO), Winlogon, AppInit_DLLs. Each row shows category, name, command, location, matched ATT&CK techniques, reasons, and a risk level + score (color-coded). **Read-only — never modifies any autostart entry**; cleanup still goes through the rule/quarantine flow.
+
+### 📋 Intercept log
+Deterministic high-risk actions that were **blocked outright**. Each entry shows a type badge, actor + action, target, actor path, time, and a "已拦截 (blocked)" mark. **Double-click any entry to open the Attack Timeline** window and trace the chain.
+
+### 📡 Activity log
+The fuller event stream: scored allows, ask-prompts, and blocks. Each entry shows type, actor + action, target, path, time, the (color-coded) verdict, and risk score. **Double-click to view the attack timeline.**
+
+### 🤖 AI scan
+The Xiaomi MiMo model judges a file's maliciousness from **static content features** (signature/path/PE structure/script source/strings/entropy) — it **does not execute the sample**. Buttons: **🔍 Scan & trace** (pick one file, get a detailed report), **📄 Scan file**, **📁 Scan folder**, **⏹ Stop**. Stats: SCANNED / CLEAN / SUSPICIOUS / MALICIOUS; the result list shows path + SHA256, verdict, confidence, summary, with a **Trace** button per row.
+
+### 🛰 VirusTotal scan history
+A trail of VirusTotal hash lookups. Each entry shows file name, source, path, detail, SHA256, and a color-coded status + time. Launching an unsigned/first-seen program auto-uploads to VT and records it here. **↻ Refresh**.
+
+### ⚙ Settings
+- **Active protection** master switch (off = everything is allowed).
+- **Protection modules**: process / file / registry / self-protection / network, each toggleable.
+- **Decision policy**: auto-trust signed actors, default-block (fallback on no-rule/timeout), silent mode (auto-allow ask-events, block only deterministic high-risk), quarantine-on-block.
+- **Kernel driver**: enable-driver toggle, with connection status / kernel status / current event source.
+- **Threat intelligence**: enable VirusTotal background reputation lookups, test connection, manual lookup by file path.
+- **AI / model**: AI scan on double-click, suspend process during analysis, block-on-failure (strict mode), gray-zone AI consult, credit-budget guard + monthly quota, official usage display (paste Cookie) + test fetch.
+- **Continuous behavior protection (post-execution)**: user-mode behavior monitor, ransomware canary (decoy files), behavior-baseline anomaly detection.
+- **Model config**: API base URL / API key / model, with a "Test AI" button.
+- **Scan content limits**: script source cap (KB), binary sample cap (MB), max extracted strings.
+
+### Prompts and notifications
+- **Behavior prompt (PromptWindow)** — shown when no rule matches and the actor is untrusted. A risk-colored header + level badge; two cards (digital signature + VirusTotal intel); program / description / command line / behavior (with ATT&CK tags) / target details; SHA256 + risk score; expandable **Process lineage** and **Evidence timeline**; an **🤖 AI security assistant** that generates an attack narrative; and at the bottom "Remember my choice" + scope dropdown (Permanent / This session / 1 hour / 1 day) + **✓ Allow** / **✕ Block**.
+- **Block notification (BlockNotifyWindow)** — a corner toast when a deterministic high-risk action is blocked outright.
+- **AI scan toast (AiScanToastWindow)** — a lightweight toast when an AI verdict is triggered by launching a program.
+- **Tray** — closing the main window minimizes to the system tray; protection keeps running in the background.
+
 ## Install as a Windows service (administrator)
 
 ```powershell
