@@ -18,6 +18,16 @@ Configured via `EventSource` in `appsettings.json`:
 - **Wmi** — user-mode observation (cannot block before the action; blocking is compensated by terminating the actor).
 - **Simulated** — demo mode, no real-system monitoring.
 
+## Screenshots
+
+| | |
+|:---:|:---:|
+| ![](docs/screenshots/screenshot-01.png) | ![](docs/screenshots/screenshot-02.png) |
+| ![](docs/screenshots/screenshot-03.png) | ![](docs/screenshots/screenshot-04.png) |
+| ![](docs/screenshots/screenshot-05.png) | ![](docs/screenshots/screenshot-06.png) |
+| ![](docs/screenshots/screenshot-07.png) | ![](docs/screenshots/screenshot-08.png) |
+| ![](docs/screenshots/screenshot-09.png) | ![](docs/screenshots/screenshot-10.png) |
+
 ## Solution structure
 
 ```

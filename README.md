@@ -10,6 +10,16 @@
 
 > 三种事件源可切换(appsettings.json 的 `EventSource`):`Driver`(内核拦截,含全部 M2–M6)、`Wmi`(用户态观测)、`Simulated`(演示)。
 
+## 截图
+
+| | |
+|:---:|:---:|
+| ![](docs/screenshots/screenshot-01.png) | ![](docs/screenshots/screenshot-02.png) |
+| ![](docs/screenshots/screenshot-03.png) | ![](docs/screenshots/screenshot-04.png) |
+| ![](docs/screenshots/screenshot-05.png) | ![](docs/screenshots/screenshot-06.png) |
+| ![](docs/screenshots/screenshot-07.png) | ![](docs/screenshots/screenshot-08.png) |
+| ![](docs/screenshots/screenshot-09.png) | ![](docs/screenshots/screenshot-10.png) |
+
 ## 解决方案结构
 
 ```
