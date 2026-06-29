@@ -1,0 +1,88 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.AiScanToastWindow"
+        Width="540"
+        SizeToContent="Height"
+        CanResize="False"
+        Topmost="True"
+        ShowInTaskbar="False"
+        SystemDecorations="None"
+        Background="Transparent"
+        Title="AiScan">
+
+    <Border CornerRadius="14" Background="{StaticResource PanelGradient}" Margin="12"
+            BorderBrush="{StaticResource HairlineStrongBrush}" BorderThickness="1"
+            BoxShadow="0 18 50 0 #99000000" ClipToBounds="True">
+        <DockPanel>
+
+            <!-- 顶部霓虹强调条 -->
+            <Border DockPanel.Dock="Top" Height="3" Background="{StaticResource AccentGradient}"/>
+
+            <!-- 品牌栏 + 关闭 -->
+            <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,*,Auto" Margin="20,16,12,0">
+                <TextBlock Grid.Column="0" Text="◆" Foreground="{StaticResource NeonCyanBrush}"
+                           FontSize="14" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock Text="磐垒 · AI 病毒研判" Foreground="{StaticResource TextHiBrush}"
+                               FontSize="14" FontWeight="Bold"/>
+                    <TextBlock Text="BULWARK AI MALWARE ANALYSIS" Foreground="{StaticResource TextDimBrush}"
+                               FontSize="9" Margin="0,1,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="2" Content="✕" Click="Close_Click" VerticalAlignment="Top"
+                        Width="26" Height="26" Padding="0" Cursor="Hand"
+                        Background="Transparent" Foreground="{StaticResource TextMidBrush}" BorderThickness="0"/>
+            </Grid>
+
+            <!-- 主体 -->
+            <StackPanel Margin="36,14,36,28" Spacing="14">
+
+                <!-- 扫描图标:暗底霓虹描边文档 + 发光扫描线 -->
+                <Border x:Name="IconBorder" Width="78" Height="94" CornerRadius="10"
+                        Background="#0E1F38" BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="2"
+                        HorizontalAlignment="Center" Margin="0,6,0,2"
+                        BoxShadow="0 0 18 0 #5522E6FF">
+                    <StackPanel VerticalAlignment="Center" Spacing="8" Margin="15,0">
+                        <Rectangle Height="3" RadiusX="2" RadiusY="2" Fill="#3322E6FF"/>
+                        <Rectangle Height="3" RadiusX="2" RadiusY="2" Fill="#3322E6FF"/>
+                        <Border x:Name="IconAccent" Height="6" CornerRadius="3" Background="{StaticResource AccentGradient}"/>
+                        <Rectangle Height="3" RadiusX="2" RadiusY="2" Fill="#3322E6FF"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 标题 -->
+                <TextBlock x:Name="TitleText" Text="正在确认此文件是否安全"
+                           Foreground="{StaticResource TextHiBrush}" FontSize="21" FontWeight="Bold"
+                           HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap"/>
+
+                <!-- 副标题 -->
+                <TextBlock x:Name="SubtitleText"
+                           Text="磐垒正在读取文件内容并交由 AI 引擎研判,以判断它对您的计算机是否有害"
+                           Foreground="{StaticResource TextMidBrush}" FontSize="13"
+                           HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap"
+                           MaxWidth="420"/>
+
+                <!-- 文件名 chip -->
+                <Border Background="{StaticResource BgPanelHiBrush}" CornerRadius="8" Padding="14,12" Margin="0,4,0,0"
+                        BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                    <StackPanel Orientation="Horizontal" Spacing="10" HorizontalAlignment="Center">
+                        <TextBlock Text="📄" FontSize="15" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="FileText" Text="—" Foreground="{StaticResource NeonCyanBrush}"
+                                   FontSize="14" FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center"
+                                   TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 进度条 -->
+                <ProgressBar x:Name="Progress" IsIndeterminate="True" Height="6"
+                             Foreground="{StaticResource NeonCyanBrush}" Background="#16223A"
+                             CornerRadius="3" Margin="0,6,0,0"/>
+
+                <!-- 倒计时 / 结论 -->
+                <TextBlock x:Name="CountdownText" Text="正在检测…"
+                           Foreground="{StaticResource NeonCyanBrush}" FontSize="14" FontWeight="SemiBold"
+                           HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap"/>
+            </StackPanel>
+        </DockPanel>
+    </Border>
+
+</Window>

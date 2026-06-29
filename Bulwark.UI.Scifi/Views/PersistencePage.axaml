@@ -1,0 +1,79 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.PersistencePage"
+             x:DataType="vm:PersistenceViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="⚓" FontSize="18" Foreground="{StaticResource NeonCyanBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="持久化审计" Classes="h1"/>
+                    <TextBlock Text="/ PERSISTENCE AUDIT" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock Grid.Column="1" Text="{Binding StatusMessage}" Foreground="{StaticResource TextDimBrush}"
+                           FontSize="11" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                <Button Grid.Column="2" Classes="neon" Content="↻ 扫描" Click="Refresh_Click"
+                        IsEnabled="{Binding NotLoading}"/>
+            </Grid>
+        </Border>
+
+        <Border Classes="hud" Padding="0">
+            <Grid>
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Padding="14,10"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                        <Grid ColumnDefinitions="90,*,70">
+                            <TextBlock Grid.Column="0" Text="TYPE" Classes="label"/>
+                            <TextBlock Grid.Column="1" Text="ENTRY" Classes="label"/>
+                            <TextBlock Grid.Column="2" Text="RISK" Classes="label"/>
+                        </Grid>
+                    </Border>
+                    <ListBox ItemsSource="{Binding Items}" Background="Transparent" BorderThickness="0" Padding="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <Border Padding="14,8" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                                    <Grid ColumnDefinitions="90,*,70">
+                                        <!-- 类别 -->
+                                        <Border Grid.Column="0" VerticalAlignment="Top" Margin="0,2,8,0"
+                                                Background="#11243B" CornerRadius="3" Padding="6,2" HorizontalAlignment="Left">
+                                            <TextBlock Text="{Binding Category}" Foreground="{StaticResource TextMidBrush}" FontSize="10"/>
+                                        </Border>
+                                        <!-- 条目详情 -->
+                                        <StackPanel Grid.Column="1" Spacing="2">
+                                            <TextBlock Text="{Binding Name}" Foreground="{StaticResource TextHiBrush}" FontSize="12" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{Binding Command}" Foreground="{StaticResource TextMidBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="10" TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding Location}" Foreground="{StaticResource TextDimBrush}" FontSize="9"/>
+                                            <TextBlock Text="{Binding TechniquesText}" Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="10"
+                                                       IsVisible="{Binding HasTechniques}" Margin="0,2,0,0"/>
+                                            <TextBlock Text="{Binding ReasonsText}" Foreground="{StaticResource TextDimBrush}"
+                                                       FontSize="10" TextWrapping="Wrap" IsVisible="{Binding HasReasons}"/>
+                                        </StackPanel>
+                                        <!-- 风险等级 + 分值 -->
+                                        <StackPanel Grid.Column="2" VerticalAlignment="Top" Spacing="2">
+                                            <TextBlock Text="{Binding Level}" Foreground="{Binding Accent}" FontSize="12" FontWeight="Bold"/>
+                                            <TextBlock Text="{Binding ScoreText}" Foreground="{Binding Accent}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="16" FontWeight="Bold"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding IsEmpty}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6">
+                    <TextBlock Text="⚓" FontSize="34" Foreground="{StaticResource TextDimBrush}" HorizontalAlignment="Center" Opacity="0.5"/>
+                    <TextBlock Text="尚未扫描自启动项" Foreground="{StaticResource TextMidBrush}" FontSize="14" HorizontalAlignment="Center"/>
+                    <TextBlock Text="点击右上角「扫描」枚举 Run 键 / 服务 / 计划任务 / 启动文件夹 / 映像劫持等自启动持久化点"
+                               Classes="label" HorizontalAlignment="Center" TextWrapping="Wrap" MaxWidth="420" TextAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

@@ -1,0 +1,46 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.AiRuleRequirementWindow"
+        Width="520" Height="360"
+        CanResize="False"
+        WindowStartupLocation="CenterOwner"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="AI 生成规则">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0">
+        <DockPanel>
+            <Border DockPanel.Dock="Top" Background="#0E1A2C" Padding="16,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <TextBlock Text="🤖" FontSize="20" Foreground="{StaticResource NeonCyanBrush}"/>
+                    <StackPanel>
+                        <TextBlock Text="AI 生成规则" Foreground="{StaticResource TextHiBrush}" FontSize="14" FontWeight="Bold"/>
+                        <TextBlock Text="DESCRIBE YOUR REQUIREMENT" Classes="label" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border DockPanel.Dock="Bottom" Padding="16,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                <Grid ColumnDefinitions="*,Auto,Auto">
+                    <Button Grid.Column="1" Content="取消" Click="Cancel_Click" Margin="0,0,8,0" Padding="16,7"/>
+                    <Button Grid.Column="2" Classes="neon" Content="✓ 生成" Click="Confirm_Click" Width="100"/>
+                </Grid>
+            </Border>
+
+            <StackPanel Margin="20,16" Spacing="10">
+                <TextBlock Text="用自然语言描述你的规则要求或条件,AI 会生成对应规则,确认后再添加。" 
+                           Foreground="{StaticResource TextMidBrush}" FontSize="12" TextWrapping="Wrap"/>
+                <TextBox x:Name="RequirementBox" 
+                         AcceptsReturn="True" TextWrapping="Wrap"
+                         Height="150" VerticalContentAlignment="Top"
+                         Watermark="例如:禁止 wscript.exe 创建任何子进程;或:只允许 C:\Program Files\ 下的程序联网。"/>
+            </StackPanel>
+        </DockPanel>
+    </Border>
+
+</Window>

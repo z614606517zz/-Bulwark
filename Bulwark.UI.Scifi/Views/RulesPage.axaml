@@ -1,0 +1,134 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.RulesPage"
+             x:DataType="vm:RulesViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="⚡" FontSize="18" Foreground="{StaticResource NeonCyanBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="规则管理" Classes="h1"/>
+                    <TextBlock Text="/ DEFENSE RULES" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="🤖 AI 生成" Click="AiGenerate_Click"
+                        IsEnabled="{Binding AiNotGenerating}" Margin="0,0,8,0"/>
+                <Button Grid.Column="2" Classes="neon" Content="↻ 刷新" Click="Refresh_Click" Margin="0,0,8,0"/>
+                <Button Grid.Column="3" Classes="neon" Content="+ 新增规则" Click="Add_Click"/>
+            </Grid>
+        </Border>
+
+        <!-- AI 规则建议面板 -->
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="14,10" Margin="0,0,0,10"
+                IsVisible="{Binding HasSuggestions}">
+            <StackPanel Spacing="6">
+                <ItemsControl ItemsSource="{Binding AiSuggestions}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:CompileBindings="False">
+                            <Border Padding="10,6" Margin="0,2" Background="#0A1120" CornerRadius="3"
+                                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="{Binding ActorPattern}" Foreground="{StaticResource TextHiBrush}" FontSize="12"/>
+                                        <TextBlock Foreground="{StaticResource TextDimBrush}" FontSize="11">
+                                            <TextBlock.Text>
+                                                <MultiBinding StringFormat="{}{0} → {1}">
+                                                    <Binding Path="TypeStr"/>
+                                                    <Binding Path="ActionStr"/>
+                                                </MultiBinding>
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding Reason}" Foreground="{StaticResource TextMidBrush}"
+                                                   FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Classes="neon" Content="采纳" Padding="10,4" FontSize="11"
+                                            Click="AcceptSuggestion_Click" Tag="{Binding}" VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
+
+        <!-- AI 状态提示(始终在有状态文本时展示) -->
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="12,9" Margin="0,0,0,10"
+                IsVisible="{Binding HasAiStatus}">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="🤖" FontSize="13" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding AiStatus}" Foreground="{StaticResource TextMidBrush}"
+                           FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
+        <Border Classes="hud" Padding="0">
+            <Grid>
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Padding="14,10"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                        <Grid ColumnDefinitions="*,120,84,64">
+                            <TextBlock Grid.Column="0" Text="主体 / 说明" Classes="label"/>
+                            <TextBlock Grid.Column="1" Text="行为类型" Classes="label"/>
+                            <TextBlock Grid.Column="2" Text="处置" Classes="label"/>
+                            <TextBlock Grid.Column="3" Text="操作" Classes="label"/>
+                        </Grid>
+                    </Border>
+                    <ListBox ItemsSource="{Binding Rules}" Background="Transparent" BorderThickness="0" Padding="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <Border Padding="14,10" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                                    <Grid ColumnDefinitions="*,120,84,64">
+                                        <StackPanel Grid.Column="0" Spacing="3" Margin="0,0,12,0">
+                                            <!-- 说明:这条规则在干嘛(最重要,放最前) -->
+                                            <TextBlock Text="{Binding Description}" Foreground="{StaticResource TextHiBrush}"
+                                                       FontSize="12.5" TextWrapping="Wrap"/>
+                                            <!-- 主体:谁触发 -->
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <TextBlock Text="主体" Foreground="{StaticResource TextDimBrush}" FontSize="11" VerticalAlignment="Center"/>
+                                                <TextBlock Text="{Binding ActorDisplay}" Foreground="{StaticResource TextMidBrush}"
+                                                           FontSize="11" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <!-- 命中条件(有才显示) -->
+                                            <TextBlock Text="{Binding ConditionSummary}" Foreground="{StaticResource TextDimBrush}"
+                                                       FontSize="11" TextWrapping="Wrap" IsVisible="{Binding HasCondition}"/>
+                                            <!-- 状态标签:临时/会话/停用(有才显示) -->
+                                            <TextBlock Text="{Binding StatusTag}" Foreground="#E0A35B"
+                                                       FontSize="11" IsVisible="{Binding HasStatusTag}"/>
+                                        </StackPanel>
+
+                                        <TextBlock Grid.Column="1" Text="{Binding TypeDisplay}" Foreground="{StaticResource TextMidBrush}"
+                                                   FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
+
+                                        <!-- 处置:拦截=红,放行/询问=青 -->
+                                        <Grid Grid.Column="2" VerticalAlignment="Center">
+                                            <Border Background="#33FF5A6E" CornerRadius="3" Padding="8,3"
+                                                    HorizontalAlignment="Left" IsVisible="{Binding ActionIsBlock}">
+                                                <TextBlock Text="{Binding ActionDisplay}" Foreground="#FF8896" FontSize="12" FontWeight="SemiBold"/>
+                                            </Border>
+                                            <Border Background="#1A36F1CD" CornerRadius="3" Padding="8,3"
+                                                    HorizontalAlignment="Left" IsVisible="{Binding ActionIsNotBlock}">
+                                                <TextBlock Text="{Binding ActionDisplay}" Foreground="{StaticResource NeonCyanBrush}" FontSize="12" FontWeight="SemiBold"/>
+                                            </Border>
+                                        </Grid>
+
+                                        <Button Grid.Column="3" Classes="neon danger" Content="删除" Padding="8,3" FontSize="11"
+                                                VerticalAlignment="Center" Click="Delete_Click" Tag="{Binding Id}"/>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding IsEmpty}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6">
+                    <TextBlock Text="⚡" FontSize="34" Foreground="{StaticResource TextDimBrush}" HorizontalAlignment="Center" Opacity="0.5"/>
+                    <TextBlock Text="暂无防御规则" Foreground="{StaticResource TextMidBrush}" FontSize="14" HorizontalAlignment="Center"/>
+                    <TextBlock Text="在弹窗中勾选「记住选择」会自动生成规则,或点右上角新增" Classes="label" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

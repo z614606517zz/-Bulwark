@@ -1,0 +1,334 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.SettingsPage"
+             x:DataType="vm:SettingsViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="⚙" FontSize="18" Foreground="{StaticResource NeonBlueBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="设置" Classes="h1"/>
+                    <TextBlock Text="/ SETTINGS" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="↻ 重新加载" Click="Refresh_Click"/>
+            </Grid>
+        </Border>
+
+        <ScrollViewer>
+            <StackPanel Spacing="12">
+
+                <!-- 总开关 -->
+                <Border Classes="hud-glow" Padding="20,14">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="主动防御" Foreground="{StaticResource TextHiBrush}" FontSize="14" FontWeight="SemiBold"/>
+                            <TextBlock Text="ACTIVE PROTECTION · 关闭后所有事件直接放行" Classes="label" Margin="0,3,0,0"/>
+                        </StackPanel>
+                        <ToggleSwitch Grid.Column="1" IsChecked="{Binding ProtectionEnabled}" VerticalAlignment="Center"/>
+                    </Grid>
+                </Border>
+
+                <!-- 防护维度 -->
+                <Border Classes="hud" Padding="20,14">
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="PROTECTION MODULES" Classes="label"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="进程防护" Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding ProcessProtection}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="文件防护" Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding FileProtection}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="注册表防护" Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding RegistryProtection}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="自我保护" Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding SelfProtection}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="网络防护" Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding NetworkProtection}"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- 决策策略 -->
+                <Border Classes="hud" Padding="20,14">
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="DECISION POLICY" Classes="label"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="自动信任签名程序" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="带可信签名的主体直接放行,减少弹窗打扰" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding TrustSignedActors}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="默认阻止" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="无规则/超时时的兜底动作" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding DefaultBlock}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="静默模式" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="询问类操作自动放行,仅拦截确定性高危行为" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding SilentMode}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="拦截即隔离" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="确认恶意时把主体文件移入隔离区(可恢复)" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <CheckBox Grid.Column="1" IsChecked="{Binding QuarantineOnBlock}" VerticalAlignment="Center"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- 内核驱动 -->
+                <Border Classes="hud" Padding="20,14">
+                    <StackPanel Spacing="10">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="KERNEL DRIVER" Classes="label" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                <Border Background="#0D2A1C" CornerRadius="8" Padding="8,3"
+                                        IsVisible="{Binding KernelConnected}">
+                                    <TextBlock Text="已连接" Foreground="{StaticResource StateOkBrush}" FontSize="10" FontWeight="SemiBold"/>
+                                </Border>
+                                <Border Background="#2A1A0D" CornerRadius="8" Padding="8,3"
+                                        IsVisible="{Binding !KernelConnected}">
+                                    <TextBlock Text="未连接" Foreground="{StaticResource StateWarnBrush}" FontSize="10" FontWeight="SemiBold"/>
+                                </Border>
+                            </StackPanel>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="启用内核驱动" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="开启后服务连接 Bulwark.sys 实现内核级拦截" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding KernelDriverEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Border Background="#0A1120" CornerRadius="3" Padding="12,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto">
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="状态:" Classes="label" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding KernelStatus}" Foreground="{StaticResource NeonCyanBrush}"
+                                           FontFamily="{StaticResource MonoFont}" FontSize="12" Margin="8,0,0,0" VerticalAlignment="Center"
+                                           TextWrapping="Wrap"/>
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="事件源:" Classes="label" VerticalAlignment="Center" Margin="0,6,0,0"/>
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding EventSource}" Foreground="{StaticResource TextMidBrush}"
+                                           FontFamily="{StaticResource MonoFont}" FontSize="12" Margin="8,6,0,0" VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
+                <!-- 威胁情报 -->
+                <Border Classes="hud" Padding="20,14">
+                    <StackPanel Spacing="10">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="THREAT INTELLIGENCE / 威胁情报" Classes="label" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Classes="neon" Content="测试连接" Padding="12,6" FontSize="12"
+                                    Click="TestVt_Click" IsEnabled="{Binding VtNotBusy}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="启用 VirusTotal 后台信誉查询" Foreground="{StaticResource TextMidBrush}"/>
+                                <TextBlock Text="对未签名+本机首见+可疑的新样本后台限流查 VT 哈希信誉;命中恶意则结束进程并固化拦截。已内置默认 Key,开箱即用" Classes="label" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding VirusTotalEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <TextBlock Text="按文件 SHA-256 查询 VirusTotal 信誉(由服务端持有 API Key,UI 仅转发)。"
+                                   Classes="label" TextWrapping="Wrap"/>
+                        <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,2,0,0">
+                            <TextBox Grid.Column="0" Text="{Binding VtFilePath}" Watermark="C:\path\to\file.exe"
+                                     FontSize="12" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Content="浏览…" Click="BrowseVt_Click" Padding="12,7" Margin="8,0,0,0"/>
+                            <Button Grid.Column="2" Classes="neon" Content="查询信誉" Click="QueryVt_Click"
+                                    Padding="14,7" Margin="8,0,0,0" IsEnabled="{Binding VtNotBusy}"/>
+                        </Grid>
+                        <Border Background="#0A1120" CornerRadius="3" Padding="12,10" Margin="0,4,0,0"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <TextBlock Text="{Binding VtResult}" Foreground="{StaticResource TextMidBrush}"
+                                       FontFamily="{StaticResource MonoFont}" FontSize="12" TextWrapping="Wrap"/>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
+                <!-- AI 大模型设置 -->
+                <Border Classes="hud" Padding="20,14">
+                    <StackPanel Spacing="10">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Grid.Column="0" Text="AI / 大模型研判" Classes="label" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                <Border Background="#0D2A1C" CornerRadius="8" Padding="8,3"
+                                        IsVisible="{Binding AiScanDoubleClickEnabled}">
+                                    <TextBlock Text="AI 启用" Foreground="{StaticResource StateOkBrush}" FontSize="10" FontWeight="SemiBold"/>
+                                </Border>
+                                <Border Background="#1A1A2A" CornerRadius="8" Padding="8,3"
+                                        IsVisible="{Binding !AiScanDoubleClickEnabled}">
+                                    <TextBlock Text="AI 关闭" Foreground="{StaticResource TextDimBrush}" FontSize="10" FontWeight="SemiBold"/>
+                                </Border>
+                            </StackPanel>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="双击启动 AI 扫描" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="用户双击运行程序时,AI 额外研判是否恶意(fail-open)" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding AiScanDoubleClickEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="研判期间挂起进程" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="AI 出结论前冻结该程序,判定安全才放行、恶意则直接结束" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding AiScanSuspendDuringScan}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="研判失败时拦截(严格模式)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="AI 不可用/超时时拦截而非放行;更安全但可能误拦,默认关闭" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding AiScanBlockOnFailure}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="灰区 AI 研判" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="需弹窗询问的灰区事件先让 AI 研判:恶意则拦截、干净且无硬指标则放行减少打扰;AI 不可用则正常弹窗(fail-open)" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding AiGrayZoneConsultEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Credits 预算护栏" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="本地累计估算月度 Credits 用量,用到额度 95% 自动停调模型(fail-open),硬性防爆额度" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding AiCreditGuardEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="月度额度(亿 Credits)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="按所购套餐填写:Lite=41 / Standard=110 / Pro=380 / Max=820" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <NumericUpDown Grid.Column="1" Width="140" VerticalAlignment="Center"
+                                           Minimum="1" Maximum="100000" Increment="1" FormatString="0"
+                                           Value="{Binding AiMonthlyCreditYi}"
+                                           IsEnabled="{Binding AiCreditGuardEnabled}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="官方用量显示(Cookie)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="填入控制台 Cookie 后,仪表盘显示小米平台官方真实用量;Cookie 过期自动回退本地估算。纯展示" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding MimoUsageEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <StackPanel Spacing="6" IsVisible="{Binding MimoUsageEnabled}">
+                            <TextBox Text="{Binding MimoUsageCookie}" Watermark="粘贴 Cookie 整串,或右键 usage 请求 → Copy as cURL 后整段粘贴(自动提取 Cookie)"
+                                     AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="90" FontSize="11"
+                                     FontFamily="{StaticResource MonoFont}"/>
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <Button Content="测试获取" Click="TestMimoUsage_Click" Padding="12,4"/>
+                                <TextBlock Text="{Binding MimoUsageTestResult}" Foreground="{StaticResource NeonCyanBrush}"
+                                           FontSize="11" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <Border Height="1" Background="{StaticResource HairlineBrush}" Margin="0,4"/>
+                        <TextBlock Text="持续行为防护(事后)" Classes="label" Margin="0,2,0,0"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="用户态持续行为监控" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="无需驱动也监视程序运行后的危险行为:自启动持久化、勒索批量改写" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding UserModeBehaviorMonitor}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="勒索蜜罐(诱饵文件)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="在文档/桌面/图片投放诱饵,任何进程改写诱饵即判定勒索并告警" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding RansomwareCanaryEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="行为基线异常检测" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="为每个程序学习正常行为画像,偏离自身历史时升分(软信号,需与硬指标互证,不单独打扰)" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding BehaviorBaselineEnabled}" VerticalAlignment="Center"/>
+                        </Grid>
+
+                        <Border Height="1" Background="{StaticResource HairlineBrush}" Margin="0,4"/>
+
+                        <TextBlock Text="MODEL CONFIG" Classes="label" Margin="0,2,0,0"/>
+                        <Grid ColumnDefinitions="Auto,*" Margin="0,4,0,0">
+                            <TextBlock Grid.Column="0" Text="API 基址:" Classes="label" VerticalAlignment="Center" Width="70"/>
+                            <TextBox Grid.Column="1" Text="{Binding AiBaseUrl}" Watermark="https://xxx/v1"
+                                     FontSize="12" FontFamily="{StaticResource MonoFont}"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,*">
+                            <TextBlock Grid.Column="0" Text="API Key:" Classes="label" VerticalAlignment="Center" Width="70"/>
+                            <TextBox Grid.Column="1" Text="{Binding AiApiKey}" Watermark="sk-..."
+                                     FontSize="12" FontFamily="{StaticResource MonoFont}" PasswordChar="●"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,*">
+                            <TextBlock Grid.Column="0" Text="模型:" Classes="label" VerticalAlignment="Center" Width="70"/>
+                            <TextBox Grid.Column="1" Text="{Binding AiModel}" Watermark="mimo-v2.5-pro"
+                                     FontSize="12" FontFamily="{StaticResource MonoFont}"/>
+                        </Grid>
+
+                        <Border Height="1" Background="{StaticResource HairlineBrush}" Margin="0,4"/>
+
+                        <TextBlock Text="扫描内容上限(喂给大模型的体积)" Classes="label" Margin="0,2,0,0"/>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="脚本源码上限 (KB)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="文本/脚本类文件读取的源码字节数,范围 1~512" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <NumericUpDown Grid.Column="1" Value="{Binding AiScanScriptTextLimitKb}"
+                                           Minimum="1" Maximum="512" Increment="8" Width="120"
+                                           FontSize="12" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="二进制采样上限 (MB)" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="可执行/二进制采样读取量(取头+尾),范围 1~64" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <NumericUpDown Grid.Column="1" Value="{Binding AiScanBinarySampleLimitMb}"
+                                           Minimum="1" Maximum="64" Increment="1" Width="120"
+                                           FontSize="12" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="字符串提取条数" Foreground="{StaticResource TextHiBrush}"/>
+                                <TextBlock Text="从二进制提取的可打印字符串最大条数,范围 50~2000" Classes="label" Margin="0,2,0,0"/>
+                            </StackPanel>
+                            <NumericUpDown Grid.Column="1" Value="{Binding AiScanMaxStrings}"
+                                           Minimum="50" Maximum="2000" Increment="50" Width="120"
+                                           FontSize="12" VerticalAlignment="Center"/>
+                        </Grid>
+
+                        <Grid ColumnDefinitions="*,Auto" Margin="0,6,0,0">
+                            <Border Grid.Column="0" Background="#0A1120" CornerRadius="3" Padding="12,8"
+                                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                                <TextBlock Text="{Binding AiTestResult}" Foreground="{StaticResource TextMidBrush}"
+                                           FontFamily="{StaticResource MonoFont}" FontSize="12" TextWrapping="Wrap"/>
+                            </Border>
+                            <Button Grid.Column="1" Classes="neon" Content="测试 AI" Padding="12,6" FontSize="12"
+                                    Click="TestAi_Click" IsEnabled="{Binding AiNotBusy}" Margin="8,0,0,0"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+
+</UserControl>

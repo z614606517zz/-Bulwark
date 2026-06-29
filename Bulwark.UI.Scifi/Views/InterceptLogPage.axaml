@@ -1,0 +1,82 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.InterceptLogPage"
+             x:DataType="vm:InterceptLogViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="🚫" FontSize="18" Foreground="{StaticResource StateDangerBrush}" VerticalAlignment="Center"/>
+                <TextBlock Text="拦截记录" Classes="h1"/>
+                <TextBlock Text="/ INTERCEPT LOG" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                <TextBlock Text="· 双击查看攻击时间线" Classes="label" VerticalAlignment="Center"
+                           Foreground="{StaticResource NeonCyanBrush}" Margin="8,0,0,0"/>
+            </StackPanel>
+        </Border>
+
+        <Border Classes="hud" Padding="8">
+            <Grid>
+                <ListBox x:Name="EntriesList" ItemsSource="{Binding Entries}" Background="Transparent" BorderThickness="0"
+                         DoubleTapped="OnEntryDoubleTapped">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="vm:InterceptLogEntry">
+                            <Border Background="#14213A" CornerRadius="6" Padding="12,10" Margin="0,0,0,6"
+                                    BorderBrush="#33FF5C6E" BorderThickness="1,1,1,1" ToolTip.Tip="双击查看攻击时间线">
+                                <Grid ColumnDefinitions="Auto,*,Auto">
+
+                                    <!-- 类型图标 -->
+                                    <Border Grid.Column="0" Width="34" Height="34" CornerRadius="6"
+                                            Background="#22FF5C6E" VerticalAlignment="Top" Margin="0,0,12,0">
+                                        <TextBlock Text="{Binding Icon}" FontSize="16"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+
+                                    <!-- 主体信息 -->
+                                    <StackPanel Grid.Column="1" Spacing="3">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Border Background="#33FF5C6E" CornerRadius="3" Padding="6,1">
+                                                <TextBlock Text="{Binding TypeBadge}" FontSize="11"
+                                                           Foreground="{StaticResource StateDangerBrush}" FontWeight="SemiBold"/>
+                                            </Border>
+                                            <TextBlock VerticalAlignment="Center" FontSize="13" TextWrapping="Wrap">
+                                                <Run Text="{Binding ActorName}" Foreground="White" FontWeight="Bold"/>
+                                                <Run Text=" " />
+                                                <Run Text="{Binding ActionText}" Foreground="#E2ECF7"/>
+                                            </TextBlock>
+                                        </StackPanel>
+
+                                        <TextBlock Text="{Binding TargetText}" IsVisible="{Binding HasTarget}"
+                                                   FontSize="12" FontFamily="{StaticResource MonoFont}"
+                                                   Foreground="{StaticResource NeonCyanBrush}" TextWrapping="Wrap"/>
+
+                                        <TextBlock Text="{Binding ActorPath}" FontSize="11"
+                                                   FontFamily="{StaticResource MonoFont}"
+                                                   Foreground="{StaticResource TextDimBrush}" TextWrapping="Wrap"/>
+                                    </StackPanel>
+
+                                    <!-- 时间 + 处置 -->
+                                    <StackPanel Grid.Column="2" Spacing="3" HorizontalAlignment="Right" Margin="10,0,0,0">
+                                        <TextBlock Text="{Binding Time}" FontSize="12"
+                                                   Foreground="{StaticResource TextMidBrush}" HorizontalAlignment="Right"/>
+                                        <Border Background="#1E5E45" CornerRadius="3" Padding="6,1" HorizontalAlignment="Right">
+                                            <TextBlock Text="已拦截" FontSize="11" Foreground="#7CF5C8" FontWeight="SemiBold"/>
+                                        </Border>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding IsEmpty}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6">
+                    <TextBlock Text="🚫" FontSize="34" Foreground="{StaticResource TextDimBrush}" HorizontalAlignment="Center" Opacity="0.5"/>
+                    <TextBlock Text="暂无拦截记录" Foreground="{StaticResource TextMidBrush}" FontSize="14" HorizontalAlignment="Center"/>
+                    <TextBlock Text="当确定性高危行为被直接拦截时,会实时记录在此" Classes="label" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

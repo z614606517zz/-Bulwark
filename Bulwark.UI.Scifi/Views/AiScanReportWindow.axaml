@@ -1,0 +1,149 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.AiScanReportWindow"
+        Width="650" Height="600"
+        CanResize="False"
+        WindowStartupLocation="CenterScreen"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="恶意足迹清理报告">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0">
+        <DockPanel>
+
+            <!-- ===== 标题栏 ===== -->
+            <Border DockPanel.Dock="Top" Background="#1A0E14" Padding="18,14"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1"
+                    PointerPressed="Title_PointerPressed">
+                <StackPanel Orientation="Horizontal" Spacing="12">
+                    <TextBlock Text="🧹" FontSize="22" Foreground="{StaticResource NeonCyanBrush}"/>
+                    <StackPanel>
+                        <TextBlock Text="恶意足迹清理报告" Foreground="{StaticResource TextHiBrush}" FontSize="15" FontWeight="Bold"/>
+                        <TextBlock Text="MALICIOUS FOOTPRINT REMEDIATION REPORT" Classes="label" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- ===== 底部操作栏 ===== -->
+            <Border DockPanel.Dock="Bottom" Padding="18,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Grid.Column="0" x:Name="TimestampText" VerticalAlignment="Center"
+                               Foreground="{StaticResource TextDimBrush}" FontSize="11"/>
+                    <Button Grid.Column="1" Classes="neon" Content="关闭" Click="Close_Click" Width="100"/>
+                </Grid>
+            </Border>
+
+            <!-- ===== 主体内容 ===== -->
+            <ScrollViewer Padding="18,14">
+                <StackPanel Spacing="14">
+
+                    <!-- 恶意主体信息 -->
+                    <Border Background="#0D1A2E" CornerRadius="4" Padding="14,10"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                        <StackPanel Spacing="4">
+                            <TextBlock x:Name="ActorText" Foreground="{StaticResource NeonCyanBrush}"
+                                       FontFamily="{StaticResource MonoFont}" FontSize="12" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="VerdictText" Foreground="{StaticResource TextMidBrush}"
+                                       FontSize="12" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 清理统计 -->
+                    <TextBlock x:Name="SummaryText" Foreground="{StaticResource TextDimBrush}" FontSize="12"/>
+
+                    <!-- 主体载荷已隔离 -->
+                    <StackPanel x:Name="ActorQuarantinedSection" Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="✓" Foreground="{StaticResource StateOkBrush}" FontSize="14" FontWeight="Bold"/>
+                            <TextBlock Text="主体载荷已隔离" Foreground="{StaticResource TextHiBrush}" FontSize="13" FontWeight="SemiBold"/>
+                        </StackPanel>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="12,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <StackPanel x:Name="ActorFileList" Spacing="3"/>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- 已隔离释放/关联文件 -->
+                    <StackPanel x:Name="QuarantinedSection" Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="✓" Foreground="{StaticResource StateOkBrush}" FontSize="14" FontWeight="Bold"/>
+                            <TextBlock x:Name="QuarantinedTitle" Foreground="{StaticResource TextHiBrush}" FontSize="13" FontWeight="SemiBold"/>
+                        </StackPanel>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="12,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="QuarantinedList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+                                            <TextBlock Text="•" Foreground="{StaticResource TextDimBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding}" Foreground="{StaticResource TextMidBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- 已移除注册表自启动 -->
+                    <StackPanel x:Name="RegistrySection" Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="✓" Foreground="{StaticResource StateOkBrush}" FontSize="14" FontWeight="Bold"/>
+                            <TextBlock x:Name="RegistryTitle" Foreground="{StaticResource TextHiBrush}" FontSize="13" FontWeight="SemiBold"/>
+                        </StackPanel>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="12,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="RegistryList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+                                            <TextBlock Text="•" Foreground="{StaticResource TextDimBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding}" Foreground="{StaticResource TextMidBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- 未能清理 -->
+                    <StackPanel x:Name="SkippedSection" Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="✕" Foreground="{StaticResource StateDangerBrush}" FontSize="14" FontWeight="Bold"/>
+                            <TextBlock x:Name="SkippedTitle" Foreground="{StaticResource TextHiBrush}" FontSize="13" FontWeight="SemiBold"/>
+                        </StackPanel>
+                        <ItemsControl x:Name="SkippedList">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:CompileBindings="False">
+                                    <Border Padding="12,8" Margin="0,0,0,3" Background="#0A1120" CornerRadius="4"
+                                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                                        <Grid ColumnDefinitions="*,Auto">
+                                            <StackPanel Grid.Column="0">
+                                                <TextBlock Text="{Binding Target}" Foreground="{StaticResource TextHiBrush}"
+                                                           FontFamily="{StaticResource MonoFont}" FontSize="11" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding Reason}" Foreground="{StaticResource TextDimBrush}"
+                                                           FontSize="10" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                            </StackPanel>
+                                            <Button Grid.Column="1" Classes="neon danger" Content="重试隔离"
+                                                    Padding="10,4" FontSize="11" VerticalAlignment="Center"
+                                                    IsVisible="{Binding IsFile}"
+                                                    Click="Retry_Click" Tag="{Binding Target}"/>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                </StackPanel>
+            </ScrollViewer>
+
+        </DockPanel>
+    </Border>
+
+</Window>

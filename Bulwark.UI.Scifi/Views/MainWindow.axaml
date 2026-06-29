@@ -1,0 +1,95 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+        x:Class="Bulwark.UI.Scifi.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Width="1060" Height="680"
+        WindowStartupLocation="CenterScreen"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="38"
+        Title="磐垒主动防御 // BULWARK">
+
+    <Grid RowDefinitions="38,*">
+
+        <!-- ======== 自定义标题栏 ======== -->
+        <Border Grid.Row="0" Background="{StaticResource BgDeepBrush}" IsHitTestVisible="True"
+                PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
+            <Grid ColumnDefinitions="Auto,*,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Margin="14,0" VerticalAlignment="Center">
+                    <TextBlock Text="◆" Foreground="{StaticResource NeonCyanBrush}" FontSize="16" Margin="0,0,8,0"/>
+                    <TextBlock Text="BULWARK" Foreground="{StaticResource TextHiBrush}" FontSize="12"
+                               FontWeight="Bold" LetterSpacing="3"/>
+                    <TextBlock Text="// 磐垒" Foreground="{StaticResource TextDimBrush}" FontSize="11"
+                               Margin="6,0,0,0" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Border Grid.Column="1" Background="Transparent" />
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button Classes="chrome" Content="─" Click="Minimize_Click"/>
+                    <Button Classes="chrome" Content="□" Click="MaxRestore_Click"/>
+                    <Button Classes="chrome close" Content="✕" Click="Close_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ======== 主体区域 ======== -->
+        <Grid Grid.Row="1" ColumnDefinitions="200,*">
+
+            <!-- ===== 左侧导航 ===== -->
+            <Border Grid.Column="0" Background="{StaticResource BgDeepBrush}"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,1,0">
+                <DockPanel>
+                    <Border DockPanel.Dock="Bottom" Padding="14,10"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#FF3B5C"/>
+                            <TextBlock Text="{Binding StatusText}" FontSize="11"
+                                       Foreground="{StaticResource TextDimBrush}"/>
+                        </StackPanel>
+                    </Border>
+
+                    <StackPanel Margin="0,16,0,0">
+                        <TextBlock Text="NAVIGATION" Classes="label" Margin="18,0,0,12"/>
+                        <Button x:Name="NavDashboard" Classes="nav active" Content="▣  仪表盘" Click="Nav_Click" Tag="Dashboard"/>
+                        <Button x:Name="NavRules" Classes="nav" Content="⚡  规则管理" Click="Nav_Click" Tag="Rules"/>
+                        <Button x:Name="NavTrust" Classes="nav" Content="✓  文件信任" Click="Nav_Click" Tag="Trust"/>
+                        <Button x:Name="NavQuarantine" Classes="nav" Content="🗃  隔离区" Click="Nav_Click" Tag="Quarantine"/>
+                        <Button x:Name="NavPersistence" Classes="nav" Content="⚓  持久化审计" Click="Nav_Click" Tag="Persistence"/>
+                        <Button x:Name="NavLog" Classes="nav" Content="📋  拦截记录" Click="Nav_Click" Tag="InterceptLog"/>
+                        <Button x:Name="NavActivity" Classes="nav" Content="📡  活动日志" Click="Nav_Click" Tag="ActivityLog"/>
+                        <Button x:Name="NavAiScan" Classes="nav" Content="🤖  AI 扫描" Click="Nav_Click" Tag="AiScan"/>
+                        <Button x:Name="NavVtHistory" Classes="nav" Content="🛰  VT 查询记录" Click="Nav_Click" Tag="VtHistory"/>
+                        <Button x:Name="NavSettings" Classes="nav" Content="⚙  设置" Click="Nav_Click" Tag="Settings"/>
+
+                        <!-- 侧栏驱动状态指示 -->
+                        <Border Margin="12,20,12,0" Padding="10,8" CornerRadius="4"
+                                Background="#0A1120" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+                                IsVisible="{Binding IsConnected}">
+                            <StackPanel Spacing="4">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Panel Width="8" Height="8">
+                                        <Ellipse Width="8" Height="8" Fill="{StaticResource StateOkBrush}"
+                                                 IsVisible="{Binding KernelConnected}"/>
+                                        <Ellipse Width="8" Height="8" Fill="{StaticResource StateWarnBrush}"
+                                                 IsVisible="{Binding !KernelConnected}"/>
+                                    </Panel>
+                                    <TextBlock Text="KERNEL" FontSize="10" LetterSpacing="1"
+                                               Foreground="{StaticResource TextDimBrush}"/>
+                                </StackPanel>
+                                <TextBlock Text="{Binding KernelStatus}" FontSize="9"
+                                           Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- ===== 右侧内容(页面切换) ===== -->
+            <ContentControl Grid.Column="1" x:Name="PageHost" Margin="20,16,20,16"/>
+
+        </Grid>
+    </Grid>
+
+</Window>

@@ -1,0 +1,49 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.TrustPage"
+             x:DataType="vm:TrustViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="✓" FontSize="18" Foreground="{StaticResource NeonTealBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="文件信任" Classes="h1"/>
+                    <TextBlock Text="/ TRUST CENTER" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="↻ 刷新" Click="Refresh_Click" Margin="0,0,8,0"/>
+                <Button Grid.Column="2" Classes="neon ok" Content="+ 添加信任" Click="Add_Click"/>
+            </Grid>
+        </Border>
+
+        <Border Classes="hud" Padding="0">
+            <Grid>
+                <ListBox ItemsSource="{Binding Entries}" Background="Transparent" BorderThickness="0" Padding="0">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:CompileBindings="False">
+                            <Border Padding="14,8" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                                <Grid ColumnDefinitions="*,80">
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="{Binding ActorPath}" Foreground="{StaticResource TextHiBrush}" FontSize="12"/>
+                                        <TextBlock Text="{Binding Note}" Foreground="{StaticResource TextDimBrush}" FontSize="11"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Classes="neon danger" Content="移除" Padding="8,3" FontSize="11"
+                                            Click="Remove_Click" Tag="{Binding Id}"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding IsEmpty}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6">
+                    <TextBlock Text="✓" FontSize="34" Foreground="{StaticResource TextDimBrush}" HorizontalAlignment="Center" Opacity="0.5"/>
+                    <TextBlock Text="暂无受信任文件" Foreground="{StaticResource TextMidBrush}" FontSize="14" HorizontalAlignment="Center"/>
+                    <TextBlock Text="点右上角「添加信任」选择可执行文件,信任后该程序行为直接放行" Classes="label" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

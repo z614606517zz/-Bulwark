@@ -1,0 +1,168 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.AttackTimelineWindow"
+        Width="640" Height="720"
+        CanResize="True"
+        WindowStartupLocation="CenterScreen"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="攻击时间线">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0">
+        <DockPanel>
+
+            <!-- 顶部标题栏(可拖动移动窗口) -->
+            <Border DockPanel.Dock="Top" Background="#0C1A2E" Padding="16,10"
+                    BorderBrush="#3326C0FF" BorderThickness="0,0,0,1"
+                    PointerPressed="TitleBar_PointerPressed">
+                <Grid ColumnDefinitions="Auto,*,Auto">
+                    <TextBlock Grid.Column="0" Text="🧭" FontSize="20" VerticalAlignment="Center"/>
+                    <StackPanel Grid.Column="1" Margin="10,0,0,0">
+                        <TextBlock Text="攻击时间线" Foreground="{StaticResource NeonCyanBrush}"
+                                   FontSize="14" FontWeight="Bold"/>
+                        <TextBlock Text="ATTACK TIMELINE · 决策可解释性" Classes="label" Margin="0,2,0,0"/>
+                    </StackPanel>
+                    <Button Grid.Column="2" Classes="neon" Content="关闭" Click="Close_Click" Width="84"/>
+                </Grid>
+            </Border>
+
+            <ScrollViewer Padding="16,14">
+                <StackPanel Spacing="14">
+
+                    <!-- 摘要 -->
+                    <Border Background="#0A1120" CornerRadius="6" Padding="12"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                        <StackPanel Spacing="8">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <StackPanel Grid.Column="0" Spacing="2">
+                                    <TextBlock x:Name="ActorNameText" Text="—" Foreground="White"
+                                               FontSize="15" FontWeight="Bold" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="ActorPathText" Text="—" Foreground="{StaticResource TextDimBrush}"
+                                               FontFamily="{StaticResource MonoFont}" FontSize="11" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <Border Grid.Column="1" x:Name="VerdictBadge" Background="#33FF5C6E" CornerRadius="4"
+                                        Padding="8,3" VerticalAlignment="Top" Margin="10,0,0,0">
+                                    <TextBlock x:Name="VerdictText" Text="已拦截" FontSize="12"
+                                               Foreground="{StaticResource StateDangerBrush}" FontWeight="SemiBold"/>
+                                </Border>
+                            </Grid>
+                            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto" >
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="行为  " Classes="label" Margin="0,0,8,2"/>
+                                <TextBlock Grid.Row="0" Grid.Column="1" x:Name="BehaviorText" Text="—"
+                                           Foreground="{StaticResource NeonCyanBrush}" FontSize="12" Margin="0,0,0,2"/>
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="目标  " Classes="label" Margin="0,0,8,2"/>
+                                <TextBlock Grid.Row="1" Grid.Column="1" x:Name="TargetText" Text="—"
+                                           Foreground="{StaticResource TextMidBrush}" FontFamily="{StaticResource MonoFont}"
+                                           FontSize="12" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="风险  " Classes="label" Margin="0,0,8,0"/>
+                                <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                    <TextBlock x:Name="ScoreText" Text="0" Foreground="{StaticResource StateWarnBrush}"
+                                               FontFamily="{StaticResource MonoFont}" FontSize="14" FontWeight="Bold"/>
+                                    <TextBlock x:Name="TimeText" Text="" Foreground="{StaticResource TextDimBrush}"
+                                               FontSize="11" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- ATT&CK 技战术标签 -->
+                    <StackPanel x:Name="TechniqueSection" Spacing="6">
+                        <TextBlock Text="MITRE ATT&amp;CK · 命中技战术" Classes="label"/>
+                        <ItemsControl x:Name="TechniqueList">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <WrapPanel Orientation="Horizontal"/>
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:CompileBindings="False">
+                                    <Border Background="#11243B" CornerRadius="4" Padding="8,3" Margin="0,0,6,6"
+                                            BorderBrush="#2E5A8C" BorderThickness="1">
+                                        <TextBlock Text="{Binding}" Foreground="{StaticResource NeonCyanBrush}"
+                                                   FontSize="11" FontFamily="{StaticResource MonoFont}"/>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <!-- 进程链(攻击叙事) -->
+                    <StackPanel x:Name="ChainSection" Spacing="6">
+                        <TextBlock Text="PROCESS CHAIN · 进程链上下文" Classes="label"/>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="10,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="ChainList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <Grid ColumnDefinitions="Auto,Auto,*,Auto" Margin="0,3">
+                                            <Border Grid.Column="0" Width="3" Background="{Binding Accent}"
+                                                    CornerRadius="2" Margin="0,1,8,1"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding TimeText}" Foreground="{StaticResource TextDimBrush}"
+                                                       FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                       VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <StackPanel Grid.Column="2" Spacing="1">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <TextBlock Text="{Binding Noun}" Foreground="{Binding Accent}"
+                                                               FontSize="11" FontWeight="Bold"/>
+                                                    <TextBlock Text="{Binding ActorText}" Foreground="{StaticResource TextHiBrush}"
+                                                               FontSize="11" FontFamily="{StaticResource MonoFont}"/>
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding TargetText}" Foreground="{StaticResource TextMidBrush}"
+                                                           FontSize="11" TextWrapping="Wrap" IsVisible="{Binding HasTarget}"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="3" Text="{Binding ScoreText}" Foreground="{Binding Accent}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- 证据链(决策时间线) -->
+                    <StackPanel x:Name="EvidenceSection" Spacing="6">
+                        <TextBlock Text="EVIDENCE TIMELINE · 判定依据" Classes="label"/>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="10,8"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="EvidenceList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,2">
+                                            <Border Grid.Column="0" Width="3" Background="{Binding Accent}"
+                                                    CornerRadius="2" Margin="0,1,8,1"/>
+                                            <StackPanel Grid.Column="1" Spacing="1">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <TextBlock Text="{Binding KindLabel}" Foreground="{Binding Accent}"
+                                                               FontSize="10" FontWeight="Bold"/>
+                                                    <TextBlock Text="{Binding Source}" Foreground="{StaticResource TextDimBrush}"
+                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"/>
+                                                    <Border Background="#1A2A44" CornerRadius="3" Padding="4,0"
+                                                            IsVisible="{Binding HasTechnique}">
+                                                        <TextBlock Text="{Binding Technique}" Foreground="{StaticResource NeonCyanBrush}"
+                                                                   FontSize="9" FontFamily="{StaticResource MonoFont}"/>
+                                                    </Border>
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding Description}" Foreground="{StaticResource TextMidBrush}"
+                                                           FontSize="12" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="2" Text="{Binding ScoreText}" Foreground="{Binding Accent}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="12"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </StackPanel>
+
+                </StackPanel>
+            </ScrollViewer>
+
+        </DockPanel>
+    </Border>
+
+</Window>

@@ -1,0 +1,26 @@
+<!-- 磐垒 · Windows Sandbox 行为监控配置模板 -->
+<!-- 由 Bulwark.UI 自动生成 -->
+<Configuration>
+  <!-- GPU 加速(提升图形性能) -->
+  <VGpu>Enable</VGpu>
+
+  <!-- 网络访问(默认禁用,防止恶意程序外联) -->
+  <Networking>{{NETWORKING}}</Networking>
+
+  <!-- 共享目录:宿主机 <-> 沙盒 -->
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>{{TRANSFER_DIR}}</HostFolder>
+      <SandboxFolder>C:\transfer</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+
+  <!-- 登录后自动执行:启动行为监控 + 目标程序 -->
+  <LogonCommand>
+    <Command>C:\transfer\sandbox_monitor.bat "{{TARGET_PATH}}" {{DURATION}}</Command>
+  </LogonCommand>
+
+  <!-- 内存分配(MB) -->
+  <MemoryInMB>{{MEMORY}}</MemoryInMB>
+</Configuration>

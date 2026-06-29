@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bulwark.Service", "Bulwark.Service\Bulwark.Service.csproj", "{1E27273E-1335-4FA2-8428-265F3D5A9264}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bulwark.Core", "Bulwark.Core\Bulwark.Core.csproj", "{E1F65784-6F53-46DD-848C-B05197F9B208}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bulwark.Core.Tests", "Bulwark.Core.Tests\Bulwark.Core.Tests.csproj", "{712A4353-FD7D-409B-8E7C-C7244029F126}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bulwark.UI.Scifi", "Bulwark.UI.Scifi\Bulwark.UI.Scifi.csproj", "{5363718F-74E2-4C02-8698-DC06ECC98F37}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1E27273E-1335-4FA2-8428-265F3D5A9264}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1E27273E-1335-4FA2-8428-265F3D5A9264}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1E27273E-1335-4FA2-8428-265F3D5A9264}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1E27273E-1335-4FA2-8428-265F3D5A9264}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E1F65784-6F53-46DD-848C-B05197F9B208}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E1F65784-6F53-46DD-848C-B05197F9B208}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E1F65784-6F53-46DD-848C-B05197F9B208}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E1F65784-6F53-46DD-848C-B05197F9B208}.Release|Any CPU.Build.0 = Release|Any CPU
+		{712A4353-FD7D-409B-8E7C-C7244029F126}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{712A4353-FD7D-409B-8E7C-C7244029F126}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{712A4353-FD7D-409B-8E7C-C7244029F126}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{712A4353-FD7D-409B-8E7C-C7244029F126}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5363718F-74E2-4C02-8698-DC06ECC98F37}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5363718F-74E2-4C02-8698-DC06ECC98F37}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5363718F-74E2-4C02-8698-DC06ECC98F37}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5363718F-74E2-4C02-8698-DC06ECC98F37}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

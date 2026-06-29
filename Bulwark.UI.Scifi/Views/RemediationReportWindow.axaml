@@ -1,0 +1,116 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.RemediationReportWindow"
+        Width="600" Height="560"
+        CanResize="False"
+        WindowStartupLocation="CenterScreen"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="威胁清理报告">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0">
+        <DockPanel>
+            <!-- 标题 -->
+            <Border DockPanel.Dock="Top" Background="#1A0E14" Padding="18,14"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1"
+                    PointerPressed="Title_PointerPressed">
+                <StackPanel Orientation="Horizontal" Spacing="12">
+                    <TextBlock Text="🛡" FontSize="22" Foreground="{StaticResource StateDangerBrush}"/>
+                    <StackPanel>
+                        <TextBlock Text="威胁清理报告" Foreground="{StaticResource TextHiBrush}" FontSize="15" FontWeight="Bold"/>
+                        <TextBlock Text="REMEDIATION REPORT" Classes="label" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- 底部操作 -->
+            <Border DockPanel.Dock="Bottom" Padding="18,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Grid.Column="0" x:Name="SummaryText" VerticalAlignment="Center"
+                               Foreground="{StaticResource TextDimBrush}" FontSize="12"/>
+                    <Button Grid.Column="1" Classes="neon" Content="关闭" Click="Close_Click" Width="100"/>
+                </Grid>
+            </Border>
+
+            <ScrollViewer Padding="18,14">
+                <StackPanel Spacing="14">
+
+                    <!-- 恶意主体 -->
+                    <Border Classes="hud" Padding="14,12">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="MALICIOUS ACTOR / 恶意主体" Classes="label"/>
+                            <TextBlock x:Name="ActorText" Foreground="{StaticResource TextHiBrush}"
+                                       FontFamily="{StaticResource MonoFont}" FontSize="12" TextWrapping="Wrap"/>
+                            <TextBlock x:Name="ReasonText" Foreground="{StaticResource StateWarnBrush}"
+                                       FontSize="12" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 已隔离文件 -->
+                    <StackPanel x:Name="QuarantinedSection" Spacing="6">
+                        <TextBlock Text="QUARANTINED FILES / 已隔离文件" Classes="label"
+                                   Foreground="{StaticResource StateOkBrush}"/>
+                        <ItemsControl x:Name="QuarantinedList">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:CompileBindings="False">
+                                    <Border Padding="12,7" Margin="0,0,0,3" Classes="hud">
+                                        <TextBlock Text="{Binding}" Foreground="{StaticResource TextMidBrush}"
+                                                   FontSize="11" TextWrapping="Wrap"/>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <!-- 已移除自启动 -->
+                    <StackPanel x:Name="RegistrySection" Spacing="6">
+                        <TextBlock Text="REMOVED AUTORUN / 已移除自启动项" Classes="label"
+                                   Foreground="{StaticResource StateOkBrush}"/>
+                        <ItemsControl x:Name="RegistryList">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:CompileBindings="False">
+                                    <Border Padding="12,7" Margin="0,0,0,3" Classes="hud">
+                                        <TextBlock Text="{Binding}" Foreground="{StaticResource TextMidBrush}"
+                                                   FontSize="11" TextWrapping="Wrap"/>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <!-- 未能清理 -->
+                    <StackPanel x:Name="SkippedSection" Spacing="6">
+                        <TextBlock Text="NOT CLEANED / 未能清理(可重试)" Classes="label"
+                                   Foreground="{StaticResource StateDangerBrush}"/>
+                        <ItemsControl x:Name="SkippedList">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:CompileBindings="False">
+                                    <Border Padding="12,8" Margin="0,0,0,3" Classes="hud">
+                                        <Grid ColumnDefinitions="*,Auto">
+                                            <StackPanel Grid.Column="0">
+                                                <TextBlock Text="{Binding Target}" Foreground="{StaticResource TextHiBrush}"
+                                                           FontSize="11" TextWrapping="Wrap"/>
+                                                <TextBlock Text="{Binding Reason}" Foreground="{StaticResource TextDimBrush}"
+                                                           FontSize="10" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                            </StackPanel>
+                                            <Button Grid.Column="1" Classes="neon danger" Content="重试隔离"
+                                                    Padding="10,4" FontSize="11" VerticalAlignment="Center"
+                                                    IsVisible="{Binding IsFile}"
+                                                    Click="Retry_Click" Tag="{Binding Target}"/>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                </StackPanel>
+            </ScrollViewer>
+        </DockPanel>
+    </Border>
+
+</Window>

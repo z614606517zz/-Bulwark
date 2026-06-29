@@ -1,0 +1,97 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.BlockNotifyWindow"
+        Width="420"
+        SizeToContent="Height"
+        CanResize="False"
+        Topmost="True"
+        ShowInTaskbar="False"
+        SystemDecorations="None"
+        Background="Transparent"
+        Title="BlockNotify">
+
+    <Border CornerRadius="8" Background="{StaticResource BgPanelBrush}"
+            BorderBrush="{StaticResource HairlineStrongBrush}" BorderThickness="1"
+            BoxShadow="0 8 28 0 #66000000" Margin="6" ClipToBounds="True">
+        <DockPanel>
+
+            <!-- ===== 头部:绿色渐变 已自动处置 ===== -->
+            <Border DockPanel.Dock="Top" Padding="16,14">
+                <Border.Background>
+                    <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                        <GradientStop Offset="0" Color="#0E7A52"/>
+                        <GradientStop Offset="1" Color="#0A5E4A"/>
+                    </LinearGradientBrush>
+                </Border.Background>
+                <Grid ColumnDefinitions="Auto,*,Auto">
+                    <TextBlock Grid.Column="0" Text="🛡" FontSize="26" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock x:Name="TitleText" Text="已拦截危险行为" Foreground="White" FontSize="16" FontWeight="Bold"/>
+                        <TextBlock Text="磐垒已自动处置,无需操作" Foreground="#CFF5E6" FontSize="11" Margin="0,2,0,0"/>
+                    </StackPanel>
+                    <Button Grid.Column="2" Content="✕" Click="Close_Click" VerticalAlignment="Top"
+                            Width="26" Height="26" Background="Transparent" Foreground="#CFF5E6"
+                            BorderThickness="0" Cursor="Hand" Padding="0"/>
+                </Grid>
+            </Border>
+
+            <!-- ===== 关闭按钮(底部) ===== -->
+            <Button DockPanel.Dock="Bottom" Content="关闭" Click="Close_Click"
+                    Margin="16,4,16,16" Height="38" HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                    Background="#16223A" Foreground="{StaticResource TextHiBrush}"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1"
+                    CornerRadius="4" Cursor="Hand" FontWeight="SemiBold"/>
+
+            <!-- ===== 主体 ===== -->
+            <StackPanel Margin="16,14,16,8" Spacing="10">
+
+                <TextBlock x:Name="LeadText"
+                           Text="已为您拦截以下危险行为。可在主界面 [拦截记录] 中查看。"
+                           Foreground="{StaticResource TextMidBrush}" FontSize="12" TextWrapping="Wrap"/>
+
+                <!-- 明细 -->
+                <Grid ColumnDefinitions="56,*" RowDefinitions="Auto,Auto,Auto,Auto" >
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="来源" Classes="label" Margin="0,0,0,6"/>
+                    <TextBlock Grid.Row="0" Grid.Column="1" x:Name="SourceText" Text="—"
+                               Foreground="{StaticResource NeonCyanBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="程序" Classes="label" Margin="0,0,0,6"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" x:Name="ProcText" Text="—"
+                               Foreground="{StaticResource TextHiBrush}" FontSize="12" FontFamily="{StaticResource MonoFont}"
+                               TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="行为" Classes="label" Margin="0,0,0,6"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" x:Name="ActionText" Text="—"
+                               Foreground="{StaticResource TextMidBrush}" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+                    <TextBlock Grid.Row="3" Grid.Column="0" Text="目标" Classes="label"/>
+                    <TextBlock Grid.Row="3" Grid.Column="1" x:Name="TargetText" Text="—"
+                               Foreground="{StaticResource TextMidBrush}" FontSize="12" FontFamily="{StaticResource MonoFont}"
+                               TextWrapping="Wrap"/>
+                </Grid>
+
+                <!-- AI 安全助手 -->
+                <Border CornerRadius="6" Padding="12,10" Margin="0,2,0,0"
+                        Background="#0E1F38" BorderBrush="#3322E6FF" BorderThickness="1">
+                    <StackPanel Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <TextBlock Text="🤖" FontSize="13" VerticalAlignment="Center"/>
+                            <TextBlock Text="AI 安全助手" Foreground="{StaticResource NeonCyanBrush}"
+                                       FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <Button x:Name="AiExplainButton" Content="让 AI 解释这次拦截(消耗少量 Credits)"
+                                Click="AiExplain_Click" HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Center" Height="30" CornerRadius="4" Cursor="Hand"
+                                Background="#11243B" Foreground="{StaticResource NeonCyanBrush}"
+                                BorderBrush="#3322E6FF" BorderThickness="1" FontSize="12"/>
+                        <TextBlock x:Name="AiText" Text="正在分析该行为…" IsVisible="False"
+                                   Foreground="{StaticResource TextMidBrush}" FontSize="12" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+
+            </StackPanel>
+        </DockPanel>
+    </Border>
+
+</Window>

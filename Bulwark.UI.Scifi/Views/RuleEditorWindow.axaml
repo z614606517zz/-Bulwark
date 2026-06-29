@@ -1,0 +1,56 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.RuleEditorWindow"
+        Width="500" Height="380"
+        CanResize="False"
+        WindowStartupLocation="CenterOwner"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="新增规则">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0">
+        <DockPanel>
+            <Border DockPanel.Dock="Top" Background="#0E1A2C" Padding="16,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <TextBlock Text="⚡" FontSize="20" Foreground="{StaticResource NeonCyanBrush}"/>
+                    <StackPanel>
+                        <TextBlock Text="新增防护规则" Foreground="{StaticResource TextHiBrush}" FontSize="14" FontWeight="Bold"/>
+                        <TextBlock Text="NEW DEFENSE RULE" Classes="label" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border DockPanel.Dock="Bottom" Padding="16,12"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                <Grid ColumnDefinitions="*,Auto,Auto">
+                    <Button Grid.Column="1" Content="取消" Click="Cancel_Click" Margin="0,0,8,0" Padding="16,7"/>
+                    <Button Grid.Column="2" Classes="neon" Content="✓ 确认" Click="Confirm_Click" Width="100"/>
+                </Grid>
+            </Border>
+
+            <StackPanel Margin="20,16" Spacing="12">
+                <StackPanel>
+                    <TextBlock Text="ACTOR PATH (主体路径)" Classes="label"/>
+                    <TextBox x:Name="ActorPathBox" Watermark="C:\path\to\app.exe (留空表示任意)" Margin="0,4,0,0"/>
+                </StackPanel>
+                <StackPanel>
+                    <TextBlock Text="EVENT TYPE (事件类型)" Classes="label"/>
+                    <ComboBox x:Name="TypeBox" Margin="0,4,0,0" HorizontalAlignment="Stretch"/>
+                </StackPanel>
+                <StackPanel>
+                    <TextBlock Text="TARGET PATTERN (目标通配)" Classes="label"/>
+                    <TextBox x:Name="TargetBox" Watermark="*\Run\* (留空表示任意)" Margin="0,4,0,0"/>
+                </StackPanel>
+                <StackPanel>
+                    <TextBlock Text="ACTION (动作)" Classes="label"/>
+                    <ComboBox x:Name="ActionBox" Margin="0,4,0,0" HorizontalAlignment="Stretch"/>
+                </StackPanel>
+            </StackPanel>
+        </DockPanel>
+    </Border>
+
+</Window>

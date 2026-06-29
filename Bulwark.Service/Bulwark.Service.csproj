@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- WinExe:以无控制台窗口方式运行,避免直接启动 exe 时弹出黑色命令行窗口。
+         作为 Windows 服务或后台进程运行时均无界面;日志仍写入审计文件。 -->
+    <OutputType>WinExe</OutputType>
+    <UserSecretsId>dotnet-Bulwark.Service-0508426e-7390-4904-8c69-c4b9ada0100b</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Bulwark.Core\Bulwark.Core.csproj" />
+  </ItemGroup>
+</Project>

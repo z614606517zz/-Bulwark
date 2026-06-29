@@ -1,0 +1,60 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.VtHistoryPage"
+             x:DataType="vm:VtHistoryViewModel">
+
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="🛰" FontSize="18" VerticalAlignment="Center"/>
+                    <TextBlock Text="VT 查询记录" Classes="h1"/>
+                    <TextBlock Text="/ VIRUSTOTAL SCAN HISTORY" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="↻ 刷新" Click="Refresh_Click"/>
+            </Grid>
+        </Border>
+
+        <Border Classes="hud" Padding="0">
+            <Grid>
+                <ListBox ItemsSource="{Binding Records}" Background="Transparent" BorderThickness="0" Padding="0">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:CompileBindings="False">
+                            <Border Padding="14,9" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                                <Grid ColumnDefinitions="*,Auto">
+                                    <StackPanel Grid.Column="0" Spacing="2">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding FileName}" Foreground="{StaticResource TextHiBrush}" FontSize="13" FontWeight="Bold"/>
+                                            <Border Background="#10FFFFFF" CornerRadius="3" Padding="5,1" VerticalAlignment="Center">
+                                                <TextBlock Text="{Binding Source}" FontSize="10" Foreground="{StaticResource TextDimBrush}"/>
+                                            </Border>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding FilePath}" Foreground="{StaticResource TextDimBrush}" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                                        <TextBlock Text="{Binding Detail}" Foreground="{StaticResource TextMidBrush}" FontSize="11" TextWrapping="Wrap"/>
+                                        <TextBlock Text="{Binding Sha256}" Foreground="{StaticResource TextDimBrush}"
+                                                   FontFamily="{StaticResource MonoFont}" FontSize="10" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Spacing="3" MinWidth="120">
+                                        <TextBlock Text="{Binding StatusText}" Foreground="{Binding StatusBrush}"
+                                                   FontSize="13" FontWeight="Bold" HorizontalAlignment="Right"/>
+                                        <TextBlock Text="{Binding TimeText}" Foreground="{StaticResource TextDimBrush}"
+                                                   FontSize="10" HorizontalAlignment="Right"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding IsEmpty}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="6">
+                    <TextBlock Text="🛰" FontSize="34" HorizontalAlignment="Center" Opacity="0.5"/>
+                    <TextBlock Text="暂无 VT 查询记录" Foreground="{StaticResource TextMidBrush}" FontSize="14" HorizontalAlignment="Center"/>
+                    <TextBlock Text="双击启动未签名/首见的程序时,会自动上传 VirusTotal 扫描并在此留痕" Classes="label" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

@@ -1,0 +1,131 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.AiScanPage"
+             x:DataType="vm:AiScanViewModel">
+
+    <DockPanel>
+        <!-- 标题栏 -->
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="🤖" FontSize="18" Foreground="{StaticResource NeonCyanBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="AI 病毒扫描" Classes="h1"/>
+                    <TextBlock Text="/ AI SCAN" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="🔍 扫描溯源" Click="ScanAndTrace_Click"
+                        IsEnabled="{Binding NotScanning}" Margin="0,0,8,0"
+                        ToolTip.Tip="选择一个文件,AI 研判后弹出详细报告"/>
+                <Button Grid.Column="2" Classes="neon" Content="📄 扫描文件" Click="ScanFile_Click"
+                        IsEnabled="{Binding NotScanning}" Margin="0,0,8,0"/>
+                <Button Grid.Column="3" Classes="neon" Content="📁 扫描文件夹" Click="ScanFolder_Click"
+                        IsEnabled="{Binding NotScanning}" Margin="0,0,8,0"/>
+                <Button Grid.Column="4" Classes="neon danger" Content="⏹ 停止" Click="Cancel_Click"
+                        IsVisible="{Binding Scanning}"/>
+            </Grid>
+        </Border>
+
+        <!-- 统计行 -->
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,*,*,*" Margin="0,0,0,12" IsVisible="{Binding HasResults}">
+            <Border Grid.Column="0" Classes="hud" Padding="12,10" Margin="0,0,6,0">
+                <StackPanel HorizontalAlignment="Center">
+                    <TextBlock Text="SCANNED" Classes="label" HorizontalAlignment="Center"/>
+                    <TextBlock Text="{Binding ScannedFiles}" Classes="metric" FontSize="22"
+                               HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Grid.Column="1" Classes="hud" Padding="12,10" Margin="6,0">
+                <StackPanel HorizontalAlignment="Center">
+                    <TextBlock Text="CLEAN" Classes="label" HorizontalAlignment="Center"/>
+                    <TextBlock Text="{Binding CleanCount}" Classes="metric" FontSize="22"
+                               Foreground="{StaticResource StateOkBrush}" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Grid.Column="2" Classes="hud" Padding="12,10" Margin="6,0">
+                <StackPanel HorizontalAlignment="Center">
+                    <TextBlock Text="SUSPICIOUS" Classes="label" HorizontalAlignment="Center"/>
+                    <TextBlock Text="{Binding SuspiciousCount}" Classes="metric" FontSize="22"
+                               Foreground="{StaticResource StateWarnBrush}" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+            <Border Grid.Column="3" Classes="hud" Padding="12,10" Margin="6,0,0,0">
+                <StackPanel HorizontalAlignment="Center">
+                    <TextBlock Text="MALICIOUS" Classes="label" HorizontalAlignment="Center"/>
+                    <TextBlock Text="{Binding MaliciousCount}" Classes="metric" FontSize="22"
+                               Foreground="{StaticResource StateDangerBrush}" HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- 状态条 -->
+        <Border DockPanel.Dock="Top" Padding="14,8" Margin="0,0,0,10"
+                Background="#0A1120" CornerRadius="4"
+                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+            <Grid ColumnDefinitions="Auto,*">
+                <TextBlock Grid.Column="0" Text="●" FontSize="10" VerticalAlignment="Center" Margin="0,0,8,0"
+                           Foreground="{StaticResource NeonCyanBrush}" IsVisible="{Binding Scanning}"/>
+                <TextBlock Grid.Column="1" Text="{Binding Status}" Foreground="{StaticResource TextMidBrush}"
+                           FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+            </Grid>
+        </Border>
+
+        <!-- 结果列表 -->
+        <Border Classes="hud" Padding="0">
+            <Grid>
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Padding="14,10"
+                            BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                        <Grid ColumnDefinitions="3*,*,*,2*">
+                            <TextBlock Grid.Column="0" Text="FILE" Classes="label"/>
+                            <TextBlock Grid.Column="1" Text="VERDICT" Classes="label"/>
+                            <TextBlock Grid.Column="2" Text="CONFIDENCE" Classes="label"/>
+                            <TextBlock Grid.Column="3" Text="SUMMARY" Classes="label"/>
+                        </Grid>
+                    </Border>
+                    <ListBox ItemsSource="{Binding Results}" Background="Transparent" BorderThickness="0" Padding="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <Border Padding="14,8" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,0,0,1">
+                                    <Grid ColumnDefinitions="3*,*,*,2*,Auto">
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="{Binding Path}" Foreground="{StaticResource TextHiBrush}"
+                                                       FontSize="11" FontFamily="{Binding Source={StaticResource MonoFont}}"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,2,0,0">
+                                                <TextBlock Text="{Binding Sha256}" Foreground="{StaticResource TextDimBrush}"
+                                                           FontSize="9" FontFamily="{Binding Source={StaticResource MonoFont}}"
+                                                           TextTrimming="CharacterEllipsis" MaxWidth="200"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                        <TextBlock Grid.Column="1" Text="{Binding Verdict}" FontSize="12"
+                                                   FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                        <TextBlock Grid.Column="2" Text="{Binding Confidence}" FontSize="11"
+                                                   Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"/>
+                                        <TextBlock Grid.Column="3" Text="{Binding Summary}" FontSize="11"
+                                                   Foreground="{StaticResource TextMidBrush}" VerticalAlignment="Center"
+                                                   TextWrapping="Wrap"/>
+                                        <Button Grid.Column="4" Classes="neon" Content="溯源" Padding="8,4" FontSize="10"
+                                                Click="Trace_Click" Tag="{Binding}"
+                                                VerticalAlignment="Center" Margin="6,0,0,0"/>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+
+                <!-- 空状态 -->
+                <StackPanel IsVisible="{Binding !HasResults}" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                    <TextBlock Text="🤖" FontSize="40" HorizontalAlignment="Center" Opacity="0.4"/>
+                    <TextBlock Text="AI 病毒扫描" Foreground="{StaticResource TextMidBrush}" FontSize="16"
+                               HorizontalAlignment="Center" FontWeight="SemiBold"/>
+                    <TextBlock Text="选择文件或文件夹,由小米 MiMo 大模型分析其恶意可能性" Classes="label"
+                               HorizontalAlignment="Center" TextWrapping="Wrap"/>
+                    <TextBlock Text="基于静态特征(签名/路径/版本信息/大小)研判,不执行样本" Classes="label"
+                               HorizontalAlignment="Center" Margin="0,4,0,0"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </DockPanel>
+
+</UserControl>

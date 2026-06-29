@@ -1,0 +1,172 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ============ 科幻 HUD 设计 Token ============ -->
+    <Styles.Resources>
+        <ResourceDictionary>
+
+            <!-- 背景层 -->
+            <Color x:Key="BgVoid">#04060C</Color>
+            <Color x:Key="BgDeep">#070B14</Color>
+            <Color x:Key="BgPanel">#0C1322</Color>
+            <Color x:Key="BgPanelHi">#111B30</Color>
+
+            <!-- 霓虹强调色 -->
+            <Color x:Key="NeonCyan">#22E6FF</Color>
+            <Color x:Key="NeonTeal">#15F0C8</Color>
+            <Color x:Key="NeonBlue">#3B82F6</Color>
+            <Color x:Key="NeonViolet">#8B5CF6</Color>
+
+            <!-- 语义色 -->
+            <Color x:Key="StateOk">#1BE38B</Color>
+            <Color x:Key="StateWarn">#FFB020</Color>
+            <Color x:Key="StateDanger">#FF3B5C</Color>
+
+            <!-- 文本 -->
+            <Color x:Key="TextHi">#EAF6FF</Color>
+            <Color x:Key="TextMid">#9FB4D0</Color>
+            <Color x:Key="TextDim">#5C708C</Color>
+
+            <!-- 画刷 -->
+            <SolidColorBrush x:Key="BgVoidBrush" Color="{StaticResource BgVoid}"/>
+            <SolidColorBrush x:Key="BgDeepBrush" Color="{StaticResource BgDeep}"/>
+            <SolidColorBrush x:Key="BgPanelBrush" Color="{StaticResource BgPanel}"/>
+            <SolidColorBrush x:Key="BgPanelHiBrush" Color="{StaticResource BgPanelHi}"/>
+            <SolidColorBrush x:Key="NeonCyanBrush" Color="{StaticResource NeonCyan}"/>
+            <SolidColorBrush x:Key="NeonTealBrush" Color="{StaticResource NeonTeal}"/>
+            <SolidColorBrush x:Key="NeonBlueBrush" Color="{StaticResource NeonBlue}"/>
+            <SolidColorBrush x:Key="StateOkBrush" Color="{StaticResource StateOk}"/>
+            <SolidColorBrush x:Key="StateWarnBrush" Color="{StaticResource StateWarn}"/>
+            <SolidColorBrush x:Key="StateDangerBrush" Color="{StaticResource StateDanger}"/>
+            <SolidColorBrush x:Key="TextHiBrush" Color="{StaticResource TextHi}"/>
+            <SolidColorBrush x:Key="TextMidBrush" Color="{StaticResource TextMid}"/>
+            <SolidColorBrush x:Key="TextDimBrush" Color="{StaticResource TextDim}"/>
+
+            <!-- 半透明边框 / 分隔线 -->
+            <SolidColorBrush x:Key="HairlineBrush" Color="#22E6FF" Opacity="0.18"/>
+            <SolidColorBrush x:Key="HairlineStrongBrush" Color="#22E6FF" Opacity="0.40"/>
+
+            <!-- 面板渐变(微弱倾斜的科技蓝) -->
+            <LinearGradientBrush x:Key="PanelGradient" StartPoint="0%,0%" EndPoint="0%,100%">
+                <GradientStop Offset="0" Color="#121C30"/>
+                <GradientStop Offset="1" Color="#0A1120"/>
+            </LinearGradientBrush>
+
+            <LinearGradientBrush x:Key="AccentGradient" StartPoint="0%,0%" EndPoint="100%,100%">
+                <GradientStop Offset="0" Color="#22E6FF"/>
+                <GradientStop Offset="1" Color="#3B82F6"/>
+            </LinearGradientBrush>
+
+            <FontFamily x:Key="MonoFont">Consolas, Cascadia Mono, monospace</FontFamily>
+        </ResourceDictionary>
+    </Styles.Resources>
+
+    <!-- ============ 全局默认 ============ -->
+    <Style Selector="TextBlock">
+        <Setter Property="Foreground" Value="{StaticResource TextMidBrush}"/>
+    </Style>
+
+    <!-- ============ 科幻面板 (HUD 卡片) ============ -->
+    <Style Selector="Border.hud">
+        <Setter Property="Background" Value="{StaticResource PanelGradient}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource HairlineBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="4"/>
+    </Style>
+
+    <Style Selector="Border.hud-glow">
+        <Setter Property="Background" Value="{StaticResource PanelGradient}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="4"/>
+        <Setter Property="BoxShadow" Value="0 0 18 0 #3322E6FF"/>
+    </Style>
+
+    <!-- ============ 标题 / 文本类 ============ -->
+    <Style Selector="TextBlock.h1">
+        <Setter Property="Foreground" Value="{StaticResource TextHiBrush}"/>
+        <Setter Property="FontSize" Value="20"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="TextBlock.label">
+        <Setter Property="Foreground" Value="{StaticResource TextDimBrush}"/>
+        <Setter Property="FontSize" Value="11"/>
+        <Setter Property="LetterSpacing" Value="2"/>
+    </Style>
+    <Style Selector="TextBlock.metric">
+        <Setter Property="Foreground" Value="{StaticResource TextHiBrush}"/>
+        <Setter Property="FontFamily" Value="{StaticResource MonoFont}"/>
+        <Setter Property="FontSize" Value="30"/>
+        <Setter Property="FontWeight" Value="Bold"/>
+    </Style>
+
+    <!-- ============ 侧栏导航按钮 ============ -->
+    <Style Selector="Button.nav">
+        <Setter Property="Height" Value="44"/>
+        <Setter Property="Margin" Value="10,2"/>
+        <Setter Property="Padding" Value="14,0"/>
+        <Setter Property="HorizontalAlignment" Value="Stretch"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{StaticResource TextMidBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="BorderBrush" Value="Transparent"/>
+        <Setter Property="CornerRadius" Value="4"/>
+        <Setter Property="FontSize" Value="13"/>
+        <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+    <Style Selector="Button.nav:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#16223A"/>
+    </Style>
+    <Style Selector="Button.nav.active">
+        <Setter Property="Background" Value="#142A44"/>
+        <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
+        <Setter Property="Foreground" Value="{StaticResource NeonCyanBrush}"/>
+    </Style>
+
+    <!-- ============ 主操作按钮(霓虹描边) ============ -->
+    <Style Selector="Button.neon">
+        <Setter Property="Background" Value="#10243B"/>
+        <Setter Property="Foreground" Value="{StaticResource NeonCyanBrush}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource HairlineStrongBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="3"/>
+        <Setter Property="Padding" Value="16,9"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+    <Style Selector="Button.neon:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#16314F"/>
+    </Style>
+    <Style Selector="Button.neon.danger">
+        <Setter Property="Background" Value="#2A0E16"/>
+        <Setter Property="Foreground" Value="{StaticResource StateDangerBrush}"/>
+        <Setter Property="BorderBrush" Value="#55FF3B5C"/>
+    </Style>
+    <Style Selector="Button.neon.ok">
+        <Setter Property="Background" Value="#0C2A1C"/>
+        <Setter Property="Foreground" Value="{StaticResource StateOkBrush}"/>
+        <Setter Property="BorderBrush" Value="#551BE38B"/>
+    </Style>
+
+    <!-- ============ 标题栏窗口按钮 ============ -->
+    <Style Selector="Button.chrome">
+        <Setter Property="Width" Value="44"/>
+        <Setter Property="Height" Value="32"/>
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{StaticResource TextMidBrush}"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="CornerRadius" Value="0"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="HorizontalContentAlignment" Value="Center"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button.chrome:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#16223A"/>
+    </Style>
+    <Style Selector="Button.chrome.close:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#FF3B5C"/>
+    </Style>
+
+</Styles>

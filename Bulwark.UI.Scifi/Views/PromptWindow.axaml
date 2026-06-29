@@ -1,0 +1,265 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Bulwark.UI.Scifi.Views.PromptWindow"
+        Width="560" Height="860"
+        CanResize="False"
+        WindowStartupLocation="Manual"
+        Topmost="True"
+        Icon="avares://Bulwark.UI.Scifi/Assets/bulwark.ico"
+        Background="{StaticResource BgVoidBrush}"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaChromeHints="NoChrome"
+        ExtendClientAreaTitleBarHeightHint="0"
+        Title="行为裁决">
+
+    <Border Classes="hud-glow" Margin="6" Padding="0" ClipToBounds="True">
+        <DockPanel>
+
+            <!-- ===== 顶部风险横幅(随风险等级着色) ===== -->
+            <Border x:Name="HeaderBorder" DockPanel.Dock="Top" Padding="16,12"
+                    PointerPressed="TitleBar_PointerPressed">
+                <Border.Background>
+                    <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,0%">
+                        <GradientStop Offset="0" Color="#7A1B0E"/>
+                        <GradientStop Offset="1" Color="#5E1A0A"/>
+                    </LinearGradientBrush>
+                </Border.Background>
+                <Grid ColumnDefinitions="Auto,*,Auto">
+                    <TextBlock x:Name="HeaderIcon" Grid.Column="0" Text="🛡" FontSize="26"
+                               VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                        <TextBlock x:Name="HeaderTitle" Text="尝试启动新进程"
+                                   Foreground="White" FontSize="16" FontWeight="Bold"/>
+                        <TextBlock x:Name="HeaderSubtitle" Text="中等风险 · 请确认是否为预期操作"
+                                   Foreground="#FFE0D6" FontSize="11"/>
+                    </StackPanel>
+                    <Border x:Name="HeaderBadge" Grid.Column="2" Background="#33000000" CornerRadius="4"
+                            Padding="9,4" VerticalAlignment="Center">
+                        <TextBlock x:Name="HeaderBadgeText" Text="可疑" Foreground="White"
+                                   FontSize="12" FontWeight="SemiBold"/>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- ===== 底部操作栏 ===== -->
+            <Border DockPanel.Dock="Bottom" Padding="16,12" Background="#070B14"
+                    BorderBrush="{StaticResource HairlineBrush}" BorderThickness="0,1,0,0">
+                <StackPanel Spacing="10">
+                    <!-- 记住选择 -->
+                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                        <CheckBox x:Name="RememberCheck" Content="不再提醒(记住此选择)"
+                                  Foreground="{StaticResource TextDimBrush}" FontSize="12"
+                                  VerticalAlignment="Center"/>
+                        <ComboBox x:Name="ScopeCombo" Width="118" FontSize="12"
+                                  VerticalAlignment="Center" SelectedIndex="0"
+                                  IsEnabled="{Binding #RememberCheck.IsChecked}">
+                            <ComboBoxItem>永久</ComboBoxItem>
+                            <ComboBoxItem>本次会话</ComboBoxItem>
+                            <ComboBoxItem>1 小时</ComboBoxItem>
+                            <ComboBoxItem>1 天</ComboBoxItem>
+                        </ComboBox>
+                    </StackPanel>
+                    <!-- 放行 / 阻止 -->
+                    <Grid ColumnDefinitions="*,*" >
+                        <Button x:Name="AllowButton" Grid.Column="0" Classes="neon ok" Content="✓ 允许"
+                                Click="Allow_Click" Margin="0,0,5,0" Height="40"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"/>
+                        <Button x:Name="BlockButton" Grid.Column="1" Classes="neon danger" Content="✕ 拦截"
+                                Click="Block_Click" Margin="5,0,0,0" Height="40"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- ===== 中间详情 ===== -->
+            <ScrollViewer Padding="16,14">
+                <StackPanel Spacing="12">
+
+                    <!-- 签名 + 威胁情报 -->
+                    <Grid ColumnDefinitions="*,*" >
+                        <Border Grid.Column="0" Background="#0A1120" CornerRadius="4" Padding="10,8" Margin="0,0,5,0"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <StackPanel Spacing="3">
+                                <TextBlock Text="数字签名" Classes="label"/>
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <TextBlock x:Name="SignIcon" Text="●" FontSize="11" VerticalAlignment="Center"
+                                               Foreground="{StaticResource StateOkBrush}"/>
+                                    <TextBlock x:Name="SignText" Text="—" FontSize="12" TextWrapping="Wrap"
+                                               Foreground="{StaticResource TextHiBrush}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                        <Border Grid.Column="1" Background="#0A1120" CornerRadius="4" Padding="10,8" Margin="5,0,0,0"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <StackPanel Spacing="3">
+                                <TextBlock Text="威胁情报 (VirusTotal)" Classes="label"/>
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <TextBlock x:Name="VtIcon" Text="●" FontSize="11" VerticalAlignment="Center"
+                                               Foreground="{StaticResource TextDimBrush}"/>
+                                    <TextBlock x:Name="VtText" Text="无情报数据" FontSize="12" TextWrapping="Wrap"
+                                               Foreground="{StaticResource TextMidBrush}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+
+                    <!-- 信息明细网格 -->
+                    <Grid ColumnDefinitions="64,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="程序" Classes="label" Margin="0,0,8,8"/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" x:Name="ActorText" Text="—"
+                                   Foreground="{StaticResource TextHiBrush}" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="12" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="说明" Classes="label" Margin="0,0,8,8"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1" x:Name="DescText" Text="—"
+                                   Foreground="{StaticResource TextMidBrush}" FontSize="12"
+                                   TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="命令行" Classes="label" Margin="0,0,8,8"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1" x:Name="CommandText" Text="—"
+                                   Foreground="{StaticResource TextDimBrush}" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="行为" Classes="label" Margin="0,0,8,8"/>
+                        <StackPanel Grid.Row="3" Grid.Column="1" Spacing="6" Margin="0,0,0,8">
+                            <TextBlock x:Name="BehaviorText" Text="—" Foreground="{StaticResource NeonCyanBrush}"
+                                       FontSize="13" FontWeight="SemiBold"/>
+                            <ItemsControl x:Name="TechniqueList">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel Orientation="Horizontal"/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <Border Background="#11243B" CornerRadius="4" Padding="7,2" Margin="0,0,6,4"
+                                                BorderBrush="#2E5A8C" BorderThickness="1">
+                                            <TextBlock Text="{Binding}" Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontSize="10" FontFamily="{StaticResource MonoFont}"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="4" Grid.Column="0" Text="目标" Classes="label" Margin="0,0,8,0"/>
+                        <TextBlock Grid.Row="4" Grid.Column="1" x:Name="TargetText" Text="—"
+                                   Foreground="{StaticResource TextMidBrush}" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="12" TextWrapping="Wrap"/>
+                    </Grid>
+
+                    <!-- SHA256 + 风险评分 -->
+                    <Grid ColumnDefinitions="64,*,Auto">
+                        <TextBlock Grid.Column="0" Text="SHA256" Classes="label" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" x:Name="Sha256Text" Text="—"
+                                   Foreground="{StaticResource TextDimBrush}" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="11" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
+                                    Margin="10,0,0,0">
+                            <TextBlock x:Name="ScoreText" Text="0" Foreground="{StaticResource StateWarnBrush}"
+                                       FontFamily="{StaticResource MonoFont}" FontSize="22" FontWeight="Bold"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock x:Name="RiskLabelText" Text="风险" Foreground="{StaticResource TextDimBrush}"
+                                       FontSize="11" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- 进程溯源 -->
+                    <Expander x:Name="ChainSection" IsExpanded="False" Padding="0"
+                              Background="Transparent" BorderThickness="0">
+                        <Expander.Header>
+                            <TextBlock Text="进程溯源 · PROCESS LINEAGE" Classes="label"/>
+                        </Expander.Header>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="10,8" Margin="0,6,0,0"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="ChainList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,2">
+                                            <Border Grid.Column="0" Width="3" Background="{Binding Accent}"
+                                                    CornerRadius="2" Margin="0,1,8,1"/>
+                                            <StackPanel Grid.Column="1" Spacing="1">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <TextBlock Text="{Binding Noun}" Foreground="{Binding Accent}"
+                                                               FontSize="10" FontWeight="Bold"/>
+                                                    <TextBlock Text="{Binding ActorText}" Foreground="{StaticResource TextHiBrush}"
+                                                               FontSize="11" FontFamily="{StaticResource MonoFont}"/>
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding TargetText}" Foreground="{StaticResource TextMidBrush}"
+                                                           FontSize="11" TextWrapping="Wrap" IsVisible="{Binding HasTarget}"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="2" Text="{Binding ScoreText}" Foreground="{Binding Accent}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </Expander>
+
+                    <!-- 证据链(判定依据) -->
+                    <Expander x:Name="EvidenceSection" IsExpanded="False" Padding="0"
+                              Background="Transparent" BorderThickness="0">
+                        <Expander.Header>
+                            <TextBlock Text="判定依据 · EVIDENCE TIMELINE" Classes="label"/>
+                        </Expander.Header>
+                        <Border Background="#0A1120" CornerRadius="4" Padding="10,8" Margin="0,6,0,0"
+                                BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                            <ItemsControl x:Name="EvidenceList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:CompileBindings="False">
+                                        <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,2">
+                                            <Border Grid.Column="0" Width="3" Background="{Binding Accent}"
+                                                    CornerRadius="2" Margin="0,1,8,1"/>
+                                            <StackPanel Grid.Column="1" Spacing="1">
+                                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                                    <TextBlock Text="{Binding KindLabel}" Foreground="{Binding Accent}"
+                                                               FontSize="10" FontWeight="Bold"/>
+                                                    <TextBlock Text="{Binding Source}" Foreground="{StaticResource TextDimBrush}"
+                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"/>
+                                                    <Border Background="#1A2A44" CornerRadius="3" Padding="4,0"
+                                                            IsVisible="{Binding HasTechnique}">
+                                                        <TextBlock Text="{Binding Technique}" Foreground="{StaticResource NeonCyanBrush}"
+                                                                   FontSize="9" FontFamily="{StaticResource MonoFont}"/>
+                                                    </Border>
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding Description}" Foreground="{StaticResource TextMidBrush}"
+                                                           FontSize="12" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="2" Text="{Binding ScoreText}" Foreground="{Binding Accent}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="12"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+                    </Expander>
+
+                    <!-- AI 安全助手 -->
+                    <Border CornerRadius="6" Padding="12,10"
+                            Background="#0E1F38" BorderBrush="#3322E6FF" BorderThickness="1">
+                        <StackPanel Spacing="8">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <TextBlock Text="🤖" FontSize="13" VerticalAlignment="Center"/>
+                                <TextBlock Text="AI 安全助手" Foreground="{StaticResource NeonCyanBrush}"
+                                           FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            </StackPanel>
+                            <Button x:Name="AiButton" Content="生成攻击叙事(消耗少量 Credits)"
+                                    Click="AiExplain_Click" HorizontalAlignment="Stretch"
+                                    HorizontalContentAlignment="Center" Height="30" CornerRadius="4" Cursor="Hand"
+                                    Background="#11243B" Foreground="{StaticResource NeonCyanBrush}"
+                                    BorderBrush="#3322E6FF" BorderThickness="1" FontSize="12"/>
+                            <TextBlock x:Name="AiText" Text="正在分析该行为…" IsVisible="False"
+                                       Foreground="{StaticResource TextMidBrush}" FontSize="12" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                </StackPanel>
+            </ScrollViewer>
+
+        </DockPanel>
+    </Border>
+
+</Window>

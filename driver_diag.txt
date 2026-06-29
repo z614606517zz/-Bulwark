@@ -1,0 +1,182 @@
+==== Bulwark 驱动诊断 周日 2026/06/28  0:33:08.31 ==== 
+ 
+[testsigning 状态] 
+testsigning             Yes
+ 
+[当前 sc query] 
+
+SERVICE_NAME: Bulwark 
+        TYPE               : 2  FILE_SYSTEM_DRIVER  
+        STATE              : 1  STOPPED 
+        WIN32_EXIT_CODE    : 1077  (0x435)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+ 
+[尝试 sc start Bulwark] 
+
+SERVICE_NAME: Bulwark 
+        TYPE               : 2  FILE_SYSTEM_DRIVER  
+        STATE              : 4  RUNNING 
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+        PID                : 0
+        FLAGS              : 
+ 
+[尝试 fltmc load Bulwark] 
+
+Load failed with error: 0x80070420
+An instance of the service is already running.
+ 
+[start 后 sc query] 
+
+SERVICE_NAME: Bulwark 
+        TYPE               : 2  FILE_SYSTEM_DRIVER  
+        STATE              : 4  RUNNING 
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+ 
+[已加载的 minifilter] 
+
+Filter Name                     Num Instances    Altitude    Frame
+------------------------------  -------------  ------------  -----
+bindflt                                 1       409800         0
+UCPD                                    6       385250.5       0
+Bulwark                                 6       385201         0
+WdFilter                                6       328010         0
+KLIF.KES-14-0                           6       320400.17761188871    0
+applockerfltr                           5       265000         0
+storqosflt                              0       244000         0
+wcifs                                   0       189900         0
+CldFlt                                  0       180451         0
+bfs                                     8       150000         0
+FileCrypt                               0       141100         0
+luafv                                   1       135000         0
+UnionFS                                 0       130850         0
+klbackupflt.KES-14-0                    4       100800.17761188871    0
+npsvctrig                               1        46000         0
+Wof                                     4        40700         0
+FileInfo                                6        40500         0
+ 
+[驱动签名详情] 
+Status=UnknownError
+StatusMessage=A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider
+Signer=CN=Bulwark Test
+Thumbprint=9DD73413663B33653CBEF1EF52D4EC54E30609FB
+ 
+[证书是否已在受信任存储] 
+Root: False
+TrustedPublisher: False
+ 
+[最近 CodeIntegrity / FilterManager 事件] 
+
+
+TimeCreated  : 2026/6/28 0:33:08
+ProviderName : Microsoft-Windows-FilterManager
+Id           : 11
+Message      : 文件系统筛选器'Bulwark' (版本 10.0，‎2026‎-‎06‎-‎22T02:17:04.000000000Z)不支持绕过 IO.
+               支持的功能： 0x4.
+
+TimeCreated  : 2026/6/28 0:33:08
+ProviderName : Microsoft-Windows-FilterManager
+Id           : 11
+Message      : 文件系统筛选器'Bulwark' (版本 10.0，‎2026‎-‎06‎-‎22T02:17:04.000000000Z)不支持绕过 IO.
+               支持的功能： 0x4.
+
+TimeCreated  : 2026/6/28 0:33:08
+ProviderName : Microsoft-Windows-FilterManager
+Id           : 11
+Message      : 文件系统筛选器'Bulwark' (版本 10.0，‎2026‎-‎06‎-‎22T02:17:04.000000000Z)不支持绕过 IO.
+               支持的功能： 0x4.
+
+TimeCreated  : 2026/6/28 0:33:08
+ProviderName : Microsoft-Windows-FilterManager
+Id           : 11
+Message      : 文件系统筛选器'Bulwark' (版本 10.0，‎2026‎-‎06‎-‎22T02:17:04.000000000Z)不支持绕过 IO.
+               支持的功能： 0x4.
+
+TimeCreated  : 2026/6/28 0:33:08
+ProviderName : Microsoft-Windows-FilterManager
+Id           : 6
+Message      : 文件系统筛选器“Bulwark”(10.0，‎2026‎-‎06‎-‎22T02:17:04.000000000Z)已成功加载并注册到筛选器管理器。
+
+
+
+ 
+[Microsoft-Windows-CodeIntegrity/Operational 最近事件] 
+
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3033
+Message     : Code Integrity determined that a process (\Device\HarddiskVolume3\Windows\System32\SecurityHealthService.
+              exe) attempted to load \Device\HarddiskVolume3\Program Files (x86)\Kaspersky Lab\KES.14.0.0\com_antivirus
+              \x64\com_antivirus.dll that did not meet the Windows signing level requirements.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:27
+Id          : 3033
+Message     : Code Integrity determined that a process (\Device\HarddiskVolume3\Windows\System32\SecurityHealthService.
+              exe) attempted to load \Device\HarddiskVolume3\Program Files (x86)\Kaspersky Lab\KES.14.0.0\com_antivirus
+              \x64\com_antivirus.dll that did not meet the Windows signing level requirements.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3033
+Message     : Code Integrity determined that a process (\Device\HarddiskVolume3\Windows\System32\SecurityHealthService.
+              exe) attempted to load \Device\HarddiskVolume3\Program Files (x86)\Kaspersky Lab\KES.14.0.0\com_antivirus
+              \x64\com_antivirus.dll that did not meet the Windows signing level requirements.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+TimeCreated : 2026/6/28 0:30:25
+Id          : 3089
+Message     : Signature information for another event. Match using the Correlation Id.
+
+
+
