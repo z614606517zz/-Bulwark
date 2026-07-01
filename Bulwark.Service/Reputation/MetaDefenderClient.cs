@@ -24,9 +24,18 @@ public sealed class MetaDefenderClient : IHashReputationService
     private readonly string? _apiKey;
     private readonly TokenBucket _bucket;
     private readonly DailyQuota _daily;
-    private readonly HttpClient _http;
 
     public bool IsEnabled { get; }
+
+    public ReputationUsage GetUsage()
+    {
+        var (used, limit) = _daily.Snapshot();
+        return new ReputationUsage
+        {
+            Source = "MetaDefender", Enabled = IsEnabled,
+            UsedToday = used, DailyLimit = limit, PerMinuteLimit = _opt.RequestsPerMinute
+        };
+    }
 
     public MetaDefenderClient(ILogger<MetaDefenderClient> logger, BulwarkOptions options)
     {
@@ -39,11 +48,6 @@ public sealed class MetaDefenderClient : IHashReputationService
                 : null;
 
         IsEnabled = !string.IsNullOrEmpty(_apiKey);
-
-        _http = ReputationHttp.Create(
-            TimeSpan.FromSeconds(Math.Max(3, _opt.QueryTimeoutSeconds)), "MetaDefender");
-        if (_apiKey is not null)
-            _http.DefaultRequestHeaders.Add("apikey", _apiKey);
 
         _bucket = new TokenBucket(Math.Max(1, _opt.RequestsPerMinute), TimeSpan.FromMinutes(1));
         _daily = new DailyQuota(Math.Max(1, _opt.RequestsPerDay));
@@ -72,26 +76,26 @@ public sealed class MetaDefenderClient : IHashReputationService
 
         try
         {
-            using var resp = await _http.GetAsync(BaseUrl + sha256, token);
+            var (code, body) = await ReputationCurl.GetAsync(
+                BaseUrl + sha256, new[] { "apikey: " + _apiKey }, _opt.QueryTimeoutSeconds, token);
 
-            if (resp.StatusCode == HttpStatusCode.NotFound)
+            if (code == 404)
             {
                 // 未收录:权威负结果,可缓存,避免反复查同一未收录文件。
                 return new FileReputation { Sha256 = sha256, Verdict = ReputationVerdict.Unknown, QuerySucceeded = true };
             }
-            if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            if (code is 401 or 403)
             {
-                _logger.LogWarning("MetaDefender 鉴权失败({code}),请检查 API Key。", (int)resp.StatusCode);
+                _logger.LogWarning("MetaDefender 鉴权失败({code}),请检查 API Key。", code);
                 return unknown;
             }
-            if (resp.StatusCode == (HttpStatusCode)429)
+            if (code == 429)
             {
                 _logger.LogWarning("MetaDefender 触发限流(429),本次跳过。");
                 return unknown;
             }
-            if (!resp.IsSuccessStatusCode) return unknown;
+            if (code != 200) return unknown;
 
-            var body = await resp.Content.ReadAsStringAsync(token);
             return Parse(sha256, body);
         }
         catch (OperationCanceledException) { return unknown; }
@@ -163,15 +167,17 @@ public sealed class MetaDefenderClient : IHashReputationService
 
         try
         {
-            using var resp = await _http.GetAsync(BaseUrl + eicarSha256, token);
-            return resp.StatusCode switch
+            var (code, _) = await ReputationCurl.GetAsync(
+                BaseUrl + eicarSha256, new[] { "apikey: " + _apiKey }, _opt.QueryTimeoutSeconds, token);
+            return code switch
             {
-                HttpStatusCode.OK => (true, "连接成功,API 密钥有效"),
-                HttpStatusCode.NotFound => (true, "连接成功(测试样本未收录,密钥有效)"),
-                HttpStatusCode.Unauthorized => (false, "API 密钥无效(401)"),
-                HttpStatusCode.Forbidden => (false, "API 密钥无权限(403)"),
-                (HttpStatusCode)429 => (true, "密钥有效,但当前已触发限流(429)"),
-                _ => (false, $"返回异常状态:{(int)resp.StatusCode}")
+                200 => (true, "连接成功,API 密钥有效"),
+                404 => (true, "连接成功(测试样本未收录,密钥有效)"),
+                401 => (false, "API 密钥无效(401)"),
+                403 => (false, "API 密钥无权限(403)"),
+                429 => (true, "密钥有效,但当前已触发限流(429)"),
+                0 => (false, "连接失败(curl 不可用或网络不通)"),
+                _ => (false, $"返回异常状态:{code}")
             };
         }
         catch (OperationCanceledException) { return (false, "请求超时或已取消"); }

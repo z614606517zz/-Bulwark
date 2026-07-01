@@ -86,10 +86,13 @@ builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService,
     Bulwark.Service.Reputation.MalwareBazaarClient>();
 builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService,
     Bulwark.Service.Reputation.OtxClient>();
-builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService,
-    Bulwark.Service.Reputation.ThreatBookClient>();
+builder.Services.AddSingleton<Bulwark.Service.Reputation.ThreatBookClient>();
+builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService>(sp =>
+    sp.GetRequiredService<Bulwark.Service.Reputation.ThreatBookClient>());
 builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService,
     Bulwark.Service.Reputation.MetaDefenderClient>();
+builder.Services.AddSingleton<Bulwark.Core.Engine.IHashReputationService,
+    Bulwark.Service.Reputation.HybridAnalysisClient>();
 
 // 聚合器:对上层(ReputationManager)呈现为单一 IHashReputationService。
 // ReputationManager 显式消费聚合器,避免与上面的多注册产生歧义。

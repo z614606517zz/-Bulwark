@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading.Tasks;
 using Avalonia.Threading;
 using Bulwark.Core.Models;
 using Bulwark.UI.Services;
@@ -15,6 +16,9 @@ public sealed class RulesViewModel : ObservableObject
 
     public ObservableCollection<RuleRowViewModel> Rules { get; } = new();
     public ObservableCollection<AiRuleSuggestion> AiSuggestions { get; } = new();
+
+    /// <summary>情报刷新生成、经 AI 复核后待用户确认的候选规则。</summary>
+    public ObservableCollection<IntelRuleReview> IntelSuggestions { get; } = new();
 
     private bool _isLoading;
     public bool IsLoading { get => _isLoading; set => Set(ref _isLoading, value); }
@@ -34,6 +38,20 @@ public sealed class RulesViewModel : ObservableObject
 
     /// <summary>是否有 AI 状态文本可展示。</summary>
     public bool HasAiStatus => !string.IsNullOrEmpty(_aiStatus);
+
+    private bool _intelRefreshing;
+    public bool IntelRefreshing { get => _intelRefreshing; set { if (Set(ref _intelRefreshing, value)) OnPropertyChanged(nameof(IntelNotRefreshing)); } }
+    public bool IntelNotRefreshing => !_intelRefreshing;
+
+    private string _intelStatus = string.Empty;
+    public string IntelStatus { get => _intelStatus; set { if (Set(ref _intelStatus, value)) OnPropertyChanged(nameof(HasIntelStatus)); } }
+
+    /// <summary>是否有情报刷新状态文本可展示。</summary>
+    public bool HasIntelStatus => !string.IsNullOrEmpty(_intelStatus);
+
+    private bool _hasIntelSuggestions;
+    /// <summary>是否有(经 AI 复核的)情报候选规则待用户确认。</summary>
+    public bool HasIntelSuggestions { get => _hasIntelSuggestions; set => Set(ref _hasIntelSuggestions, value); }
 
     public RulesViewModel(IpcClient ipc)
     {
@@ -129,5 +147,103 @@ public sealed class RulesViewModel : ObservableObject
         });
         AiSuggestions.Remove(s);
         HasSuggestions = AiSuggestions.Count > 0;
+    }
+
+    /// <summary>
+    /// 立即从情报源(ThreatFox)拉取最近威胁,生成候选规则 →<b>不直接落地</b>,
+    /// 先交 AI 大模型复核确定 → 展示给用户,由用户逐条(或一键)决定是否采纳。
+    /// </summary>
+    public async void RefreshIntelRules()
+    {
+        if (IntelRefreshing) return;
+        IntelRefreshing = true;
+        IntelSuggestions.Clear();
+        HasIntelSuggestions = false;
+        IntelStatus = "正在从情报源拉取最近威胁并生成候选规则…";
+        try
+        {
+            // 1) 服务端仅生成候选规则(预览,不落地)。
+            var r = await _ipc.RefreshIntelRulesAsync(TimeSpan.FromSeconds(60));
+            if (!r.Success)
+            {
+                IntelStatus = $"✕ {r.Message}";
+                return;
+            }
+            if (r.GeneratedRules.Count == 0)
+            {
+                IntelStatus = "本次未生成任何候选规则(可能无达标 IOC)。";
+                return;
+            }
+
+            // 2) 交 AI 大模型复核 IOC 规则(剔除过宽/异常/低置信);AI 不可用时 fail-open 交用户判断。
+            IntelStatus = $"已生成 {r.GeneratedRules.Count} 条候选规则,正在请 AI 复核并合成行为规则…";
+
+            // 并行:a) 复核 IOC 规则; b) 由情报语境合成「行为类」防护规则(进程/注册表/注入等)。
+            var vetTask = App.Ai.VetIntelRulesAsync(r.GeneratedRules);
+            var behaviorTask = App.Ai.GenerateBehaviorRulesFromIntelAsync(r.ThreatContext);
+            await Task.WhenAll(vetTask, behaviorTask);
+
+            var reviews = vetTask.Result;
+            var behaviorRules = behaviorTask.Result;
+
+            var kept = reviews.Where(x => x.Keep).ToList();
+            int dropped = reviews.Count - kept.Count;
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                IntelSuggestions.Clear();
+                foreach (var x in kept)
+                    IntelSuggestions.Add(x);
+                foreach (var b in behaviorRules)
+                    IntelSuggestions.Add(b);
+                HasIntelSuggestions = IntelSuggestions.Count > 0;
+
+                var parts = new List<string>();
+                if (kept.Count > 0) parts.Add($"IOC 规则 {kept.Count} 条");
+                if (behaviorRules.Count > 0) parts.Add($"AI 合成行为规则 {behaviorRules.Count} 条");
+                if (dropped > 0) parts.Add($"剔除低质量 {dropped} 条");
+
+                IntelStatus = HasIntelSuggestions
+                    ? $"AI 复核完成:{string.Join("、", parts)}。请确认后点击「采纳」或「全部采纳」。"
+                    : $"AI 复核后无推荐规则(剔除 {dropped} 条),未添加任何规则。";
+            });
+        }
+        catch (Exception ex)
+        {
+            IntelStatus = $"✕ 情报刷新失败: {ex.Message}";
+        }
+        finally
+        {
+            IntelRefreshing = false;
+        }
+    }
+
+    /// <summary>采纳一条(经 AI 复核的)情报候选规则:下发服务端应用,并从待确认列表移除。</summary>
+    public async void AcceptIntelSuggestion(IntelRuleReview review)
+    {
+        if (review is null) return;
+        var res = await _ipc.ApplyIntelRulesAsync(new List<DefenseRule> { review.Rule });
+        Dispatcher.UIThread.Post(() =>
+        {
+            IntelSuggestions.Remove(review);
+            HasIntelSuggestions = IntelSuggestions.Count > 0;
+            IntelStatus = res.Success ? $"✓ {res.Message}" : $"✕ {res.Message}";
+            if (res.Success) Refresh();
+        });
+    }
+
+    /// <summary>一键采纳当前所有(经 AI 复核的)情报候选规则。</summary>
+    public async void AcceptAllIntelSuggestions()
+    {
+        if (IntelSuggestions.Count == 0) return;
+        var rules = IntelSuggestions.Select(x => x.Rule).ToList();
+        var res = await _ipc.ApplyIntelRulesAsync(rules);
+        Dispatcher.UIThread.Post(() =>
+        {
+            IntelSuggestions.Clear();
+            HasIntelSuggestions = false;
+            IntelStatus = res.Success ? $"✓ {res.Message}" : $"✕ {res.Message}";
+            if (res.Success) Refresh();
+        });
     }
 }

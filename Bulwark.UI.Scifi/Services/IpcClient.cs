@@ -76,6 +76,12 @@ public sealed class IpcClient : IAsyncDisposable
     /// <summary>等待响应的手动隔离请求:RequestId -> 完成源。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, TaskCompletionSource<ManualQuarantineResultPayload>> _pendingManualQ = new();
 
+    /// <summary>等待响应的情报刷新请求:RequestId -> 完成源。</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, TaskCompletionSource<IntelRefreshResultPayload>> _pendingIntel = new();
+
+    /// <summary>等待响应的情报采纳请求:RequestId -> 完成源。</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, TaskCompletionSource<IntelRefreshResultPayload>> _pendingIntelApply = new();
+
     public void Start()
     {
         _cts = new CancellationTokenSource();
@@ -209,6 +215,16 @@ public sealed class IpcClient : IAsyncDisposable
             case IpcMessageType.VtHistoryResponse:
                 var vh = msg.GetPayload<VtHistoryResponsePayload>();
                 if (vh is not null) VtHistoryReceived?.Invoke(vh.Records);
+                break;
+            case IpcMessageType.IntelRefreshResponse:
+                var irr = msg.GetPayload<IntelRefreshResultPayload>();
+                if (irr is not null && _pendingIntel.TryRemove(irr.RequestId, out var ircs))
+                    ircs.TrySetResult(irr);
+                break;
+            case IpcMessageType.IntelApplyResponse:
+                var iar = msg.GetPayload<IntelRefreshResultPayload>();
+                if (iar is not null && _pendingIntelApply.TryRemove(iar.RequestId, out var iacs))
+                    iacs.TrySetResult(iar);
                 break;
         }
     }
@@ -344,6 +360,72 @@ public sealed class IpcClient : IAsyncDisposable
             new VtRequestPayload { Kind = VtRequestKind.TestConnection },
             timeout ?? TimeSpan.FromSeconds(20));
 
+    /// <summary>
+    /// 请求服务端从情报源(ThreatFox)生成一批候选防护规则(<b>仅预览、不落地</b>),
+    /// 供 UI 交 AI 复核 + 用户确认后再采纳。超时/未连接返回失败。
+    /// </summary>
+    public async Task<IntelRefreshResultPayload> RefreshIntelRulesAsync(TimeSpan? timeout = null)
+    {
+        var req = new IntelRefreshRequestPayload { PreviewOnly = true };
+        if (!IsConnected)
+            return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "未连接服务" };
+
+        var tcs = new TaskCompletionSource<IntelRefreshResultPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingIntel[req.RequestId] = tcs;
+        try
+        {
+            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(60));
+            await using var reg = cts.Token.Register(() => tcs.TrySetCanceled());
+
+            bool sent = await SendAsync(IpcMessage.Create(IpcMessageType.IntelRefreshRequest, req), CancellationToken.None);
+            if (!sent)
+                return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "发送失败:未连接服务" };
+
+            return await tcs.Task;
+        }
+        catch (OperationCanceledException)
+        {
+            return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "请求超时" };
+        }
+        finally
+        {
+            _pendingIntel.TryRemove(req.RequestId, out _);
+        }
+    }
+
+    /// <summary>
+    /// 请求服务端把用户(经 AI 复核)确认采纳的一批情报规则应用到引擎。超时/未连接返回失败。
+    /// </summary>
+    public async Task<IntelRefreshResultPayload> ApplyIntelRulesAsync(
+        System.Collections.Generic.List<DefenseRule> rules, TimeSpan? timeout = null)
+    {
+        var req = new IntelApplyRequestPayload { Rules = rules ?? new System.Collections.Generic.List<DefenseRule>() };
+        if (!IsConnected)
+            return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "未连接服务" };
+
+        var tcs = new TaskCompletionSource<IntelRefreshResultPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingIntelApply[req.RequestId] = tcs;
+        try
+        {
+            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(30));
+            await using var reg = cts.Token.Register(() => tcs.TrySetCanceled());
+
+            bool sent = await SendAsync(IpcMessage.Create(IpcMessageType.IntelApplyRequest, req), CancellationToken.None);
+            if (!sent)
+                return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "发送失败:未连接服务" };
+
+            return await tcs.Task;
+        }
+        catch (OperationCanceledException)
+        {
+            return new IntelRefreshResultPayload { RequestId = req.RequestId, Success = false, Message = "请求超时" };
+        }
+        finally
+        {
+            _pendingIntelApply.TryRemove(req.RequestId, out _);
+        }
+    }
+
     /// <summary>测试指定威胁情报源(VirusTotal / MalwareBazaar / OTX)的连接。</summary>
     public Task<VtResponsePayload> TestReputationSourceAsync(string source, TimeSpan? timeout = null)
         => SendVtRequestAsync(
@@ -355,6 +437,12 @@ public sealed class IpcClient : IAsyncDisposable
         => SendVtRequestAsync(
             new VtRequestPayload { Kind = VtRequestKind.QueryFile, FilePath = filePath },
             timeout ?? TimeSpan.FromSeconds(30));
+
+    /// <summary>请求各情报源的实时用量统计(今日已用 / 配额)。</summary>
+    public Task<VtResponsePayload> RequestReputationUsageAsync(TimeSpan? timeout = null)
+        => SendVtRequestAsync(
+            new VtRequestPayload { Kind = VtRequestKind.UsageStats },
+            timeout ?? TimeSpan.FromSeconds(10));
 
     /// <summary>
     /// 请求服务对某文件执行「强制隔离」(清理报告里「重试隔离」)。等待结果,超时/未连接返回失败。

@@ -380,6 +380,179 @@ public sealed class AiClient : IDisposable
         return result;
     }
 
+    // ========== AI 复核情报规则(ThreatFox 候选规则的把关) ==========
+
+    /// <summary>
+    /// 让大模型复核一批「情报源(ThreatFox)自动生成的候选防护规则」,逐条判定是否值得采纳。
+    /// 目的:剔除格式异常、过度宽泛(易误伤正常程序)、低置信的规则,只把可靠的留给用户确认。
+    /// 未配置 / 调用失败时 fail-open:全部标记为「未经复核」返回,由用户自行判断(绝不静默丢弃)。
+    /// </summary>
+    public async Task<List<IntelRuleReview>> VetIntelRulesAsync(
+        IReadOnlyList<DefenseRule> candidates, CancellationToken token = default)
+    {
+        var reviews = new List<IntelRuleReview>();
+        if (candidates is null || candidates.Count == 0) return reviews;
+
+        // fail-open 兜底:AI 不可用时,把全部候选原样返回(标注未复核),用户仍可自行采纳。
+        List<IntelRuleReview> FallbackAll(string reason)
+            => candidates.Select(r => new IntelRuleReview { Rule = r, Keep = true, Reason = reason }).ToList();
+
+        if (!IsConfigured)
+            return FallbackAll("(未配置 AI,未经模型复核,请人工确认)");
+
+        try
+        {
+            var prompt = BuildIntelVetPrompt(candidates);
+            var reply = await ChatAsync(prompt,
+                "你是 Bulwark 主动防御系统的威胁情报规则审核专家。你会拿到一批由 ThreatFox 情报自动生成的候选拦截规则" +
+                "(基于恶意文件哈希 / 恶意 IP / 恶意域名)。请逐条判断是否值得采纳:剔除 IOC 格式异常、匹配过度宽泛" +
+                "(可能误伤正常程序/网站)、或明显不合理的规则。仅以 JSON 数组回复,不要任何额外文字。",
+                "情报规则复核",
+                token);
+
+            var decisions = ParseIntelVetDecisions(reply);
+            if (decisions.Count == 0)
+                return FallbackAll("(AI 未返回有效复核结果,未经模型确认,请人工判断)");
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                if (decisions.TryGetValue(i, out var d))
+                    reviews.Add(new IntelRuleReview { Rule = candidates[i], Keep = d.keep, Reason = d.reason });
+                // 模型未覆盖到的条目:保守起见默认保留但标注未复核,交用户判断。
+                else
+                    reviews.Add(new IntelRuleReview { Rule = candidates[i], Keep = true, Reason = "(AI 未对此条给出结论,请人工确认)" });
+            }
+            return reviews;
+        }
+        catch
+        {
+            return FallbackAll("(AI 复核失败,未经模型确认,请人工判断)");
+        }
+    }
+
+    private static string BuildIntelVetPrompt(IReadOnlyList<DefenseRule> candidates)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("以下是待审核的候选防护规则(来自 ThreatFox 威胁情报,索引从 0 开始):");
+        sb.AppendLine();
+        for (int i = 0; i < candidates.Count; i++)
+            sb.AppendLine($"[{i}] {IntelRuleReview.Describe(candidates[i])}");
+        sb.AppendLine();
+        sb.AppendLine("请逐条判断该规则是否值得采纳。判 keep=false 的情形:");
+        sb.AppendLine("· IOC 明显无效/格式异常(如空、私有 IP 段、localhost、过短哈希);");
+        sb.AppendLine("· 域名/IP 匹配过度宽泛,可能误伤知名正常服务(如大厂 CDN、云厂商共享 IP);");
+        sb.AppendLine("· 情报置信度过低或语义上不像真实威胁。");
+        sb.AppendLine("其余可信、精确的规则判 keep=true。");
+        sb.AppendLine("以如下 JSON 数组回复(每条一个对象,reason 用一句中文):");
+        sb.AppendLine("[{\"index\":0,\"keep\":true,\"reason\":\"简要理由\"}]");
+        return sb.ToString();
+    }
+
+    private static Dictionary<int, (bool keep, string reason)> ParseIntelVetDecisions(string? reply)
+    {
+        var map = new Dictionary<int, (bool, string)>();
+        if (string.IsNullOrWhiteSpace(reply)) return map;
+        try
+        {
+            var json = ExtractJson(reply);
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return map;
+
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                if (!item.TryGetProperty("index", out var idxEl) || !idxEl.TryGetInt32(out var idx)) continue;
+                bool keep = item.TryGetProperty("keep", out var k) && k.ValueKind != JsonValueKind.False
+                            && (k.ValueKind == JsonValueKind.True
+                                || (k.ValueKind == JsonValueKind.String && !string.Equals(k.GetString(), "false", StringComparison.OrdinalIgnoreCase)));
+                string reason = item.TryGetProperty("reason", out var r) ? (r.GetString() ?? string.Empty) : string.Empty;
+                map[idx] = (keep, reason);
+            }
+        }
+        catch { /* 解析失败:返回空,调用方 fail-open */ }
+        return map;
+    }
+
+    // ========== AI 从情报语境合成「行为类」防护规则 ==========
+
+    /// <summary>情报合成的行为规则来源标记(区别于 IOC 规则,后台刷新不会清理)。</summary>
+    public const string IntelBehaviorNoteTag = "[情报-行为]";
+
+    /// <summary>
+    /// 根据本批情报涉及的恶意家族 / 威胁类型,让大模型合成针对其典型 TTP 的「行为类」防护规则
+    /// (进程创建链、注册表持久化、远程线程注入、可疑文件写入等)。这些规则是情报源无法直接提供的,
+    /// 由 AI 依据家族已知手法生成,供用户确认后采纳。未配置 / 失败返回空(不影响 IOC 规则流程)。
+    /// </summary>
+    public async Task<List<IntelRuleReview>> GenerateBehaviorRulesFromIntelAsync(
+        IReadOnlyList<string> threatContext, CancellationToken token = default)
+    {
+        var result = new List<IntelRuleReview>();
+        if (!IsConfigured || threatContext is null || threatContext.Count == 0) return result;
+
+        try
+        {
+            var prompt = BuildIntelBehaviorRulePrompt(threatContext);
+            var reply = await ChatAsync(prompt,
+                "你是 Bulwark 主动防御系统的行为检测规则专家。根据给定的恶意软件家族 / 威胁类型,生成针对其典型 TTP" +
+                "(进程创建链、注册表持久化、远程线程注入、可疑文件写入、C2 外联等)的精确行为拦截规则。" +
+                "规则必须足够精确以避免误伤正常软件。仅以 JSON 数组回复,不要任何额外文字。",
+                "情报行为规则生成",
+                token);
+
+            var suggestions = ParseRuleSuggestions(reply);
+            foreach (var s in suggestions)
+            {
+                var type = s.ParseType();
+                string? actor = string.IsNullOrWhiteSpace(s.ActorPattern) ? null : s.ActorPattern!.Trim();
+                string? target = string.IsNullOrWhiteSpace(s.TargetPattern) ? null : s.TargetPattern!.Trim();
+                string? cmd = string.IsNullOrWhiteSpace(s.CommandLinePattern) ? null : s.CommandLinePattern!.Trim();
+
+                // 安全闸门:至少要有一个具体条件,否则规则过宽(命中一切)会误伤正常程序 —— 丢弃。
+                if (type is null && actor is null && target is null && cmd is null)
+                    continue;
+
+                var rule = new DefenseRule
+                {
+                    ActorPattern = actor,
+                    Type = type,
+                    TargetPattern = target,
+                    CommandLinePattern = cmd,
+                    Action = s.ParseAction(),
+                    Note = IntelBehaviorNoteTag + (string.IsNullOrWhiteSpace(s.Reason) ? "" : " " + s.Reason!.Trim()),
+                };
+                result.Add(new IntelRuleReview { Rule = rule, Keep = true, Reason = s.Reason });
+            }
+        }
+        catch { /* 失败:返回空,不影响 IOC 规则流程 */ }
+        return result;
+    }
+
+    private static string BuildIntelBehaviorRulePrompt(IReadOnlyList<string> threatContext)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("以下是最近威胁情报中出现的恶意软件家族 / 威胁类型:");
+        sb.AppendLine();
+        foreach (var t in threatContext)
+            sb.AppendLine("· " + t);
+        sb.AppendLine();
+        sb.AppendLine("请针对这些家族的【已知典型行为(TTP)】,生成 3~8 条精确的行为拦截规则,");
+        sb.AppendLine("覆盖:进程创建链(如 office 派生脚本宿主)、注册表持久化(Run 键 / 服务 / IFEO)、");
+        sb.AppendLine("远程线程注入、可疑文件写入(启动目录 / 系统目录)等。要求:");
+        sb.AppendLine("· 规则要精确,尽量用 actorPattern + parentPattern + targetPattern 限定,避免误伤正常程序;");
+        sb.AppendLine("· type 从以下取值:ProcessCreate / ProcessTerminate / RemoteThread / ImageLoad / FileWrite / FileDelete / RegistryWrite / NetworkConnect;");
+        sb.AppendLine("· 通配符用 *;未适用的字段填 null;动作固定为 Block;");
+        sb.AppendLine("· 若无法给出足够精确的规则,返回空数组 []。");
+        sb.AppendLine("每条规则以如下 JSON 格式提供(整体用数组包裹):");
+        sb.AppendLine("[{");
+        sb.AppendLine("  \"actorPattern\": \"主体匹配模式(通配符*,可null)\",");
+        sb.AppendLine("  \"type\": \"事件类型(见上,可null)\",");
+        sb.AppendLine("  \"targetPattern\": \"目标匹配模式(通配符*,可null)\",");
+        sb.AppendLine("  \"commandLinePattern\": \"命令行匹配模式(可null)\",");
+        sb.AppendLine("  \"action\": \"Block\",");
+        sb.AppendLine("  \"reason\": \"一句话说明这条规则针对哪个家族的什么手法\"");
+        sb.AppendLine("}]");
+        return sb.ToString();
+    }
+
     // ========== HTTP 底层 ==========
 
     private async Task<string?> ChatAsync(string userMessage, string systemMessage, string category, CancellationToken token = default)
@@ -943,4 +1116,71 @@ public sealed class AiRuleSuggestion
         => string.Equals(ActionStr, "Allow", StringComparison.OrdinalIgnoreCase)
             ? VerdictAction.Allow
             : VerdictAction.Block;
+}
+
+/// <summary>
+/// 一条「AI 复核过的情报候选规则」:承载原始 <see cref="DefenseRule"/> 与模型的采纳建议 + 理由。
+/// UI 展示时给用户 <b>最终</b>决定是否采纳。
+/// </summary>
+public sealed class IntelRuleReview
+{
+    /// <summary>原始候选规则(带 ThreatFox 来源标记)。用户采纳时原样下发给服务。</summary>
+    public DefenseRule Rule { get; set; } = new();
+
+    /// <summary>AI 复核建议:是否值得采纳(true=建议采纳)。用户仍可自行覆盖。</summary>
+    public bool Keep { get; set; } = true;
+
+    /// <summary>AI 给出的一句话理由(或「未复核」说明)。</summary>
+    public string? Reason { get; set; }
+
+    /// <summary>给用户看的规则标题(依据 IOC 类型生成)。</summary>
+    public string Title => Describe(Rule);
+
+    /// <summary>规则命中的行为类型 + 处置(展示用)。</summary>
+    public string ActionLine
+    {
+        get
+        {
+            string typ = Rule.Type?.ToString() ?? "任意行为";
+            string act = Rule.Action == VerdictAction.Block ? "拦截" : "放行";
+            return $"{typ} → {act}";
+        }
+    }
+
+    /// <summary>把一条情报规则渲染成一句人类可读的描述(哈希 / IP / 域名 / 行为)。</summary>
+    public static string Describe(DefenseRule r)
+    {
+        if (r.ActorHashes is { Count: > 0 })
+        {
+            var h = System.Linq.Enumerable.First(r.ActorHashes);
+            var shortH = h.Length > 16 ? h[..16] + "…" : h;
+            return $"拦截恶意文件哈希 {shortH}";
+        }
+        if (r.Type == EventType.NetworkConnect && !string.IsNullOrEmpty(r.TargetPattern))
+            return $"拦截外联到 {r.TargetPattern!.Trim('*')}";
+
+        // 行为类规则:主体 + 行为类型 (+ 目标)。
+        string typeLabel = r.Type switch
+        {
+            EventType.ProcessCreate => "创建进程",
+            EventType.ProcessTerminate => "结束进程",
+            EventType.RemoteThread => "远程线程注入",
+            EventType.ImageLoad => "加载模块/驱动",
+            EventType.FileWrite => "写入文件",
+            EventType.FileDelete => "删除文件",
+            EventType.RegistryWrite => "写注册表",
+            EventType.NetworkConnect => "网络外联",
+            EventType.SelfProtect => "操作防护自身",
+            _ => "任意行为"
+        };
+        string act = r.Action == VerdictAction.Block ? "拦截" : "放行";
+        string actor = string.IsNullOrEmpty(r.ActorPattern) ? "任意程序" : r.ActorPattern!;
+        if (!string.IsNullOrEmpty(r.TargetPattern))
+            return $"{act} {actor} 的{typeLabel} → {r.TargetPattern}";
+        if (r.Type is not null || !string.IsNullOrEmpty(r.ActorPattern))
+            return $"{act} {actor} 的{typeLabel}";
+        if (!string.IsNullOrEmpty(r.TargetPattern))
+            return $"{act}目标 {r.TargetPattern}";
+        return r.Note ?? "情报规则";
+    }
 }

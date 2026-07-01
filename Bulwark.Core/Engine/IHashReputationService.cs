@@ -28,4 +28,9 @@ public interface IHashReputationService
     /// 与 <see cref="QueryAsync"/> 不同,本方法能区分"鉴权失败"与"文件未收录"。
     /// </summary>
     Task<(bool Ok, string Message)> TestConnectionAsync(CancellationToken token = default);
+
+    /// <summary>
+    /// 返回该源的实时用量快照(今日已用 / 配额),供「情报源连接」页展示。纯展示,不影响裁决。
+    /// </summary>
+    ReputationUsage GetUsage();
 }

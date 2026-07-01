@@ -135,15 +135,15 @@
                     <StackPanel Spacing="10">
                         <Grid ColumnDefinitions="*,Auto">
                             <TextBlock Grid.Column="0" Text="THREAT INTELLIGENCE / 威胁情报" Classes="label" VerticalAlignment="Center"/>
-                            <Button Grid.Column="1" Classes="neon" Content="测试连接" Padding="12,6" FontSize="12"
-                                    Click="TestVt_Click" IsEnabled="{Binding VtNotBusy}"/>
                         </Grid>
+                        <TextBlock Text="各情报源(VirusTotal / MalwareBazaar / OTX / 微步 / MetaDefender / Hybrid Analysis)的启用开关与连接测试,已统一移至左侧「情报源连接」页管理。"
+                                   Classes="label" TextWrapping="Wrap"/>
                         <Grid ColumnDefinitions="*,Auto">
                             <StackPanel Grid.Column="0">
-                                <TextBlock Text="启用 VirusTotal 后台信誉查询" Foreground="{StaticResource TextMidBrush}"/>
-                                <TextBlock Text="对未签名+本机首见+可疑的新样本后台限流查 VT 哈希信誉;命中恶意则结束进程并固化拦截。已内置默认 Key,开箱即用" Classes="label" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                <TextBlock Text="微步 IP 情报(网络防护)" Foreground="{StaticResource TextMidBrush}"/>
+                                <TextBlock Text="对可疑外联用微步 ThreatBook 的 IP 信誉做情报互证:判定恶意则拦截并固化进内核网络黑名单。场景接口月配额极低(约 20/月),仅对已可疑的外联查询且强缓存。需服务端配置微步 API Key" Classes="label" Margin="0,2,0,0" TextWrapping="Wrap"/>
                             </StackPanel>
-                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding VirusTotalEnabled}" VerticalAlignment="Center"/>
+                            <ToggleSwitch Grid.Column="1" IsChecked="{Binding ThreatBookNetworkIntelEnabled}" VerticalAlignment="Center"/>
                         </Grid>
                         <TextBlock Text="按文件 SHA-256 查询 VirusTotal 信誉(由服务端持有 API Key,UI 仅转发)。"
                                    Classes="label" TextWrapping="Wrap"/>

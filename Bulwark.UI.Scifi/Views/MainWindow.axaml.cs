@@ -98,6 +98,7 @@ public partial class MainWindow : Window
                 "ActivityLog" => new ActivityLogPage { DataContext = main?.ActivityLogVm },
                 "AiScan" => new AiScanPage { DataContext = main?.AiScanVm },
                 "VtHistory" => new VtHistoryPage { DataContext = main?.VtHistoryVm },
+                "ApiStatus" => new ApiStatusPage { DataContext = main?.ApiStatusVm },
                 "Settings" => new SettingsPage { DataContext = main?.SettingsVm },
                 _ => new DashboardPage { DataContext = main }
             };

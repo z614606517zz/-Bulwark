@@ -118,7 +118,7 @@ public sealed class BulwarkOptions
     /// <summary>VirusTotal 威胁情报集成配置。</summary>
     public VirusTotalOptions VirusTotal { get; set; } = new();
 
-    /// <summary>MalwareBazaar(abuse.ch)哈希信誉集成配置。免费、无需 API Key。</summary>
+    /// <summary>MalwareBazaar(abuse.ch)哈希信誉集成配置。免费,需一个免费 Auth-Key。</summary>
     public MalwareBazaarOptions MalwareBazaar { get; set; } = new();
 
     /// <summary>AlienVault OTX 哈希信誉集成配置。免费,需 API Key。</summary>
@@ -129,6 +129,12 @@ public sealed class BulwarkOptions
 
     /// <summary>MetaDefender Cloud(OPSWAT)多引擎哈希信誉集成配置。</summary>
     public MetaDefenderOptions MetaDefender { get; set; } = new();
+
+    /// <summary>Hybrid Analysis(Falcon Sandbox)哈希信誉集成配置。需服务端配置 API Key。</summary>
+    public HybridAnalysisOptions HybridAnalysis { get; set; } = new();
+
+    /// <summary>ThreatFox(abuse.ch)情报 feed 配置:定期拉取最近恶意 IOC,自动生成一批防护规则。</summary>
+    public ThreatFoxFeedOptions ThreatFoxFeed { get; set; } = new();
 
     /// <summary>大模型(AI)接入配置。用于双击启动 AI 病毒扫描、AI 规则生成等。</summary>
     public AiOptions Ai { get; set; } = new();
@@ -172,8 +178,8 @@ public sealed class AiOptions
 /// <summary>
 /// MalwareBazaar(abuse.ch)哈希信誉查询配置。绑定 "Bulwark:MalwareBazaar" 节。
 /// 完全免费、无需付费配额;命中即代表样本被收录为已知恶意,高可信。
-/// 新版 abuse.ch API 需要一个免费的 Auth-Key(环境变量 BULWARK_MB_AUTHKEY),
-/// 留空也可尝试匿名访问(可能被限流)。
+/// 新版 abuse.ch API 强制要求一个免费的 Auth-Key(环境变量 BULWARK_MB_AUTHKEY),
+/// 未配置 Auth-Key 时本源不启用(匿名请求会被拒 401)。
 /// </summary>
 public sealed class MalwareBazaarOptions
 {
@@ -248,6 +254,18 @@ public sealed class ThreatBookOptions
     /// <summary>每日最大请求数(免费档约 300)。</summary>
     public int RequestsPerDay { get; set; } = 300;
 
+    /// <summary>
+    /// 场景接口(IP 信誉 / 失陷检测)的每月配额上限。免费档极低(常见 20/月),
+    /// 故与文件信誉配额分开计数。仅对「已可疑的外联」做情报互证时消耗。
+    /// </summary>
+    public int SceneRequestsPerMonth { get; set; } = 20;
+
+    /// <summary>
+    /// 是否允许在网络防护里用微步 IP 信誉对可疑外联做情报互证。
+    /// 因场景接口月配额极低,默认关闭,由用户显式开启。
+    /// </summary>
+    public bool NetworkIntelEnabled { get; set; }
+
     /// <summary>单次查询的 HTTP 超时(秒)。</summary>
     public int QueryTimeoutSeconds { get; set; } = 10;
 }
@@ -279,6 +297,39 @@ public sealed class MetaDefenderOptions
 
     /// <summary>"恶意"判定阈值:检出引擎数 >= 此值判为 Malicious。</summary>
     public int MaliciousThreshold { get; set; } = 3;
+}
+
+/// <summary>
+/// Hybrid Analysis(Falcon Sandbox)哈希信誉查询配置。绑定 "Bulwark:HybridAnalysis" 节。
+/// 调用 GET https://www.hybrid-analysis.com/api/v2/overview/{sha256},按 SHA-256 查询样本概览,
+/// 读取 verdict(malicious/suspicious/whitelisted/no specific threat)、threat_score(0~100)、
+/// vx_family、multiscan_result。作为与 VirusTotal 互证的第二权威源(双证据)。
+///
+/// HA 要求请求头携带 api-key 与固定 User-Agent("Falcon Sandbox"),否则返回 403。
+/// API Key:环境变量 BULWARK_HA_APIKEY 优先,其次配置 ApiKey。免费档配额有限,默认限流保守。
+/// </summary>
+public sealed class HybridAnalysisOptions
+{
+    /// <summary>环境变量名:优先从此环境变量读取 API Key。</summary>
+    public const string ApiKeyEnvVar = "BULWARK_HA_APIKEY";
+
+    /// <summary>是否启用 Hybrid Analysis 信誉查询。</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>API Key(回退用)。优先级:环境变量 BULWARK_HA_APIKEY > 此字段。</summary>
+    public string? ApiKey { get; set; }
+
+    /// <summary>每分钟最大请求数(免费档保守取 5)。</summary>
+    public int RequestsPerMinute { get; set; } = 5;
+
+    /// <summary>每日最大请求数(免费档约 200)。</summary>
+    public int RequestsPerDay { get; set; } = 200;
+
+    /// <summary>单次查询的 HTTP 超时(秒)。</summary>
+    public int QueryTimeoutSeconds { get; set; } = 10;
+
+    /// <summary>"恶意"判定的 threat_score 阈值:verdict 非明确恶意时,threat_score >= 此值判为 Malicious。</summary>
+    public int MaliciousThreatScore { get; set; } = 70;
 }
 
 /// <summary>
@@ -319,4 +370,75 @@ public sealed class VirusTotalOptions
 
     /// <summary>Unknown(VT 未收录/查询失败)的负缓存有效期(小时)。避免反复查同一未收录文件。</summary>
     public int UnknownCacheTtlHours { get; set; } = 24;
+}
+
+/// <summary>
+/// ThreatFox(abuse.ch)情报 feed 配置。绑定 "Bulwark:ThreatFoxFeed" 节。
+///
+/// 与「信誉源(逐条查询某 IOC 好不好)」不同,本 feed 是【批量拉取最近已知恶意 IOC】,
+/// 用来【一次性生成一批防护规则】——主动防御的「情报订阅 → 自动布防」。
+///
+/// 数据来源:POST https://threatfox-api.abuse.ch/api/v1/  body {"query":"get_iocs","days":N}
+///   鉴权:请求头 Auth-Key(abuse.ch 账号密钥,与 MalwareBazaar 同一个;留空则回退用 MalwareBazaar 的)。
+/// 生成规则:
+///   · sha256_hash → 按哈希 Block 规则(该文件任何行为都拦,改名无效);
+///   · ip:port     → NetworkConnect Block 规则(拦截外联到该 IP);
+///   · domain(可选)→ NetworkConnect Block 规则(TargetPattern 含该域名)。
+/// 生成的规则统一带来源标记 <see cref="RuleNoteTag"/> 和过期时间(随 feed 刷新,避免无限堆积)。
+/// </summary>
+public sealed class ThreatFoxFeedOptions
+{
+    /// <summary>情报生成规则的来源标记前缀(写入 DefenseRule.Note,便于识别/去重/刷新)。</summary>
+    public const string RuleNoteTag = "[情报-ThreatFox]";
+
+    /// <summary>环境变量名:优先从此环境变量读取 abuse.ch Auth-Key。</summary>
+    public const string AuthKeyEnvVar = "BULWARK_ABUSECH_AUTHKEY";
+
+    /// <summary>是否启用 ThreatFox 情报 feed 自动生成规则。默认关闭。</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// abuse.ch Auth-Key(回退用)。优先级:环境变量 BULWARK_ABUSECH_AUTHKEY &gt; 此字段 &gt;
+    /// 复用 MalwareBazaar 的 AuthKey(同一个 abuse.ch 账号)。
+    /// </summary>
+    public string? AuthKey { get; set; }
+
+    /// <summary>拉取最近多少天的 IOC(ThreatFox 支持 1~7)。</summary>
+    public int Days { get; set; } = 3;
+
+    /// <summary>只采信置信度 &gt;= 此值的 IOC(0~100),降低误报。</summary>
+    public int MinConfidence { get; set; } = 75;
+
+    /// <summary>单次最多生成多少条规则(防止一次性灌入过多)。</summary>
+    public int MaxRules { get; set; } = 500;
+
+    /// <summary>生成规则的有效期(天)。到期自动失效(feed 会刷新),避免规则无限堆积。</summary>
+    public int RuleTtlDays { get; set; } = 7;
+
+    /// <summary>是否生成「按 SHA-256 哈希拦截」规则。</summary>
+    public bool GenerateHashRules { get; set; } = true;
+
+    /// <summary>是否生成「拦截外联到恶意 IP」规则。</summary>
+    public bool GenerateIpRules { get; set; } = true;
+
+    /// <summary>是否生成「拦截外联到恶意域名」规则(域名匹配较弱,默认关闭)。</summary>
+    public bool GenerateDomainRules { get; set; }
+
+    /// <summary>启动后首次拉取的延迟(秒),避开服务启动高峰。</summary>
+    public int InitialDelaySeconds { get; set; } = 60;
+
+    /// <summary>自动刷新周期(小时);&lt;=0 表示只在启动时拉一次,不周期刷新。</summary>
+    public int RefreshIntervalHours { get; set; } = 12;
+
+    /// <summary>单次请求 HTTP 超时(秒)。</summary>
+    public int QueryTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>解析最终生效的 Auth-Key:环境变量 &gt; 本字段 &gt; 回退调用方传入的 MalwareBazaar key。</summary>
+    public string ResolveAuthKey(string? malwareBazaarFallback)
+    {
+        var env = System.Environment.GetEnvironmentVariable(AuthKeyEnvVar);
+        if (!string.IsNullOrWhiteSpace(env)) return env.Trim();
+        if (!string.IsNullOrWhiteSpace(AuthKey)) return AuthKey!.Trim();
+        return malwareBazaarFallback?.Trim() ?? string.Empty;
+    }
 }

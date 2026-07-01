@@ -34,6 +34,22 @@ public sealed class AggregateReputationService : IHashReputationService
 
     public bool IsEnabled => _sources.Any(IsActive);
 
+    /// <summary>聚合器自身的用量无实际意义(占位实现,满足接口)。真实用量见 <see cref="GetUsages"/>。</summary>
+    public ReputationUsage GetUsage() => new() { Source = "Aggregate", Enabled = IsEnabled };
+
+    /// <summary>逐源收集实时用量快照。Enabled 以「配置可用 且 运行时开关未关」为准。</summary>
+    public IReadOnlyList<ReputationUsage> GetUsages()
+    {
+        var list = new List<ReputationUsage>();
+        foreach (var s in _sources)
+        {
+            var u = s.GetUsage();
+            u.Enabled = IsActive(s);
+            list.Add(u);
+        }
+        return list;
+    }
+
     public AggregateReputationService(
         ILogger<AggregateReputationService> logger,
         IEnumerable<IHashReputationService> sources)
@@ -50,13 +66,14 @@ public sealed class AggregateReputationService : IHashReputationService
     /// <summary>
     /// 按运行时设置更新各源开关。Worker 在设置变更时调用。
     /// </summary>
-    public void SetRuntimeEnabled(bool virusTotal, bool malwareBazaar, bool otx, bool threatBook, bool metaDefender)
+    public void SetRuntimeEnabled(bool virusTotal, bool malwareBazaar, bool otx, bool threatBook, bool metaDefender, bool hybridAnalysis)
     {
         _runtimeEnabled[SourceName(typeof(VirusTotalClient))] = virusTotal;
         _runtimeEnabled[SourceName(typeof(MalwareBazaarClient))] = malwareBazaar;
         _runtimeEnabled[SourceName(typeof(OtxClient))] = otx;
         _runtimeEnabled[SourceName(typeof(ThreatBookClient))] = threatBook;
         _runtimeEnabled[SourceName(typeof(MetaDefenderClient))] = metaDefender;
+        _runtimeEnabled[SourceName(typeof(HybridAnalysisClient))] = hybridAnalysis;
     }
 
     /// <summary>某源当前是否真正参与查询:配置可用 且 运行时开关未关闭。</summary>
@@ -191,6 +208,7 @@ public sealed class AggregateReputationService : IHashReputationService
         nameof(OtxClient) => "OTX",
         nameof(ThreatBookClient) => "ThreatBook",
         nameof(MetaDefenderClient) => "MetaDefender",
+        nameof(HybridAnalysisClient) => "HybridAnalysis",
         _ => t.Name,
     };
 }

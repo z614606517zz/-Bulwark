@@ -116,6 +116,14 @@ public sealed class ThreatRemediator
         }
 
         Consider(malicious.ActorPath);
+
+        // 主体自身的签名是否「不可信」——被吊销 / 失配(篡改·盗用) / 过期后签名。
+        // 若为真,说明恶意判定本就基于「签名滥用」,此时绝不能因为「文件带签名」而豁免清理
+        // (否则出现自相矛盾:判恶意的理由是证书被盗吊销,清理却因"有签名"而保护不动)。
+        bool actorSignatureUntrusted =
+            malicious.CertRevoked || malicious.SignatureMismatch || malicious.SignedAfterCertExpiry;
+        var actorPath = malicious.ActorPath?.Trim();
+
         foreach (var ev in footprint)
         {
             if (ev.Type is EventType.FileWrite or EventType.FileDelete)
@@ -130,7 +138,13 @@ public sealed class ThreatRemediator
             try
             {
                 if (!File.Exists(path)) continue;
-                if (!IsSafeToRemove(path, out var why))
+
+                // 主体自身且其签名不可信(吊销/失配/过期后签名)时,跳过「有签名即保护」豁免:
+                // 恶意判定正是基于签名滥用,不能反过来因"有签名"而放它一马。
+                bool bypassSignatureGuard = actorSignatureUntrusted
+                    && string.Equals(path, actorPath, StringComparison.OrdinalIgnoreCase);
+
+                if (!IsSafeToRemove(path, bypassSignatureGuard, out var why))
                 {
                     report.Skipped.Add(SkipFile(path, why));
                     continue;
@@ -416,7 +430,11 @@ public sealed class ThreatRemediator
     }
 
     /// <summary>是否可安全清理:位于用户可写落地区、不在系统/安装目录、且无可信签名。</summary>
-    private static bool IsSafeToRemove(string path, out string reason)
+    /// <param name="bypassSignatureGuard">
+    /// 为 true 时跳过「带可信签名即保护」这一豁免 —— 用于恶意判定本就基于签名滥用
+    /// (证书吊销 / 签名失配 / 过期后签名)的主体,避免"因有签名而保护不动"的自相矛盾。
+    /// </param>
+    private static bool IsSafeToRemove(string path, bool bypassSignatureGuard, out string reason)
     {
         reason = string.Empty;
         var lower = path.ToLowerInvariant().Replace('/', '\\');
@@ -432,15 +450,19 @@ public sealed class ThreatRemediator
             return false;
         }
         // 带可信签名的文件几乎不可能是恶意释放物,绝不清理(防误删合法组件)。
-        try
+        // 例外:主体签名本身已被判定为滥用(吊销/失配/过期后签名)——此时签名不可信,不再豁免。
+        if (!bypassSignatureGuard)
         {
-            if (ProcessInspector.IsSigned(path))
+            try
             {
-                reason = "带可信数字签名,保护不动";
-                return false;
+                if (ProcessInspector.IsSigned(path))
+                {
+                    reason = "带可信数字签名,保护不动";
+                    return false;
+                }
             }
+            catch { /* 签名校验失败时按未签名处理,继续清理 */ }
         }
-        catch { /* 签名校验失败时按未签名处理,继续清理 */ }
 
         return true;
     }

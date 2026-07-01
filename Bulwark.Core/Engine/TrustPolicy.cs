@@ -54,8 +54,10 @@ public static class TrustPolicy
     {
         // Windows Defender
         "msmpeng.exe", "mpcmdrun.exe", "nissrv.exe", "mpdefendercoreservice.exe", "securityhealthservice.exe",
-        // Kaspersky
+        // Kaspersky(含无缝更新工具 avpsus.exe / 网络代理 klnagent.exe:它们会在
+        // 自身 ProgramData\Kaspersky Lab 目录内批量删改文件做更新,极易被误判勒索)
         "avp.exe", "avpui.exe", "kavfs.exe", "kavfswp.exe", "ksde.exe", "ksdeui.exe",
+        "avpsus.exe", "klnagent.exe", "ksn.exe",
         // ESET
         "ekrn.exe", "egui.exe",
         // McAfee

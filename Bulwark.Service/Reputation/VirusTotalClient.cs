@@ -52,6 +52,16 @@ public sealed class VirusTotalClient : IHashReputationService
 
     public bool IsEnabled { get; }
 
+    public ReputationUsage GetUsage()
+    {
+        var (used, limit) = _daily.Snapshot();
+        return new ReputationUsage
+        {
+            Source = "VirusTotal", Enabled = IsEnabled,
+            UsedToday = used, DailyLimit = limit, PerMinuteLimit = _opt.RequestsPerMinute
+        };
+    }
+
     public VirusTotalClient(ILogger<VirusTotalClient> logger, BulwarkOptions options)
     {
         _logger = logger;

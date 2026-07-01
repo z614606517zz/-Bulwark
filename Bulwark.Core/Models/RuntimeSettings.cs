@@ -60,12 +60,25 @@ public sealed class RuntimeSettings
     public bool ThreatBookEnabled { get; set; }
 
     /// <summary>
+    /// 是否启用微步 ThreatBook「IP 信誉」对网络防护里的可疑外联做情报互证。
+    /// 因场景接口月配额极低(常见 20/月),默认关闭,由用户显式开启;
+    /// 且仅对「已可疑的外联」查询、结果强缓存,绝不逐连接调用。
+    /// </summary>
+    public bool ThreatBookNetworkIntelEnabled { get; set; }
+
+    /// <summary>
     /// 是否启用 MetaDefender Cloud(OPSWAT)多引擎哈希信誉源。与其它源并联。需服务端配置 API Key。默认关闭。
     /// </summary>
     public bool MetaDefenderEnabled { get; set; }
 
+    /// <summary>
+    /// 是否启用 Hybrid Analysis(Falcon Sandbox)哈希信誉源。与 VirusTotal 互证(双证据);
+    /// 按 SHA-256 查询样本概览(verdict/threat_score/vx_family)。需服务端配置 API Key。默认关闭。
+    /// </summary>
+    public bool HybridAnalysisEnabled { get; set; }
+
     /// <summary>是否启用任一威胁情报源(任意一个开启即触发后台信誉查询流程)。</summary>
-    public bool AnyReputationEnabled => VirusTotalEnabled || MalwareBazaarEnabled || OtxEnabled || ThreatBookEnabled || MetaDefenderEnabled;
+    public bool AnyReputationEnabled => VirusTotalEnabled || MalwareBazaarEnabled || OtxEnabled || ThreatBookEnabled || MetaDefenderEnabled || HybridAnalysisEnabled;
 
     /// <summary>
     /// 是否对「用户双击启动的应用」启用 AI 病毒扫描。

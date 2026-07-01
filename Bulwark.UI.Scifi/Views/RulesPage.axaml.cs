@@ -23,6 +23,8 @@ public partial class RulesPage : UserControl
 
     private void Refresh_Click(object? sender, RoutedEventArgs e) => Vm?.Refresh();
 
+    private void Intel_Click(object? sender, RoutedEventArgs e) => Vm?.RefreshIntelRules();
+
     private async void Add_Click(object? sender, RoutedEventArgs e)
     {
         var dlg = new RuleEditorWindow();
@@ -65,4 +67,13 @@ public partial class RulesPage : UserControl
         if (sender is Button btn && btn.Tag is AiRuleSuggestion suggestion && Vm is not null)
             Vm.AcceptSuggestion(suggestion);
     }
+
+    private void AcceptIntel_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.Tag is IntelRuleReview review && Vm is not null)
+            Vm.AcceptIntelSuggestion(review);
+    }
+
+    private void AcceptAllIntel_Click(object? sender, RoutedEventArgs e)
+        => Vm?.AcceptAllIntelSuggestions();
 }

@@ -26,9 +26,14 @@ public class Worker : BackgroundService
     private readonly ProcessChainTracker _chain;
     private readonly ReputationManager _reputation;
     private readonly VirusTotalClient _vt;
+    private readonly ThreatBookClient _threatBook;
     private readonly VtScanHistoryStore _vtHistory;
     private readonly QuarantineManager _quarantine;
     private readonly ThreatRemediator? _remediator;
+
+    /// <summary>ThreatFox 情报 feed 客户端(批量拉取恶意 IOC 生成防护规则)。未启用时其 IsEnabled=false。</summary>
+    private readonly ThreatFoxFeedClient _threatFoxFeed;
+    private readonly ThreatFoxFeedOptions _threatFoxOpt;
 
     /// <summary>若事件源支持裁决回写(如内核驱动),则非空。</summary>
     private readonly IVerdictSink? _verdictSink;
@@ -65,6 +70,7 @@ public class Worker : BackgroundService
         ProcessChainTracker chain,
         ReputationManager reputation,
         VirusTotalClient vt,
+        ThreatBookClient threatBook,
         VtScanHistoryStore vtHistory,
         QuarantineManager quarantine,
         BulwarkOptions options)
@@ -81,11 +87,17 @@ public class Worker : BackgroundService
         _chain = chain;
         _reputation = reputation;
         _vt = vt;
+        _threatBook = threatBook;
         _vtHistory = vtHistory;
         _quarantine = quarantine;
         _remediator = OperatingSystem.IsWindows() ? new ThreatRemediator(quarantine, logger) : null;
         _verdictSink = eventSource as IVerdictSink;
         _moduleBlockSink = eventSource as IModuleBlockSink;
+
+        // ThreatFox 情报 feed:批量拉取最近恶意 IOC 自动生成防护规则。
+        // Auth-Key 缺省复用 MalwareBazaar 的(同一个 abuse.ch 账号)。
+        _threatFoxOpt = options.ThreatFoxFeed;
+        _threatFoxFeed = new ThreatFoxFeedClient(logger, _threatFoxOpt, options.MalwareBazaar.AuthKey);
 
         // 用 appsettings.json 作为默认值初始化设置
 #pragma warning disable CA1416 // EventSourceCoordinator 仅在 Windows 创建
@@ -106,7 +118,9 @@ public class Worker : BackgroundService
             MalwareBazaarEnabled = options.MalwareBazaar.Enabled,
             OtxEnabled = options.Otx.Enabled,
             ThreatBookEnabled = options.ThreatBook.Enabled,
+            ThreatBookNetworkIntelEnabled = options.ThreatBook.NetworkIntelEnabled,
             MetaDefenderEnabled = options.MetaDefender.Enabled,
+            HybridAnalysisEnabled = options.HybridAnalysis.Enabled,
             AiBaseUrl = options.Ai.BaseUrl ?? string.Empty,
             AiApiKey = options.Ai.ResolveApiKey(),
             AiModel = options.Ai.Model ?? string.Empty
@@ -156,6 +170,10 @@ public class Worker : BackgroundService
         _engine.LoadRules(rules);
         _logger.LogInformation("已加载 {count} 条防护规则。", rules.Count);
 
+        // 情报订阅:若启用 ThreatFox feed,启动后台循环,定期批量拉取恶意 IOC 生成防护规则。
+        if (_threatFoxFeed.IsEnabled)
+            _ = RunIntelFeedLoopAsync(stoppingToken);
+
         // 注册本软件自身目录到引擎白名单:服务自身目录,以及同级的 UI 目录。
         // 使本软件所有组件(服务/UI/托盘/探针)发起的行为一律放行,绝不自我拦截。
         RegisterSelfDirectories();
@@ -176,7 +194,9 @@ public class Worker : BackgroundService
             // 新增信誉源:旧版持久化设置不含 ThreatBook 字段(反序列化为 false),
             // 用 appsettings 的开关兜底开启,避免被旧设置覆盖关闭。
             saved.ThreatBookEnabled = saved.ThreatBookEnabled || _settings.ThreatBookEnabled;
+            saved.ThreatBookNetworkIntelEnabled = saved.ThreatBookNetworkIntelEnabled || _settings.ThreatBookNetworkIntelEnabled;
             saved.MetaDefenderEnabled = saved.MetaDefenderEnabled || _settings.MetaDefenderEnabled;
+            saved.HybridAnalysisEnabled = saved.HybridAnalysisEnabled || _settings.HybridAnalysisEnabled;
             _settings = saved;
         }
         ApplySettings();
@@ -299,6 +319,8 @@ public class Worker : BackgroundService
         _ipc.SettingsUpdated = updated =>
         {
             updated.EventSource = _settings.EventSource; // 只读字段保持不变
+            // UI 现已通过「情报源连接」页管理全部 6 个信誉源开关(Build() 已含),网络 IP 情报开关也由 UI 管理,
+            // 故不再需要回填任何情报源字段;仅 EventSource 为只读、保持不变。
             bool kernelToggled = updated.KernelDriverEnabled != _settings.KernelDriverEnabled;
             _settings = updated;
             ApplySettings();
@@ -352,6 +374,14 @@ public class Worker : BackgroundService
                     var (ok, message) = await _reputation.TestConnectionAsync(req.Source, CancellationToken.None);
                     return new VtResponsePayload { Success = ok, Message = message };
                 }
+                case VtRequestKind.UsageStats:
+                {
+                    return new VtResponsePayload
+                    {
+                        Success = true,
+                        Usages = new List<ReputationUsage>(_reputation.GetUsages())
+                    };
+                }
                 case VtRequestKind.QueryFile:
                 {
                     var path = req.FilePath;
@@ -388,6 +418,12 @@ public class Worker : BackgroundService
         // VT 扫描历史:UI 打开「VT 查询记录」视图时请求完整历史。
         _ipc.VtHistoryRequested = () =>
             new VtHistoryResponsePayload { Records = _vtHistory.GetAll() };
+
+        // 情报刷新:UI 点「立即从情报刷新规则」按钮时,预览模式仅生成不落地(交 AI 复核 + 用户确认)。
+        _ipc.IntelRefreshRequested = req => RefreshIntelRulesAsync(req.PreviewOnly, CancellationToken.None);
+
+        // 情报采纳:UI 端用户(经 AI 复核)确认采纳的规则,增量应用到引擎。
+        _ipc.IntelApplyRequested = req => ApplyUserApprovedIntelRulesAsync(req.Rules, CancellationToken.None);
 
         // 自我保护:UI 连接时把其 PID 加入内核受保护进程列表
         _ipc.UiProcessConnected = pid =>
@@ -602,7 +638,7 @@ public class Worker : BackgroundService
         _promptTimeout = TimeSpan.FromSeconds(Math.Max(5, _settings.PromptTimeoutSeconds));
         // 把各威胁情报源的运行时开关下发给聚合器。
         _reputation.SetRuntimeEnabled(
-            _settings.VirusTotalEnabled, _settings.MalwareBazaarEnabled, _settings.OtxEnabled, _settings.ThreatBookEnabled, _settings.MetaDefenderEnabled);
+            _settings.VirusTotalEnabled, _settings.MalwareBazaarEnabled, _settings.OtxEnabled, _settings.ThreatBookEnabled, _settings.MetaDefenderEnabled, _settings.HybridAnalysisEnabled);
 
         // 用户态持续行为监控开关(自启动持久化 + 勒索蜜罐)下发给协调器。
 #pragma warning disable CA1416 // EventSourceCoordinator 仅在 Windows 创建
@@ -666,6 +702,180 @@ public class Worker : BackgroundService
             _logger.LogWarning("当前运行环境不支持内核驱动事件源,开关被忽略。");
         }
 #pragma warning restore CA1416
+    }
+
+    /// <summary>
+    /// 手动「立即刷新」:同步拉取一次 ThreatFox IOC 并生成规则。
+    ///  · <paramref name="preview"/>=false:与后台循环一致,直接应用并返回生效条数;
+    ///  · <paramref name="preview"/>=true:只生成候选规则回传 UI(不落地),由 AI 复核 + 用户确认后再采纳。
+    /// feed 未启用时返回失败说明。
+    /// </summary>
+    private async Task<IntelRefreshResultPayload> RefreshIntelRulesAsync(bool preview, CancellationToken token)
+    {
+        if (!_threatFoxFeed.IsEnabled)
+            return new IntelRefreshResultPayload
+            {
+                Success = false,
+                Message = "ThreatFox 情报 feed 未启用(检查 Bulwark:ThreatFoxFeed:Enabled 与 Auth-Key)"
+            };
+
+        try
+        {
+            var iocs = await _threatFoxFeed.FetchRecentAsync(token);
+            if (iocs.Count == 0)
+                return new IntelRefreshResultPayload
+                {
+                    Success = false, IocCount = 0, RulesApplied = 0,
+                    Message = "未获取到达标 IOC(可能网络失败、Auth-Key 无效或置信度阈值过高)"
+                };
+
+            var generated = IntelRuleGenerator.Generate(iocs, _threatFoxOpt);
+
+            if (preview)
+            {
+                // 只生成、不应用:把候选规则交回 UI(→ AI 复核 → 用户确认采纳)。
+                // 同时汇总本批情报涉及的恶意家族/威胁类型,供 UI 交 AI 合成「行为类」防护规则。
+                var context = iocs
+                    .Select(i =>
+                    {
+                        string fam = !string.IsNullOrWhiteSpace(i.Malware) ? i.Malware!
+                                   : !string.IsNullOrWhiteSpace(i.ThreatType) ? i.ThreatType! : "";
+                        string tt = string.IsNullOrWhiteSpace(i.ThreatType) ? "" : $" ({i.ThreatType})";
+                        return string.IsNullOrWhiteSpace(fam) ? "" : fam + tt;
+                    })
+                    .Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(30)
+                    .ToList();
+
+                _logger.LogInformation("情报刷新(预览):拉取 {ioc} 条 IOC,生成 {n} 条候选规则(待 AI 复核 + 用户确认)。",
+                    iocs.Count, generated.Count);
+                return new IntelRefreshResultPayload
+                {
+                    Success = true, IocCount = iocs.Count, RulesApplied = 0,
+                    GeneratedRules = generated,
+                    ThreatContext = context,
+                    Message = $"已生成 {generated.Count} 条候选规则(源 IOC {iocs.Count} 条),待复核确认"
+                };
+            }
+
+            int applied = await ApplyIntelRulesAsync(generated, token);
+            _logger.LogInformation("情报刷新(手动):拉取 {ioc} 条 IOC,应用 {n} 条防护规则。", iocs.Count, applied);
+            return new IntelRefreshResultPayload
+            {
+                Success = true, IocCount = iocs.Count, RulesApplied = applied,
+                Message = $"已从情报生成 {applied} 条防护规则(源 IOC {iocs.Count} 条)"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "情报刷新(手动)失败");
+            return new IntelRefreshResultPayload { Success = false, Message = "刷新失败:" + ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// 应用用户(经 AI 复核)确认采纳的一批情报规则。<b>增量合并</b>:在现有规则集上追加,
+    /// 按来源标记 + 目标 + 哈希去重,不清空上一轮情报规则、不影响用户自定义/信任/内置规则。
+    /// 返回本次实际新增生效的条数。
+    /// </summary>
+    private async Task<IntelRefreshResultPayload> ApplyUserApprovedIntelRulesAsync(
+        List<DefenseRule> approved, CancellationToken token)
+    {
+        try
+        {
+            if (approved is null || approved.Count == 0)
+                return new IntelRefreshResultPayload { Success = false, Message = "没有可采纳的规则" };
+
+            var current = _engine.GetRules().ToList();
+
+            // 已存在的情报规则去重键(来源标记 + 目标模式 + 哈希),避免重复采纳。
+            static string Key(DefenseRule r) =>
+                (r.Note ?? string.Empty) + "|" + (r.TargetPattern ?? string.Empty) + "|"
+                + (r.ActorHashes is { Count: > 0 } ? string.Join(",", r.ActorHashes) : string.Empty);
+
+            var existingKeys = new HashSet<string>(current.Select(Key), StringComparer.OrdinalIgnoreCase);
+
+            int added = 0;
+            foreach (var rule in approved)
+            {
+                if (existingKeys.Add(Key(rule)))
+                {
+                    current.Add(rule);
+                    added++;
+                }
+            }
+
+            _engine.LoadRules(current);
+            await _store.SaveAsync(current, token);
+            _logger.LogInformation("情报采纳:用户确认 {req} 条,实际新增生效 {n} 条。", approved.Count, added);
+
+            return new IntelRefreshResultPayload
+            {
+                Success = true, RulesApplied = added,
+                Message = added > 0 ? $"已采纳 {added} 条防护规则" : "所选规则已存在,无需重复添加"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "情报规则采纳失败");
+            return new IntelRefreshResultPayload { Success = false, Message = "采纳失败:" + ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// 情报订阅后台循环:按配置周期从 ThreatFox 批量拉取恶意 IOC,生成防护规则并应用。
+    /// 首次延迟 InitialDelaySeconds;RefreshIntervalHours&lt;=0 则只拉一次。全程 fail-safe,绝不抛断。
+    /// </summary>
+    private async Task RunIntelFeedLoopAsync(CancellationToken token)
+    {
+        try { await Task.Delay(TimeSpan.FromSeconds(Math.Max(0, _threatFoxOpt.InitialDelaySeconds)), token); }
+        catch (OperationCanceledException) { return; }
+
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                var iocs = await _threatFoxFeed.FetchRecentAsync(token);
+                if (iocs.Count > 0)
+                {
+                    var generated = IntelRuleGenerator.Generate(iocs, _threatFoxOpt);
+                    int applied = await ApplyIntelRulesAsync(generated, token);
+                    _logger.LogInformation("情报订阅(ThreatFox):拉取 {ioc} 条 IOC,应用 {n} 条防护规则。",
+                        iocs.Count, applied);
+                }
+                else
+                {
+                    _logger.LogInformation("情报订阅(ThreatFox):本次未获取到达标 IOC。");
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "情报订阅(ThreatFox)本轮失败,稍后重试。");
+            }
+
+            if (_threatFoxOpt.RefreshIntervalHours <= 0) break;
+            try { await Task.Delay(TimeSpan.FromHours(_threatFoxOpt.RefreshIntervalHours), token); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    /// <summary>
+    /// 应用一批情报生成的规则:先移除上一轮同来源(带来源标记)的旧规则,再灌入新规则,
+    /// 然后原子替换引擎规则集并落盘。返回本次实际生效的规则条数。
+    /// 用户自定义/信任/内置规则不受影响(仅动带 ThreatFox 来源标记的)。
+    /// </summary>
+    private async Task<int> ApplyIntelRulesAsync(List<DefenseRule> generated, CancellationToken token)
+    {
+        var current = _engine.GetRules().ToList();
+        current.RemoveAll(r => !string.IsNullOrEmpty(r.Note)
+            && r.Note.StartsWith(ThreatFoxFeedOptions.RuleNoteTag, StringComparison.Ordinal));
+        current.AddRange(generated);
+
+        _engine.LoadRules(current);
+        await _store.SaveAsync(current, token);
+        return generated.Count;
     }
 
     /// <summary>
@@ -1312,6 +1522,109 @@ public class Worker : BackgroundService
         _logger.LogWarning("AI 确认恶意,已固化哈希拦截规则(后续免重复调用大模型):{hash}", hash);
     }
 
+    /// <summary>网络 IP 情报互证的最低触发分(低于此分且无硬指标的外联不查,保护月配额)。</summary>
+    private const int NetworkIntelMinScore = 40;
+
+    /// <summary>IP 情报结果强缓存(保护微步场景接口的极低月配额)。</summary>
+    private static readonly TimeSpan IpIntelCacheTtl = TimeSpan.FromDays(7);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (ReputationVerdict Verdict, string? Label, DateTime FetchedUtc)> _ipIntelCache = new();
+
+    /// <summary>
+    /// 网络防护 IP 情报互证:对「已可疑的公网外联」用微步 IP 信誉做研判,折叠进裁决。
+    /// 严守低误报 + 双证据 + 保护月配额:强可信/健康签名主体不查;无可疑信号不查;
+    /// 结果强缓存;情报源不可用/无结论一律维持原裁决(fail-open)。
+    ///   - 判定恶意 -> 升格 Block,并把该 IP 固化进内核网络黑名单(后续预动作拦截);
+    ///   - 判定可疑 且 原为 Allow -> 升级为 Ask,交用户裁决;
+    ///   - 其余 -> 维持原裁决。
+    /// </summary>
+    private async Task<Verdict> NetworkIntelConsultAsync(SecurityEvent e, Verdict current, CancellationToken token)
+    {
+        if (!_threatBook.IsEnabled) return current;
+
+        var ip = ExtractRemoteIpv4(e.Target);
+        if (ip is null || IsPrivateOrReserved(ip)) return current;
+
+        // 强可信 / 健康签名主体的外联不查(正常业务外联,省配额、也符合低误报)。
+        if (TrustPolicy.IsStronglyTrusted(e, out _) || TrustPolicy.IsHealthySigned(e, out _))
+            return current;
+
+        // 仅对「已有可疑信号」的外联做情报互证:硬指标 / 风险分达阈值 / 主体未签名。
+        bool suspicious = e.HasThreatIndicator || e.RiskScore >= NetworkIntelMinScore || !e.ActorSigned;
+        if (!suspicious) return current;
+
+        ReputationVerdict verdict;
+        string? label;
+        if (_ipIntelCache.TryGetValue(ip, out var cached)
+            && DateTime.UtcNow - cached.FetchedUtc < IpIntelCacheTtl)
+        {
+            verdict = cached.Verdict;
+            label = cached.Label;
+        }
+        else
+        {
+            IpReputation rep;
+            try { rep = await _threatBook.QueryIpAsync(ip, token); }
+            catch { return current; }
+            if (!rep.QuerySucceeded) return current; // fail-open:失败不缓存,维持原裁决
+            verdict = rep.Verdict;
+            label = rep.ThreatLabel;
+            _ipIntelCache[ip] = (verdict, label, DateTime.UtcNow);
+        }
+
+        if (verdict == ReputationVerdict.Malicious)
+        {
+            e.HasThreatIndicator = true;
+            e.AddEvidence("ThreatBookIp", EvidenceKind.Corroboration,
+                $"微步 IP 信誉:远端 {ip} 判定为恶意{(string.IsNullOrEmpty(label) ? "" : " · " + label)}");
+#pragma warning disable CA1416 // EventSourceCoordinator 仅在 Windows 创建
+            try { (_eventSource as EventSourceCoordinator)?.AddBlockedIp(ip); } catch { }
+#pragma warning restore CA1416
+            _logger.LogWarning("微步 IP 信誉判定恶意,拦截外联并固化黑名单:{actor} -> {ip}", e.ActorPath, ip);
+            return Verdict.For(e, VerdictAction.Block, VerdictSource.Heuristic);
+        }
+
+        if (verdict == ReputationVerdict.Suspicious && current.Action == VerdictAction.Allow)
+        {
+            e.AddEvidence("ThreatBookIp", EvidenceKind.Corroboration,
+                $"微步 IP 信誉:远端 {ip} 可疑{(string.IsNullOrEmpty(label) ? "" : " · " + label)},升级为询问");
+            return Verdict.For(e, VerdictAction.Ask, VerdictSource.Heuristic);
+        }
+
+        return current;
+    }
+
+    /// <summary>从事件目标("ip" 或 "ip:port")提取 IPv4 字符串;非 IPv4 返回 null。</summary>
+    private static string? ExtractRemoteIpv4(string? target)
+    {
+        if (string.IsNullOrWhiteSpace(target)) return null;
+        var host = target.Trim();
+        int colon = host.LastIndexOf(':');
+        if (colon > 0 && host.IndexOf(':') == colon) // 单个冒号 -> ip:port
+            host = host[..colon];
+        if (System.Net.IPAddress.TryParse(host, out var addr)
+            && addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            return addr.ToString();
+        return null;
+    }
+
+    /// <summary>是否私网 / 环回 / 链路本地 / 保留地址(内网外联不做云端情报查询)。</summary>
+    private static bool IsPrivateOrReserved(string ipv4)
+    {
+        if (!System.Net.IPAddress.TryParse(ipv4, out var addr)) return true;
+        var b = addr.GetAddressBytes();
+        if (b.Length != 4) return true;
+        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 0.0.0.0/8, 100.64.0.0/10(CGNAT)
+        if (b[0] == 10) return true;
+        if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
+        if (b[0] == 192 && b[1] == 168) return true;
+        if (b[0] == 127) return true;
+        if (b[0] == 169 && b[1] == 254) return true;
+        if (b[0] == 0) return true;
+        if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true;
+        if (b[0] >= 224) return true; // 组播/保留
+        return false;
+    }
+
     private async Task HandleEventAsync(SecurityEvent e, CancellationToken token)
     {
         try
@@ -1372,6 +1685,15 @@ public class Worker : BackgroundService
                 {
                     verdict = await VtGrayZoneConsultAsync(e, verdict, token);
                 }
+            }
+
+            // 网络防护:对「可疑外联」用微步 IP 信誉做情报互证(月配额极低,仅可疑外联才查 + 强缓存)。
+            // 判定恶意 -> 升格拦截并把该 IP 固化进内核黑名单;可疑 -> 升级为询问;其余不变(fail-open)。
+            if (_settings.ThreatBookNetworkIntelEnabled
+                && e.Type == EventType.NetworkConnect
+                && verdict.Action != VerdictAction.Block)
+            {
+                verdict = await NetworkIntelConsultAsync(e, verdict, token);
             }
 
             if (verdict.Action == VerdictAction.Ask)
