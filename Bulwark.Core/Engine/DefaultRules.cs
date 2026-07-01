@@ -41,6 +41,8 @@ public static class DefaultRules
         AddByovdRules(list);             // BYOVD 脆弱驱动落地 / 加载
         AddSilverFox2026Rules(list);     // 银狐 2025-2026 最新动向(Winos/ValleyRAT/ABCDoor/AtlasCross)
         AddImControlRules(list);         // 远控木马劫持微信/QQ群发(注入/侧载/自动化)
+        AddImMassMessagingRules(list);   // 银狐:微信/QQ 群发外挂框架(wcferry/ntchat/wxbot 等)
+        AddImHarvestAndFrameworkRules(list); // 银狐:补充群控框架 + 通讯录/聊天库窃取(群发目标采集)
         AddDeepPersistenceRules(list);   // 深层持久化:LSA包/netsh helper/COR_PROFILER/BootExecute/AppCertDLLs
         AddCmdlineEvasionRules(list);    // 命令行关防护 / UAC 绕过(auto-elevate 劫持)
         AddNetworkC2Rules(list);         // 脚本解释器 / 可疑目录程序网络外联(疑似 C2)
@@ -1463,6 +1465,207 @@ public static class DefaultRules
             "命令行调用微信网页协议库 itchat(疑似群发)");
         Cmd(list, @"*PyWeChatSpy*", VerdictAction.Ask,
             "命令行调用微信控制框架 PyWeChatSpy(疑似群发)");
+    }
+
+    // ======================================================================
+    // 批次 14b:银狐 —— 微信 / QQ「群发外挂框架」专项(一键群发广告/诈骗链接)
+    //
+    // 背景:银狐(ValleyRAT/Winos 系)与灰产「营销外挂」落地后,普遍不是自己实现协议,
+    // 而是复用成熟的第三方「PC 微信/QQ 群控框架」挂进 IM 进程,调用其内部接口做:
+    //   自动群发消息/朋友圈、批量加好友、拉群、导出通讯录与聊天记录。
+    // 这些框架各自有非常具名的注入模块 DLL 与命令行/包名特征,正常用户环境几乎不出现。
+    //
+    // 覆盖的已知框架(按注入模块/CLI 命名)——
+    //   WeChatFerry(wcf/wcferry/spy.dll)、ntchat(wcprobe.dll)、
+    //   WeChatPCAPI、wxbot / wxbotpp、CWeChatRobot、微信 hook「sidecar」等;
+    //   QQ 侧:qqbot / QQRobot / TIMHook 等群发模块。
+    //
+    // 防误伤原则(与批次 14 一致):
+    //   - 「具名群控/群发模块 DLL 落地或被加载」= 确定性外挂特征 -> Block
+    //     (这些名字正常软件不会出现,改名规避由批次 14 的未签名侧载 Ask 兜底);
+    //   - 「命令行调用群发框架 / 包」可能是安全研究或自动化办公 -> Ask,交用户确认;
+    //   - 「向企业微信 / QQ 附属进程注入远程线程」-> 仅未签名注入方才命中(Ask)。
+    // ======================================================================
+    private static void AddImMassMessagingRules(List<DefenseRule> list)
+    {
+        // --- 已知群发/群控框架的注入模块 DLL 落地(确定性外挂特征)-> Block ---
+        // WeChatFerry:开源 PC 微信 RPC 框架,常被灰产用于自动群发/机器人。
+        File_(list, @"*\wcf.dll", VerdictAction.Block,
+            "微信群发框架 WeChatFerry 模块 wcf.dll 落地(自动群发/机器人)");
+        File_(list, @"*\wcferry*.dll", VerdictAction.Block,
+            "微信群发框架 WeChatFerry 模块落地(自动群发/机器人)");
+        File_(list, @"*\WeChatFerry*.dll", VerdictAction.Block,
+            "微信群发框架 WeChatFerry 模块落地(自动群发/机器人)");
+        File_(list, @"*\spy.dll", VerdictAction.Block,
+            "微信群发框架注入模块 spy.dll 落地(WeChatFerry/hook 群发)");
+        // ntchat:另一常见 PC 微信 hook 框架,注入模块名 wcprobe.dll。
+        File_(list, @"*\wcprobe.dll", VerdictAction.Block,
+            "微信群控框架 ntchat 模块 wcprobe.dll 落地(群发/hook)");
+        // WeChatPCAPI / CWeChatRobot / wxbot 系列群控 SDK。
+        File_(list, @"*\WeChatPCAPI*.dll", VerdictAction.Block,
+            "微信群控 SDK WeChatPCAPI 落地(群发/自动化)");
+        File_(list, @"*\CWeChatRobot*.dll", VerdictAction.Block,
+            "微信机器人群控模块 CWeChatRobot 落地(群发)");
+        File_(list, @"*\wxbot*.dll", VerdictAction.Block,
+            "微信群发机器人模块 wxbot 落地(群发)");
+        File_(list, @"*\WeChatSpy*.dll", VerdictAction.Block,
+            "微信监听/群控模块 WeChatSpy 落地(群发/聊天记录窃取)");
+        File_(list, @"*\WxSender*.dll", VerdictAction.Block,
+            "微信群发模块 WxSender 落地(批量群发)");
+        // QQ / TIM 侧群发模块。
+        File_(list, @"*\qqbot*.dll", VerdictAction.Block,
+            "QQ 群发机器人模块 qqbot 落地(群发)");
+        File_(list, @"*\QQRobot*.dll", VerdictAction.Block,
+            "QQ 群控机器人模块 QQRobot 落地(群发)");
+        File_(list, @"*\TIMHook*.dll", VerdictAction.Block,
+            "TIM 群控 hook 模块 TIMHook 落地(群发)");
+
+        // --- 上述模块被加载进任意进程(运行期拦截,兜底改名后仍按已知名命中)-> Block ---
+        foreach (var mod in new[]
+        {
+            @"*\wcf.dll", @"*\wcferry*.dll", @"*\WeChatFerry*.dll", @"*\spy.dll",
+            @"*\wcprobe.dll", @"*\WeChatPCAPI*.dll", @"*\CWeChatRobot*.dll",
+            @"*\wxbot*.dll", @"*\WeChatSpy*.dll", @"*\WxSender*.dll",
+            @"*\qqbot*.dll", @"*\QQRobot*.dll", @"*\TIMHook*.dll"
+        })
+        {
+            list.Add(new DefenseRule
+            {
+                Type = EventType.ImageLoad,
+                TargetPattern = mod,
+                Action = VerdictAction.Block,
+                Note = $"{BuiltInTag} 加载微信/QQ 群发外挂模块(群发/自动化)"
+            });
+        }
+
+        // --- 命令行调用群发框架 / 包(可能是自动化办公或安全研究)-> Ask ---
+        Cmd(list, @"*wcferry*", VerdictAction.Ask,
+            "命令行调用微信群发框架 WeChatFerry(疑似群发)");
+        Cmd(list, @"*ntchat*", VerdictAction.Ask,
+            "命令行调用微信群控框架 ntchat(疑似群发)");
+        Cmd(list, @"*wechaty*", VerdictAction.Ask,
+            "命令行调用微信机器人框架 wechaty(疑似群发)");
+        Cmd(list, @"*wxpy*", VerdictAction.Ask,
+            "命令行调用微信控制库 wxpy(疑似群发)");
+        Cmd(list, @"*WeChatPCAPI*", VerdictAction.Ask,
+            "命令行调用微信群控 SDK WeChatPCAPI(疑似群发)");
+        Cmd(list, @"*wxpusher*", VerdictAction.Ask,
+            "命令行调用微信推送框架 wxpusher(疑似群发)");
+        Cmd(list, @"*qqbot*", VerdictAction.Ask,
+            "命令行调用 QQ 机器人框架 qqbot(疑似群发)");
+        // UI 自动化群发(uiautomation/pyautogui 驱动微信窗口批量发消息)。
+        Cmd(list, @"*uiautomation*wechat*", VerdictAction.Ask,
+            "UI 自动化驱动微信(疑似模拟点击批量群发)");
+        Cmd(list, @"*pyautogui*wechat*", VerdictAction.Ask,
+            "pyautogui 驱动微信(疑似模拟点击批量群发)");
+
+        // --- 向企业微信 / 微信小程序宿主 / QQ 附属进程注入远程线程(未签名注入方)-> Ask ---
+        // 补齐批次 14 未覆盖的 IM 进程;群发外挂常挂进这些进程调用发送接口。
+        ImInjectRemoteThread(list, @"*\WXWork.exe",
+            "向企业微信(WXWork)注入远程线程(疑似群发/群控)");
+        ImInjectRemoteThread(list, @"*\WeChatAppEx.exe",
+            "向微信小程序渲染宿主注入远程线程(疑似控制)");
+        ImInjectRemoteThread(list, @"*\QQExternal.exe",
+            "向 QQ 外部模块注入远程线程(疑似群发/群控)");
+
+        // --- 群控框架从用户可写目录加载未签名 DLL 挂进 IM(白加黑侧载补充)-> Ask ---
+        // 批次 14 已覆盖 AppData/Temp,这里补 Public / ProgramData 两个常见落地目录。
+        foreach (var actor in new[] { @"*\WeChat.exe", @"*\Weixin.exe", @"*\WXWork.exe", @"*\QQ.exe", @"*\TIM.exe" })
+        {
+            list.Add(new DefenseRule
+            {
+                Type = EventType.ImageLoad,
+                ActorPattern = actor,
+                TargetPattern = @"*\Users\Public\*.dll",
+                RequireUnsigned = true,
+                Action = VerdictAction.Ask,
+                Note = $"{BuiltInTag} IM 从 Public 目录加载未签名 DLL(疑似群发白加黑侧载)"
+            });
+            list.Add(new DefenseRule
+            {
+                Type = EventType.ImageLoad,
+                ActorPattern = actor,
+                TargetPattern = @"*\ProgramData\*.dll",
+                RequireUnsigned = true,
+                Action = VerdictAction.Ask,
+                Note = $"{BuiltInTag} IM 从 ProgramData 加载未签名 DLL(疑似群发白加黑侧载)"
+            });
+        }
+    }
+
+    // ======================================================================
+    // 批次 14c:银狐 —— 补充群控框架 + 通讯录/聊天库窃取(群发目标采集)
+    //
+    // 背景补充(承接批次 14 / 14b):
+    //   1) 群发前,银狐通常先「采集群发目标」—— 解密并导出微信/QQ 本地通讯录与聊天库,
+    //      拿到好友/群成员清单后再批量发广告/诈骗链接。这一步依赖一批具名的
+    //      「微信数据库解密/导出」工具(PyWxDump / SharpWxDump / WeChatMsg / wxdump 等)。
+    //   2) 除批次 14/14b 已列的框架外,野外还流行另一批具名 hook/群控模块
+    //      (wxhook / WeChatSDK / vchat / WeChatRobotCE / 企业微信 WeWorkHook 等)。
+    //   3) 企业微信(WXWork)与微信 OCR/工具子进程也是群发外挂的注入落点。
+    //
+    // 防误伤原则(与批次 14/14b 一致):
+    //   - 「具名群控/导出工具模块 DLL 落地或被加载」= 确定性外挂特征 -> Block;
+    //   - 「命令行调用具名导出/群控工具」可能是取证/研究 -> Ask,交用户确认;
+    //   - 绝不对微信本体正常写库(MicroMsg.db 等)下 FileWrite 规则,避免海量误报 ——
+    //     只锁定「具名解密导出工具」这类正常用户环境不出现的特征。
+    // ======================================================================
+    private static void AddImHarvestAndFrameworkRules(List<DefenseRule> list)
+    {
+        // --- 补充:野外常见的具名群控/hook 模块 DLL 落地(确定性外挂特征)-> Block ---
+        // 这些名字均为第三方"微信/QQ 群控·群发·hook"框架的注入模块,正常软件不会出现。
+        var extraModules = new[]
+        {
+            (@"*\wxhook.dll",          "微信 hook 群控模块 wxhook.dll"),
+            (@"*\WeChatHook*.dll",     "微信 hook 群控模块 WeChatHook"),
+            (@"*\WeChatSDK*.dll",      "第三方微信群控 SDK WeChatSDK"),
+            (@"*\vchat*.dll",          "微信群控框架 vchat 模块"),
+            (@"*\WeChatRobotCE*.dll",  "微信机器人群控模块 WeChatRobotCE"),
+            (@"*\wxbotpp*.dll",        "微信群发机器人模块 wxbotpp"),
+            (@"*\WeChatManager*.dll",  "微信多开/群控管理模块 WeChatManager"),
+            (@"*\WeWorkHook*.dll",     "企业微信 hook 群控模块 WeWorkHook"),
+            (@"*\wework_api*.dll",     "企业微信群发接口模块 wework_api"),
+            (@"*\wxDump*.dll",         "微信数据库导出模块 wxDump"),
+            (@"*\QQHook*.dll",         "QQ hook 群控模块 QQHook"),
+        };
+        foreach (var (pattern, note) in extraModules)
+        {
+            File_(list, pattern, VerdictAction.Block, $"{note} 落地(群发/群控外挂)");
+            list.Add(new DefenseRule
+            {
+                Type = EventType.ImageLoad,
+                TargetPattern = pattern,
+                Action = VerdictAction.Block,
+                Note = $"{BuiltInTag} 加载{note}(群发/群控外挂)"
+            });
+        }
+
+        // --- 命令行调用「微信数据库解密/导出」工具(采集群发目标:好友/群成员/聊天记录)-> Ask ---
+        // 这些是具名工具,正常用户几乎不会用;取证/研究用途保留 Ask 让用户放行。
+        Cmd(list, @"*PyWxDump*", VerdictAction.Ask,
+            "命令行调用微信取证工具 PyWxDump(解密导出通讯录/聊天库,疑似采集群发目标)");
+        Cmd(list, @"*SharpWxDump*", VerdictAction.Ask,
+            "命令行调用微信取证工具 SharpWxDump(导出账号/密钥,疑似采集群发目标)");
+        Cmd(list, @"*wxdump*", VerdictAction.Ask,
+            "命令行调用微信数据库导出工具 wxdump(疑似采集群发目标)");
+        Cmd(list, @"*WeChatMsg*", VerdictAction.Ask,
+            "命令行调用微信聊天记录导出工具 WeChatMsg(疑似采集群发目标)");
+        Cmd(list, @"*wxhook*", VerdictAction.Ask,
+            "命令行调用微信 hook 群控框架 wxhook(疑似群发)");
+        Cmd(list, @"*vchat*", VerdictAction.Ask,
+            "命令行调用微信群控框架 vchat(疑似群发)");
+
+        // --- 补充注入落点:企业微信 / 微信 OCR·工具子进程(未签名注入方)-> Ask ---
+        ImInjectRemoteThread(list, @"*\WeChatOCR.exe",
+            "向微信 OCR 子进程注入远程线程(疑似群控挂载)");
+        ImInjectRemoteThread(list, @"*\WeChatUtility.exe",
+            "向微信工具子进程注入远程线程(疑似群控挂载)");
+        ImInjectRemoteThread(list, @"*\WXWorkWeb.exe",
+            "向企业微信 Web 宿主注入远程线程(疑似群发/群控)");
+
+        // --- 非官方进程向企业微信安装目录植入 DLL(替换群发模块)-> Ask ---
+        File_(list, @"*\WXWork\*\wwapi*.dll", VerdictAction.Ask,
+            "向企业微信安装目录写入接口 DLL(疑似植入群发模块)");
     }
 
     /// <summary>

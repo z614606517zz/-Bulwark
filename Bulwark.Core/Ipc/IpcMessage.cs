@@ -99,7 +99,15 @@ public enum IpcMessageType
     /// <summary>UI -> 服务:请求 VT 扫描历史记录列表(打开「VT 查询记录」视图时)。</summary>
     VtHistoryRequest,
     /// <summary>服务 -> UI:返回 VT 扫描历史记录列表。</summary>
-    VtHistoryResponse
+    VtHistoryResponse,
+    /// <summary>UI -> 服务:立即从情报源(ThreatFox)拉取并刷新一批防护规则(手动触发)。</summary>
+    IntelRefreshRequest,
+    /// <summary>服务 -> UI:情报刷新结果(应用规则条数 / IOC 数 / 说明)。</summary>
+    IntelRefreshResponse,
+    /// <summary>UI -> 服务:把用户(经 AI 复核后)确认采纳的情报规则应用到引擎。</summary>
+    IntelApplyRequest,
+    /// <summary>服务 -> UI:情报规则应用结果(实际生效条数 / 说明)。</summary>
+    IntelApplyResponse
 }
 
 /// <summary>
@@ -318,7 +326,9 @@ public enum VtRequestKind
     /// <summary>测试连接 / API Key 有效性。</summary>
     TestConnection,
     /// <summary>查询指定文件的哈希信誉。</summary>
-    QueryFile
+    QueryFile,
+    /// <summary>请求各情报源的实时用量统计(今日已用 / 配额)。</summary>
+    UsageStats
 }
 
 /// <summary>服务 -> UI 的 VirusTotal 响应。</summary>
@@ -334,6 +344,9 @@ public sealed class VtResponsePayload
 
     /// <summary>查询到的信誉结论(可空:测试连接或未收录时可能为空)。</summary>
     public FileReputation? Reputation { get; set; }
+
+    /// <summary>各情报源用量统计(仅 UsageStats 请求时填充)。</summary>
+    public System.Collections.Generic.List<ReputationUsage>? Usages { get; set; }
 }
 
 /// <summary>
@@ -406,4 +419,60 @@ public sealed class VtHistoryResponsePayload
 {
     /// <summary>历史记录(按时间倒序,最近在前)。</summary>
     public System.Collections.Generic.List<VtScanRecord> Records { get; set; } = new();
+}
+
+/// <summary>UI -> 服务:手动触发「立即从情报源刷新防护规则」。用 RequestId 关联响应。</summary>
+public sealed class IntelRefreshRequestPayload
+{
+    public System.Guid RequestId { get; set; } = System.Guid.NewGuid();
+
+    /// <summary>
+    /// 仅预览:为 true 时服务只拉取 IOC 并生成规则,<b>不</b>应用到引擎,把生成的规则
+    /// (<see cref="IntelRefreshResultPayload.GeneratedRules"/>)回传给 UI,交 AI 复核 + 用户确认后再采纳。
+    /// UI 手动点「情报刷新」走此模式;后台订阅循环仍直接应用(preview=false)。
+    /// </summary>
+    public bool PreviewOnly { get; set; }
+}
+
+/// <summary>服务 -> UI:情报刷新结果(以 RequestId 关联)。</summary>
+public sealed class IntelRefreshResultPayload
+{
+    public System.Guid RequestId { get; set; }
+
+    /// <summary>是否成功拉取并应用(feed 未启用 / 网络失败时为 false)。</summary>
+    public bool Success { get; set; }
+
+    /// <summary>本次拉取到的 IOC 条数。</summary>
+    public int IocCount { get; set; }
+
+    /// <summary>本次实际应用(生效)的防护规则条数。</summary>
+    public int RulesApplied { get; set; }
+
+    /// <summary>
+    /// 预览模式下生成、但尚未应用的候选规则(供 UI 交 AI 复核 + 用户确认)。
+    /// 非预览模式为空。
+    /// </summary>
+    public System.Collections.Generic.List<DefenseRule> GeneratedRules { get; set; } = new();
+
+    /// <summary>
+    /// 本批情报涉及的恶意家族 / 威胁类型描述(去重),供 UI 交 AI 大模型据此
+    /// 合成针对性的「行为类」防护规则(进程创建 / 注册表持久化 / 注入等)。
+    /// 形如「AgentTesla (payload)」。非预览模式为空。
+    /// </summary>
+    public System.Collections.Generic.List<string> ThreatContext { get; set; } = new();
+
+    /// <summary>结果说明(成功/失败原因,人类可读)。</summary>
+    public string Message { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// UI -> 服务:把用户(经 AI 复核)确认采纳的一批情报规则应用到引擎。用 RequestId 关联响应。
+/// 服务端做增量合并(追加去重,不影响用户自定义/信任/内置规则)。
+/// </summary>
+public sealed class IntelApplyRequestPayload
+{
+    public System.Guid RequestId { get; set; } = System.Guid.NewGuid();
+
+    /// <summary>用户确认采纳的规则(通常已带 ThreatFox 来源标记)。</summary>
+    public System.Collections.Generic.List<DefenseRule> Rules { get; set; } = new();
 }

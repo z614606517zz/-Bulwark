@@ -322,6 +322,12 @@ public sealed class EventSourceCoordinator : IEventSource, IVerdictSink, IDispos
             sink.SubmitVerdict(e, action);
     }
 
+    /// <summary>运行时向内核追加单个网络黑名单条目(仅内核源在线时生效)。</summary>
+    public void AddBlockedIp(string ip, ushort port = 0)
+    {
+        lock (_gate) _driver?.AddBlockedIp(ip, port);
+    }
+
     /// <summary>把 UI 进程 PID 加入自我保护(若内核源在运行则下发,并记录以便重启后补发)。</summary>
     public void AddProtectedUiPid(int pid)
     {

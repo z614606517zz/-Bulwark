@@ -47,10 +47,10 @@ public sealed class ReputationManager : IDisposable
     /// <summary>
     /// 按运行时设置更新各信誉源开关(仅当底层为聚合器时生效)。
     /// </summary>
-    public void SetRuntimeEnabled(bool virusTotal, bool malwareBazaar, bool otx, bool threatBook, bool metaDefender)
+    public void SetRuntimeEnabled(bool virusTotal, bool malwareBazaar, bool otx, bool threatBook, bool metaDefender, bool hybridAnalysis)
     {
         if (_client is AggregateReputationService agg)
-            agg.SetRuntimeEnabled(virusTotal, malwareBazaar, otx, threatBook, metaDefender);
+            agg.SetRuntimeEnabled(virusTotal, malwareBazaar, otx, threatBook, metaDefender, hybridAnalysis);
     }
 
     /// <summary>测试指定源的连接;source 为空则测试全部已启用源(透传客户端)。</summary>
@@ -124,6 +124,12 @@ public sealed class ReputationManager : IDisposable
     /// <summary>测试连接 / API Key 有效性(透传客户端)。</summary>
     public Task<(bool Ok, string Message)> TestConnectionAsync(CancellationToken token = default)
         => _client.TestConnectionAsync(token);
+
+    /// <summary>收集各情报源的实时用量快照(仅底层为聚合器时有意义;否则返回空)。</summary>
+    public IReadOnlyList<ReputationUsage> GetUsages()
+        => _client is AggregateReputationService agg
+            ? agg.GetUsages()
+            : System.Array.Empty<ReputationUsage>();
 
     /// <summary>
     /// 判断某事件是否"值得"查 VT,并在值得时入队后台查询。

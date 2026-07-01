@@ -25,13 +25,22 @@ public sealed class OtxClient : IHashReputationService
     private const string BaseUrl = "https://otx.alienvault.com/api/v1/indicators/file/";
 
     private readonly ILogger<OtxClient> _logger;
-    private readonly HttpClient _http;
     private readonly OtxOptions _opt;
     private readonly string? _apiKey;
     private readonly TokenBucket _bucket;
     private readonly DailyQuota _daily;
 
     public bool IsEnabled { get; }
+
+    public ReputationUsage GetUsage()
+    {
+        var (used, limit) = _daily.Snapshot();
+        return new ReputationUsage
+        {
+            Source = "OTX", Enabled = IsEnabled,
+            UsedToday = used, DailyLimit = limit, PerMinuteLimit = _opt.RequestsPerMinute
+        };
+    }
 
     public OtxClient(ILogger<OtxClient> logger, BulwarkOptions options)
     {
@@ -44,11 +53,6 @@ public sealed class OtxClient : IHashReputationService
                 : null;
 
         IsEnabled = _opt.Enabled && !string.IsNullOrEmpty(_apiKey);
-
-        _http = ReputationHttp.Create(
-            TimeSpan.FromSeconds(Math.Max(3, _opt.QueryTimeoutSeconds)), "OTX");
-        if (_apiKey is not null)
-            _http.DefaultRequestHeaders.Add("X-OTX-API-KEY", _apiKey);
 
         _bucket = new TokenBucket(Math.Max(1, _opt.RequestsPerMinute), TimeSpan.FromMinutes(1));
         _daily = new DailyQuota(Math.Max(1, _opt.RequestsPerDay));
@@ -77,33 +81,33 @@ public sealed class OtxClient : IHashReputationService
 
         try
         {
-            using var resp = await _http.GetAsync($"{BaseUrl}{sha256}/general", token);
+            var (code, body) = await ReputationCurl.GetAsync(
+                $"{BaseUrl}{sha256}/general", new[] { "X-OTX-API-KEY: " + _apiKey }, _opt.QueryTimeoutSeconds, token);
 
-            if (resp.StatusCode == HttpStatusCode.NotFound)
+            if (code == 404)
             {
                 // OTX 无该指标记录:权威负结果,可缓存,但不等于"干净"。保持 Unknown。
                 ReputationHttp.DiagLog($"OTX query {sha256[..12]} => 404 NotFound");
                 return new FileReputation { Sha256 = sha256, Verdict = ReputationVerdict.Unknown, QuerySucceeded = true };
             }
-            if (resp.StatusCode == HttpStatusCode.Unauthorized || resp.StatusCode == HttpStatusCode.Forbidden)
+            if (code is 401 or 403)
             {
-                _logger.LogWarning("OTX 鉴权失败({code}),请检查 API Key。", (int)resp.StatusCode);
-                ReputationHttp.DiagLog($"OTX query {sha256[..12]} => AUTH FAIL {(int)resp.StatusCode}");
+                _logger.LogWarning("OTX 鉴权失败({code}),请检查 API Key。", code);
+                ReputationHttp.DiagLog($"OTX query {sha256[..12]} => AUTH FAIL {code}");
                 return unknown;
             }
-            if (resp.StatusCode == (HttpStatusCode)429)
+            if (code == 429)
             {
                 _logger.LogWarning("OTX 触发限流(429),本次跳过。");
                 return unknown;
             }
-            if (!resp.IsSuccessStatusCode)
+            if (code != 200)
             {
-                ReputationHttp.DiagLog($"OTX query {sha256[..12]} => HTTP {(int)resp.StatusCode}");
+                ReputationHttp.DiagLog($"OTX query {sha256[..12]} => HTTP {code}");
                 return unknown;
             }
 
-            await using var stream = await resp.Content.ReadAsStreamAsync(token);
-            var parsed = Parse(sha256, stream);
+            var parsed = Parse(sha256, body);
             ReputationHttp.DiagLog($"OTX query {sha256[..12]} => {parsed.Verdict} pulses={parsed.Malicious}");
             return parsed;
         }
@@ -117,7 +121,7 @@ public sealed class OtxClient : IHashReputationService
     }
 
     /// <summary>解析 OTX general 响应,提取 pulse_info.count 与标签。</summary>
-    private FileReputation Parse(string sha256, Stream json)
+    private FileReputation Parse(string sha256, string json)
     {
         var rep = new FileReputation { Sha256 = sha256, Verdict = ReputationVerdict.Unknown };
         try
@@ -173,15 +177,17 @@ public sealed class OtxClient : IHashReputationService
 
         try
         {
-            using var resp = await _http.GetAsync($"{BaseUrl}{eicarSha256}/general", token);
-            return resp.StatusCode switch
+            var (code, _) = await ReputationCurl.GetAsync(
+                $"{BaseUrl}{eicarSha256}/general", new[] { "X-OTX-API-KEY: " + _apiKey }, _opt.QueryTimeoutSeconds, token);
+            return code switch
             {
-                HttpStatusCode.OK => (true, "连接成功,API 密钥有效"),
-                HttpStatusCode.NotFound => (true, "连接成功(测试样本无记录,密钥有效)"),
-                HttpStatusCode.Unauthorized => (false, "API 密钥无效(401)"),
-                HttpStatusCode.Forbidden => (false, "API 密钥无权限(403)"),
-                (HttpStatusCode)429 => (true, "密钥有效,但当前已触发限流(429)"),
-                _ => (false, $"返回异常状态:{(int)resp.StatusCode}")
+                200 => (true, "连接成功,API 密钥有效"),
+                404 => (true, "连接成功(测试样本无记录,密钥有效)"),
+                401 => (false, "API 密钥无效(401)"),
+                403 => (false, "API 密钥无权限(403)"),
+                429 => (true, "密钥有效,但当前已触发限流(429)"),
+                0 => (false, "连接失败(curl 不可用或网络不通)"),
+                _ => (false, $"返回异常状态:{code}")
             };
         }
         catch (OperationCanceledException) { return (false, "请求超时或已取消"); }

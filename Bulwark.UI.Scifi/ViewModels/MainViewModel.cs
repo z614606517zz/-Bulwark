@@ -18,6 +18,7 @@ public sealed class MainViewModel : ObservableObject
     public SettingsViewModel SettingsVm { get; }
     public AiScanViewModel AiScanVm { get; }
     public VtHistoryViewModel VtHistoryVm { get; }
+    public ReputationSourcesViewModel ApiStatusVm { get; }
 
     public MainViewModel(IpcClient ipc)
     {
@@ -31,6 +32,7 @@ public sealed class MainViewModel : ObservableObject
         SettingsVm = new SettingsViewModel(ipc);
         AiScanVm = new AiScanViewModel();
         VtHistoryVm = new VtHistoryViewModel(ipc);
+        ApiStatusVm = new ReputationSourcesViewModel(ipc, SettingsVm);
 
         // 官方用量配置变化 / Cookie 测试成功 -> 立即重新拉取官方用量刷新仪表盘(不必等 5 分钟定时器)。
         SettingsVm.OfficialUsageConfigChanged += () =>

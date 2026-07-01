@@ -1,0 +1,86 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Bulwark.UI.Scifi.ViewModels"
+             x:Class="Bulwark.UI.Scifi.Views.ApiStatusPage"
+             x:DataType="vm:ReputationSourcesViewModel">
+
+    <DockPanel>
+        <!-- 标题栏 -->
+        <Border DockPanel.Dock="Top" Classes="hud" Padding="16,12" Margin="0,0,0,14">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="🛰" FontSize="18" Foreground="{StaticResource NeonBlueBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="情报源连接" Classes="h1"/>
+                    <TextBlock Text="/ THREAT INTEL SOURCES" Classes="label" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Column="1" Classes="neon" Content="↻ 全部测试" Click="TestAll_Click"
+                        IsEnabled="{Binding NotBusy}"/>
+            </Grid>
+        </Border>
+
+        <ScrollViewer>
+            <StackPanel Spacing="12">
+
+                <!-- 汇总提示 -->
+                <Border Classes="hud" Padding="16,10">
+                    <TextBlock Text="{Binding Summary}" Foreground="{StaticResource TextMidBrush}"
+                               FontSize="12" TextWrapping="Wrap"/>
+                </Border>
+
+                <!-- 各源卡片 -->
+                <ItemsControl ItemsSource="{Binding Sources}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ReputationSourceItem">
+                            <Border Classes="hud" Padding="18,14" Margin="0,0,0,10">
+                                <Grid ColumnDefinitions="Auto,*,Auto">
+
+                                    <!-- 状态点 -->
+                                    <Ellipse Grid.Column="0" Width="12" Height="12" VerticalAlignment="Center"
+                                             Margin="0,0,14,0" Fill="{Binding StatusBrush}"/>
+
+                                    <!-- 名称 + 描述 + 明细 -->
+                                    <StackPanel Grid.Column="1" Spacing="3">
+                                        <StackPanel Orientation="Horizontal" Spacing="10">
+                                            <TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource TextHiBrush}"
+                                                       FontSize="14" FontWeight="SemiBold"/>
+                                            <Border CornerRadius="8" Padding="8,2" VerticalAlignment="Center"
+                                                    Background="#0A1120" BorderBrush="{StaticResource HairlineBrush}" BorderThickness="1">
+                                                <TextBlock Text="{Binding StatusText}" Foreground="{Binding StatusBrush}"
+                                                           FontSize="10" FontWeight="SemiBold"/>
+                                            </Border>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding Note}" Classes="label" TextWrapping="Wrap"/>
+                                        <TextBlock Text="{Binding Detail}" Foreground="{StaticResource TextDimBrush}"
+                                                   FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                   TextWrapping="Wrap" Margin="0,2,0,0"/>
+
+                                        <!-- 今日用量:进度条 + 文案(取到用量才显示) -->
+                                        <Grid ColumnDefinitions="*,Auto" Margin="0,4,0,0" IsVisible="{Binding HasUsage}">
+                                            <ProgressBar Grid.Column="0" Minimum="0" Maximum="100"
+                                                         Value="{Binding UsagePercent}" Height="6"
+                                                         Foreground="{Binding UsageBrush}" VerticalAlignment="Center"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding UsageText}" Margin="10,0,0,0"
+                                                       Foreground="{StaticResource TextMidBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                       VerticalAlignment="Center"/>
+                                        </Grid>
+                                    </StackPanel>
+
+                                    <!-- 启用开关 + 单独测试按钮 -->
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                                        <ToggleSwitch IsChecked="{Binding Enabled}" OnContent="启用" OffContent="停用"
+                                                      VerticalAlignment="Center"/>
+                                        <Button Content="测试" Padding="16,7" VerticalAlignment="Center"
+                                                Click="TestOne_Click" IsEnabled="{Binding NotBusy}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+
+</UserControl>

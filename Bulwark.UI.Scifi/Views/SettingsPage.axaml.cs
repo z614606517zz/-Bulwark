@@ -20,8 +20,6 @@ public partial class SettingsPage : UserControl
 
     private void Refresh_Click(object? sender, RoutedEventArgs e) => Vm?.Refresh();
 
-    private void TestVt_Click(object? sender, RoutedEventArgs e) => Vm?.TestConnection();
-
     private void QueryVt_Click(object? sender, RoutedEventArgs e) => Vm?.QueryFile();
 
     private void TestAi_Click(object? sender, RoutedEventArgs e) => Vm?.TestAiConnection();

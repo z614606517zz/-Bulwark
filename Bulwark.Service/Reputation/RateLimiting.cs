@@ -95,4 +95,19 @@ public sealed class DailyQuota
             return true;
         }
     }
+
+    /// <summary>只读快照:今日已用次数与上限(带跨日归零)。供用量展示,不消费配额。</summary>
+    public (int Used, int Limit) Snapshot()
+    {
+        lock (_lock)
+        {
+            var today = DateTime.UtcNow.Date;
+            if (today != _dayUtc)
+            {
+                _dayUtc = today;
+                _count = 0;
+            }
+            return (_count, _limit);
+        }
+    }
 }

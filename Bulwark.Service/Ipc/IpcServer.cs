@@ -92,6 +92,12 @@ public sealed class IpcServer : IAsyncDisposable
     /// <summary>UI 请求 VT 扫描历史记录列表时触发,返回历史记录。</summary>
     public Func<VtHistoryResponsePayload>? VtHistoryRequested { get; set; }
 
+    /// <summary>UI 请求「立即从情报源刷新防护规则」时触发,异步返回刷新结果(含预览标记)。</summary>
+    public Func<IntelRefreshRequestPayload, Task<IntelRefreshResultPayload>>? IntelRefreshRequested { get; set; }
+
+    /// <summary>UI 端用户(经 AI 复核)确认采纳情报规则时触发,异步返回应用结果。</summary>
+    public Func<IntelApplyRequestPayload, Task<IntelRefreshResultPayload>>? IntelApplyRequested { get; set; }
+
     public void Start(CancellationToken externalToken)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
@@ -390,7 +396,57 @@ public sealed class IpcServer : IAsyncDisposable
             case IpcMessageType.VtHistoryRequest:
                 _ = SendVtHistoryAsync();
                 break;
+
+            case IpcMessageType.IntelRefreshRequest:
+                var ir = msg.GetPayload<IntelRefreshRequestPayload>();
+                if (ir is not null)
+                    _ = HandleIntelRefreshAsync(ir);
+                break;
+
+            case IpcMessageType.IntelApplyRequest:
+                var ia = msg.GetPayload<IntelApplyRequestPayload>();
+                if (ia is not null)
+                    _ = HandleIntelApplyAsync(ia);
+                break;
         }
+    }
+
+    /// <summary>处理 UI 的「立即刷新情报规则」请求,异步执行并回推结果。</summary>
+    private async Task HandleIntelRefreshAsync(IntelRefreshRequestPayload req)
+    {
+        IntelRefreshResultPayload result;
+        try
+        {
+            result = IntelRefreshRequested is not null
+                ? await IntelRefreshRequested.Invoke(req)
+                : new IntelRefreshResultPayload { Message = "情报刷新未启用" };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "情报刷新请求处理失败");
+            result = new IntelRefreshResultPayload { Success = false, Message = "刷新失败:" + ex.Message };
+        }
+        result.RequestId = req.RequestId;
+        await SendAsync(IpcMessage.Create(IpcMessageType.IntelRefreshResponse, result), CancellationToken.None);
+    }
+
+    /// <summary>处理 UI 的「采纳(已 AI 复核的)情报规则」请求,异步应用并回推结果。</summary>
+    private async Task HandleIntelApplyAsync(IntelApplyRequestPayload req)
+    {
+        IntelRefreshResultPayload result;
+        try
+        {
+            result = IntelApplyRequested is not null
+                ? await IntelApplyRequested.Invoke(req)
+                : new IntelRefreshResultPayload { Message = "情报采纳未启用" };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "情报规则采纳处理失败");
+            result = new IntelRefreshResultPayload { Success = false, Message = "采纳失败:" + ex.Message };
+        }
+        result.RequestId = req.RequestId;
+        await SendAsync(IpcMessage.Create(IpcMessageType.IntelApplyResponse, result), CancellationToken.None);
     }
 
     /// <summary>向 UI 推送当前 VT 扫描历史记录列表。</summary>

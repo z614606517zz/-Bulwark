@@ -39,6 +39,12 @@ public sealed class SettingsViewModel : ObservableObject
             KernelStatus = string.IsNullOrEmpty(s.KernelStatus) ? "未知" : s.KernelStatus;
             EventSource = s.EventSource;
             VirusTotalEnabled = s.VirusTotalEnabled;
+            HybridAnalysisEnabled = s.HybridAnalysisEnabled;
+            MalwareBazaarEnabled = s.MalwareBazaarEnabled;
+            OtxEnabled = s.OtxEnabled;
+            ThreatBookEnabled = s.ThreatBookEnabled;
+            MetaDefenderEnabled = s.MetaDefenderEnabled;
+            ThreatBookNetworkIntelEnabled = s.ThreatBookNetworkIntelEnabled;
             AiScanDoubleClickEnabled = s.AiScanDoubleClickEnabled;
             AiScanSuspendDuringScan = s.AiScanSuspendDuringScan;
             AiScanBlockOnFailure = s.AiScanBlockOnFailure;
@@ -75,6 +81,12 @@ public sealed class SettingsViewModel : ObservableObject
         KernelDriverEnabled = KernelDriverEnabled,
         EventSource = EventSource,
         VirusTotalEnabled = VirusTotalEnabled,
+        HybridAnalysisEnabled = HybridAnalysisEnabled,
+        MalwareBazaarEnabled = MalwareBazaarEnabled,
+        OtxEnabled = OtxEnabled,
+        ThreatBookEnabled = ThreatBookEnabled,
+        MetaDefenderEnabled = MetaDefenderEnabled,
+        ThreatBookNetworkIntelEnabled = ThreatBookNetworkIntelEnabled,
         AiScanDoubleClickEnabled = AiScanDoubleClickEnabled,
         AiScanSuspendDuringScan = AiScanSuspendDuringScan,
         AiScanBlockOnFailure = AiScanBlockOnFailure,
@@ -143,29 +155,39 @@ public sealed class SettingsViewModel : ObservableObject
     /// <summary>VirusTotal 后台信誉查询总开关。改动即保存(由服务端以管理员权限持久化)。</summary>
     public bool VirusTotalEnabled { get => _virusTotalEnabled; set { if (Set(ref _virusTotalEnabled, value)) Save(); } }
 
+    private bool _hybridAnalysisEnabled;
+    /// <summary>Hybrid Analysis 后台信誉查询开关(与 VirusTotal 互证)。改动即保存。需服务端配置 HA API Key。</summary>
+    public bool HybridAnalysisEnabled { get => _hybridAnalysisEnabled; set { if (Set(ref _hybridAnalysisEnabled, value)) Save(); } }
+
+    private bool _malwareBazaarEnabled;
+    /// <summary>MalwareBazaar(abuse.ch)哈希信誉源开关。改动即保存。需服务端配置 Auth-Key。</summary>
+    public bool MalwareBazaarEnabled { get => _malwareBazaarEnabled; set { if (Set(ref _malwareBazaarEnabled, value)) Save(); } }
+
+    private bool _otxEnabled;
+    /// <summary>AlienVault OTX 哈希信誉源开关。改动即保存。需服务端配置 API Key。</summary>
+    public bool OtxEnabled { get => _otxEnabled; set { if (Set(ref _otxEnabled, value)) Save(); } }
+
+    private bool _threatBookEnabled;
+    /// <summary>微步在线 ThreatBook 哈希信誉源开关。改动即保存。需服务端配置 API Key。</summary>
+    public bool ThreatBookEnabled { get => _threatBookEnabled; set { if (Set(ref _threatBookEnabled, value)) Save(); } }
+
+    private bool _metaDefenderEnabled;
+    /// <summary>MetaDefender Cloud(OPSWAT)哈希信誉源开关。改动即保存。需服务端配置 API Key。</summary>
+    public bool MetaDefenderEnabled { get => _metaDefenderEnabled; set { if (Set(ref _metaDefenderEnabled, value)) Save(); } }
+
+    private bool _threatBookNetworkIntelEnabled;
+    /// <summary>微步 IP 情报(网络防护)开关:对可疑外联做 IP 信誉互证。改动即保存。场景接口月配额极低,默认关闭。</summary>
+    public bool ThreatBookNetworkIntelEnabled { get => _threatBookNetworkIntelEnabled; set { if (Set(ref _threatBookNetworkIntelEnabled, value)) Save(); } }
+
     private bool _vtBusy;
     public bool VtBusy { get => _vtBusy; set { if (Set(ref _vtBusy, value)) OnPropertyChanged(nameof(VtNotBusy)); } }
     public bool VtNotBusy => !_vtBusy;
 
-    private string _vtResult = "尚未查询。可测试连接,或选择文件查询其哈希信誉。";
+    private string _vtResult = "尚未查询。选择文件即可查询其哈希信誉。";
     public string VtResult { get => _vtResult; set => Set(ref _vtResult, value); }
 
     private string _vtFilePath = string.Empty;
     public string VtFilePath { get => _vtFilePath; set => Set(ref _vtFilePath, value); }
-
-    /// <summary>测试威胁情报源(VirusTotal)连接 / API Key 有效性。</summary>
-    public async void TestConnection()
-    {
-        VtBusy = true;
-        VtResult = "正在测试连接…";
-        try
-        {
-            var resp = await _ipc.TestVirusTotalAsync();
-            VtResult = resp.Success ? $"✓ 连接正常 · {resp.Message}" : $"✕ 连接失败 · {resp.Message}";
-        }
-        catch (System.Exception ex) { VtResult = $"✕ 异常:{ex.Message}"; }
-        finally { VtBusy = false; }
-    }
 
     /// <summary>按 SHA-256 查询指定文件的 VirusTotal 信誉。</summary>
     public async void QueryFile()

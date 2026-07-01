@@ -61,6 +61,7 @@
                         <Button x:Name="NavActivity" Classes="nav" Content="📡  活动日志" Click="Nav_Click" Tag="ActivityLog"/>
                         <Button x:Name="NavAiScan" Classes="nav" Content="🤖  AI 扫描" Click="Nav_Click" Tag="AiScan"/>
                         <Button x:Name="NavVtHistory" Classes="nav" Content="🛰  VT 查询记录" Click="Nav_Click" Tag="VtHistory"/>
+                        <Button x:Name="NavApiStatus" Classes="nav" Content="🌐  情报源连接" Click="Nav_Click" Tag="ApiStatus"/>
                         <Button x:Name="NavSettings" Classes="nav" Content="⚙  设置" Click="Nav_Click" Tag="Settings"/>
 
                         <!-- 侧栏驱动状态指示 -->

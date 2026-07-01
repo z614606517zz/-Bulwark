@@ -968,6 +968,18 @@ public sealed class DriverEventSource : IEventSource, IVerdictSink, IModuleBlock
         _logger.LogInformation("已向内核下发网络黑名单。");
     }
 
+    /// <summary>
+    /// 运行时向内核追加单个网络黑名单条目(不清空既有)。供情报判定「某远端 IP 恶意」后
+    /// 固化拦截:后续该 IP 的外联在内核层预动作拦截。ip 为点分十进制,port=0 表示任意端口。
+    /// </summary>
+    public void AddBlockedIp(string ip, ushort port = 0)
+    {
+        if (_port is null || _port.IsInvalid) return;
+        var entry = port > 0 ? $"{ip}:{port}" : ip;
+        if (TryParseIpEndpoint(entry, out var ipv4, out var p))
+            SendConfig(DriverConst.BlwCmdAddBlockIp, string.Empty, 0, ipv4, p);
+    }
+
     /// <summary>解析 "a.b.c.d" 或 "a.b.c.d:port" 为主机字节序 IPv4 + 端口(0=任意)。</summary>
     private static bool TryParseIpEndpoint(string entry, out uint ipHostOrder, out ushort port)
     {

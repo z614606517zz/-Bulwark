@@ -27,6 +27,17 @@ public partial class AiScanToastWindow : Window
     private const int MaxVisible = 1;   // 居中卡片,同一时刻只显示一个,其余排队
     private const int MaxQueued = 20;   // 排队上限,超出丢弃最旧的
 
+    // ===== 按目标文件去重(核心)=====
+    // 同一文件可能产生多个 SecurityEvent(不同 Id):被拉起多次、或被多个监控点各报一次,
+    // 每个事件各自触发一次 VT 扫描 -> 若仅按扫描 Id 去重,会为同一文件弹出多张一模一样的卡片。
+    // 这里额外以「规范化文件路径」为键做去重:同一文件已有卡片(显示中或排队中)时复用并更新,
+    // 绝不再开第二张。路径为空时回退用事件 Id 作键(不误合并不同来源)。
+    private static readonly Dictionary<string, AiScanToastWindow> _byKey = new(StringComparer.OrdinalIgnoreCase);
+    private string? _key;
+
+    private static string KeyFor(string? path, Guid fallback)
+        => !string.IsNullOrWhiteSpace(path) ? path!.Trim().ToLowerInvariant() : "id:" + fallback;
+
     private const int EstimateSeconds = 120; // 初始"预计等待"估值
 
     // 主题色(取自 Themes/Scifi.axaml)
@@ -76,6 +87,9 @@ public partial class AiScanToastWindow : Window
             lock (_sync)
             {
                 _active.Remove(this);
+                // 仅当映射仍指向本窗口时才移除路径键(避免误删同名后续卡片)。
+                if (_key != null && _byKey.TryGetValue(_key, out var owner) && ReferenceEquals(owner, this))
+                    _byKey.Remove(_key);
                 if (_queue.Count > 0)
                 {
                     next = _queue.Dequeue();
@@ -93,10 +107,22 @@ public partial class AiScanToastWindow : Window
     /// </summary>
     public static AiScanToastWindow Create(SecurityEvent e)
     {
-        var w = new AiScanToastWindow(e);
+        var key = KeyFor(e.ActorPath, e.Id);
+
+        // 同一文件已有卡片(显示中或排队中):直接复用,不再新开第二张。
+        lock (_sync)
+        {
+            if (_byKey.TryGetValue(key, out var dup)) return dup;
+        }
+
+        var w = new AiScanToastWindow(e) { _key = key };
         bool show;
         lock (_sync)
         {
+            // 二次确认(极小并发窗口):期间若已有同键卡片则丢弃本次新建,复用既有。
+            if (_byKey.TryGetValue(key, out var dup2)) return dup2;
+            _byKey[key] = w;
+
             show = _active.Count < MaxVisible;
             if (show) _active.Add(w);
             else
@@ -116,20 +142,35 @@ public partial class AiScanToastWindow : Window
     /// </summary>
     public static void VtUpdate(VtScanRecord r)
     {
-        if (_vtToasts.TryGetValue(r.Id, out var existing))
+        var key = KeyFor(r.FilePath, r.Id);
+
+        // 1) 先按扫描 Id 找同一次扫描的卡片;找不到再按文件路径复用同一文件的既有卡片。
+        AiScanToastWindow? target = null;
+        lock (_sync)
         {
-            existing.ApplyVtRecord(r);
+            if (_vtToasts.TryGetValue(r.Id, out var byId)) target = byId;
+            else if (_byKey.TryGetValue(key, out var byKey))
+            {
+                target = byKey;
+                _vtToasts[r.Id] = byKey;   // 让该扫描 Id 的后续更新继续路由到同一张卡
+            }
+        }
+        if (target is not null)
+        {
+            target.ApplyVtRecord(r);
             if (r.IsTerminal) _vtToasts.TryRemove(r.Id, out _);
             return;
         }
 
-        // 终态但从未见过该 Id(命中历史/秒级完成):仍弹一张卡片直接展示结论。
-        var w = new AiScanToastWindow(VtToEvent(r)) { _isVt = true, _vtId = r.Id, _pendingVt = r };
-        _vtToasts[r.Id] = w;
+        // 2) 首次出现该文件/扫描:新建一张卡片(终态也可直接展示结论)。
+        var w = new AiScanToastWindow(VtToEvent(r)) { _isVt = true, _vtId = r.Id, _pendingVt = r, _key = key };
 
         bool show;
         lock (_sync)
         {
+            _vtToasts[r.Id] = w;
+            _byKey[key] = w;
+
             show = _active.Count < MaxVisible;
             if (show) _active.Add(w);
             else

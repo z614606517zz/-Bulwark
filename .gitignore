@@ -62,6 +62,17 @@ $RECYCLE.BIN/
 appsettings.*.local.json
 *.secrets.json
 .env
+# 服务主配置含真实情报源 API 密钥,不入库;改用 appsettings.example.json 模板
+Bulwark.Service/appsettings.json
+
+# ---- Verify/scan output dirs (may contain copied secrets) ----
+bin_verify_svc/
+
+# ---- Dev scratch / one-off debug artifacts (.txt / scratch) ----
+__*.txt
+ui_out.txt
+ui_err.txt
+query
 
 # ---- Dev scratch / one-off debug artifacts (not part of the product) ----
 __*.ps1
