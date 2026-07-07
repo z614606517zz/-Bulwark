@@ -1,0 +1,116 @@
+#pragma once
+#include <QByteArray>
+#include <QList>
+#include <QObject>
+#include <QString>
+#include <QUuid>
+
+#include "ai/AiScanner.h"
+#include "bulwark/ipc/IpcMessage.h"
+#include "bulwark/ipc/Payloads.h"
+#include "bulwark/models/DefenseRule.h"
+#include "bulwark/models/Enums.h"
+#include "bulwark/models/RuntimeSettings.h"
+#include "bulwark/models/SecurityEvent.h"
+#include "bulwark/models/VtScanRecord.h"
+
+class QLocalSocket;
+class QTimer;
+class AiScanner;
+class AiScanHistoryStore;
+
+// UI-side named-pipe client. Connects to the service's control pipe
+// ("Bulwark.Control"), performs the Hello handshake, reads newline-delimited
+// JSON frames and re-emits them as Qt signals. Auto-reconnects. Event-driven
+// (QLocalSocket) — no background thread, unlike the .NET blocking loop.
+//
+// Beyond the push channel (prompt / block / ai-scan / log), this now speaks the
+// full request/response protocol so the management pages bind to live service
+// data: rules, trust, settings, quarantine, persistence audit, VT history and
+// ThreatFox intel. Each request has a matching *Received signal.
+class IpcClient : public QObject
+{
+    Q_OBJECT
+public:
+    explicit IpcClient(QObject* parent = nullptr);
+    ~IpcClient() override;
+
+    void start();               // begin connecting + auto-reconnect
+    bool isConnected() const;
+
+    // UI -> service: the user's verdict for a prompted event.
+    void sendVerdict(const QUuid& eventId, bulwark::VerdictAction action, bool remember,
+                     bulwark::RememberScope scope);
+
+    // ---- UI -> service requests (no-op when disconnected) ----
+    void requestRules();
+    void addRule(const bulwark::ipc::AddRulePayload& p);
+    void deleteRule(const QUuid& ruleId);
+    void requestSettings();
+    void updateSettings(const bulwark::RuntimeSettings& s);
+    void requestTrust();
+    void addTrust(const QString& actorPath, const QString& note, bool isDirectory = false);
+    void removeTrust(const QUuid& ruleId);
+    void requestQuarantine();
+    void quarantineRestore(const QUuid& id);
+    void quarantineDelete(const QUuid& id);
+    void requestPersistence();
+    void requestEventHistory();
+    void clearEventHistory();          // 清空服务端事件历史(活动日志/拦截记录共享)
+    void requestVtHistory();
+    void manualQuarantine(const QString& path); // 清理报告「重试隔离」
+    void vtQuery(const bulwark::ipc::VtRequestPayload& p);
+    void vtDetail(const QString& sha256); // 按需拉取某哈希的 VT 完整报告(云信誉详情弹窗)
+    void intelRefresh(bool previewOnly);
+    void intelApply(const QList<bulwark::DefenseRule>& rules);
+    void aiScanFile(const QString& path);          // manual AI research of a chosen file
+    void aiGenerateRules(const QString& request);  // natural-language -> suggested rules (UI-side)
+
+    // Persisted AI research history (newest first). AI scans run UI-side, so this
+    // is where the "AI 研判" page backfills its records across restarts.
+    QList<AiScanResult> aiScanHistory() const;
+    void clearAiScanHistory();         // 清空 UI 侧 AI 研判历史(落盘同步清空)
+
+signals:
+    void connectionChanged(bool connected);
+    // Push channel.
+    void promptReceived(const bulwark::SecurityEvent& event);
+    void blockNotification(const bulwark::SecurityEvent& event);
+    void aiScanStarted(const bulwark::SecurityEvent& event);
+    void logReceived(const QString& line);
+    void eventLogReceived(const bulwark::ipc::EventLogPayload& entry);
+    void eventHistoryReceived(const QList<bulwark::ipc::EventLogPayload>& events);
+    void vtScanUpdate(const bulwark::VtScanRecord& record);
+    void remediationReport(const bulwark::ipc::RemediationReportPayload& report);
+    void manualQuarantineResult(const bulwark::ipc::ManualQuarantineResultPayload& result);
+    // Request/response channel.
+    void rulesReceived(const QList<bulwark::DefenseRule>& rules);
+    void trustReceived(const QList<bulwark::DefenseRule>& entries);
+    void settingsReceived(const bulwark::RuntimeSettings& settings);
+    void quarantineReceived(const QList<bulwark::ipc::QuarantineItemPayload>& items);
+    void quarantineActionResult(const bulwark::ipc::QuarantineActionResultPayload& r);
+    void persistenceReceived(const bulwark::ipc::PersistenceListResponsePayload& payload);
+    void vtResponse(const bulwark::ipc::VtResponsePayload& resp);
+    void vtDetailReceived(const bulwark::ipc::VtDetailResponsePayload& detail); // VT 完整报告
+    void vtHistoryReceived(const QList<bulwark::VtScanRecord>& records);
+    void intelResult(const bulwark::ipc::IntelRefreshResultPayload& result);
+    void aiScanRecord(const AiScanResult& result); // a completed AI research (auto or manual)
+    void aiRulesSuggested(const QList<AiSuggestedRule>& rules); // NL -> suggested rules for review
+
+private slots:
+    void tryConnect();
+    void onConnected();
+    void onDisconnected();
+    void onReadyRead();
+
+private:
+    void send(const bulwark::ipc::IpcMessage& msg);
+    void dispatch(const QString& line);
+
+    QLocalSocket* m_sock = nullptr;
+    QTimer* m_reconnect = nullptr;
+    QByteArray m_buf;
+    bool m_connected = false;
+    AiScanner* m_ai = nullptr; // UI-side AI research client (config from live settings)
+    AiScanHistoryStore* m_aiHistory = nullptr; // persisted AI research records (UI-side)
+};

@@ -1,0 +1,106 @@
+# ---- Build results ----
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+build/
+build_drv/
+build-ninja/
+build_pkg/
+cpp/dist/
+dist/
+bld/
+[Oo]ut/
+msbuild.log
+msbuild.err
+msbuild.wrn
+
+# Project-specific verify/scan output (may contain copied secrets)
+bin_verify/
+__verify_out/
+build_log.txt
+build_all.txt
+reg_scan_result*.txt
+
+# ---- Visual Studio / Rider ----
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.rsuser
+.idea/
+
+# ---- NuGet ----
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+.nuget/
+
+# ---- Test results ----
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# ---- OS files ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ---- Logs & temp ----
+*.log
+*.tmp
+
+# ---- Secrets / local config (do NOT commit real keys) ----
+appsettings.*.local.json
+*.secrets.json
+.env
+# 服务主配置含真实情报源 API 密钥,不入库;改用 appsettings.example.json 模板
+Bulwark.Service/appsettings.json
+
+# ---- Verify/scan output dirs (may contain copied secrets) ----
+bin_verify_svc/
+
+# ---- Dev scratch / one-off debug artifacts (.txt / scratch) ----
+__*.txt
+ui_out.txt
+ui_err.txt
+query
+
+# ---- Dev scratch / one-off debug artifacts (not part of the product) ----
+__*.ps1
+deploy2.txt
+deploy_threatintel.ps1
+driver_diag.txt
+fix_winlogon_hijack.ps1
+launch2.txt
+launch3.txt
+p.txt
+pe_build.txt
+pid.txt
+probe.txt
+reg_scan.ps1
+rel.txt
+state1.txt
+state2.txt
+test_log.txt
+test_out.txt
+verify_build.txt
+userinit_backup_*.txt
+Remediate-Threat.ps1
+# One-off incident-response cleanup scripts/logs
+_cleanup_*.ps1
+_cleanup_*.txt
+运行清理_管理员.bat

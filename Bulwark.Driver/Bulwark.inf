@@ -1,0 +1,65 @@
+;
+; Bulwark.inf - 磐垒主动防御内核驱动安装信息
+; 这是一个借用 Filter Manager 通信端口的轻量过滤驱动 + 进程创建回调。
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31d-4f34-1f76-fa75d6f1a0b7}
+Provider    = %ProviderName%
+DriverVer   = 06/06/2026,1.0.0.0
+CatalogFile = Bulwark.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 12
+Bulwark.DriverFiles   = 12            ; %windir%\system32\drivers
+
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDesc%
+CopyFiles   = Bulwark.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,Bulwark.Service
+
+[DefaultUninstall.NTamd64]
+DelFiles    = Bulwark.DriverFiles
+
+[DefaultUninstall.NTamd64.Services]
+DelService  = %ServiceName%,0x200       ; SPSVCINST_STOPSERVICE
+
+[Bulwark.Service]
+DisplayName     = %ServiceName%
+Description     = %ServiceDesc%
+ServiceBinary   = %12%\Bulwark.sys
+Dependencies    = "FltMgr"
+ServiceType     = 2                      ; SERVICE_FILE_SYSTEM_DRIVER
+StartType       = 1                      ; SERVICE_SYSTEM_START(开机随系统加载,避免重启后出现“服务先于驱动启动→降级为WMI无文件遥测→勒索漏拦”的防护空窗)
+ErrorControl    = 1                      ; SERVICE_ERROR_NORMAL
+LoadOrderGroup  = "FSFilter Activity Monitor"
+AddReg          = Bulwark.AddRegistry
+
+[Bulwark.AddRegistry]
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+[Bulwark.DriverFiles]
+Bulwark.sys
+
+[SourceDisksFiles]
+Bulwark.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskId1%,,,
+
+[Strings]
+ProviderName        = "Bulwark"
+ServiceName         = "Bulwark"
+ServiceDesc         = "磐垒主动防御内核驱动"
+DiskId1             = "Bulwark Installation Disk"
+DefaultInstance     = "Bulwark Instance"
+Instance1.Name      = "Bulwark Instance"
+Instance1.Altitude  = "385201"
+Instance1.Flags     = 0x0                ; 0x0 = 附加到卷(文件防护需要)
