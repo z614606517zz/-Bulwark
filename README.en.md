@@ -12,13 +12,12 @@ Bulwark is built as three cooperating layers: a **kernel-mode driver (R0)** for 
 
 > ⚠ **The kernel driver has not yet been validated end-to-end inside a real kernel.** `Bulwark.sys` must be loaded with test-signing enabled inside a **snapshotted test VM** before it can truly enable "before-the-action" kernel interception; a faulty kernel callback can bluescreen (BSOD). The default release artifacts run the **ETW user-mode observation pipeline**.
 
-## Three switchable event sources
+## Two switchable event sources
 
 Chosen via `EventSource` in `appsettings.json`; the decision logic and UI are identical whichever you pick:
 
 - **`Driver`** — kernel driver + ETW observation. The kernel blocks hard-block lists / protected items / the network blocklist / self-protection "before the action"; process creation uses a "telemetry + post-launch kill" compensation model.
 - **`Wmi`** — ETW user-mode observation only (the value name "Wmi" is historical; it is actually ETW). Cannot block before the action; blocking is compensated by terminating the offending process tree afterward.
-- **`Simulated`** — demo mode, does not monitor the real system.
 
 > Whatever the source, user mode always runs a parallel "continuous behavior source" (autostart-persistence watch + ransomware decoys) to cover the blind spot *after* a program is running.
 
@@ -115,12 +114,32 @@ Stateful temporal monitors (per-PID / per-series sliding windows, thread-safe):
 
 ## Cloud reputation, threat intel and AI research
 
-- **Multi-engine hash reputation** — transported via `curl.exe`, tiered cache (`%ProgramData%\Bulwark\reputation.jsonl`: malicious permanent / clean 7 days / suspicious 24 h / unknown short negative cache, with last-known fallback for enrichment when offline), rate-limited. Aggregates 6 sources and takes the strongest verdict (Malicious > Suspicious > Clean > Unknown): **VirusTotal (flagship, built-in default key, full-file upload+scan + per-engine detail), ThreatBook (微步, plus IP reputation), MalwareBazaar, OTX, MetaDefender, HybridAnalysis (plus sandbox behavior profile)**. All opt-in (off by default, VT too); reputation only adds/subtracts score, never acts alone, and going offline does not affect real-time protection.
+- **Multi-engine hash reputation** — transported via `curl.exe`, tiered cache (`%ProgramData%\Bulwark\reputation.jsonl`: malicious permanent / clean 7 days / suspicious 24 h / unknown short negative cache, with last-known fallback for enrichment when offline), rate-limited. Aggregates 6 sources and takes the strongest verdict (Malicious > Suspicious > Clean > Unknown): **VirusTotal (flagship, full-file upload+scan + per-engine detail), ThreatBook (微步, plus IP reputation), MalwareBazaar, OTX, MetaDefender, HybridAnalysis (plus sandbox behavior profile)**. All opt-in (off by default; enable each by entering its API key on the Settings page — signup links below); reputation only adds/subtracts score, never acts alone, and going offline does not affect real-time protection.
+
+> The open-source build **bundles no vendor keys** — every key field in the source and repo is blank (VirusTotal's built-in key is only injectable at build time via `-DBULWARK_VT_BUILTIN_KEY`, and is not injected by default).
 - **Threat-intel feed (ThreatFox / abuse.ch)** — periodically pulls recent malicious IOCs (by confidence threshold) and **auto-generates hash / IP / domain block rules** (source-tagged, with expiry); also manual "refresh / preview / adopt" in the UI.
 - **Network egress IP intel** — only for suspicious egress, a rate-limited background ThreatBook IP-reputation lookup (very low monthly quota + 7-day hard cache + in-flight dedup); on confirmed malice it compensates by terminating the egress process tree.
 - **Double-click / dropped-payload malware scan** — double-click launches, dropper-spawned children, recently-dropped executables, and double-clicked MSI/MSP installers are hash-queried against VT, then the full file is uploaded for a cloud scan if unknown; progress streams to a UI card, results are deduped into VT history, and confirmed malice triggers compensation.
 - **AI research (UI-side LLM)** — OpenAI-compatible, async, fail-open on any error. Two capabilities: (1) judge a file's maliciousness from **static content features only** (**never executes the sample**); (2) turn a natural-language security intent into 1–5 reviewable defense rules. Static features are extracted bounds-safely by `StaticFeatureExtractor`: PE header + per-section Shannon entropy (packing, entropy > 7.2), dangerous Win32 APIs / URLs / IPs in ASCII/UTF-16 strings, capability tags (injection / anti-debug / keylogging / ransomware / download / persistence / privilege escalation / discovery / command exec), script snippet. AI history is persisted at `%ProgramData%\Bulwark\ai_scan_history.json`.
 - **AI gray-zone policy** — consults the model only for "Ask" gray-zone events: AI-malicious → escalate to Block; AI-clean with no hard indicator → downgrade to Allow (less nagging); otherwise keep the original verdict. **AI never suppresses a hard indicator, and never overrides a deterministic block or a strongly-trusted allow.**
+
+## Intel sources & AI keys (all optional — it works without them)
+
+Cloud reputation, the threat-intel feed and AI research are all **enhancements**: off by default, and the local heuristics + behavior detection run fine with no keys at all. To enable one, enter its API key on the UI **Settings** page and flip the switch; most sources have a **free tier**.
+
+> 🔐 **Key safety**: keys you enter are stored only on your machine at `%ProgramData%\Bulwark\settings.json` (or as environment variables) — they are **never written into source, never uploaded, never committed**. Every key field in the repo's `appsettings.json` is blank.
+
+| Intel / AI source | Purpose | Sign-up | Notes |
+|----|------|---------|-------|
+| **VirusTotal** | flagship hash reputation (70+ engines) + full-file upload scan | https://www.virustotal.com/ | after signup, get the key under avatar → API Key; free public quota |
+| **ThreatBook (微步)** | hash reputation + network IP reputation | https://x.threatbook.com/ | community tier, key in the personal center; low monthly IP-intel quota |
+| **MalwareBazaar / ThreatFox** (abuse.ch) | malware-hash lookup + intel feed that auto-generates rules | https://auth.abuse.ch/ | one free Auth-Key, shared by both |
+| **AlienVault OTX** | community threat intel (pulses) | https://otx.alienvault.com/ | key under Settings → API; free |
+| **MetaDefender Cloud** (OPSWAT) | multi-engine hash reputation | https://metadefender.opswat.com/ | key on the account page; free tier |
+| **Hybrid Analysis** | sandbox reputation + behavior profile | https://www.hybrid-analysis.com/ | key under Profile → API key; free |
+| **Xiaomi MiMo LLM** | AI behavior research + natural-language rule generation | https://mimo.mi.com/ | log in with a Xiaomi account, apply under Console → API Keys; base URL / model in the `Ai` section of `appsettings.json` |
+
+> Three ways to supply a key (precedence: env var > config file): ① the **UI Settings page** per source (easiest, instant); ② **environment variables** (`BULWARK_VT_APIKEY` / `BULWARK_THREATBOOK_APIKEY` / `BULWARK_MDC_APIKEY` / `BULWARK_OTX_APIKEY` / `BULWARK_HA_APIKEY` / `BULWARK_MB_AUTHKEY` (abuse.ch) / `BULWARK_AI_APIKEY`); ③ the matching field in a local `appsettings.json` — **don't commit a config that contains real keys**.
 
 ## Enforcement, quarantine and footprint cleanup
 
@@ -141,7 +160,7 @@ The config file must sit next to `bulwark_service.exe`; missing keys keep defaul
 ```jsonc
 {
   "Bulwark": {
-    "EventSource": "Driver",       // Driver = kernel + ETW / Wmi = ETW observation only / Simulated = demo
+    "EventSource": "Driver",       // Driver = kernel + ETW / Wmi = ETW observation only
     "KernelDriverEnabled": true,   // enable the kernel driver (implied when EventSource = Driver)
     "TrustSignedActors": true,     // auto-allow strongly-trusted signed programs
     "PromptTimeoutSeconds": 30,    // prompt timeout (falls back to the default policy)
@@ -173,6 +192,47 @@ The config file must sit next to `bulwark_service.exe`; missing keys keep defaul
 ```
 
 > The full default config is in `cpp/service/appsettings.json`. Each intel source also has its own rate limits (per-minute / per-day), timeout and malicious-verdict threshold; the `Etw` section has per-process per-minute report caps and a dedup window. Reputation sources and AI are off by default, enabled per-source from the UI with hot-updatable API keys. You can also set `ProxyUrl` (global proxy), `TrustedDirectories` (whole-directory trust), and `EnforceUiClientSignature` (only a signed UI may connect to the pipe — IPC self-protection).
+
+## Beginner guide (from source to running)
+
+No prior experience needed. Everything here requires **administrator privileges** (real-time monitoring is a system-level capability).
+
+**Step 1 · Install two things**
+1. **Visual Studio 2022** (Community is free): during setup, check the "**Desktop development with C++**" workload.
+2. **Qt 6.8** (open-source edition is free): in the Qt online installer pick the **MSVC 2022 64-bit** component, default path `C:\Qt\6.8.3\msvc2022_64`.
+
+> You can skip the WDK for a quick try; you only need the **Windows Driver Kit (WDK)** to build the kernel driver.
+
+**Step 2 · Get the code**
+```powershell
+git clone https://github.com/z614606517zz/-Bulwark.git
+cd -Bulwark
+```
+
+**Step 3 · Easiest: double-click a one-click script**
+Double-click **`一键启动-仅用户态.bat`** in the repo root. It auto-requests administrator, then: build → package to `cpp\dist` → install and start `BulwarkService` → open the UI. **No kernel driver, no test signing, no BSOD risk** — ideal for a first try.
+(If the Qt path in the script differs from yours, edit `cpp\scripts\dev-all.ps1`.)
+
+**Step 3 (alternative) · Build manually**
+```powershell
+cmake -G "Visual Studio 17 2022" -A x64 -S cpp -B cpp\build -DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64"
+cmake --build cpp\build --config Release
+```
+The outputs are `cpp\build\service\Release\bulwark_service.exe` and `cpp\build\ui\Release\bulwark_ui.exe`. Run the service first, then the UI, **both as administrator** (`appsettings.json` must sit next to the service exe).
+
+**Step 4 · Use it**
+- A **green** status dot at the sidebar bottom ("connected") means you're ready.
+- It runs quietly; a suspicious gray-zone action pops a **prompt** to Allow / Block, with an optional "remember" that creates a rule.
+- Closing the main window **minimizes to the tray** and keeps protecting; right-click the tray icon to quit.
+
+**Step 5 (optional) · Enable cloud scanning / AI**: enter API keys on the **Settings** page and flip the switches (sign-up links in "Intel sources & AI keys" above). It works without them — you just lose cloud reputation and AI research.
+
+**Step 6 (optional · advanced) · Try kernel "before-the-action" blocking**: ⚠ this enables test signing and loads the kernel driver, and **a faulty callback can BSOD**. Double-click `一键启动.bat` **only inside a snapshotted test VM**, never on your daily machine.
+
+**Troubleshooting**
+- **UI stuck on "not connected"**: usually not running as administrator, or the service didn't start. Re-run elevated, or `sc start BulwarkService`.
+- **CMake can't find Qt**: make sure `-DCMAKE_PREFIX_PATH` points at your real `Qt\...\msvc2022_64` directory.
+- **No events at all**: real-time monitoring (ETW) needs administrator privileges.
 
 ## Quick start (one click)
 

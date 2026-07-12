@@ -12,13 +12,12 @@
 
 > ⚠ **内核驱动尚未在真实内核里做过端到端验证。** `Bulwark.sys` 必须在**带快照的测试虚拟机**里开启测试签名并加载后,才能真正启用「行为发生前」内核拦截;内核回调出错可能蓝屏(BSOD)。默认发布产物跑的是 **ETW 用户态观测链路**。
 
-## 三种事件源(可切换)
+## 两种事件源(可切换)
 
 由 `appsettings.json` 的 `EventSource` 决定,无论选哪种,决策与 UI 完全一致:
 
 - **`Driver`** —— 加载内核驱动 + ETW 观测。内核对硬拦名单 / 受保护项 / 网络黑名单 / 自我保护做「行为前」原地拦截;进程创建走「遥测 + 启动后结束」补偿模型。
 - **`Wmi`** —— 仅 ETW 用户态观测(取值名沿用历史「Wmi」,实际是 ETW)。无法在动作前拦截,拦截由「事后结束作恶进程树」补偿。
-- **`Simulated`** —— 演示模式,不监控真实系统。
 
 > 无论哪种事件源,用户态都始终并行一个「持续行为源」(自启动持久化监视 + 勒索诱饵),弥补程序运行「之后」的事后盲区。
 
@@ -115,12 +114,32 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 
 ## 云信誉、威胁情报与 AI 研判
 
-- **多引擎哈希信誉** —— 经 `curl.exe` 传输、分级缓存(`%ProgramData%\Bulwark\reputation.jsonl`:恶意永久 / 干净 7 天 / 可疑 24 时 / 未知短负缓存,断网时用「最近已知」兜底富化)、限流。聚合 6 个源并取最强结论(恶意 > 可疑 > 干净 > 未知):**VirusTotal(旗舰,内置默认 Key,支持整文件上传扫描 + 每引擎详情)、微步 ThreatBook(另含 IP 信誉)、MalwareBazaar、OTX、MetaDefender、HybridAnalysis(另含沙箱行为画像)**。全部 opt-in(默认关,VT 也需显式开启);信誉只加 / 减分,绝不单独处置,断网不影响实时防护。
+- **多引擎哈希信誉** —— 经 `curl.exe` 传输、分级缓存(`%ProgramData%\Bulwark\reputation.jsonl`:恶意永久 / 干净 7 天 / 可疑 24 时 / 未知短负缓存,断网时用「最近已知」兜底富化)、限流。聚合 6 个源并取最强结论(恶意 > 可疑 > 干净 > 未知):**VirusTotal(旗舰,支持整文件上传扫描 + 每引擎详情)、微步 ThreatBook(另含 IP 信誉)、MalwareBazaar、OTX、MetaDefender、HybridAnalysis(另含沙箱行为画像)**。全部 opt-in(默认关,须在设置页填入各自 API Key 后开启,申请地址见下节);信誉只加 / 减分,绝不单独处置,断网不影响实时防护。
+
+> 开源版**不内置任何厂商密钥**——源码与仓库里各 Key 字段一律为空(VirusTotal 的内置 Key 仅支持构建时经 `-DBULWARK_VT_BUILTIN_KEY` 注入,默认不注入)。
 - **威胁情报 feed(ThreatFox / abuse.ch)** —— 定期拉取近期恶意 IOC(按可信度阈值),**自动生成哈希 / IP / 域名拦截规则**(带来源标记与到期时间),也支持在 UI 里手动「立即刷新 / 预览 / 采纳」。
 - **网络外联 IP 情报互证** —— 仅对可疑外联,后台限流查微步 IP 信誉(月配额极低 + 7 天强缓存 + 在途去重),确认恶意再补偿处置(结束外联进程树)。
 - **双击 / 释放载荷病毒扫描** —— 双击启动、dropper 派生、近期落盘的可执行体,以及双击的 MSI/MSP 安装包,后台先按哈希查 VT、未收录则上传整文件云端扫描,进度实时推 UI 卡片、结果落 VT 历史去重,确认恶意即补偿处置。
 - **AI 研判(UI 侧,大模型)** —— OpenAI 兼容接口,异步、任何失败都 fail-open。两种能力:①基于**纯静态内容特征**研判文件恶意性(**绝不执行样本**);②把自然语言安全意图转成 1~5 条可复核的防御规则。静态特征由 `StaticFeatureExtractor` 越界安全地提取:PE 头 + 各节香农熵(判壳,熵 > 7.2)、ASCII/UTF-16 字符串里的危险 Win32 API / URL / IP、能力标签(进程注入 / 反调试 / 键盘钩子 / 加密勒索 / 网络下载 / 持久化 / 提权 / 进程发现 / 命令执行)、脚本片段。AI 研判历史落盘于 `%ProgramData%\Bulwark\ai_scan_history.json`。
 - **AI 灰区研判策略** —— 仅对「询问(Ask)」类灰区事件咨询大模型:AI 判恶意 → 升格 Block;AI 判干净且无硬指标 → 降级 Allow(减打扰);其余维持原判。**AI 绝不压制硬指标、也绝不改判确定性拦截或强可信放行。**
+
+## 情报源与 AI 密钥申请(全部可选,不填也能用)
+
+云信誉、威胁情报 feed、AI 研判都是**锦上添花**:默认全部关闭,不填任何 Key 也能正常跑本地启发式 + 行为检测。想开哪个,就去 UI **设置**页填对应 API Key 再打开开关即可;绝大多数源都有**免费额度**。
+
+> 🔐 **关于密钥安全**:你填的 Key 只保存在本机 `%ProgramData%\Bulwark\settings.json`(或环境变量),**绝不写入源码、绝不上传、绝不进版本库**——开源仓库里的 `appsettings.json` 各 Key 字段一律为空。
+
+| 情报 / AI 源 | 用途 | 申请地址 | 备注 |
+|----|------|----------|------|
+| **VirusTotal** | 哈希信誉旗舰(70+ 引擎)+ 整文件上传扫描 | https://www.virustotal.com/ | 注册后在 头像 → API Key 获取;免费公开额度 |
+| **微步 ThreatBook** | 哈希信誉 + 网络 IP 信誉 | https://x.threatbook.com/ | 社区版注册后在个人中心获取;IP 信誉月配额较低 |
+| **MalwareBazaar / ThreatFox**(abuse.ch) | 恶意样本哈希查询 + 情报 feed 自动生成规则 | https://auth.abuse.ch/ | 免费注册一个 Auth-Key,两者共用 |
+| **AlienVault OTX** | 社区威胁情报(pulse) | https://otx.alienvault.com/ | 注册后在 Settings → API 获取;免费 |
+| **MetaDefender Cloud**(OPSWAT) | 多引擎哈希信誉 | https://metadefender.opswat.com/ | 注册后在账户页获取;有免费额度 |
+| **Hybrid Analysis** | 沙箱信誉 + 行为画像 | https://www.hybrid-analysis.com/ | 注册后在 Profile → API key 获取;免费 |
+| **小米 MiMo 大模型** | AI 行为研判 + 自然语言生成规则 | https://mimo.mi.com/ | 用小米账号登录,在 控制台 → API Keys 申请;基址 / 模型见 `appsettings.json` 的 `Ai` 节 |
+
+> 填 Key 的三种方式(优先级:环境变量 > 配置文件):① **UI 设置页**逐项填写(最方便,即时生效);② **环境变量**(`BULWARK_VT_APIKEY` / `BULWARK_THREATBOOK_APIKEY` / `BULWARK_MDC_APIKEY` / `BULWARK_OTX_APIKEY` / `BULWARK_HA_APIKEY` / `BULWARK_MB_AUTHKEY`(abuse.ch)/ `BULWARK_AI_APIKEY`);③ 本机 `appsettings.json` 对应字段——**注意别把带真实 Key 的配置提交上库**。
 
 ## 处置、隔离与足迹清理
 
@@ -141,7 +160,7 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 ```jsonc
 {
   "Bulwark": {
-    "EventSource": "Driver",       // Driver=内核+ETW / Wmi=仅 ETW 观测 / Simulated=演示
+    "EventSource": "Driver",       // Driver=内核+ETW / Wmi=仅 ETW 观测
     "KernelDriverEnabled": true,   // 启用内核驱动(EventSource=Driver 时等效开启)
     "TrustSignedActors": true,     // 自动放行强可信签名程序
     "PromptTimeoutSeconds": 30,    // 弹窗超时(超时按默认策略处置)
@@ -173,6 +192,47 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 ```
 
 > 完整默认配置见 `cpp/service/appsettings.json`。每个情报源还有独立的限流(每分钟 / 每天上限)、超时与恶意判定阈值;`Etw` 节另有每进程每分钟上报上限与去重窗口。信誉源与 AI 默认全关,由 UI 逐项开启并可热更 API Key。另可配 `ProxyUrl`(全局代理)、`TrustedDirectories`(整目录信任)、`EnforceUiClientSignature`(仅放行签名 UI 连管道,IPC 自保)。
+
+## 小白上手指南(从零到跑起来)
+
+零基础也能编译体验。全程需要**管理员权限**(实时监控是系统级能力)。
+
+**第 1 步 · 装两样东西**
+1. **Visual Studio 2022**(社区版免费):安装时勾选「**使用 C++ 的桌面开发**」工作负载。
+2. **Qt 6.8**(开源版免费):在 Qt 在线安装器里选 **MSVC 2022 64-bit** 组件,默认装到 `C:\Qt\6.8.3\msvc2022_64`。
+
+> 只尝鲜可跳过 WDK;想体验内核驱动才需要额外装 **Windows Driver Kit(WDK)**。
+
+**第 2 步 · 拿代码**
+```powershell
+git clone https://github.com/z614606517zz/-Bulwark.git
+cd -Bulwark
+```
+
+**第 3 步 · 最省事:双击一键脚本**
+在仓库根目录双击 **`一键启动-仅用户态.bat`**。它会自动请求管理员权限,然后:编译 → 打包到 `cpp\dist` → 安装并启动 `BulwarkService` → 打开界面。**不加载内核驱动、不改测试签名、没有蓝屏风险**,最适合第一次尝鲜。
+（若脚本里的 Qt 路径和你的不一致,编辑 `cpp\scripts\dev-all.ps1` 改成你的 Qt 路径。）
+
+**第 3 步(备选)· 手动编译**
+```powershell
+cmake -G "Visual Studio 17 2022" -A x64 -S cpp -B cpp\build -DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64"
+cmake --build cpp\build --config Release
+```
+产物在 `cpp\build\service\Release\bulwark_service.exe` 与 `cpp\build\ui\Release\bulwark_ui.exe`。**以管理员**先跑服务、再跑 UI(`appsettings.json` 要和服务 exe 同目录)。
+
+**第 4 步 · 开始用**
+- 界面左下角状态点变**绿**(“已连接服务”)= 一切就绪。
+- 平时静默运行;遇到可疑灰区行为会**弹窗**让你选「允许 / 拦截」,可勾「记住」生成规则。
+- 关掉主窗口会**最小化到托盘**继续防护;右键托盘图标可退出。
+
+**第 5 步(可选)· 开云查毒 / AI**:去**设置**页填对应 API Key 并打开开关(申请地址见上节「情报源与 AI 密钥申请」)。不填也能用,只是少了云端信誉和 AI 研判。
+
+**第 6 步(可选 · 进阶)· 体验内核「行为前」拦截**:⚠ 会开启测试签名并加载内核驱动,**回调出错可能蓝屏**。**务必在带快照的测试虚拟机里**双击 `一键启动.bat`,切勿在日常电脑上直接跑。
+
+**常见问题**
+- **UI 一直「未连接服务」**:多半没以管理员运行,或服务没起来。用管理员重跑,或 `sc start BulwarkService`。
+- **CMake 找不到 Qt**:确认 `-DCMAKE_PREFIX_PATH` 指向你真实的 `Qt\...\msvc2022_64` 目录。
+- **没有任何事件**:实时监控(ETW)需要管理员权限。
 
 ## 快速开始(一键启动)
 
