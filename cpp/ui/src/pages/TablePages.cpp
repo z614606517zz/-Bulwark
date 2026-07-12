@@ -169,6 +169,30 @@ void verdictPill(bulwark::VerdictAction a, QString& text, QColor& color)
     }
 }
 
+// 处置文案:action==Block 时按【真实执行结果】(enforcement)显示,杜绝「判了 Block 就显示已拦截、
+// 实则毫无动作」的假拦截。只有真前拦 / 已结束进程 / 已加黑名单才算真拦;未能处置如实标注。
+void dispositionPill(bulwark::VerdictAction action, bulwark::EnforcementOutcome enf,
+                     QString& text, QColor& color)
+{
+    if (action != bulwark::VerdictAction::Block) {
+        if (action == bulwark::VerdictAction::Ask) { text = u("已询问"); color = theme::warning(); }
+        else                                       { text = u("已放行"); color = theme::success(); }
+        return;
+    }
+    using EO = bulwark::EnforcementOutcome;
+    switch (enf) {
+    case EO::KernelBlocked:     text = u("已拦截");        color = theme::danger();  break; // 内核前拦
+    case EO::Terminated:        text = u("已结束进程");    color = theme::danger();  break; // 事后杀成功
+    case EO::ModuleBlacklisted: text = u("已禁止加载");    color = theme::danger();  break; // 下次前拦
+    case EO::AlertedOnly:       text = u("仅告警·未拦截"); color = theme::warning(); break; // 未实际拦截
+    case EO::Failed:            text = u("拦截失败");      color = theme::warning(); break;
+    case EO::NotApplicable:
+    default:                    text = u("已拦截");        color = theme::danger();  break; // 历史记录兜底
+    }
+}
+
+
+
 constexpr int kMaxLogRows = 200; // cap the live-fed log tables to bound memory
 
 } // namespace
@@ -197,14 +221,16 @@ QWidget* pages::interceptions(IpcClient* ipc)
     wireAttackTimeline(t, b.page); // 双击回溯攻击时间线
 
     // Insert a Block row at the top (newest first), using the event's own timestamp.
-    auto addRowTop = [t](const bulwark::SecurityEvent& e) {
+    // 处置列按【真实执行结果】显示(内核前拦/已结束进程/已禁止加载/仅告警未拦截),而非一律"已拦截"。
+    auto addRowTop = [t](const bulwark::SecurityEvent& e, bulwark::EnforcementOutcome enf) {
         t->insertRow(0);
         put(t, 0, 0, e.timestampUtc.toLocalTime().toString(QStringLiteral("MM-dd HH:mm:ss")), true, true);
         put(t, 0, 1, eventTypeLabel(e.type));
         put(t, 0, 2, QFileInfo(e.actorPath).fileName());
         put(t, 0, 3, e.target, true, true);
         ui::pillCell(t, 0, 4, riskLabel(e.riskScore), riskColor(e.riskScore));
-        ui::pillCell(t, 0, 5, u("已拦截"), theme::danger());
+        QString dt; QColor dc; dispositionPill(bulwark::VerdictAction::Block, enf, dt, dc);
+        ui::pillCell(t, 0, 5, dt, dc);
         stashEvent(t, 0, e);
         while (t->rowCount() > kMaxLogRows) t->removeRow(t->rowCount() - 1);
     };
@@ -214,14 +240,14 @@ QWidget* pages::interceptions(IpcClient* ipc)
     QObject::connect(ipc, &IpcClient::eventLogReceived, b.page,
                      [addRowTop, refreshCount](const bulwark::ipc::EventLogPayload& p) {
                          if (p.action != bulwark::VerdictAction::Block) return;
-                         addRowTop(p.event);
+                         addRowTop(p.event, p.enforcement);
                          refreshCount();
                      });
     QObject::connect(ipc, &IpcClient::eventHistoryReceived, b.page,
                      [t, addRowTop, refreshCount](const QList<bulwark::ipc::EventLogPayload>& events) {
                          t->setRowCount(0);
                          for (const auto& p : events) // oldest->newest, insert-at-top => newest on top
-                             if (p.action == bulwark::VerdictAction::Block) addRowTop(p.event);
+                             if (p.action == bulwark::VerdictAction::Block) addRowTop(p.event, p.enforcement);
                          refreshCount();
                      });
     QObject::connect(ipc, &IpcClient::connectionChanged, b.page,

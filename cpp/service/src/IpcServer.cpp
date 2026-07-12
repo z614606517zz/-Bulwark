@@ -283,11 +283,13 @@ void IpcServer::sendLog(const QString& line) {
 }
 
 void IpcServer::sendEventLog(const bulwark::SecurityEvent& e,
-                             bulwark::VerdictAction action, bulwark::VerdictSource source) {
+                             bulwark::VerdictAction action, bulwark::VerdictSource source,
+                             bulwark::EnforcementOutcome enforcement) {
     EventLogPayload p;
     p.event = e;
     p.action = action;
     p.source = source;
+    p.enforcement = enforcement;
     broadcast(IpcMessage::from(IpcMessageType::EventLogEntry, p));
 }
 

@@ -62,7 +62,9 @@ public:
     void sendBlock(const bulwark::SecurityEvent& e);    // BlockNotification
     void sendLog(const QString& line);                  // LogEntry(纯字符串)
     void sendEventLog(const bulwark::SecurityEvent& e,
-                      bulwark::VerdictAction action, bulwark::VerdictSource source); // EventLogEntry
+                      bulwark::VerdictAction action, bulwark::VerdictSource source,
+                      bulwark::EnforcementOutcome enforcement =
+                          bulwark::EnforcementOutcome::NotApplicable); // EventLogEntry
     void sendRemediationReport(const bulwark::ipc::RemediationReportPayload& report); // RemediationReport
     void sendVtScanUpdate(const bulwark::VtScanRecord& record);                       // VtScanUpdate
     void sendVtDetail(const bulwark::ipc::VtDetailResponsePayload& detail);           // VtDetailResponse(异步)

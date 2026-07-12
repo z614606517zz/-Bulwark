@@ -498,6 +498,9 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventFileRename:
             e.actorPath = actorPlaceholder;
             e.target = targetPath;
+            // 这两类仅由内核 FileMonitor 的「命中硬拦名单 / 受保护路径」阻断分支上报——
+            // 上报即代表内核已在动作前 STATUS_ACCESS_DENIED,故标记真前拦。
+            e.kernelBlocked = true;
             e.detail = (ev.Type == BlwEventFileDelete)
                 ? QStringLiteral("内核拦截 · 删除受保护文件")
                 : QStringLiteral("内核拦截 · 重命名/移动受保护文件");
@@ -522,11 +525,15 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventRegistryDeleteKey:
             e.actorPath = actorPlaceholder;
             e.target = targetPath;
+            // 注意:受保护注册表键(\Run/\Winlogon/\Services 等宽子串)在内核是【上报后放行】
+            // (无条件拦截会打死系统),仅「注册表硬拦名单」才真前拦。二者事件类型相同,内核未
+            // 附带 blocked 标志,故此处保守标记为「观测」(kernelBlocked 保持 false),由 Worker
+            // 事后补偿处置(结束发起进程)并如实记录结果——绝不谎称"内核拦截"。
             e.detail = (ev.Type == BlwEventRegistrySetValue)
-                ? QStringLiteral("内核拦截 · 写入受保护注册表键")
+                ? QStringLiteral("内核监控 · 写入受保护注册表键(观测,事后处置)")
                 : (ev.Type == BlwEventRegistryDeleteValue)
-                      ? QStringLiteral("内核拦截 · 删除受保护注册表值")
-                      : QStringLiteral("内核拦截 · 删除受保护注册表键");
+                      ? QStringLiteral("内核监控 · 删除受保护注册表值(观测,事后处置)")
+                      : QStringLiteral("内核监控 · 删除受保护注册表键(观测,事后处置)");
             // 创建服务经 SCM(services.exe)代写服务键,内核归因为 SCM。尝试还原真实 RPC 发起者
             // (发起线程此刻阻塞在 WrLpcReply)。仅高置信唯一候选才改写主体,否则保守留 SCM。
             if (ServiceControlTracer::isServiceDatabaseKey(targetPath)) {
@@ -543,6 +550,8 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventSelfProtect:
             e.actorPath = actorPlaceholder;
             e.target = QStringLiteral("受保护进程 PID %1").arg(ev.ParentPid);
+            // 内核 ObCallback 已在句柄打开时剥离危险权限(结束/写内存/远程线程),攻击在发生前失效。
+            e.kernelBlocked = true;
             e.detail = QStringLiteral("内核自保 · 已剥离对本软件的危险访问权限");
             break;
 
@@ -553,6 +562,8 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
             e.actorPath = actorPlaceholder;
             e.target = victimPath.isEmpty() ? QStringLiteral("PID %1").arg(victim) : victimPath;
             e.memoryInjection = true;
+            // 内核 ObCallback 已在句柄打开时剥离「写内存/远程线程」权限,跨进程注入在发生前失效。
+            e.kernelBlocked = true;
             e.detail = QStringLiteral("内核内存防护 · 已阻止跨进程注入 -> %1(PID %2)")
                            .arg(QFileInfo(e.target).fileName()).arg(victim);
             break;
@@ -561,6 +572,8 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventNetworkConnect:
             e.actorPath = actorPlaceholder;
             e.target = QStringLiteral("%1:%2").arg(formatIpv4Host(ev.RemoteIpV4)).arg(ev.RemotePort);
+            // 内核 WFP 仅对命中黑名单的外联上报本类事件,且已 FWP_ACTION_BLOCK 真前拦。
+            e.kernelBlocked = true;
             e.detail = QStringLiteral("内核拦截 · 已阻断对黑名单地址的外联");
             break;
 
@@ -578,6 +591,8 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventImageBlocked:
             e.actorPath = e.actorPid > 0 ? actorPlaceholder : QStringLiteral("(加载方未知)");
             e.target = targetPath;
+            // 命中内核「禁止加载」名单,执行/映射打开已被 STATUS_ACCESS_DENIED 前拦。
+            e.kernelBlocked = true;
             e.detail = QStringLiteral("内核拦截 · 已阻止加载禁用模块 %1(白加黑防护)")
                            .arg(QFileInfo(targetPath).fileName());
             break;

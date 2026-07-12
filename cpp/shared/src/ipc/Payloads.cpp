@@ -45,6 +45,7 @@ QJsonObject EventLogPayload::toJson() const {
     o["event"] = event.toJson();
     o["action"] = static_cast<int>(action);
     o["source"] = static_cast<int>(source);
+    o["enforcement"] = static_cast<int>(enforcement);
     return o;
 }
 
@@ -54,6 +55,8 @@ EventLogPayload EventLogPayload::fromJson(const QJsonObject& o) {
     p.event = bulwark::SecurityEvent::fromJson(o.value(QLatin1String("event")).toObject());
     p.action = static_cast<VerdictAction>(getInt(o, "action", 0));
     p.source = static_cast<VerdictSource>(getInt(o, "source", static_cast<int>(VerdictSource::DefaultPolicy)));
+    p.enforcement = static_cast<bulwark::EnforcementOutcome>(
+        getInt(o, "enforcement", static_cast<int>(bulwark::EnforcementOutcome::NotApplicable)));
     return p;
 }
 

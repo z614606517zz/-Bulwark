@@ -305,23 +305,6 @@ void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayloa
     (new RemediationReportDialog(report, m_ipc, this))->show();
 }
 
-void MainWindow::previewNotifications()
-{
-    if (!m_toasts)
-        return;
-    bulwark::SecurityEvent blk;
-    blk.type = bulwark::EventType::RemoteThread;
-    blk.actorPath = QStringLiteral("C:\\Users\\Public\\a1b2.tmp.exe");
-    blk.target = QString::fromUtf8("lsass.exe (PID 780)");
-    blk.techniques = {QStringLiteral("T1055"), QStringLiteral("T1003.001")};
-    m_toasts->showBlock(blk);
-
-    bulwark::SecurityEvent scan;
-    scan.type = bulwark::EventType::ProcessCreate;
-    scan.actorPath = QStringLiteral("D:\\Downloads\\setup_installer.exe");
-    m_toasts->showAiScan(scan);
-}
-
 // ---- System tray + close-to-tray -------------------------------------------
 
 void MainWindow::setupTray()

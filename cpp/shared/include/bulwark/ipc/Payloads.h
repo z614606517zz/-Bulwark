@@ -45,6 +45,9 @@ struct EventLogPayload {
     bulwark::SecurityEvent event;
     VerdictAction action = VerdictAction::Allow;
     VerdictSource source = VerdictSource::DefaultPolicy;
+    // 实际执行结果(与 action 区分:action 是裁决意图,enforcement 是真的做了什么)。
+    // UI 据此如实显示处置,杜绝假拦截。
+    bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
 
     QJsonObject toJson() const;
     static EventLogPayload fromJson(const QJsonObject& o);

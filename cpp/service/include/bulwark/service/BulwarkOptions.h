@@ -152,7 +152,7 @@ struct ThreatFoxFeedOptions {
 struct BulwarkOptions {
     static constexpr const char* SectionName = "Bulwark";
 
-    QString EventSource = QStringLiteral("Wmi"); // "Wmi" (real) or "Simulated" (demo)
+    QString EventSource = QStringLiteral("Wmi"); // "Wmi" (ETW observation) or "Driver" (kernel + ETW)
     bool KernelDriverEnabled = true;             // full-dimension protection needs the driver on
     bool TrustSignedActors = true;
     VerdictAction DefaultAction = VerdictAction::Allow;

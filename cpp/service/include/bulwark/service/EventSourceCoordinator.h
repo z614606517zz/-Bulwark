@@ -12,7 +12,7 @@ namespace bulwark::service {
 class DriverEventSource;
 class UserModeBehaviorSource;
 
-// 事件源协调器。始终运行一个用户态基础源(ETW/模拟)用于观测,并可在运行时按用户开关
+// 事件源协调器。始终运行一个用户态基础源(ETW)用于观测,并可在运行时按用户开关
 // 动态启动/停止内核驱动源(Bulwark.sys);始终并行一个用户态持续行为源(自启动 + 勒索诱饵)。
 // 三路事件合并后对外统一 emit,作为 Worker 的唯一事件源。
 //
@@ -41,6 +41,7 @@ public:
     void configureBehaviorMonitor(bool enabled, bool canaryEnabled);
     void addProtectedUiPid(int pid);
     void addBlockedIp(const QString& ip, quint16 port = 0);
+    bool blockModuleLoad(const QString& modulePath) override; // 转发到内核驱动源(未连接则 no-op)
 
     // 状态(供设置页回报)。
     bool kernelConnected() const;
@@ -54,7 +55,7 @@ private slots:
     void onKernelRetry();
 
 private:
-    EventSource* base_ = nullptr;                // 基础源(ETW/模拟),非拥有
+    EventSource* base_ = nullptr;                // 基础源(ETW),非拥有
     UserModeBehaviorSource* behavior_ = nullptr; // 行为源,非拥有(可空)
     DriverEventSource* driver_ = nullptr;        // 内核源,拥有(懒创建)
     const BulwarkOptions& options_;

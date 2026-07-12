@@ -26,9 +26,6 @@ class MainWindow : public QWidget
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 
-    // Pop a representative block + AI-scan toast (manual/demo/QA preview).
-    void previewNotifications();
-
 protected:
     void closeEvent(QCloseEvent* event) override;
 

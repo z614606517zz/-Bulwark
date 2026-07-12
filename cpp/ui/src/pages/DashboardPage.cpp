@@ -144,15 +144,29 @@ DashboardPage::DashboardPage(IpcClient* ipc, QWidget* parent) : QWidget(parent),
     connect(ipc, &IpcClient::eventLogReceived, this,
             [this](const bulwark::ipc::EventLogPayload& p) {
         m_statEvents->setText(QString::number(++m_eventCount));
-        if (p.action == bulwark::VerdictAction::Block)
+        // 「本次拦截」只统计【真实拦截】(内核前拦 / 已结束进程 / 已禁止加载);仅告警、拦截失败
+        // 不计入,避免拦截数虚高造成"看起来拦了很多、其实没拦"的假象。
+        using EO = bulwark::EnforcementOutcome;
+        const bool realBlock = p.action == bulwark::VerdictAction::Block
+            && (p.enforcement == EO::KernelBlocked || p.enforcement == EO::Terminated
+                || p.enforcement == EO::ModuleBlacklisted || p.enforcement == EO::NotApplicable);
+        if (realBlock)
             m_statBlocked->setText(QString::number(++m_blockedCount));
-        // Prepend a compact activity row (cap at 6).
+        // Prepend a compact activity row (cap at 6). 处置按【真实执行结果】显示,杜绝假拦截。
         const bulwark::SecurityEvent& e = p.event;
         QString risk; QColor rc;
-        switch (p.action) {
-        case bulwark::VerdictAction::Block: risk = u("已拦截"); rc = theme::danger(); break;
-        case bulwark::VerdictAction::Ask:   risk = u("已询问"); rc = theme::warning(); break;
-        default:                            risk = u("已放行"); rc = theme::success(); break;
+        if (p.action != bulwark::VerdictAction::Block) {
+            if (p.action == bulwark::VerdictAction::Ask) { risk = u("已询问"); rc = theme::warning(); }
+            else                                         { risk = u("已放行"); rc = theme::success(); }
+        } else {
+            switch (p.enforcement) {
+            case EO::KernelBlocked:     risk = u("已拦截");        rc = theme::danger();  break;
+            case EO::Terminated:        risk = u("已结束进程");    rc = theme::danger();  break;
+            case EO::ModuleBlacklisted: risk = u("已禁止加载");    rc = theme::danger();  break;
+            case EO::AlertedOnly:       risk = u("仅告警·未拦截"); rc = theme::warning(); break;
+            case EO::Failed:            risk = u("拦截失败");      rc = theme::warning(); break;
+            default:                    risk = u("已拦截");        rc = theme::danger();  break;
+            }
         }
         const QString name = QFileInfo(e.actorPath).fileName();
         auto* r = activityRow("activity", rc, eventTypeLabel(e.type) + u(" · ") + name,

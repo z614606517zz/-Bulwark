@@ -60,6 +60,7 @@ QJsonObject SecurityEvent::toJson() const {
     o["hasThreatIndicator"] = hasThreatIndicator;
     o["matchedRuleNote"] = matchedRuleNote;
     o["userModeObserved"] = userModeObserved;
+    o["kernelBlocked"] = kernelBlocked;
     o["memoryInjection"] = memoryInjection;
     o["fileDescription"] = fileDescription;
 
@@ -112,6 +113,7 @@ SecurityEvent SecurityEvent::fromJson(const QJsonObject& o) {
     e.hasThreatIndicator = getBool(o, "hasThreatIndicator");
     e.matchedRuleNote = getStr(o, "matchedRuleNote");
     e.userModeObserved = getBool(o, "userModeObserved");
+    e.kernelBlocked = getBool(o, "kernelBlocked");
     e.memoryInjection = getBool(o, "memoryInjection");
     e.fileDescription = getStr(o, "fileDescription");
 

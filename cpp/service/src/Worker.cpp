@@ -275,6 +275,7 @@ void Worker::onEvent(const SecurityEvent& incoming) {
         log_.info(QStringLiteral("已签名主体默认放行(信任签名,不弹询问):%1").arg(e.actorPath));
     }
 
+    bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
     switch (action) {
         case VerdictAction::Ask:
             pending_.insert(e.id, e);
@@ -282,7 +283,7 @@ void Worker::onEvent(const SecurityEvent& incoming) {
             break;
         case VerdictAction::Block:
             ipc_->sendBlock(e);
-            enforceBlock(e);            // 用户态观测源:事后补偿性结束进程树
+            enforcement = enforceBlock(e); // 真实处置结果:内核前拦 / 已结束进程 / 加黑名单 / 仅告警
             // 确定性恶意:隔离载荷 + 清除持久化。用最终裁决(可能被静默模式升级为 Block)驱动,
             // 而非原始 v —— 否则静默升级的高危不会触发隔离(v.action 仍是 Ask)。
             remediateIfMalicious(e, action == v.action ? v
@@ -298,12 +299,13 @@ void Worker::onEvent(const SecurityEvent& incoming) {
         source_->submitVerdict(e, action);
 
     ipc_->sendLog(describe(e, action));
-    ipc_->sendEventLog(e, action, source);
+    ipc_->sendEventLog(e, action, source, enforcement);
     if (eventHistory_) { // 落结构化事件历史,供 UI 打开活动日志/拦截记录时回填
         bulwark::ipc::EventLogPayload p;
         p.event = e;
         p.action = action;
         p.source = source;
+        p.enforcement = enforcement;
         eventHistory_->add(p);
     }
     writeAudit(e, action, source);
@@ -360,16 +362,16 @@ void Worker::onPromptResponse(const QUuid& eventId, VerdictAction action,
         ruleStore_->save(engine_->getRules());
     }
 
-    // 用户裁决为拦截:对用户态观测源(含内核驱动进程创建等 fire-and-forget 事件)补偿性
-    // 结束进程树(enforceBlock 内部仅对 userModeObserved 生效,并含关键进程防护)。
+    // 用户裁决为拦截:执行真实处置并拿到真实结果(内核前拦 / 已结束进程 / 加黑名单 / 仅告警)。
+    bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
     if (action == VerdictAction::Block)
-        enforceBlock(e);
+        enforcement = enforceBlock(e);
     // 阻塞式源(内核驱动):把用户裁决回写内核。仅文件/注册表/结束进程等内核等待类事件真正回复。
     if (source_ && source_->wantsVerdict())
         source_->submitVerdict(e, action);
 
     ipc_->sendLog(describe(e, action));
-    recordEvent(e, action, VerdictSource::UserPrompt); // 用户裁决登记到活动 / 拦截记录
+    recordEvent(e, action, VerdictSource::UserPrompt, enforcement); // 用户裁决登记到活动 / 拦截记录
     writeAudit(e, action, VerdictSource::UserPrompt);
 }
 
@@ -488,24 +490,44 @@ void Worker::seedAncestryChain(SecurityEvent& e) {
         e.chainContext += seeded;
 }
 
-void Worker::enforceBlock(const SecurityEvent& e) {
-    // 内核源(驱动)是真正的 pre-action 拦截,动作发生前即被阻断,无需在此重复结束。
-    // 用户态观测源(ETW / WMI)只能观测,故对其拦截执行补偿性处置——结束作恶进程树。
-    if (!e.userModeObserved)
-        return;
+bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e) {
+    using bulwark::EnforcementOutcome;
+
+    // (a) 内核已在【动作发生前】真正阻断(文件/注册表硬拦名单、受保护路径删除/改名、禁止加载、
+    //     自我保护剥权、反注入剥权、黑名单 IP 的 WFP 阻断)。拦截真实且完整;发起方可能只是误触
+    //     受保护目标的正常程序,故不再补杀(遵循「最小化误伤」)。如实返回「已拦截」。
+    if (e.kernelBlocked)
+        return EnforcementOutcome::KernelBlocked;
+
+    // (b) 观测型事件——动作已经发生(ETW/WMI 观测,或内核 fire-and-forget 的进程创建/镜像加载/
+    //     软注册表/远程线程/网络观测):内核无法在发生前阻断,唯一真实的处置是【立即结束作恶
+    //     进程】。对侧载模块额外加入内核禁止加载名单,使【下次】加载被内核前拦(白加黑防护)。
+    bool blacklisted = false;
+    if (e.type == bulwark::EventType::ImageLoad && source_ && !e.target.trimmed().isEmpty())
+        blacklisted = source_->blockModuleLoad(e.target);
 
     // 优先结束 RPC 真凶(如经 svchost 代发的请求),否则结束事件主体本身。
     const int pid = e.originatorPid > 0 ? e.originatorPid : e.actorPid;
-    if (pid <= 4)
-        return; // 系统/Idle 等绝不触碰
+    if (pid > 4) {
+        const int killed = ProcessInspector::terminateProcessTree(pid);
+        if (killed > 0) {
+            log_.info(QStringLiteral("拦截处置:已结束进程树 PID=%1(共 %2 个进程)。")
+                          .arg(pid).arg(killed));
+            return EnforcementOutcome::Terminated;
+        }
+    }
 
-    const int killed = ProcessInspector::terminateProcessTree(pid);
-    if (killed > 0)
-        log_.info(QStringLiteral("拦截处置:已结束进程树 PID=%1(共 %2 个进程)。")
-                      .arg(pid).arg(killed));
-    else
-        log_.warning(QStringLiteral("拦截处置:PID=%1 未结束任何进程(已退出,或为受保护/关键进程)。")
-                         .arg(pid));
+    // 未能结束任何进程。若已把侧载模块加入禁止加载名单,本次虽未拦下,下次加载会被内核前拦。
+    if (blacklisted) {
+        log_.info(QStringLiteral("拦截处置:侧载模块已加入内核禁止加载名单(下次加载将被前拦):%1")
+                      .arg(e.target));
+        return EnforcementOutcome::ModuleBlacklisted;
+    }
+
+    // 既非内核前拦、又无可结束的进程、又非可加黑的模块:如实标记「仅告警,未实际拦截」。
+    log_.warning(QStringLiteral("拦截处置:PID=%1 未能结束任何进程(已退出/受保护/关键进程),"
+                                "该事件仅告警、未实际拦截。").arg(pid));
+    return EnforcementOutcome::AlertedOnly;
 }
 
 void Worker::remediateIfMalicious(const SecurityEvent& e, const bulwark::Verdict& v) {
@@ -602,11 +624,12 @@ void Worker::onReputationMalicious(const SecurityEvent& e, const bulwark::FileRe
     if (ev.riskScore < 90) ev.riskScore = 90;
     ev.riskReasons.append(QStringLiteral("%1 判定恶意:%2").arg(srcName, detail));
     ipc_->sendBlock(ev);
-    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic);
-
-    // 结束进程树(样本可能仍在运行);关键系统进程由 ProcessInspector 内部安全门槛保护。
-    if (ev.actorPid > 4)
-        ProcessInspector::terminateProcessTree(ev.actorPid);
+    // 先结束进程树(样本可能仍在运行)并据真实结果如实记录处置;关键系统进程由内部安全门槛保护。
+    // 未能结束(进程已退出)时标 AlertedOnly——载荷仍会在下方 remediate 阶段被隔离失活。
+    bulwark::EnforcementOutcome outcome = bulwark::EnforcementOutcome::AlertedOnly;
+    if (ev.actorPid > 4 && ProcessInspector::terminateProcessTree(ev.actorPid) > 0)
+        outcome = bulwark::EnforcementOutcome::Terminated;
+    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic, outcome);
 
     // 主动防护 + 记忆:据行为画像 IOC 生成拦截规则,并【记住该恶意样本本身的哈希】——注入本地
     // 硬拦规则(落盘)后,下次同一文件再运行会被本地引擎直接拦截,不再重复调用 VT / 云端。
@@ -709,11 +732,12 @@ void Worker::onAiMalicious(const SecurityEvent& e, const QString& summary) {
     if (ev.riskScore < 90) ev.riskScore = 90;
     ev.riskReasons.append(QString::fromUtf8("AI 研判判定恶意"));
     ipc_->sendBlock(ev);
-    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic);
-
-    // 补偿处置:结束进程树(关键系统进程由 ProcessInspector 内部安全门槛保护)。
-    if (ev.actorPid > 4)
-        ProcessInspector::terminateProcessTree(ev.actorPid);
+    // 先补偿处置(结束进程树)并据真实结果如实记录;关键系统进程由内部安全门槛保护。
+    // 未能结束(进程已退出)时标 AlertedOnly——载荷仍会在下方 remediate 阶段被隔离失活。
+    bulwark::EnforcementOutcome outcome = bulwark::EnforcementOutcome::AlertedOnly;
+    if (ev.actorPid > 4 && ProcessInspector::terminateProcessTree(ev.actorPid) > 0)
+        outcome = bulwark::EnforcementOutcome::Terminated;
+    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic, outcome);
 
     // 隔离载荷 + 清除持久化。
     int quarantined = 0, removed = 0, skipped = 0;
@@ -826,9 +850,11 @@ void Worker::onEgressMalicious(const bulwark::SecurityEvent& e, const QString& i
     ipc_->sendBlock(ev);
 
     // 补偿处置:结束外联进程树(用户态观测源无法在连接前阻断)。关键系统进程由内部安全门槛保护。
+    // 据真实结果如实记录;未能结束(进程已退出)时标 AlertedOnly。
     const int pid = ev.originatorPid > 0 ? ev.originatorPid : ev.actorPid;
-    if (pid > 4)
-        ProcessInspector::terminateProcessTree(pid);
+    bulwark::EnforcementOutcome outcome = bulwark::EnforcementOutcome::AlertedOnly;
+    if (pid > 4 && ProcessInspector::terminateProcessTree(pid) > 0)
+        outcome = bulwark::EnforcementOutcome::Terminated;
 
     using namespace bulwark::json;
     QJsonObject o;
@@ -843,18 +869,20 @@ void Worker::onEgressMalicious(const bulwark::SecurityEvent& e, const QString& i
     o["reasons"] = strListToJson(QStringList{
         QStringLiteral("微步 IP 信誉:远端 %1 判定为恶意%2").arg(ip, suffix) });
     audit_->writeRecord(o);
-    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic);
+    recordEvent(ev, VerdictAction::Block, VerdictSource::Heuristic, outcome);
 }
 
 // 登记到结构化事件历史 + 实时 EventLogEntry(见 Worker.h 说明)。异步补偿处置与用户
 // 裁决都经此,拦截记录 / 活动日志才看得到它们。
-void Worker::recordEvent(const SecurityEvent& e, VerdictAction action, VerdictSource source) {
-    ipc_->sendEventLog(e, action, source);
+void Worker::recordEvent(const SecurityEvent& e, VerdictAction action, VerdictSource source,
+                         bulwark::EnforcementOutcome enforcement) {
+    ipc_->sendEventLog(e, action, source, enforcement);
     if (eventHistory_) {
         bulwark::ipc::EventLogPayload p;
         p.event = e;
         p.action = action;
         p.source = source;
+        p.enforcement = enforcement;
         eventHistory_->add(p);
     }
 }

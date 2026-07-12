@@ -84,7 +84,6 @@ int main(int argc, char* argv[])
         ev.techniques = {QStringLiteral("T1055"), QStringLiteral("T1059.001")};
         auto* dlg = new PromptDialog(ev, &w);
         dlg->show();
-        w.previewNotifications(); // exercise the block + AI-scan toasts too
         QTimer::singleShot(1500, &app, &QApplication::quit);
     }
 

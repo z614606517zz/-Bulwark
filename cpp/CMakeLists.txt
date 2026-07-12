@@ -22,7 +22,7 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Core)
 
 add_subdirectory(shared)
-add_subdirectory(service)   # phase B: daemon (IPC server, simulated source, storage)
+add_subdirectory(service)   # phase B: daemon (IPC server, ETW source, storage)
 add_subdirectory(ui)        # phase 7: Qt Widgets front-end (redesigned)
 
 # --- Future phases (uncomment as each is implemented) -------------------------

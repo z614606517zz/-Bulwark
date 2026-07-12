@@ -2,8 +2,8 @@
 # Runs as a Windows service (or console for debugging). Mirrors the .NET
 # Bulwark.Service project. Links the shared contract/engine layer.
 #
-# PHASE B (minimal runnable daemon): storage + named-pipe IPC server + a
-# simulated event source wired to the RuleEngine, so the service runs and talks
+# PHASE B (minimal runnable daemon): storage + named-pipe IPC server + an ETW
+# event source wired to the RuleEngine, so the service runs and talks
 # to the UI end-to-end. Heavier modules (monitoring/ProcessInspector, the full
 # reputation clients, quarantine/remediation, kernel driver IPC) are ported in
 # later phases and added back below as they land.
@@ -52,7 +52,6 @@ qt_add_executable(bulwark_service
     include/bulwark/service/IpcServer.h
     include/bulwark/service/Worker.h
     src/IpcServer.cpp
-    src/SimulatedEventSource.cpp
     src/EtwProcessEventSource.cpp
     # kernel driver (R0) integration: minifilter comms + auto register/load
     src/DriverEventSource.cpp

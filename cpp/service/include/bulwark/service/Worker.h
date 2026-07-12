@@ -78,8 +78,10 @@ private:
     void enrich(bulwark::SecurityEvent& e);
     // 用 OS API 回溯完整父进程祖先链,种入 e.chainContext(即便跟踪器无历史也保证溯源完整)。
     void seedAncestryChain(bulwark::SecurityEvent& e);
-    // 用户态观测源的拦截:动作已发生,只能事后补偿——结束作恶进程树(带关键进程防护)。
-    void enforceBlock(const bulwark::SecurityEvent& e);
+    // 拦截的实际执行,并【返回真实结果】。内核已前拦的事件(kernelBlocked)直接如实返回
+    // KernelBlocked 不再补杀;观测型事件(动作已发生)结束作恶进程树(带关键进程防护),对侧载
+    // 模块额外加入内核禁止加载名单。返回值供 UI 如实显示处置,杜绝假拦截。
+    bulwark::EnforcementOutcome enforceBlock(const bulwark::SecurityEvent& e);
     // 对确定性恶意(命中规则 / 启发式)的进程主体:隔离磁盘载荷 + 清除自启动持久化。
     void remediateIfMalicious(const bulwark::SecurityEvent& e, const bulwark::Verdict& v);
     // 后台线程:确认恶意后顺带拉取样本行为画像(VT 沙箱报告),再编组回主线程处置。
@@ -118,7 +120,9 @@ private:
     // 并实时推送一条 EventLogEntry。同步派发外的路径——异步补偿处置(信誉 / AI / IP 判恶)
     // 与用户裁决——都必须经此,否则它们只发了拦截 toast、写了审计,却不会出现在拦截记录里。
     void recordEvent(const bulwark::SecurityEvent& e, bulwark::VerdictAction action,
-                     bulwark::VerdictSource source);
+                     bulwark::VerdictSource source,
+                     bulwark::EnforcementOutcome enforcement =
+                         bulwark::EnforcementOutcome::NotApplicable);
     void writeAudit(const bulwark::SecurityEvent& e, bulwark::VerdictAction action,
                     bulwark::VerdictSource source);
     QString describe(const bulwark::SecurityEvent& e, bulwark::VerdictAction action) const;

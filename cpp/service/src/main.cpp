@@ -527,13 +527,10 @@ static int serviceRun(int argc, char** argv) {
     if (!ipc.start())
         log.warning(QStringLiteral("IPC 控制管道监听失败;UI 将无法连接。"));
 
-    // 基础用户态事件源(始终运行):EventSource="Simulated" 用模拟源(演示);否则(默认
-    // "Wmi"/其它/"Driver")用 ETW 实时观测源。ETW 需管理员权限,不可用时降级但服务照常运行。
+    // 基础用户态事件源(始终运行):ETW 实时观测源(进程/网络/DNS/注册表/文件)。
+    // ETW 需管理员权限,不可用时降级但服务照常运行。
     std::unique_ptr<EventSource> baseSource;
-    if (options.EventSource.compare(QStringLiteral("Simulated"), Qt::CaseInsensitive) == 0) {
-        baseSource = std::make_unique<SimulatedEventSource>();
-        log.info(QStringLiteral("基础事件源 = Simulated(模拟演示)。"));
-    } else {
+    {
         auto etwSource = std::make_unique<EtwProcessEventSource>(options.Etw);
         // 注册表/文件 ETW 监视集:受保护键/路径 + 硬拦列表。只有命中监视集的写/删才上报,
         // 避免全量事件洪泛(与驱动的受保护路径模型一致)。空监视集则不产生该类事件。

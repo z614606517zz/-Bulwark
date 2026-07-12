@@ -2,8 +2,6 @@
 #include <QObject>
 #include "bulwark/models/SecurityEvent.h"
 
-class QTimer;
-
 namespace bulwark::service {
 
 // 事件源抽象:持续产出安全事件(Qt 信号驱动,无需后台线程)。
@@ -20,30 +18,19 @@ public:
 
     // ---- 同步裁决回写(仅内核驱动等「行为前」阻塞源需要)----------------------
     // 内核驱动在动作发生前同步等待用户态裁决:引擎判定后必须把 Allow/Block 回写内核
-    // (FilterReplyMessage),否则内核超时兜底。纯观测源(ETW/WMI/模拟)无法在动作前
+    // (FilterReplyMessage),否则内核超时兜底。纯观测源(ETW/WMI)无法在动作前
     // 阻断,保持默认空实现,拦截由 Worker 事后补偿(结束进程树)。
     // wantsVerdict()==true 时,Worker 会在得出终裁后调用 submitVerdict。
     virtual bool wantsVerdict() const { return false; }
     virtual void submitVerdict(const bulwark::SecurityEvent& /*e*/,
                                bulwark::VerdictAction /*action*/) {}
 
+    // 把已确认恶意的侧载 DLL/EXE 加入内核「禁止加载」名单(命中即内核前拦执行/映射打开)。
+    // 仅内核驱动源真正实现;纯观测源保持空实现返回 false。用于镜像加载 Block 的真实前拦(下次)。
+    virtual bool blockModuleLoad(const QString& /*modulePath*/) { return false; }
+
 signals:
     void eventProduced(const bulwark::SecurityEvent& e);
-};
-
-// 模拟事件源(M1 打通 服务<->UI 链路,无需驱动即可演示完整流程)。
-// 周期性产生若干代表性敏感行为事件。对应 .NET Monitoring/SimulatedEventSource.cs。
-class SimulatedEventSource : public EventSource {
-    Q_OBJECT
-public:
-    explicit SimulatedEventSource(QObject* parent = nullptr);
-    void start() override;
-    void stop() override;
-
-private:
-    void tick();
-    QTimer* timer_ = nullptr;
-    int index_ = 0;
 };
 
 } // namespace bulwark::service

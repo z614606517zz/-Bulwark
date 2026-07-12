@@ -51,6 +51,9 @@ struct SecurityEvent {
     bool hasThreatIndicator = false;      // 是否出现"硬"恶意指标
     QString matchedRuleNote;              // 可空:命中规则说明
     bool userModeObserved = false;        // 用户态观测源产生(需事后补偿处置)
+    bool kernelBlocked = false;           // 该事件对应的操作已被内核在【发生前】真正阻断
+                                          //(STATUS_ACCESS_DENIED / 剥权 / WFP BLOCK / 禁止加载),
+                                          // 用于如实区分「真前拦」与「事后处置」,避免假拦截显示。
     bool userTrusted = false;             // 运行时:命中用户明确信任(文件/文件夹),引擎在检测前放行,
                                           // Worker 据此跳过全部后台扫描(VT/IP/AI)。运行时标记,不序列化。
     bool memoryInjection = false;         // 内存防护(反注入)命中

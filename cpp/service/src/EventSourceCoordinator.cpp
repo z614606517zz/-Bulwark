@@ -116,6 +116,10 @@ void EventSourceCoordinator::addBlockedIp(const QString& ip, quint16 port) {
     if (driver_) driver_->addBlockedIp(ip, port);
 }
 
+bool EventSourceCoordinator::blockModuleLoad(const QString& modulePath) {
+    return driver_ ? driver_->blockModuleLoad(modulePath) : false;
+}
+
 void EventSourceCoordinator::onBaseEvent(const bulwark::SecurityEvent& e) {
     // 内核已接管进程事件时,丢弃基础源的进程创建/退出,避免与内核源重复上报。
     if (kernelConnected() &&

@@ -68,6 +68,18 @@ enum class VtRequestKind {
     UsageStats,           // 各源用量统计
 };
 
+// 拦截的「实际执行结果」——与 VerdictAction(裁决意图)严格区分:裁决为 Block 不代表真的拦住了。
+// UI / 审计据此如实显示处置,杜绝「判了 Block 就显示已拦截、实则毫无动作」的假拦截提示。
+enum class EnforcementOutcome {
+    NotApplicable = 0, // 放行/询问,或未进入处置阶段
+    KernelBlocked,     // 内核前拦截:操作发生前即被真正阻断(文件/注册表硬拦名单、受保护路径删除、
+                       //             禁止加载名单、自我保护剥权、反注入剥权、黑名单 IP 的 WFP 阻断)
+    Terminated,        // 事后补偿:动作已发生,作恶进程树已被真实结束(OpenProcess+TerminateProcess)
+    ModuleBlacklisted, // 侧载模块已加入内核禁止加载名单:本次未拦下,但下次加载将被内核前拦
+    Failed,            // 尝试处置但未成功(进程已退出 / 受保护 / 关键进程,无法结束)
+    AlertedOnly,       // 仅告警:未做任何实际阻断(内核无法前拦且无可结束的进程),需人工关注
+};
+
 // ---- EvidenceKind <-> string (wire form) ------------------------------------
 inline QString evidenceKindToString(EvidenceKind k) {
     switch (k) {
@@ -129,6 +141,18 @@ inline QString verdictSourceToString(VerdictSource s) {
         case VerdictSource::DefaultPolicy: return QStringLiteral("DefaultPolicy");
     }
     return QStringLiteral("Rule");
+}
+
+inline QString enforcementOutcomeToString(EnforcementOutcome o) {
+    switch (o) {
+        case EnforcementOutcome::NotApplicable:     return QStringLiteral("NotApplicable");
+        case EnforcementOutcome::KernelBlocked:     return QStringLiteral("KernelBlocked");
+        case EnforcementOutcome::Terminated:        return QStringLiteral("Terminated");
+        case EnforcementOutcome::ModuleBlacklisted: return QStringLiteral("ModuleBlacklisted");
+        case EnforcementOutcome::Failed:            return QStringLiteral("Failed");
+        case EnforcementOutcome::AlertedOnly:       return QStringLiteral("AlertedOnly");
+    }
+    return QStringLiteral("NotApplicable");
 }
 
 } // namespace bulwark

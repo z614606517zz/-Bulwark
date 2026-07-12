@@ -13,12 +13,11 @@ Monitor sensitive system behavior → rule engine decides → prompt the user fo
 3. Decision priority: matched rule → threat score / hard malicious indicators → strongly-trusted signature → default policy.
 4. When no rule applies and the actor is untrusted, the UI shows a behavior prompt; the user can choose Allow/Block and optionally persist the choice as a rule.
 
-## Three Switchable Event Sources
+## Two Switchable Event Sources
 
 Configured via `EventSource` in `appsettings.json`:
 - **Driver** — kernel-mode interception (true pre-action blocking; covers process/file/registry/self-protection/network milestones M2–M6).
 - **Wmi** — user-mode observation (cannot block before the action; blocking is compensated by terminating the actor).
-- **Simulated** — demo mode, no real-system monitoring.
 
 ## Design Principles
 
