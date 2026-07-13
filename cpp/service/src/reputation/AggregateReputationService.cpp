@@ -70,6 +70,10 @@ bulwark::FileReputation AggregateReputationService::merge(
 }
 
 bulwark::FileReputation AggregateReputationService::query(const QString& sha256) {
+    return query(sha256, false);
+}
+
+bulwark::FileReputation AggregateReputationService::query(const QString& sha256, bool priority) {
     bulwark::FileReputation unknown;
     unknown.sha256 = sha256;
     if (sha256.isEmpty())
@@ -77,11 +81,13 @@ bulwark::FileReputation AggregateReputationService::query(const QString& sha256)
 
     // 顺序查询各已启用源(本方法在 ReputationManager 后台线程调用,阻塞可接受)。
     // 每个客户端自身 fail-open(失败/超时返回 Unknown),单源异常不影响整体。
+    // priority 透传给各源:VT 会据此占用预留的优先级配额(供内存防护/反注入验证低延迟命中,
+    // 尽量不被双击查杀等普通查询挤占)。不支持优先级的源默认忽略该参数。
     QVector<bulwark::FileReputation> results;
     for (const auto& s : sources_) {
         if (!isActive(s.get()))
             continue;
-        bulwark::FileReputation r = s->query(sha256);
+        bulwark::FileReputation r = s->query(sha256, priority);
         if (r.source.isEmpty())
             r.source = s->name(); // 记录该结论来自哪个源,供合并后标注命中来源
         results.append(r);

@@ -26,7 +26,7 @@ std::optional<bulwark::FileReputation> ReputationManager::tryGetCached(const QSt
     return cache_->tryGetForEnrichment(sha256);
 }
 
-bulwark::FileReputation ReputationManager::queryNow(const QString& sha256) {
+bulwark::FileReputation ReputationManager::queryNow(const QString& sha256, bool priority) {
     bulwark::FileReputation unknown;
     unknown.sha256 = sha256;
     if (sha256.isEmpty() || !client_)
@@ -37,7 +37,7 @@ bulwark::FileReputation ReputationManager::queryNow(const QString& sha256) {
         if (cached.has_value())
             return cached.value();
     }
-    bulwark::FileReputation rep = client_->query(sha256); // 阻塞(调用方线程,用户主动触发)
+    bulwark::FileReputation rep = client_->query(sha256, priority); // 阻塞(调用方线程)
     rep.sha256 = sha256;
     if (cache_)
         cache_->store(rep);

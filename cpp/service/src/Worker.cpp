@@ -131,7 +131,8 @@ Worker::Worker(bulwark::engine::RuleEngine* engine, IpcServer* ipc, EventSource*
                QuarantineManager* quarantine, reputation::ReputationManager* reputation,
                const bulwark::RuntimeSettings* settings, QObject* parent)
     : QObject(parent), engine_(engine), ipc_(ipc), ruleStore_(ruleStore), audit_(audit),
-      firstSeen_(firstSeen), quarantine_(quarantine), reputation_(reputation), settings_(settings) {
+      firstSeen_(firstSeen), quarantine_(quarantine), reputation_(reputation), settings_(settings),
+      memVtBucket_(4, 3600000) { // 内存防护 VT 验证限流桶:默认 4/小时(由 BulwarkOptions.MemoryProtectionVtVerifyPerHour 配置)
     if (quarantine)
         remediator_ = std::make_unique<ThreatRemediator>(*quarantine, Logger(QStringLiteral("Remediator")));
     if (reputation_) {
@@ -233,6 +234,11 @@ void Worker::onEvent(const SecurityEvent& incoming) {
     // 目录的安装包/可执行体直接送 VT 扫描(不依赖执行、不抢命令行),命中恶意即隔离文件(不杀写入方)。
     if (!skipDetection && e.type == bulwark::EventType::FileWrite && v.action != VerdictAction::Block)
         maybeScanDroppedInstaller(e);
+
+    // 内存防护 VT 验证:内核驱动已阻止跨进程注入(ObRegisterCallbacks 剥权),但注入源是恶意
+    // 程序还是正常软件的误触仍需确认。限流(默认 4/小时)查 VT,命中恶意则补偿处置。
+    if (!skipDetection && e.memoryInjection && settings_ && settings_->memoryProtectionVtVerifyEnabled)
+        maybeVerifyMemoryInjection(e);
 
     // AI 大模型研判(可选补充,默认关):双击查杀的主路径是 VirusTotal(上面的 maybeScanDoubleClick)。
     // 只有当用户显式开启「灰区 AI 会诊」(aiGrayZoneConsultEnabled)时,才对未拦截的双击/释放载荷
@@ -598,6 +604,15 @@ void Worker::confirmReputationMaliciousAsync(const SecurityEvent& e, const bulwa
     const QString sha = !rep.sha256.isEmpty() ? rep.sha256 : e.actorHash;
     if (reputation_ && !sha.isEmpty())
         profile = reputation_->fetchBehaviorProfile(sha); // 聚合 VT + HA 等各源的行为画像
+    // 据「已知恶意哈希」(样本自身 + VT 释放物哈希)在本机落地区按哈希精确定位实际落地的文件,
+    // 交由 remediate 隔离(即使带合法数字签名也照隔离,如 BYOVD 驱动)。只读、有界扫描,在此
+    // 后台线程执行——绝不阻塞主线程。无哈希则为空,处置照旧降级为「隔离主体 + 清持久化」。
+    {
+        QStringList hashTargets = profile.droppedFileHashes;
+        if (sha.size() == 64) hashTargets << sha.toLower();
+        if (!hashTargets.isEmpty())
+            profile.locatedLocalPaths = ThreatRemediator::locateDroppedFilesByHash(hashTargets);
+    }
     QMetaObject::invokeMethod(
         this, [this, e, rep, profile] { onReputationMalicious(e, rep, profile); },
         Qt::QueuedConnection);
@@ -675,9 +690,14 @@ void Worker::onReputationMalicious(const SecurityEvent& e, const bulwark::FileRe
         // 情报补充摘要(供 UI「清理报告」展示:该样本已知会做什么 + 已生成多少主动拦截规则)。
         payload.intelSource = profile.source;
         payload.intelDroppedFiles = profile.droppedFileNames;
+        payload.intelDroppedFilePaths = profile.droppedFilePaths;
+        payload.intelDroppedFileHashes = profile.droppedFileHashes;
         payload.intelRegistryKeys = profile.registryKeysSet;
         payload.intelContactedIps = profile.contactedIps;
         payload.intelContactedDomains = profile.contactedDomains;
+        payload.intelServices = profile.serviceNames;
+        payload.intelProcessNames = profile.processNames;
+        payload.intelMutexes = profile.mutexes;
         payload.intelRulesInjected = injectedRules;
         ipc_->sendRemediationReport(payload);
     }
@@ -1113,6 +1133,56 @@ void Worker::maybeScanDroppedInstaller(const bulwark::SecurityEvent& e) {
     }
     vtCv_.wakeOne();
     log_.info(QStringLiteral("安装包/可执行体落盘送 VirusTotal 扫描:%1").arg(path));
+}
+
+void Worker::maybeVerifyMemoryInjection(const bulwark::SecurityEvent& e) {
+    // 内存防护 VT 验证:内核 ObRegisterCallbacks 已在打开句柄时剥离写内存/远程线程/
+    // 挂起/结束权限,注入已被阻止。这里只做追溯验证——确认注入源是否恶意,以便补偿处置。
+    const QString hash = e.actorHash;
+    if (hash.size() != 64) {
+        // 哈希为空时跳过(注入事件可能来自短命进程,未完成签名/哈希富化)。
+        if (!e.actorPath.isEmpty() && e.actorPid > 4)
+            log_.debug(QStringLiteral("内存防护 VT 验跳过(无哈希):%1 PID %2")
+                           .arg(e.actorPath).arg(e.actorPid));
+        return;
+    }
+    {   QMutexLocker lk(&memVtMx_);
+        if (memVtCachedMalicious_.contains(hash))
+            return; // 已确认过恶意,不必重复查
+    }
+    if (!memVtBucket_.tryConsume(false)) {
+        log_.debug(QStringLiteral("内存防护 VT 验证跳过(超限流,默认 4/小时):%1").arg(hash.left(12)));
+        return;
+    }
+    // 同步查 VT(限流 4/小时,1 次 HTTP 往返对主线程影响可忽略);priority=true 占用 VT 预留的
+    // 优先级配额,内存防护/反注入验证尽量不被双击查杀等普通查询挤占。
+    const bulwark::FileReputation rep = reputation_->queryNow(hash, /*priority=*/true);
+    if (!rep.querySucceeded) {
+        log_.debug(QStringLiteral("内存防护 VT 验证查询失败:%1").arg(hash.left(12)));
+        return;
+    }
+    if (rep.verdict != bulwark::ReputationVerdict::Malicious) {
+        log_.debug(QStringLiteral("内存防护 VT 验证:非恶意(%1/%2):%3")
+                       .arg(rep.malicious).arg(rep.totalEngines).arg(hash.left(12)));
+        return;
+    }
+    // VT 确认恶意:记缓存 + 补偿处置(注入已阻止,但仍需结束作恶进程树 + 隔离载荷)。
+    {
+        QMutexLocker lk(&memVtMx_);
+        memVtCachedMalicious_.insert(hash);
+        if (memVtCachedMalicious_.size() > 1024) {
+            // 有界缓存:移除最旧的 128 条。
+            auto it = memVtCachedMalicious_.begin();
+            for (int i = 0; i < 128 && it != memVtCachedMalicious_.end(); ++i)
+                it = memVtCachedMalicious_.erase(it);
+        }
+    }
+    log_.warning(QStringLiteral("内存防护 VT 验证:注入源确认恶意(%1/%2),Hash=%3,路径=%4")
+                     .arg(rep.malicious).arg(rep.totalEngines).arg(hash.left(16)).arg(e.actorPath));
+    // 编组回主线程补偿处置(与 onReputationMalicious 共享路径)。
+    QMetaObject::invokeMethod(this, [this, e, rep] {
+        onReputationMalicious(e, rep);
+    }, Qt::QueuedConnection);
 }
 
 void Worker::vtScanLoop() {

@@ -25,6 +25,17 @@ void TokenBucket::refill() {
     }
 }
 
+bool TokenBucket::tryConsume(bool priority) {
+    QMutexLocker lk(&mutex_);
+    refill();
+    const bool yieldToPriority = !priority && priorityWaiters_.load() > 0;
+    if (tokens_ >= 1.0 && !yieldToPriority) {
+        tokens_ -= 1.0;
+        return true;
+    }
+    return false;
+}
+
 void TokenBucket::wait(bool priority) {
     if (priority) priorityWaiters_.fetch_add(1);
     for (;;) {

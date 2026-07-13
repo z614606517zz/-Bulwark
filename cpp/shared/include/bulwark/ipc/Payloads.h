@@ -272,9 +272,14 @@ struct RemediationReportPayload {
     // 情报补充(VT 等沙箱行为画像):该样本已知会释放什么 / 外联何处 + 据此新注入的主动拦截规则数。
     QString intelSource;               // 提供画像的情报源名(可空)
     QStringList intelDroppedFiles;     // 已知释放文件名
+    QStringList intelDroppedFilePaths; // 已知释放文件完整沙箱路径(供 AI 翻译到本机)
+    QStringList intelDroppedFileHashes;// 已知释放文件 SHA256
     QStringList intelRegistryKeys;     // 已知写入的注册表键
     QStringList intelContactedIps;     // 已知 C2 外联 IP
     QStringList intelContactedDomains; // 已知 C2 外联域名
+    QStringList intelServices;         // 已知创建/启动的服务名
+    QStringList intelProcessNames;     // 已知创建的可执行名
+    QStringList intelMutexes;          // 已知互斥体
     int intelRulesInjected = 0;        // 据画像新注入的主动拦截规则数
     QJsonObject toJson() const;
     static RemediationReportPayload fromJson(const QJsonObject& o);

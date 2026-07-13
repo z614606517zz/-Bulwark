@@ -1,20 +1,28 @@
 #include "dialogs/RemediationReportDialog.h"
+#include "ai/AiScanner.h"
 #include "ipc/IpcClient.h"
 #include "widgets/AppIcon.h"
 #include "widgets/Cards.h"
 #include "widgets/Ui.h"
 #include "Theme.h"
 
+#include <QApplication>
+#include <QClipboard>
+#include <QDir>
 #include <QFileInfo>
 #include <QGraphicsDropShadowEffect>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMessageBox>
 #include <QMouseEvent>
+#include <QPlainTextEdit>
+#include <QProcess>
 #include <QPushButton>
 #include <QScreen>
 #include <QScrollArea>
 #include <QShowEvent>
+#include <QTemporaryFile>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -70,8 +78,8 @@ QWidget* pathRow(const QString& path, const QString& note = QString())
 } // namespace
 
 RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload& report,
-                                                 IpcClient* ipc, QWidget* parent)
-    : QDialog(parent), m_ipc(ipc)
+                                                 IpcClient* ipc, AiScanner* ai, QWidget* parent)
+    : QDialog(parent), m_ipc(ipc), m_ai(ai), m_actorName(QFileInfo(report.actorPath).fileName())
 {
     setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
     setAttribute(Qt::WA_TranslucentBackground);
@@ -217,29 +225,120 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
 
     // ── 情报补充:该样本(据 VT 等沙箱行为画像)已知会释放 / 外联什么。既解释了上面为何清理
     //    这些项,也说明了据此生成的主动拦截规则覆盖了哪些 IOC。────────────────────────
-    {
-        const bool hasIntel = !report.intelDroppedFiles.isEmpty()
-                           || !report.intelContactedIps.isEmpty()
-                           || !report.intelContactedDomains.isEmpty()
-                           || !report.intelRegistryKeys.isEmpty();
-        if (hasIntel) {
-            const QString src = report.intelSource.trimmed().isEmpty() ? u("威胁情报")
-                                                                       : report.intelSource;
-            list->addWidget(sectionHead(u("情报补充 · ") + src, theme::accentAlt(), 0));
-            auto addCapped = [&](const QString& title, const QStringList& items) {
-                if (items.isEmpty()) return;
-                list->addWidget(pathRow(title + u("(") + QString::number(items.size()) + u(" 项)")));
-                const int cap = 10;
-                for (int i = 0; i < items.size() && i < cap; ++i)
-                    list->addWidget(pathRow(QStringLiteral("· ") + items[i]));
-                if (items.size() > cap)
-                    list->addWidget(pathRow(u("…… 还有 ") + QString::number(items.size() - cap) + u(" 项")));
-            };
-            addCapped(u("已知释放文件"), report.intelDroppedFiles);
-            addCapped(u("已知外联 IP"), report.intelContactedIps);
-            addCapped(u("已知外联域名"), report.intelContactedDomains);
-            addCapped(u("已知写入注册表"), report.intelRegistryKeys);
-        }
+    const bool hasIntel = !report.intelDroppedFiles.isEmpty()
+                       || !report.intelContactedIps.isEmpty()
+                       || !report.intelContactedDomains.isEmpty()
+                       || !report.intelRegistryKeys.isEmpty();
+    if (hasIntel) {
+        const QString src = report.intelSource.trimmed().isEmpty() ? u("威胁情报")
+                                                                   : report.intelSource;
+        list->addWidget(sectionHead(u("情报补充 · ") + src, theme::accentAlt(), 0));
+        auto addCapped = [&](const QString& title, const QStringList& items) {
+            if (items.isEmpty()) return;
+            list->addWidget(pathRow(title + u("(") + QString::number(items.size()) + u(" 项)")));
+            const int cap = 10;
+            for (int i = 0; i < items.size() && i < cap; ++i)
+                list->addWidget(pathRow(QStringLiteral("· ") + items[i]));
+            if (items.size() > cap)
+                list->addWidget(pathRow(u("…… 还有 ") + QString::number(items.size() - cap) + u(" 项")));
+        };
+        addCapped(u("已知释放文件"), report.intelDroppedFiles);
+        addCapped(u("已知外联 IP"), report.intelContactedIps);
+        addCapped(u("已知外联域名"), report.intelContactedDomains);
+        addCapped(u("已知写入注册表"), report.intelRegistryKeys);
+    }
+
+    // ── AI 清理脚本:基于 VT 行为画像由 AI 生成 PowerShell 清理脚本───────────────
+    if (m_ai && m_ai->isConfigured() && hasIntel) {
+        list->addWidget(ui::hDivider());
+        list->addWidget(sectionHead(u("AI 清理脚本"), theme::accent(), 0));
+        m_genBtn = new QPushButton(u("🤖 生成清理脚本"));
+        m_genBtn->setProperty("variant", "primary");
+        m_genBtn->setCursor(Qt::PointingHandCursor);
+        connect(m_genBtn, &QPushButton::clicked, this, [this, report] {
+            m_genBtn->setEnabled(false);
+            m_genBtn->setText(u("AI 生成中…"));
+            m_ai->generateCleanupScript(report);
+        });
+        list->addWidget(m_genBtn);
+
+        m_scriptView = new QPlainTextEdit;
+        m_scriptView->setReadOnly(true);
+        m_scriptView->setFont(QFont(QStringLiteral("Consolas"), 9));
+        m_scriptView->setMaximumHeight(250);
+        m_scriptView->setPlaceholderText(u("点击上方按钮,AI 将基于威胁情报生成清理脚本…"));
+        m_scriptView->hide();
+        list->addWidget(m_scriptView);
+
+        auto* actionRow = new QHBoxLayout;
+        actionRow->setSpacing(8);
+        m_copyBtn = new QPushButton(u("📋 复制脚本"));
+        m_copyBtn->setProperty("variant", "ghost");
+        m_copyBtn->setCursor(Qt::PointingHandCursor);
+        m_copyBtn->hide();
+        connect(m_copyBtn, &QPushButton::clicked, this, [this] {
+            QApplication::clipboard()->setText(m_scriptView->toPlainText());
+            m_copyBtn->setText(u("✅ 已复制"));
+        });
+        actionRow->addWidget(m_copyBtn);
+
+        m_runBtn = new QPushButton(u("▶ 一键执行(需确认)"));
+        m_runBtn->setProperty("variant", "primary");
+        m_runBtn->setCursor(Qt::PointingHandCursor);
+        m_runBtn->hide();
+        connect(m_runBtn, &QPushButton::clicked, this, [this] {
+            const QString title = u("确认执行清理脚本");
+            const QString msg = u("即将执行 AI 生成的 PowerShell 清理脚本,该脚本会:\n"
+                                  "1. 尝试终止相关进程\n"
+                                  "2. 删除释放的文件\n"
+                                  "3. 清理注册表项\n"
+                                  "4. 添加防火墙/hosts 阻断规则\n\n"
+                                  "请确认脚本内容后再执行。要继续吗?");
+            if (QMessageBox::warning(this, title, msg,
+                                     QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+                return;
+            QTemporaryFile tmp(QDir::tempPath() + QStringLiteral("/bulwark_cleanup_XXXXXX.ps1"));
+            if (tmp.open()) {
+                tmp.write(m_scriptView->toPlainText().toUtf8());
+                tmp.flush();
+                const QString scriptPath = tmp.fileName();
+                tmp.setAutoRemove(false);
+                tmp.close();
+                QProcess::startDetached(QStringLiteral("powershell"),
+                    { QStringLiteral("-NoProfile"), QStringLiteral("-ExecutionPolicy"),
+                      QStringLiteral("Bypass"), QStringLiteral("-File"), scriptPath });
+            }
+        });
+        actionRow->addWidget(m_runBtn);
+        actionRow->addStretch();
+        auto* actionW = new QWidget;
+        actionW->setLayout(actionRow);
+        actionW->hide();
+        list->addWidget(actionW);
+
+        // Store action widgets for show/hide on completion.
+        struct Scope {
+            QPushButton* copy;
+            QPushButton* run;
+            QPlainTextEdit* view;
+            QWidget* row;
+        };
+        auto* scope = new Scope{ m_copyBtn, m_runBtn, m_scriptView, actionW };
+        connect(m_ai, &AiScanner::cleanupScriptGenerated, this,
+                [this, scope](const QString& script) {
+            m_genBtn->setText(u("🤖 重新生成"));
+            m_genBtn->setEnabled(true);
+            if (script.isEmpty()) {
+                m_scriptView->setPlainText(u("AI 生成失败(网络/模型不可用)"));
+                m_scriptView->show();
+                return;
+            }
+            m_scriptView->setPlainText(script);
+            m_scriptView->show();
+            scope->copy->show();
+            scope->run->show();
+            scope->row->show();
+        });
     }
 
     list->addStretch();

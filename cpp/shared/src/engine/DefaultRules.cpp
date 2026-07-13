@@ -159,6 +159,7 @@ void addImHarvestAndFrameworkRules(QVector<DefenseRule>& list);
 void addDeepPersistenceRules(QVector<DefenseRule>& list);
 void addCmdlineEvasionRules(QVector<DefenseRule>& list);
 void addNetworkC2Rules(QVector<DefenseRule>& list);
+void addSilverFoxWdacByovdRules(QVector<DefenseRule>& list);
 
 const QSet<QString>& devToolProcessNames() {
     static const QSet<QString> s = {
@@ -221,6 +222,7 @@ QVector<DefenseRule> DefaultRules::build() {
     addDeepPersistenceRules(list);
     addCmdlineEvasionRules(list);
     addNetworkC2Rules(list);
+    addSilverFoxWdacByovdRules(list);
     return list;
 }
 
@@ -1212,6 +1214,88 @@ void addNetworkC2Rules(QVector<DefenseRule>& list) {
     netActor(list, "*\\docker.exe", "Docker 发起网络外联(容器工具)");
     netActor(list, "*\\npm.exe", "npm 发起网络外联(包管理器)");
     netActor(list, "*\\yarn.exe", "yarn 发起网络外联(包管理器)");
+}
+
+}} // namespace bulwark::engine :: anonymous
+
+namespace bulwark::engine { namespace {
+
+// 本机实捕的银狐(SilverFox/ValleyRAT)战役规则:补齐本轮攻击暴露的盲区——BYOVD 驱动改名 .jpg
+// 放 \Windows\Temp\ 规避"仅.sys"旧规则、用 WDAC 策略瘫痪安全软件、32 位 svchost 伪装。
+// 精确 IOC 哈希 / "图片文件被当模块加载" / "SysWOW64 svchost" = 硬指标 Block;
+// WDAC 策略写入用可信 OS 组件豁免,避免误伤 Windows 自身维护。
+void addSilverFoxWdacByovdRules(QVector<DefenseRule>& list) {
+    // 1) 精确 IOC:本机实捕样本哈希(任意事件类型命中即硬拦,大小写各存一份以防匹配端大小写差异)
+    auto hashBlock = [&](const char* sha256, const char* n) {
+        DefenseRule r;
+        const QString h = QString::fromLatin1(sha256);
+        r.actorHashes.insert(h.toUpper());
+        r.actorHashes.insert(h.toLower());
+        r.action = VerdictAction::Block;
+        r.hardOverride = true;
+        r.note = note(n);
+        list.append(r);
+    };
+    hashBlock("EB605363DED7B7798921E76BD2421DD8EF8FC9DF14D3C515F23633D91FBDD86E",
+              "\xe9\x93\xb6\xe7\x8b\x90 BYOVD:Adlice/TrueSight \xe9\xa9\xb1\xe5\x8a\xa8(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95 ranchserv.jpg,\xe5\x85\xb3\xe6\x9d\x80\xe8\xbd\xaf)");
+    hashBlock("62736A42086961DDBCD329CC48E656EEE20ECF518658DB5EA36465F42F210889",
+              "\xe9\x93\xb6\xe7\x8b\x90:\xe9\x87\x8a\xe6\x94\xbe\xe5\x99\xa8/\xe8\xbd\xbd\xe8\x8d\xb7(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95 ProgramData \xe9\x9a\x8f\xe6\x9c\xba\xe7\x9b\xae\xe5\xbd\x95 bzSTJXfc.exe)");
+    hashBlock("BEF9D2E205BB36349CAF2279C11E0604C4C67D02FF2CEF80696529D26A58461B",
+              "\xe9\x93\xb6\xe7\x8b\x90:\xe7\x99\xbd\xe5\x8a\xa0\xe9\xbb\x91\xe4\xbe\xa7\xe8\xbd\xbd\xe6\x81\xb6\xe6\x84\x8f\xe6\xa8\xa1\xe5\x9d\x97 log.dll(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95,hotaj \xe9\xa1\xba\xe7\xbd\x91\xe7\xad\xbe\xe5\x90\x8d\xe5\xae\xbf\xe4\xb8\xbb\xe6\x97\x81)");
+    hashBlock("8FA14771A5971D2A14C8F5BB392136C83F22A6B4A5880E2BF910D359AEB2FF80",
+              "\xe9\x93\xb6\xe7\x8b\x90:\xe4\xbc\xaa\xe8\xa3\x85 MicrosoftEdgeUpdate \xe7\x9a\x84\xe8\xbd\xbd\xe8\x8d\xb7(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95,Windows Sidebar \xe7\x9b\xae\xe5\xbd\x95)");
+
+    // 2) 图片/数据扩展名的文件被当作模块/驱动加载 = 必恶意(如 ranchserv.jpg 改名规避)。
+    static const char* kDisguisedModulePaths[] = {
+        "*\\Temp\\*.jpg", "*\\Temp\\*.png", "*\\Temp\\*.gif", "*\\Temp\\*.bmp",
+        "*\\Temp\\*.dat", "*\\Temp\\*.tmp", "*\\Temp\\*.log", "*\\Temp\\*.ico",
+        "*\\Users\\Public\\*.jpg", "*\\Users\\Public\\*.png", "*\\Users\\Public\\*.dat",
+        "*\\ProgramData\\*.jpg", "*\\ProgramData\\*.dat", "*\\AppData\\*.jpg",
+    };
+    for (const char* p : kDisguisedModulePaths) {
+        DefenseRule r; r.type = EventType::ImageLoad; r.targetPattern = QLatin1String(p);
+        r.action = VerdictAction::Block; r.hardOverride = true;
+        r.note = note("\xe9\x93\xb6\xe7\x8b\x90:\xe5\x8a\xa0\xe8\xbd\xbd\xe4\xbc\xaa\xe8\xa3\x85\xe6\x88\x90\xe5\x9b\xbe\xe7\x89\x87/\xe6\x95\xb0\xe6\x8d\xae\xe6\x96\x87\xe4\xbb\xb6\xe7\x9a\x84\xe5\x8f\xaf\xe6\x89\xa7\xe8\xa1\x8c\xe6\xa8\xa1\xe5\x9d\x97(\xe5\xae\x9e\xe4\xb8\xba PE \xe9\xa9\xb1\xe5\x8a\xa8/DLL,\xe5\xa6\x82 ranchserv.jpg)");
+        list.append(r);
+    }
+    // 从 \Windows\Temp\ 加载内核驱动(.sys)——补齐旧规则仅覆盖 AppData/Public 的盲区。
+    ilRule(list, "*\\Windows\\Temp\\*.sys", nullptr, false, VerdictAction::Block,
+           "\xe9\x93\xb6\xe7\x8b\x90 BYOVD:\xe4\xbb\x8e Windows\\Temp \xe5\x8a\xa0\xe8\xbd\xbd\xe5\x86\x85\xe6\xa0\xb8\xe9\xa9\xb1\xe5\x8a\xa8(.sys)");
+
+    // 3) 32 位 SysWOW64\svchost.exe 运行 = 必恶意(真 svchost 只在 System32);actorPattern 匹配被创建进程。
+    {
+        DefenseRule r; r.type = EventType::ProcessCreate;
+        r.actorPattern = QStringLiteral("*\\SysWOW64\\svchost.exe");
+        r.action = VerdictAction::Block; r.hardOverride = true;
+        r.note = note("\xe9\x93\xb6\xe7\x8b\x90:\xe4\xbb\x8e SysWOW64 \xe8\xbf\x90\xe8\xa1\x8c svchost(32 \xe4\xbd\x8d svchost \xe5\xbf\x85\xe4\xb8\xba\xe4\xbc\xaa\xe8\xa3\x85,\xe5\xa6\x82 -k netcssv \xe5\x81\x87\xe6\x9c\x8d\xe5\x8a\xa1\xe7\xbb\x84)");
+        list.append(r);
+    }
+
+    // 4) 用 WDAC 应用程序控制策略瘫痪安全软件(本轮攻击手法);可信 OS 组件豁免,避免误伤系统维护。
+    {
+        DefenseRule r; r.type = EventType::FileWrite;
+        r.targetPattern = QStringLiteral("*\\CodeIntegrity\\SiPolicy.p7b");
+        r.action = VerdictAction::Block; r.exemptTrustedOsComponent = true;
+        r.note = note("\xe9\x93\xb6\xe7\x8b\x90:\xe9\x83\xa8\xe7\xbd\xb2 WDAC \xe7\xad\x96\xe7\x95\xa5 SiPolicy.p7b(\xe7\x94\xa8\xe5\xba\x94\xe7\x94\xa8\xe7\xa8\x8b\xe5\xba\x8f\xe6\x8e\xa7\xe5\x88\xb6\xe7\x98\xab\xe7\x97\xaa\xe6\x9d\x80\xe8\xbd\xaf/EDR/\xe6\x9c\xac\xe6\x9c\xba\xe9\x98\xb2\xe6\x8a\xa4)");
+        list.append(r);
+    }
+    {
+        DefenseRule r; r.type = EventType::FileWrite;
+        r.targetPattern = QStringLiteral("*\\CodeIntegrity\\CiPolicies\\Active\\*");
+        r.action = VerdictAction::Block; r.exemptTrustedOsComponent = true;
+        r.note = note("\xe9\x93\xb6\xe7\x8b\x90:\xe5\x86\x99\xe5\x85\xa5 WDAC \xe5\xa4\x9a\xe7\xad\x96\xe7\x95\xa5(CiPolicies\\Active,\xe7\x98\xab\xe7\x97\xaa\xe5\xae\x89\xe5\x85\xa8\xe8\xbd\xaf\xe4\xbb\xb6\xe7\x9a\x84\xe5\xba\x94\xe7\x94\xa8\xe7\xa8\x8b\xe5\xba\x8f\xe6\x8e\xa7\xe5\x88\xb6)");
+        list.append(r);
+    }
+    cmd(list, "*CiTool*update-policy*", VerdictAction::Ask,
+        "\xe7\x96\x91\xe4\xbc\xbc\xe9\x83\xa8\xe7\xbd\xb2 WDAC \xe7\xad\x96\xe7\x95\xa5(CiTool update-policy,\xe5\x8f\xaf\xe8\x83\xbd\xe7\x98\xab\xe7\x97\xaa\xe5\xae\x89\xe5\x85\xa8\xe8\xbd\xaf\xe4\xbb\xb6)");
+
+    // 5) 伪装系统服务名 + 已知计划任务(本机实捕)。
+    reg(list, "*\\Services\\DnsCache SstpSvc*", VerdictAction::Block,
+        "\xe9\x93\xb6\xe7\x8b\x90:\xe5\x88\x9b\xe5\xbb\xba\xe4\xbc\xaa\xe8\xa3\x85\xe7\xb3\xbb\xe7\xbb\x9f\xe6\x9c\x8d\xe5\x8a\xa1\xe5\x90\x8d 'DnsCache SstpSvc' \xe7\x9a\x84\xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe6\x9c\x8d\xe5\x8a\xa1(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95)");
+    reg(list, "*\\Services\\RacMan*", VerdictAction::Block,
+        "\xe9\x93\xb6\xe7\x8b\x90:\xe5\x88\x9b\xe5\xbb\xba\xe4\xbc\xaa\xe8\xa3\x85 RasMan \xe7\x9a\x84 'RacMan' \xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe6\x9c\x8d\xe5\x8a\xa1(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95,\xe6\x8c\x87\xe5\x90\x91 hotaj)");
+    file_(list, "*\\System32\\Tasks\\LDStM", VerdictAction::Block,
+          "\xe9\x93\xb6\xe7\x8b\x90:\xe5\x88\x9b\xe5\xbb\xba\xe8\xae\xa1\xe5\x88\x92\xe4\xbb\xbb\xe5\x8a\xa1 \\LDStM(\xe6\x9c\xac\xe6\x9c\xba\xe5\xae\x9e\xe6\x8d\x95,\xe6\x8c\x87\xe5\x90\x91 Public \xe8\xbd\xbd\xe8\x8d\xb7)");
 }
 
 }} // namespace bulwark::engine :: anonymous

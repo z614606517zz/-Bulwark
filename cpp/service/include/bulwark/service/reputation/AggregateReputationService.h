@@ -23,6 +23,7 @@ public:
 
     bool isEnabled() const override;
     bulwark::FileReputation query(const QString& sha256) override;
+    bulwark::FileReputation query(const QString& sha256, bool priority) override;
     // 遍历活跃源拉取行为画像并合并(各源结果取并集,去重)。供确认恶意后清理 + 生成规则。
     bulwark::ThreatBehaviorProfile fetchBehaviorProfile(const QString& sha256) override;
     std::pair<bool, QString> testConnection() override;

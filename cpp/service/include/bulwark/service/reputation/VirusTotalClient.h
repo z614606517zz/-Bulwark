@@ -7,11 +7,14 @@
 #include "bulwark/models/ThreatBehaviorProfile.h"
 #include "bulwark/ipc/Payloads.h" // VtDetailResponsePayload
 
+#include <QDateTime>
 #include <QMutex>
 #include <QString>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <utility>
+#include <vector>
 
 // VirusTotal v3 hash-reputation + file-upload-scan client. Faithful to
 // Bulwark.Service/Reputation/VirusTotalClient.cs: HTTPS via curl.exe, self
@@ -39,7 +42,7 @@ public:
 
     // Priority query for memory-protection / anti-injection verifies: gets
     // preference on both the token bucket and the reserved daily quota.
-    bulwark::FileReputation query(const QString& sha256, bool priority);
+    bulwark::FileReputation query(const QString& sha256, bool priority) override;
 
     // Progress sink for uploadAndScan (staged, for the UI scan card): the
     // percent is only meaningful for the Uploading stage.
@@ -66,18 +69,45 @@ public:
     bulwark::ipc::VtDetailResponsePayload fetchDetailReport(const QString& sha256);
 
 private:
+    // 每个 API Key 独立的限流状态:自己的分钟令牌桶 + 每日配额 + 冷却态(429/鉴权失败时
+    // 临时禁用,让后续请求自动跳过它)。这样多 Key 的额度是真正叠加的(总量 = ΣKey 日配额),
+    // 且能混用免费/Premium(各自不同的 rpm/rpd)。含 QMutex/TokenBucket/DailyQuota,不可拷贝/移动,
+    // 只经 shared_ptr 持有——请求全程持有一份,即便期间 setApiKey 重建池也不会悬空。
+    struct KeyState {
+        QString key;
+        int rpm = 4;                // 该 Key 的每分钟上限(仅供 getUsage 汇总展示)
+        int rpd = 500;              // 该 Key 的每日上限(仅供展示)
+        TokenBucket bucket;         // 分钟速率
+        DailyQuota daily;           // 每日配额(含优先保留)
+        QMutex stateMx;             // guards disabledUntilUtc
+        QDateTime disabledUntilUtc; // 429/鉴权失败冷却截止(UTC);无效=可用
+        KeyState(QString k, int rpmVal, int rpdVal, int reserve)
+            : key(std::move(k)), rpm(rpmVal), rpd(rpdVal),
+              bucket(rpmVal, 60000), daily(rpdVal, reserve) {}
+    };
+
     bulwark::FileReputation parse(const QString& sha256, const QString& json) const;
     void parseBehaviour(const QString& json, bulwark::ThreatBehaviorProfile& prof) const;
     void parseDetail(const QString& json, bulwark::ipc::VtDetailResponsePayload& d) const;
     static void diag(const QString& line);
-    QString apiKey() const; // thread-safe snapshot (guards apiKey_)
+
+    // 按 "KEY[:RPD[:RPM]]" 逐条解析(逗号分隔多 Key),重建每 Key 独立限流池并更新 enabled_。
+    // 未标注 RPD/RPM 的 Key 沿用 opt_ 里的默认(VT 免费档 500/天、4/分)。
+    void rebuildPool(const QString& raw);
+    // 选一个「有日配额且未冷却」的 Key:先占用其日配额,再等其分钟令牌;轮询起点均衡分摊。
+    // 所有 Key 日配额耗尽/冷却中则返回 nullptr(调用方 fail-open 返回 Unknown)。
+    std::shared_ptr<KeyState> acquireKey(bool priority);
+    // 测试连接用:轮询取一个 Key(不占日配额、不跳过冷却,以便探测 Key 是否已修复)。
+    std::shared_ptr<KeyState> acquireProbeKey();
+    // 据 HTTP 结果标注该 Key:429 短冷却(60s)、401/403 长冷却(6h)、2xx/404 清除冷却。
+    static void noteHttpResult(const std::shared_ptr<KeyState>& ks, int httpCode);
+    int keyCount() const;
 
     VirusTotalOptions opt_;
-    QString apiKey_;
-    mutable QMutex keyMutex_;   // guards apiKey_ (hot-swapped from UI thread)
-    std::atomic<bool> enabled_; // atomic: read on worker threads, set on UI thread
-    TokenBucket bucket_;
-    DailyQuota daily_;
+    std::vector<std::shared_ptr<KeyState>> keys_; // 每 Key 独立令牌桶 + 日配额 + 冷却态
+    mutable QMutex keyMutex_;                     // guards keys_ + rrCursor_
+    mutable int rrCursor_ = 0;                    // 轮询游标(均衡分摊各 Key)
+    std::atomic<bool> enabled_;                   // atomic: read on worker threads, set on UI thread
     Logger log_;
 };
 

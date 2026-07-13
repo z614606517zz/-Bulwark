@@ -17,6 +17,12 @@ public:
     virtual ~IHashReputationService() = default;
     virtual bool isEnabled() const = 0;
     virtual bulwark::FileReputation query(const QString& sha256) = 0;
+    // Priority variant for latency/quota-sensitive verifies (memory-protection /
+    // anti-injection). Default forwards to the normal query; sources with a
+    // reserved priority quota (VirusTotal) override to honour it.
+    virtual bulwark::FileReputation query(const QString& sha256, bool /*priority*/) {
+        return query(sha256);
+    }
     virtual std::pair<bool, QString> testConnection() = 0;
     virtual bulwark::ReputationUsage getUsage() = 0;
     virtual QString name() const = 0;

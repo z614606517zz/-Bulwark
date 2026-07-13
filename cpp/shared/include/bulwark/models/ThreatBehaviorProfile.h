@@ -25,6 +25,10 @@ struct ThreatBehaviorProfile {
     QStringList droppedFileNames;  // 释放/写入文件的 basename(小写,去重)—— 用于生成拦截规则
     QStringList droppedFilePaths;  // 释放文件的原始(沙箱)完整路径 —— 清理时翻译到本机用户目录
     QStringList droppedFileHashes; // 释放文件的 sha256(小写,可空)
+    // 运行时(不来自情报源):据上面已知恶意哈希在本机落地区【实际定位到】的文件绝对路径。
+    // 由 Worker 后台线程扫描落地区按哈希精确匹配得到,清理时对这些「哈希确认恶意」的文件
+    // 绕过签名护栏隔离(BYOVD 的合法签名驱动也照隔离),但仍受落地区约束不碰系统/安装目录。
+    QStringList locatedLocalPaths;
     QStringList registryKeysSet;   // 写入的注册表键(可能含 \\值名)
     QStringList processNames;      // 创建进程涉及的可执行名(小写 *.exe)
     QStringList contactedIps;      // 外联 "ip" 或 "ip:port"
@@ -58,6 +62,7 @@ struct ThreatBehaviorProfile {
         o["droppedFileNames"] = arr(droppedFileNames);
         o["droppedFilePaths"] = arr(droppedFilePaths);
         o["droppedFileHashes"] = arr(droppedFileHashes);
+        o["locatedLocalPaths"] = arr(locatedLocalPaths);
         o["registryKeysSet"] = arr(registryKeysSet);
         o["processNames"] = arr(processNames);
         o["contactedIps"] = arr(contactedIps);
@@ -81,6 +86,7 @@ struct ThreatBehaviorProfile {
         p.droppedFileNames = lst(o.value(QStringLiteral("droppedFileNames")));
         p.droppedFilePaths = lst(o.value(QStringLiteral("droppedFilePaths")));
         p.droppedFileHashes = lst(o.value(QStringLiteral("droppedFileHashes")));
+        p.locatedLocalPaths = lst(o.value(QStringLiteral("locatedLocalPaths")));
         p.registryKeysSet = lst(o.value(QStringLiteral("registryKeysSet")));
         p.processNames = lst(o.value(QStringLiteral("processNames")));
         p.contactedIps = lst(o.value(QStringLiteral("contactedIps")));

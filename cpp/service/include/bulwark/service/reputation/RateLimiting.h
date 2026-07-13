@@ -14,6 +14,7 @@ class TokenBucket {
 public:
     TokenBucket(int tokensPerPeriod, qint64 periodMs);
     void wait(bool priority = false);
+    bool tryConsume(bool priority = false); // 非阻塞:有令牌即消耗返回 true,无令牌返回 false
 
 private:
     void refill();

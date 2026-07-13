@@ -4,7 +4,10 @@
 
 #include "bulwark/ipc/Payloads.h"
 
+class AiScanner;
 class IpcClient;
+class QPlainTextEdit;
+class QPushButton;
 class QShowEvent;
 
 // "恶意足迹清理报告" — surfaced after the service confirms an actor malicious,
@@ -18,7 +21,7 @@ class RemediationReportDialog : public QDialog
     Q_OBJECT
 public:
     RemediationReportDialog(const bulwark::ipc::RemediationReportPayload& report,
-                            IpcClient* ipc, QWidget* parent = nullptr);
+                            IpcClient* ipc, AiScanner* ai, QWidget* parent = nullptr);
 
 protected:
     void mousePressEvent(QMouseEvent*) override;
@@ -27,6 +30,12 @@ protected:
 
 private:
     IpcClient* m_ipc = nullptr;
+    AiScanner* m_ai = nullptr;
+    QPlainTextEdit* m_scriptView = nullptr;
+    QPushButton* m_genBtn = nullptr;
+    QPushButton* m_copyBtn = nullptr;
+    QPushButton* m_runBtn = nullptr;
+    QString m_actorName;
     QPoint m_dragOffset;
     bool m_centered = false;
 };

@@ -43,7 +43,8 @@ public:
 
     // 手动查询(UI 主动触发):先缓存(含负缓存去重)后网络。网络查询在调用方线程阻塞
     // (用户主动点击「查询」可接受),命中缓存则立即返回。绝不用于事件热路径。
-    bulwark::FileReputation queryNow(const QString& sha256);
+    // priority=true 供内存防护/反注入验证:占用 VT 预留的优先级配额,尽量不被普通查询挤占。
+    bulwark::FileReputation queryNow(const QString& sha256, bool priority = false);
 
     // 拉取样本行为画像:委托聚合器遍历各源并集合并(VT 释放物/注册表 + HA 网络 IOC…)。
     // 在调用方线程阻塞——仅在「后台确认恶意」后调用,用于清理释放物 + 生成主动拦截规则。

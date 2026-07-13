@@ -312,10 +312,22 @@ RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& mali
                 consider(cand);
     }
 
+    // 据「已知恶意 sha256」在本机实际定位到的文件(哈希精确确认恶意):并入清理候选并标记。
+    // 这些即使带合法数字签名(BYOVD 常见,如被滥用的 Adlice/TrueSight 驱动)也照隔离
+    // —— 下方对其绕过「签名即豁免」护栏;但仍受落地区约束,绝不碰系统/安装目录。
+    QSet<QString> hashConfirmedLower;
+    for (const QString& p : profile.locatedLocalPaths) {
+        const QString t = p.trimmed();
+        if (t.isEmpty() || !looksLikeFilePath(t)) continue;
+        consider(t);
+        hashConfirmedLower.insert(t.toLower());
+    }
+
     // 2) file cleanup: quarantine (not delete) drop-zone, unsigned files only.
     for (const QString& path : maliciousFiles) {
         if (!QFileInfo::exists(path)) continue;
-        const bool bypass = actorSignatureUntrusted && path.compare(actorPath, Qt::CaseInsensitive) == 0;
+        const bool bypass = (actorSignatureUntrusted && path.compare(actorPath, Qt::CaseInsensitive) == 0)
+                            || hashConfirmedLower.contains(path.toLower());
         QString why;
         if (!isSafeToRemove(path, bypass, why)) {
             report.skipped.append(mkSkip(path, why, true));
@@ -355,6 +367,92 @@ std::pair<bool, QString> ThreatRemediator::forceQuarantine(const QString& path) 
         return { true, u("已移入隔离区") };
     }
     return { false, u("隔离失败(文件可能被占用或权限不足)") };
+}
+
+// 据已知恶意 sha256 在本机落地区按哈希精确定位实际落地的文件(样本副本 / 释放物)。
+// 只读、有界、后台线程调用:限深度 4、最多枚举 15 万文件 / 算 5000 次哈希、单文件 <=64MB,
+// 仅对可执行/常被伪装的扩展名算哈希(图片/文本类仅小体积才算),跳过 node_modules 等大目录。
+QStringList ThreatRemediator::locateDroppedFilesByHash(const QStringList& maliciousHashes) {
+    QSet<QString> targets;
+    for (const QString& h : maliciousHashes)
+        if (h.size() == 64) targets.insert(h.toLower());
+    if (targets.isEmpty()) return {};
+
+    QStringList roots;
+    for (const QString& prof : localUserProfiles()) {
+        roots << prof + QStringLiteral("\\AppData\\Local")
+              << prof + QStringLiteral("\\AppData\\Local\\Temp")
+              << prof + QStringLiteral("\\AppData\\LocalLow")
+              << prof + QStringLiteral("\\AppData\\Roaming")
+              << prof + QStringLiteral("\\Downloads")
+              << prof + QStringLiteral("\\Desktop")
+              << prof + QStringLiteral("\\Documents");
+    }
+    const QString drive = qEnvironmentVariable("SystemDrive", QStringLiteral("C:"));
+    roots << drive + QStringLiteral("\\Windows\\Temp")
+          << drive + QStringLiteral("\\Users\\Public")
+          << drive + QStringLiteral("\\ProgramData");
+
+    static const QSet<QString> kHashExts = {
+        QStringLiteral("exe"), QStringLiteral("dll"), QStringLiteral("sys"), QStringLiteral("scr"),
+        QStringLiteral("ocx"), QStringLiteral("cpl"), QStringLiteral("com"), QStringLiteral("bin"),
+        QStringLiteral("dat"), QStringLiteral("tmp"), QStringLiteral("jpg"), QStringLiteral("png"),
+        QStringLiteral("gif"), QStringLiteral("ico"), QStringLiteral("txt"), QStringLiteral("log"),
+        QStringLiteral("dmp"), QStringLiteral("db"),
+    };
+    static const QSet<QString> kSkipDirs = {
+        QStringLiteral("node_modules"), QStringLiteral(".git"), QStringLiteral("cache"),
+        QStringLiteral("gpucache"), QStringLiteral("code cache"), QStringLiteral("service worker"),
+        QStringLiteral("blob_storage"), QStringLiteral("__bulwark_quarantine"),
+    };
+    const int kMaxDepth = 5, kMaxExamined = 200000, kMaxHash = 8000;
+    const qint64 kMaxSize = 64LL * 1024 * 1024, kMediaCap = 8LL * 1024 * 1024;
+
+    QStringList found;
+    QSet<QString> foundLower;
+    int examined = 0, hashed = 0;
+
+    QStringList dirStack;
+    QList<int> depthStack;
+    for (const QString& r : roots)
+        if (QFileInfo::exists(r)) { dirStack << r; depthStack << 0; }
+
+    while (!dirStack.isEmpty() && examined < kMaxExamined && hashed < kMaxHash) {
+        const QString dir = dirStack.takeLast();
+        const int depth = depthStack.takeLast();
+        QDir d(dir);
+        const QFileInfoList files =
+            d.entryInfoList(QDir::Files | QDir::NoSymLinks | QDir::Hidden | QDir::System);
+        for (const QFileInfo& fi : files) {
+            if (examined >= kMaxExamined || hashed >= kMaxHash) break;
+            ++examined;
+            const qint64 sz = fi.size();
+            if (sz <= 0 || sz > kMaxSize) continue;
+            const QString ext = fi.suffix().toLower();
+            if (!kHashExts.contains(ext)) continue;
+            const bool media = (ext == QLatin1String("jpg") || ext == QLatin1String("png")
+                                || ext == QLatin1String("gif") || ext == QLatin1String("ico")
+                                || ext == QLatin1String("txt") || ext == QLatin1String("log"));
+            if (media && sz > kMediaCap) continue; // 真实照片/日志通常更大,跳过以省成本
+            const QString h = QuarantineManager::tryComputeSha256(fi.absoluteFilePath()).toLower();
+            ++hashed;
+            if (!h.isEmpty() && targets.contains(h)) {
+                QString p = fi.absoluteFilePath();
+                p.replace(QLatin1Char('/'), QLatin1Char('\\'));
+                if (!foundLower.contains(p.toLower())) { foundLower.insert(p.toLower()); found << p; }
+            }
+        }
+        if (depth < kMaxDepth) {
+            const QFileInfoList subs = d.entryInfoList(
+                QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks | QDir::Hidden | QDir::System);
+            for (const QFileInfo& sub : subs) {
+                if (kSkipDirs.contains(sub.fileName().toLower())) continue;
+                dirStack << sub.absoluteFilePath();
+                depthStack << (depth + 1);
+            }
+        }
+    }
+    return found;
 }
 
 } // namespace bulwark::service

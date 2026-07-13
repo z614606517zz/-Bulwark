@@ -22,6 +22,7 @@
 #include "bulwark/engine/RuleEngine.h"
 #include "bulwark/engine/ProcessChainTracker.h"
 #include "bulwark/service/Logger.h"
+#include "bulwark/service/reputation/RateLimiting.h"
 
 namespace bulwark::service {
 
@@ -111,6 +112,7 @@ private:
     void maybeScanDoubleClick(const bulwark::SecurityEvent& e);        // 合格进程创建入队后台扫描
     void maybeScanInstallerPackage(const bulwark::SecurityEvent& e);  // 双击 MSI/MSP:扫描安装包本身(msiexec 仅宿主)
     void maybeScanDroppedInstaller(const bulwark::SecurityEvent& e);  // 落盘即扫:写入用户目录的安装包/可执行体送 VT(PID 清零,只隔离不杀进程)
+    void maybeVerifyMemoryInjection(const bulwark::SecurityEvent& e); // 内存防护:限流查 VT 确认注入源恶意性
     void vtScanLoop();                                                 // 后台线程:逐个跑扫描
     void runVtScan(bulwark::SecurityEvent e);                          // 后台:去重->冻结->查/传->落结论
     void finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::FileReputation& rep); // 映射终态
@@ -168,6 +170,11 @@ private:
     QWaitCondition vtCv_;
     QQueue<bulwark::SecurityEvent> vtQueue_;
     QSet<QString> vtInflight_; // 在途去重(哈希优先,回退路径)
+
+    // ---- 内存防护 VT 验证(限流) ----
+    QMutex memVtMx_;                        // 保护 memVtCachedMalicious_
+    reputation::TokenBucket memVtBucket_;    // MemoryProtectionVtVerifyPerHour 限流
+    QSet<QString> memVtCachedMalicious_;     // 已确认恶意的哈希缓存(避免重复查)
 };
 
 } // namespace bulwark::service

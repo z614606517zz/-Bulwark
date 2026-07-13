@@ -68,6 +68,7 @@ public:
 
     // Persisted AI research history (newest first). AI scans run UI-side, so this
     // is where the "AI 研判" page backfills its records across restarts.
+    AiScanner* aiScanner() const { return m_ai; }
     QList<AiScanResult> aiScanHistory() const;
     void clearAiScanHistory();         // 清空 UI 侧 AI 研判历史(落盘同步清空)
 

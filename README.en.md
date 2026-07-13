@@ -140,6 +140,10 @@ Cloud reputation, the threat-intel feed and AI research are all **enhancements**
 | **Xiaomi MiMo LLM** | AI behavior research + natural-language rule generation | https://mimo.mi.com/ | log in with a Xiaomi account, apply under Console → API Keys; base URL / model in the `Ai` section of `appsettings.json` |
 
 > Three ways to supply a key (precedence: env var > config file): ① the **UI Settings page** per source (easiest, instant); ② **environment variables** (`BULWARK_VT_APIKEY` / `BULWARK_THREATBOOK_APIKEY` / `BULWARK_MDC_APIKEY` / `BULWARK_OTX_APIKEY` / `BULWARK_HA_APIKEY` / `BULWARK_MB_AUTHKEY` (abuse.ch) / `BULWARK_AI_APIKEY`); ③ the matching field in a local `appsettings.json` — **don't commit a config that contains real keys**.
+>
+> 🔑 **VirusTotal multi-key / higher quota**: VT accepts several comma-separated keys (e.g. `key1,key2,key3`). **Each key is metered independently and quotas truly stack**; a key that hits rate-limit (429) or fails auth (401) is auto-cooled and skipped. Each key may optionally carry its own limits as `KEY:perDay:perMinute` to mix free and premium, e.g. `freeKey,yourPremiumKey:100000:1000` (unannotated keys use the free-tier defaults, 500/day, 4/min). When running as a (SYSTEM) service, set the env var at **machine scope** — user-scope variables aren't visible to SYSTEM.
+>
+> ⚠️ VT's terms forbid registering multiple free accounts to bypass limits, and the public API may not be used in commercial products. Multi-key is intended for **Premium / enterprise keys** or keys you legitimately own; for sustained high-volume use, get the VT Premium API.
 
 ## Enforcement, quarantine and footprint cleanup
 

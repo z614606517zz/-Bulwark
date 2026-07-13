@@ -302,7 +302,7 @@ void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayloa
 
     // 完整报告卡片:主体 / 判定 / 已隔离项 / 未能清理项(文件可一键重试强制隔离)。
     // 非模态,不打断用户;自身带滚动区与关闭按钮。
-    (new RemediationReportDialog(report, m_ipc, this))->show();
+    (new RemediationReportDialog(report, m_ipc, m_ipc->aiScanner(), this))->show();
 }
 
 // ---- System tray + close-to-tray -------------------------------------------

@@ -122,6 +122,22 @@ const char* kScanSystemPrompt =
     "只输出一个严格 JSON 对象,不要输出任何多余文字或代码块围栏,格式:\n"
     "{\"malicious\": true/false, \"confidence\": \"高/中/低\", \"summary\": \"一句话中文理由,须引用具体静态特征\"}";
 
+const char* kCleanupSystemPrompt =
+    "你是一名恶意软件应急清理专家。根据以下病毒行为画像,生成一个 PowerShell 清理脚本。\n"
+    "\n"
+    "【安全原则,必须遵守】\n"
+    "- 只删除用户可写目录下的文件,绝不碰 C:\\Windows\\System32、C:\\Program Files 等系统/安装目录;\n"
+    "- 注册表只清理 HKCU 和 HKLM\\Software 下指向恶意文件的值,不碰系统注册表项;\n"
+    "- 每条操作前加 Write-Host 说明在做什么;\n"
+    "- 没有把握的项宁缺勿滥,不要误杀;\n"
+    "- 输出纯文本 PowerShell 代码,不要 markdown 代码块围栏,不要额外解释;\n"
+    "- 按顺序分节:终止进程 → 删除文件 → 清理注册表 → 防火墙阻断 → hosts 屏蔽;\n"
+    "- 对于文件路径,加上 Test-Path 判断,路径不存在时跳过不报错;\n"
+    "- 删除文件用 Remove-Item -LiteralPath -Force -ErrorAction SilentlyContinue;\n"
+    "- 防火墙规则用 netsh advfirewall firewall add rule … dir=out action=block;\n"
+    "- hosts 屏蔽用 Add-Content 追加到 $env:SystemRoot\\System32\\drivers\\etc\\hosts;\n"
+    "- 注册表删除用 Remove-ItemProperty -Path -Name -Force -ErrorAction SilentlyContinue。";
+
 const char* kRuleSystemPrompt =
     "你是磐垒 HIPS 的规则助手。把用户的自然语言安全意图转成 1~5 条防护规则。"
     "只输出一个严格 JSON 数组,不要输出任何多余文字或代码块围栏。每个元素:"
@@ -347,5 +363,62 @@ void AiScanner::generateRules(const QString& request)
             if (out.size() >= 5) break; // cap per the product spec (1..5)
         }
         emit rulesSuggested(out);
+    });
+}
+
+void AiScanner::generateCleanupScript(const bulwark::ipc::RemediationReportPayload& report)
+{
+    if (!isConfigured()) {
+        emit cleanupScriptGenerated(QString());
+        return;
+    }
+
+    QStringList lines;
+    lines << u("病毒主体: ") + report.actorPath;
+    if (report.actorPid > 0)
+        lines << u("PID: ") + QString::number(report.actorPid);
+    lines << QString();
+
+    if (!report.intelDroppedFilePaths.isEmpty() || !report.intelDroppedFiles.isEmpty()) {
+        lines << u("== 释放文件 ==");
+        for (const QString& p : report.intelDroppedFilePaths) lines << p;
+        for (const QString& n : report.intelDroppedFiles) {
+            if (!report.intelDroppedFilePaths.contains(n))
+                lines << n;
+        }
+    }
+    if (!report.intelDroppedFileHashes.isEmpty()) {
+        lines << u("== 释放文件哈希(用于进程匹配) ==");
+        for (const QString& h : report.intelDroppedFileHashes) lines << h.left(16) + QStringLiteral("…");
+    }
+    if (!report.intelRegistryKeys.isEmpty()) {
+        lines << u("== 注册表写入 ==");
+        for (const QString& k : report.intelRegistryKeys) lines << k;
+    }
+    if (!report.intelContactedIps.isEmpty()) {
+        lines << u("== C2 外联 IP ==");
+        for (const QString& ip : report.intelContactedIps) lines << ip;
+    }
+    if (!report.intelContactedDomains.isEmpty()) {
+        lines << u("== C2 域名 ==");
+        for (const QString& d : report.intelContactedDomains) lines << d;
+    }
+    if (!report.intelServices.isEmpty()) {
+        lines << u("== 创建/启动的服务 ==");
+        for (const QString& s : report.intelServices) lines << s;
+    }
+    if (!report.intelProcessNames.isEmpty()) {
+        lines << u("== 创建的可执行进程 ==");
+        for (const QString& p : report.intelProcessNames) lines << p;
+    }
+    if (!report.intelMutexes.isEmpty()) {
+        lines << u("== 互斥体 ==");
+        for (const QString& m : report.intelMutexes) lines << m;
+    }
+
+    postChat(QString::fromUtf8(kCleanupSystemPrompt),
+             lines.join(QLatin1Char('\n')),
+             [this](bool ok, const QString& content, int) {
+        emit cleanupScriptGenerated(ok ? content.trimmed() : QString());
     });
 }

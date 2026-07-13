@@ -433,9 +433,14 @@ QJsonObject RemediationReportPayload::toJson() const {
     o["skipped"] = sk;
     o["intelSource"] = intelSource;
     o["intelDroppedFiles"] = strListToJson(intelDroppedFiles);
+    o["intelDroppedFilePaths"] = strListToJson(intelDroppedFilePaths);
+    o["intelDroppedFileHashes"] = strListToJson(intelDroppedFileHashes);
     o["intelRegistryKeys"] = strListToJson(intelRegistryKeys);
     o["intelContactedIps"] = strListToJson(intelContactedIps);
     o["intelContactedDomains"] = strListToJson(intelContactedDomains);
+    o["intelServices"] = strListToJson(intelServices);
+    o["intelProcessNames"] = strListToJson(intelProcessNames);
+    o["intelMutexes"] = strListToJson(intelMutexes);
     o["intelRulesInjected"] = intelRulesInjected;
     return o;
 }
@@ -453,9 +458,14 @@ RemediationReportPayload RemediationReportPayload::fromJson(const QJsonObject& o
         if (v.isObject()) p.skipped.append(RemediationSkippedItem::fromJson(v.toObject()));
     p.intelSource = getStr(o, "intelSource");
     p.intelDroppedFiles = getStrList(o, "intelDroppedFiles");
+    p.intelDroppedFilePaths = getStrList(o, "intelDroppedFilePaths");
+    p.intelDroppedFileHashes = getStrList(o, "intelDroppedFileHashes");
     p.intelRegistryKeys = getStrList(o, "intelRegistryKeys");
     p.intelContactedIps = getStrList(o, "intelContactedIps");
     p.intelContactedDomains = getStrList(o, "intelContactedDomains");
+    p.intelServices = getStrList(o, "intelServices");
+    p.intelProcessNames = getStrList(o, "intelProcessNames");
+    p.intelMutexes = getStrList(o, "intelMutexes");
     p.intelRulesInjected = getInt(o, "intelRulesInjected");
     return p;
 }

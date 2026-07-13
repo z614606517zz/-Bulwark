@@ -60,10 +60,12 @@ public:
     void scan(const bulwark::SecurityEvent& e, const QString& source); // research a (service) event
     void scanFile(const QString& path, const QString& source);          // manual file scan
     void generateRules(const QString& request);                         // NL -> suggested rules
+    void generateCleanupScript(const bulwark::ipc::RemediationReportPayload& report); // VT IOC -> PS cleanup script
 
 signals:
     void finished(const AiScanResult& result);
     void rulesSuggested(const QList<AiSuggestedRule>& rules);
+    void cleanupScriptGenerated(const QString& script);
 
 private:
     QString buildUserPrompt(const bulwark::SecurityEvent& e) const;

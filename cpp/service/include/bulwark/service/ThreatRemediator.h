@@ -37,6 +37,12 @@ public:
     std::pair<bool, QString> forceQuarantine(const QString& path);
     RemediationReport cleanupPersistenceEntry(const bulwark::PersistenceEntry& entry);
 
+    // 据「已知恶意 sha256」在本机用户可写落地区(Temp/Roaming/Downloads/Desktop/Public/
+    // ProgramData/Windows\Temp)按哈希精确定位实际落地的样本/释放物。只读磁盘扫描,有界
+    // (限深度/文件数/大小,跳过 node_modules 等大目录),【须在后台线程调用】——绝不碰主线程。
+    // 返回命中的本机绝对路径,交由 remediate(profile.locatedLocalPaths) 隔离(绕过签名护栏)。
+    static QStringList locateDroppedFilesByHash(const QStringList& maliciousHashes);
+
 private:
     void removeAutostartPersistence(const QStringList& maliciousFiles, RemediationReport& report);
     void removeIfeoPersistence(const QStringList& maliciousFiles, RemediationReport& report);

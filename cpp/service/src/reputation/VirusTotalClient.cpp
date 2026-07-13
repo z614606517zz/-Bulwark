@@ -67,36 +67,107 @@ QString VirusTotalClient::builtInApiKey() {
 }
 
 VirusTotalClient::VirusTotalClient(const BulwarkOptions& options)
-    : opt_(options.VirusTotal),
-      bucket_(std::max(1, options.VirusTotal.RequestsPerMinute), 60000),
-      daily_(std::max(1, options.VirusTotal.RequestsPerDay), options.VirusTotal.PriorityDailyReserve),
-      log_(QStringLiteral("VirusTotal")) {
+    : opt_(options.VirusTotal), log_(QStringLiteral("VirusTotal")) {
+    // 多 Key 来源:环境变量 > 配置文件 > 内置 Key。各来源均可逗号分隔多 Key,
+    // 每个可选标注 "KEY:RPD:RPM"(不标注则用 opt_ 默认,即 VT 免费档 500/天、4/分)。
     const QString env = qEnvironmentVariable(VirusTotalOptions::ApiKeyEnvVar).trimmed();
-    apiKey_ = !env.isEmpty()                     ? env
-            : !opt_.ApiKey.trimmed().isEmpty()   ? opt_.ApiKey.trimmed()
-                                                 : builtInApiKey();
-    enabled_ = !apiKey_.isEmpty();
-    const QString keySource = !env.isEmpty()                   ? QStringLiteral("环境变量 Key")
-                            : !opt_.ApiKey.trimmed().isEmpty() ? QStringLiteral("配置文件 Key")
-                            : !apiKey_.isEmpty()               ? QStringLiteral("内置 Key")
-                                                              : QStringLiteral("未配置 Key,查询禁用");
-    log_.info(QStringLiteral("VirusTotal 信誉查询就绪(经 curl,限流 %1/min, %2/day,%3);"
-                             "是否参与查询由运行时开关控制。")
-                  .arg(opt_.RequestsPerMinute)
-                  .arg(opt_.RequestsPerDay)
-                  .arg(keySource));
+    QString raw;
+    QString keySource;
+    if (!env.isEmpty()) {
+        raw = env;
+        keySource = QStringLiteral("环境变量 Key");
+    } else if (!opt_.ApiKey.trimmed().isEmpty()) {
+        raw = opt_.ApiKey.trimmed();
+        keySource = QStringLiteral("配置文件 Key");
+    } else {
+        raw = builtInApiKey();
+        keySource = raw.isEmpty() ? QStringLiteral("未配置 Key,查询禁用") : QStringLiteral("内置 Key");
+    }
+    rebuildPool(raw); // 设置 keys_ + enabled_
+
+    // 汇总总额度(各 Key 相加),让日志直观反映「多 Key 真正叠加」。
+    int totalRpm = 0, totalRpd = 0;
+    { QMutexLocker lk(&keyMutex_);
+      for (const auto& ks : keys_) { totalRpm += ks->rpm; totalRpd += ks->rpd; } }
+    log_.info(QStringLiteral("VirusTotal 信誉查询就绪(经 curl,%1 个 Key,合计限流 %2/min、%3/day,来源:%4);"
+                             "每 Key 独立计账,是否参与查询由运行时开关控制。")
+                  .arg(keyCount()).arg(totalRpm).arg(totalRpd).arg(keySource));
 }
 
-QString VirusTotalClient::apiKey() const {
+void VirusTotalClient::rebuildPool(const QString& raw) {
+    std::vector<std::shared_ptr<KeyState>> pool;
+    for (const QString& entry : raw.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        // 每条形如 KEY 或 KEY:RPD 或 KEY:RPD:RPM(VT Key 为 64 位十六进制,不含冒号,分隔安全)。
+        const QStringList parts = entry.split(QLatin1Char(':'));
+        const QString key = parts.value(0).trimmed();
+        if (key.isEmpty()) continue;
+        bool okRpd = false, okRpm = false;
+        int rpd = parts.value(1).trimmed().toInt(&okRpd);
+        int rpm = parts.value(2).trimmed().toInt(&okRpm);
+        if (!okRpd || rpd <= 0) rpd = std::max(1, opt_.RequestsPerDay);   // 默认 VT 免费档
+        if (!okRpm || rpm <= 0) rpm = std::max(1, opt_.RequestsPerMinute);
+        const int reserve = std::max(0, std::min(opt_.PriorityDailyReserve, rpd - 1));
+        pool.push_back(std::make_shared<KeyState>(key, rpm, rpd, reserve));
+    }
     QMutexLocker lk(&keyMutex_);
-    return apiKey_;
+    keys_ = std::move(pool);
+    rrCursor_ = 0;
+    enabled_ = !keys_.empty();
+}
+
+int VirusTotalClient::keyCount() const {
+    QMutexLocker lk(&keyMutex_);
+    return static_cast<int>(keys_.size());
+}
+
+std::shared_ptr<VirusTotalClient::KeyState> VirusTotalClient::acquireKey(bool priority) {
+    std::vector<std::shared_ptr<KeyState>> snap;
+    int start = 0;
+    { QMutexLocker lk(&keyMutex_);
+      if (keys_.empty()) return nullptr;
+      snap = keys_;                                     // 持有一份快照,请求全程不怕 setApiKey 重建
+      start = rrCursor_;
+      rrCursor_ = (rrCursor_ + 1) % static_cast<int>(keys_.size()); }
+
+    const int n = static_cast<int>(snap.size());
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    std::shared_ptr<KeyState> chosen;
+    for (int i = 0; i < n; ++i) {
+        const auto& ks = snap[(start + i) % n];
+        { QMutexLocker sl(&ks->stateMx);
+          if (ks->disabledUntilUtc.isValid() && nowUtc < ks->disabledUntilUtc)
+              continue; } // 冷却中(429/鉴权失败),跳过该 Key
+        if (ks->daily.tryConsume(priority)) { chosen = ks; break; } // 占用该 Key 的日配额
+    }
+    if (!chosen)
+        return nullptr;             // 所有 Key 日配额耗尽 / 冷却中 -> 调用方 fail-open
+    chosen->bucket.wait(priority);  // 已占日配额,等该 Key 的分钟令牌(4/min,很快补充)
+    return chosen;
+}
+
+std::shared_ptr<VirusTotalClient::KeyState> VirusTotalClient::acquireProbeKey() {
+    QMutexLocker lk(&keyMutex_);
+    if (keys_.empty()) return nullptr;
+    const int idx = rrCursor_ % static_cast<int>(keys_.size());
+    rrCursor_ = (idx + 1) % static_cast<int>(keys_.size());
+    return keys_[idx];
+}
+
+void VirusTotalClient::noteHttpResult(const std::shared_ptr<KeyState>& ks, int httpCode) {
+    if (!ks) return;
+    QMutexLocker sl(&ks->stateMx);
+    if (httpCode == 429)
+        ks->disabledUntilUtc = QDateTime::currentDateTimeUtc().addSecs(60);       // 限流:冷却 60s
+    else if (httpCode == 401 || httpCode == 403)
+        ks->disabledUntilUtc = QDateTime::currentDateTimeUtc().addSecs(6 * 3600);  // 鉴权失败:长冷却 6h
+    else if (httpCode == 200 || httpCode == 404)
+        ks->disabledUntilUtc = QDateTime();                                        // 正常:清除冷却
 }
 
 void VirusTotalClient::setApiKey(const QString& key) {
-    // 空 Key -> 回退内置(构建期可注入,默认空 = 禁用);非空则用用户 Key。
-    const QString k = key.trimmed().isEmpty() ? builtInApiKey() : key.trimmed();
-    { QMutexLocker lk(&keyMutex_); apiKey_ = k; }
-    enabled_ = !k.isEmpty();
+    // 空 Key -> 回退内置;逗号分隔可配置多 Key,每个可标注 "KEY:RPD:RPM"。
+    const QString k = key.trimmed();
+    rebuildPool(k.isEmpty() ? builtInApiKey() : k);
 }
 
 void VirusTotalClient::diag(const QString& line) {
@@ -116,14 +187,15 @@ bulwark::FileReputation VirusTotalClient::query(const QString& sha256, bool prio
     if (!enabled_ || sha256.isEmpty())
         return unknown;
 
-    if (!daily_.tryConsume(priority)) {
-        log_.debug(QStringLiteral("VirusTotal 日配额已用尽,跳过查询 ") + sha256.left(12));
+    auto ks = acquireKey(priority);
+    if (!ks) {
+        log_.debug(QStringLiteral("VirusTotal 日配额已用尽(所有 Key),跳过查询 ") + sha256.left(12));
         return unknown;
     }
-    bucket_.wait(priority);
 
-    const QStringList headers{ QStringLiteral("x-apikey: ") + apiKey() };
+    const QStringList headers{ QStringLiteral("x-apikey: ") + ks->key };
     const auto res = ReputationCurl::get(vtBase(opt_) + sha256, headers, opt_.QueryTimeoutSeconds);
+    noteHttpResult(ks, res.first);
     const int code = res.first;
     const QString tag = sha256.left(12);
 
@@ -222,16 +294,16 @@ bulwark::FileReputation VirusTotalClient::uploadAndScan(const QString& filePath,
         diag(QStringLiteral("上传扫描跳过:文件过大 %1 字节").arg(size));
         return unknown;
     }
-    if (!daily_.tryConsume(false)) {
-        diag(QStringLiteral("上传扫描跳过:VT 日配额已用尽"));
+    auto ks = acquireKey(false);
+    if (!ks) {
+        diag(QStringLiteral("上传扫描跳过:VT 日配额已用尽(所有 Key)"));
         return unknown;
     }
 
-    const QStringList headers{ QStringLiteral("x-apikey: ") + apiKey() };
+    const QStringList headers{ QStringLiteral("x-apikey: ") + ks->key };
     const QString name = fi.fileName();
 
-    // 一次令牌覆盖(大文件的)取上传 URL + 上传本体,与 .NET 行为一致。
-    bucket_.wait();
+    // acquireKey 已占该 Key 一枚令牌,覆盖(大文件的)取上传 URL + 上传本体,与 .NET 行为一致。
     if (progress)
         progress(bulwark::VtScanStage::Uploading, 0);
 
@@ -251,6 +323,7 @@ bulwark::FileReputation VirusTotalClient::uploadAndScan(const QString& filePath,
     const auto up = ReputationCurl::postFile(target, fi.absoluteFilePath(), headers,
                                              std::max(300, opt_.QueryTimeoutSeconds));
     if (up.first != 200) {
+        noteHttpResult(ks, up.first);
         diag(QStringLiteral("上传 %1 => HTTP %2").arg(name).arg(up.first));
         return unknown;
     }
@@ -276,7 +349,7 @@ bulwark::FileReputation VirusTotalClient::uploadAndScan(const QString& filePath,
     const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 4LL * 60 * 1000;
     while (QDateTime::currentMSecsSinceEpoch() < deadline) {
         std::this_thread::sleep_for(std::chrono::seconds(15));
-        bucket_.wait();
+        ks->bucket.wait();
 
         const auto pr = ReputationCurl::get(vtAnalysesUrl(opt_) + analysisId, headers, opt_.QueryTimeoutSeconds);
         if (pr.first != 200) {
@@ -315,16 +388,17 @@ bulwark::ThreatBehaviorProfile VirusTotalClient::fetchBehaviorProfile(const QStr
     if (!enabled_ || sha256.isEmpty())
         return prof;
 
-    // 与哈希查询共用限流:行为报告只在「确认恶意」后拉取,频次很低。
-    if (!daily_.tryConsume(false)) {
-        diag(QStringLiteral("behaviour %1 => 跳过(日配额已用尽)").arg(sha256.left(12)));
+    // 每 Key 独立计账:行为报告只在「确认恶意」后拉取,频次很低。
+    auto ks = acquireKey(false);
+    if (!ks) {
+        diag(QStringLiteral("behaviour %1 => 跳过(所有 Key 日配额已用尽)").arg(sha256.left(12)));
         return prof;
     }
-    bucket_.wait(false);
 
-    const QStringList headers{ QStringLiteral("x-apikey: ") + apiKey() };
+    const QStringList headers{ QStringLiteral("x-apikey: ") + ks->key };
     const QString url = vtBase(opt_) + sha256 + QStringLiteral("/behaviour_summary");
     const auto res = ReputationCurl::get(url, headers, opt_.QueryTimeoutSeconds);
+    noteHttpResult(ks, res.first);
     if (res.first != 200) {
         diag(QStringLiteral("behaviour %1 => HTTP %2").arg(sha256.left(12)).arg(res.first));
         return prof; // 404(无沙箱数据)/ 401 / 429 等一律 fail-open
@@ -457,13 +531,14 @@ bulwark::ipc::VtDetailResponsePayload VirusTotalClient::fetchDetailReport(const 
         d.message = QStringLiteral("VirusTotal 未启用或哈希为空");
         return d;
     }
-    if (!daily_.tryConsume(false)) {
-        d.message = QStringLiteral("VirusTotal 日配额已用尽,稍后再试");
+    auto ks = acquireKey(false);
+    if (!ks) {
+        d.message = QStringLiteral("VirusTotal 日配额已用尽(所有 Key),稍后再试");
         return d;
     }
-    bucket_.wait(false);
-    const QStringList headers{ QStringLiteral("x-apikey: ") + apiKey() };
+    const QStringList headers{ QStringLiteral("x-apikey: ") + ks->key };
     const auto res = ReputationCurl::get(vtBase(opt_) + sha256, headers, opt_.QueryTimeoutSeconds);
+    noteHttpResult(ks, res.first);
     if (res.first == 404) { d.message = QStringLiteral("VirusTotal 未收录该文件"); return d; }
     if (res.first == 401 || res.first == 403) { d.message = QStringLiteral("VirusTotal 鉴权失败,请检查 API Key"); return d; }
     if (res.first == 429) { d.message = QStringLiteral("VirusTotal 触发限流(429),稍后再试"); return d; }
@@ -542,22 +617,29 @@ void VirusTotalClient::parseDetail(const QString& json, bulwark::ipc::VtDetailRe
 }
 
 bulwark::ReputationUsage VirusTotalClient::getUsage() {
-    const auto snap = daily_.snapshot();
     bulwark::ReputationUsage u;
     u.source = QStringLiteral("VirusTotal");
     u.enabled = enabled_;
-    u.usedToday = snap.first;
-    u.dailyLimit = snap.second;
-    u.perMinuteLimit = opt_.RequestsPerMinute;
+    // 跨所有 Key 汇总(今日已用 / 每日上限 / 每分钟上限),反映多 Key 叠加后的总额度。
+    std::vector<std::shared_ptr<KeyState>> snap;
+    { QMutexLocker lk(&keyMutex_); snap = keys_; }
+    for (const auto& ks : snap) {
+        const auto s = ks->daily.snapshot();
+        u.usedToday += s.first;
+        u.dailyLimit += s.second;
+        u.perMinuteLimit += ks->rpm;
+    }
     return u;
 }
 
 std::pair<bool, QString> VirusTotalClient::testConnection() {
-    if (apiKey_.isEmpty())
+    auto ks = acquireProbeKey();
+    if (!ks)
         return { false, QStringLiteral("未配置 API 密钥") };
-    bucket_.wait();
+    ks->bucket.wait();
     const auto res = ReputationCurl::get(vtBase(opt_) + kEicar,
-                                         { QStringLiteral("x-apikey: ") + apiKey() }, opt_.QueryTimeoutSeconds);
+                                         { QStringLiteral("x-apikey: ") + ks->key }, opt_.QueryTimeoutSeconds);
+    noteHttpResult(ks, res.first);
     switch (res.first) {
         case 200: return { true,  QStringLiteral("连接成功,API 密钥有效") };
         case 401: return { false, QStringLiteral("API 密钥无效(401)") };

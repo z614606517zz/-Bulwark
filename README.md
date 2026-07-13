@@ -140,6 +140,10 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 | **小米 MiMo 大模型** | AI 行为研判 + 自然语言生成规则 | https://mimo.mi.com/ | 用小米账号登录,在 控制台 → API Keys 申请;基址 / 模型见 `appsettings.json` 的 `Ai` 节 |
 
 > 填 Key 的三种方式(优先级:环境变量 > 配置文件):① **UI 设置页**逐项填写(最方便,即时生效);② **环境变量**(`BULWARK_VT_APIKEY` / `BULWARK_THREATBOOK_APIKEY` / `BULWARK_MDC_APIKEY` / `BULWARK_OTX_APIKEY` / `BULWARK_HA_APIKEY` / `BULWARK_MB_AUTHKEY`(abuse.ch)/ `BULWARK_AI_APIKEY`);③ 本机 `appsettings.json` 对应字段——**注意别把带真实 Key 的配置提交上库**。
+>
+> 🔑 **VirusTotal 多 Key / 提额**:VT 支持一次配多个 Key,用英文逗号分隔(如 `key1,key2,key3`)。**每个 Key 独立计账,额度真正叠加**;某个 Key 触发限流(429)或失效(401)会自动冷却、跳到下一个。每个 Key 还可选按 `KEY:每日上限:每分钟上限` 标注额度,便于混用免费与 Premium,例如 `免费key,你的PremiumKey:100000:1000`(不标注则用免费档默认 500/天、4/分)。若在服务(SYSTEM)身份下运行,环境变量需设为**系统级**,否则读不到用户级变量。
+>
+> ⚠️ VT 服务条款禁止「注册多个免费账号绕过限额」,公开 API 也不得用于商业产品。多 Key 主要面向 **Premium / 企业 Key** 或你合法拥有的独立 Key;要长期高频 / 全量使用,请走 VT Premium API。
 
 ## 处置、隔离与足迹清理
 
