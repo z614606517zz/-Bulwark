@@ -31,6 +31,8 @@ qt_add_executable(bulwark_ui WIN32
     src/dialogs/PromptDialog.cpp
     src/dialogs/RemediationReportDialog.h
     src/dialogs/RemediationReportDialog.cpp
+    src/dialogs/AiCleanupDialog.h
+    src/dialogs/AiCleanupDialog.cpp
     src/dialogs/AttackTimelineWindow.h
     src/dialogs/AttackTimelineWindow.cpp
     src/dialogs/ToastWindow.h

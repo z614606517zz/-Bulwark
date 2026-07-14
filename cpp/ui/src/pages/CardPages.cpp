@@ -1,5 +1,6 @@
 #include "pages/CardPages.h"
 #include "ipc/IpcClient.h"
+#include "dialogs/AiCleanupDialog.h"
 #include "widgets/AppIcon.h"
 #include "widgets/Cards.h"
 #include "widgets/TableKit.h"
@@ -40,6 +41,7 @@
 #include <QWheelEvent>
 #include <QTimer>
 #include <functional>
+#include <memory>
 
 namespace {
 
@@ -346,19 +348,23 @@ void showVtRecordDetail(QWidget* parent, const bulwark::VtScanRecord& r,
     // 初始只用记录本身画(文件 → 判定 → 结论);打开后异步拉完整报告补全行为/检出。
     buildBehaviorGraph(graph, r, nullptr);
 
+    // 最新的完整报告(缓存命中或异步补全后更新),供「AI 清理」按钮据此构建清理画像。
+    auto detail = std::make_shared<bulwark::ipc::VtDetailResponsePayload>();
+
     const QString shaKey = r.sha256.toLower();
     if (cache && cache->contains(shaKey)) {
-        const bulwark::ipc::VtDetailResponsePayload cached = cache->value(shaKey);
-        buildBehaviorGraph(graph, r, &cached); // 缓存命中:直接补全,不再联网
+        *detail = cache->value(shaKey);
+        buildBehaviorGraph(graph, r, detail.get()); // 缓存命中:直接补全,不再联网
     } else if (ipc && r.isTerminal() && r.sha256.size() == 64) {
         statusLbl->setText(u("正在联网获取完整报告…"));
         QObject::connect(ipc, &IpcClient::vtDetailReceived, dlg,
-                         [cache, graph, statusLbl, r, shaKey](const bulwark::ipc::VtDetailResponsePayload& d) {
+                         [cache, graph, statusLbl, r, shaKey, detail](const bulwark::ipc::VtDetailResponsePayload& d) {
             if (d.sha256.toLower() != shaKey) return;
             if (cache) (*cache)[shaKey] = d;
+            *detail = d;
             statusLbl->setText(d.success ? QString()
                                          : (d.message.isEmpty() ? u("未获取到完整报告") : d.message));
-            buildBehaviorGraph(graph, r, &d);
+            buildBehaviorGraph(graph, r, detail.get());
         });
         ipc->vtDetail(r.sha256);
     }
@@ -378,6 +384,31 @@ void showVtRecordDetail(QWidget* parent, const bulwark::VtScanRecord& r,
     footer->addWidget(zoomLbl);
     footer->addWidget(fitBtn);
     footer->addStretch();
+    // AI 清理:仅对判为恶意/可疑且有本机路径的文件提供——把行为画像(释放文件 / 外联 /
+    // 注册表)交给大模型生成 PowerShell 清理方案,用户复核后一键(提权)执行。
+    if (ipc && r.isTerminal() && !r.filePath.isEmpty()
+        && (r.outcome == bulwark::VtScanOutcome::Malicious
+            || r.outcome == bulwark::VtScanOutcome::Suspicious)) {
+        auto* aiCleanBtn = new QPushButton(u("🤖 AI 清理"));
+        aiCleanBtn->setProperty("variant", "danger");
+        aiCleanBtn->setCursor(Qt::PointingHandCursor);
+        aiCleanBtn->setMinimumWidth(96);
+        aiCleanBtn->setToolTip(u("把该文件的行为画像交给大模型,由 AI 生成清理方案并可一键执行"));
+        footer->addWidget(aiCleanBtn);
+        QObject::connect(aiCleanBtn, &QPushButton::clicked, dlg, [dlg, ipc, r, detail] {
+            bulwark::ipc::RemediationReportPayload rep;
+            rep.actorPath   = r.filePath;
+            rep.reason      = !r.threatLabel.isEmpty() ? r.threatLabel : u("云信誉判定为恶意 / 可疑");
+            rep.intelSource = QStringLiteral("VirusTotal");
+            if (detail->success) {
+                rep.intelDroppedFiles     = detail->droppedFiles;
+                rep.intelRegistryKeys     = detail->registryKeys;
+                rep.intelContactedIps     = detail->contactedIps;
+                rep.intelContactedDomains = detail->contactedDomains;
+            }
+            (new AiCleanupDialog(r, rep, ipc, ipc->aiScanner(), dlg))->show();
+        });
+    }
     auto* fullBtn = new QPushButton(u("最大化"));
     fullBtn->setProperty("variant", "ghost");
     fullBtn->setCursor(Qt::PointingHandCursor);
