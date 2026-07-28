@@ -8,6 +8,154 @@
 > C++ 迁移后测试基建尚未重建(`cpp/CMakeLists.txt` 里 `enable_testing()` 仍为注释),
 > 当前仓库**没有任何自动化测试**。规则本身已随 `cpp/shared/src/engine/DefaultRules.cpp` 迁移过来。
 
+---
+
+## [v2.0.3] - 2026-07-29 (GitHub同步发布)
+
+### 发布 🚀
+- **源代码已同步至 GitHub** - https://github.com/z614606517zz/-Bulwark
+  - 完整的 V2.0.3 版本代码库
+  - 190 个文件更新,21903+ 行代码新增
+  - 包含驱动、服务、UI、ML训练管道的完整实现
+
+### 主要特性总览 ✨
+本次发布整合了以下核心功能模块:
+
+#### 1. 攻击溯源与可视化
+- **攻击图构建器** (`cpp/shared/src/engine/AttackGraphBuilder.cpp`)
+  - 将孤立事件还原为完整攻击链
+  - 进程树关联与时间线重建
+  - 节点类型:进程/文件/注册表/网络/服务/计划任务
+- **进程启动来源溯源** (`cpp/service/src/monitoring/ProcessOriginResolver.cpp`)
+  - 将 svchost.exe 还原为具体服务名
+  - 计划任务宿主还原为任务名
+  - SCM/COM 权威快照与注册表回退机制
+- **取证服务** (`cpp/service/src/ForensicsService.cpp`)
+  - 事件时间线查询(按时间窗/类型/PID/关键字)
+  - 攻击关系图生成与下发
+  - 历史事件深度检索(扫描 events.jsonl)
+- **UI 增强**
+  - 攻击图窗口 (`cpp/ui/src/dialogs/AttackGraphWindow.cpp`)
+  - 进程详情对话框 (`cpp/ui/src/dialogs/ProcessDetailDialog.cpp`)
+  - 事件时间线页面(新增)
+
+#### 2. 进程管理与监控
+- **进程枚举器** (`cpp/service/src/monitoring/ProcessEnumerator.cpp`)
+  - 带取证能力的进程管理视图
+  - 启动来源列(服务名/计划任务名)
+  - 签名验证与静态风险提示
+  - 处置功能:结束/挂起/恢复/隔离/信任
+  - 自我保护:拒绝操作自身组件与关键系统进程
+
+#### 3. 主动防护增强
+- **内核命令行硬拦截** (`Bulwark.Driver/ProcessMonitor.c` + `Policy.c`)
+  - 执行前拦截(零 IPC、零往返)
+  - LOLBin 用法检测(vssadmin/wmic/bcdedit/reg等)
+  - 内置 13 条反勒索/反凭据窃取基线
+  - 持久化到注册表,服务未启动时仍生效
+- **注册表防护补齐** (`Bulwark.Driver/RegistryMonitor.c`)
+  - 新增 5 类通知覆盖:Rename/SaveKey/SetSecurity/CreateKey/LoadKey
+  - 内置凭据 hive 硬拦(SAM/SECURITY 导出零配置拒绝)
+  - 修复键改名/ACL 篡改绕过路径型防护的漏洞
+- **哈希扫描模块** (`Bulwark.Driver/HashScan.c`)
+  - 内核本地已知恶意哈希查杀
+  - 独立于用户态服务运行
+- **规则作用域修复**
+  - 收窄"良性厂商应用"信任通道至仅 NetworkConnect/DnsQuery
+  - 修复 IM 客户端规则旁路问题(微信/QQ 群控防护规则现已生效)
+
+#### 4. 云信誉与情报整合
+- **代理声誉服务** (`cpp/service/src/reputation/ProxyReputationService.cpp`)
+  - 中央信誉服务集成(默认 https://vt.bulwark.icu:8787)
+  - 失败时自动回退到直连 VirusTotal
+  - 仅发送 SHA-256 摘要,不传输文件内容
+- **主动防护规则生成** (`Worker.cpp::buildRulesFromProfile()`)
+  - 从 VirusTotal 行为画像自动生成 5 类拦截规则:
+    1. 释放文件哈希拦截(ProcessCreate → Block)
+    2. C2 IP 拦截(NetworkConnect → Block)
+    3. C2 域名拦截(DnsQuery → Block,新增)
+    4. 释放文件名监控(FileWrite → Ask)
+    5. 注册表持久化拦截(RegistrySetValue → Block,新增)
+  - 智能过滤:排除 CDN/云服务商域名,限制规则数量避免误报
+
+#### 5. ML 训练管道
+- **数据采集工具** (`ml/tools/`)
+  - Collect-BenignPE.ps1 - 良性 PE 样本采集
+  - Collect-BenignSamples.ps1 - 通过 winget 采集可信应用
+  - Collect-CleanWim.ps1 - 从 Windows WIM 镜像提取系统文件
+  - Collect-MalwareBazaar.ps1 - 恶意样本下载与管理
+  - github_dl.py - GitHub 热门项目可执行文件下载
+- **特征提取与训练** (`ml/train/`)
+  - extract_features.py - PE 静态特征提取
+  - behavior_runtime_features.py - 运行时行为特征
+  - train.py - LightGBM 模型训练主流程
+  - vt_enrich.py / vt_behaviours.py - VirusTotal 情报增强
+  - mb_enrich.py - MalwareBazaar 元数据集成
+- **注意**: 产品不包含已训练模型,检测能力来自规则+启发式+云信誉
+
+#### 6. 部署与工具
+- **构建脚本**
+  - build.bat / build_service_v2.ps1 - 服务构建
+  - cpp/build_ui.bat - UI 构建
+  - rebuild_all_for_portable.ps1 - 便携版完整构建
+- **部署脚本** (`scripts/`)
+  - _kiro_deploy_service.ps1 - 服务部署
+  - _kiro_load_now.ps1 - 驱动加载
+  - _kiro_restart_svc.ps1 - 服务重启
+  - deploy-driver-vm.ps1 - 虚拟机驱动部署
+- **启动器与辅助工具** (`tools/`)
+  - bulwark_launcher.cpp - 启动器实现
+  - auto-allow.ps1 - 自动信任规则生成
+- **服务端组件** (`server/bulwark-broker/`)
+  - broker.py - 中央信誉代理服务
+  - ember_pkg/features.py - EMBER 特征提取
+
+### 文档与配置 📚
+- **新增文档**
+  - PROACTIVE_DEFENSE.md - 主动防护技术文档
+  - REAL_TIME_PROTECTION_STATUS.md - 实时防护状态分析
+  - SYSTEM_TOOL_PROTECTION.md - 系统工具保护机制
+  - TESTING_GUIDE.md - 综合测试指南
+  - V2.0.2_TEST_GUIDE.md - V2.0.2 测试指南
+  - V2.0.3_RELEASE.md - V2.0.3 发布说明
+  - SUMMARY.md - 项目概要
+- **配置完善**
+  - cpp/dist/appsettings.json - 运行时配置模板
+  - cpp/service/appsettings.json - 服务配置示例
+  - cpp/scripts/set-baseline-policy.ps1 - 基线策略设置
+
+### 技术架构变更 🔧
+- **协议保持兼容** - IPC 协议版本维持 v9,新旧两端可降级互通
+- **事件类型扩展** - 新增 CommandBlocked / RegistryHiveDump 等事件类型
+- **数据模型增强**
+  - SecurityEvent / ChainEventInfo 新增 origin* 字段
+  - ProcessEntry / AttackGraph 模型(新增)
+  - ProcessOriginKind 枚举类型(新增)
+- **IPC 消息扩展** - IpcMessageType 追加 50-57(时间线/攻击图/进程管理相关)
+
+### 安全与隐私 🔒
+- **明确数据外发行为**
+  - 默认开启中央信誉服务(仅发送 SHA-256 摘要)
+  - README 已说明关闭方法与自建方式
+  - 本地 API Key 不会上传到中央服务
+- **自我保护增强**
+  - 进程管理拒绝操作自身组件
+  - 关键系统进程保护(防 0xEF 蓝屏)
+  - 驱动独立运行能力(服务停止时仍拦截)
+
+### 已知限制 ⚠️
+- **上报逻辑缺陷**: 引擎裁决 Allow 但内核已拦截时,UI 会错误显示为"放行"
+  - 影响事件: SelfProtect / MemoryProtect / ImageBlocked / NetworkConnect / CommandBlocked / RegistryHiveDump
+  - 原因: `Worker::enforceBlock` 仅在裁决为 Block 时调用
+  - 建议: `kernelBlocked=true` 时无条件报告 `KernelBlocked`(待决策)
+- **测试覆盖**: C++ 版本无自动化测试(enable_testing() 仍注释状态)
+- **模型推理**: 当前版本不包含 ML 模型推理路径,ml/ 仅用于离线训练
+
+### 致谢 🙏
+感谢所有参与测试、反馈问题和贡献代码的用户与开发者。
+
+---
+
 ## [未发布] - 2026-07-28 (最新)
 
 ### 修复 🐛
