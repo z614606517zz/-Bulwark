@@ -73,6 +73,13 @@ bool DailyQuota::tryConsume(bool priority) {
     return true;
 }
 
+void DailyQuota::release() {
+    QMutexLocker lk(&lock_);
+    const QDate today = QDateTime::currentDateTimeUtc().date();
+    if (today != dayUtc_) { dayUtc_ = today; count_ = 0; return; } // 跨天后计数已归零,无可退还
+    if (count_ > 0) --count_;
+}
+
 std::pair<int, int> DailyQuota::snapshot() {
     QMutexLocker lk(&lock_);
     const QDate today = QDateTime::currentDateTimeUtc().date();

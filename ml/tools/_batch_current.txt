@@ -1,0 +1,10 @@
+# Bulwark ML 白样本 winget 扩充 —— 当前批次（每行一个包 ID，# 为注释）
+# 批次 1：口碑好、安装快、释放 PE 多样的常见第三方软件
+7zip.7zip
+Notepad++.Notepad++
+voidtools.Everything
+SumatraPDF.SumatraPDF
+VideoLAN.VLC
+Microsoft.PowerToys
+Mozilla.Firefox
+Google.Chrome

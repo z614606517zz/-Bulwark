@@ -1,7 +1,11 @@
 #include "bulwark/service/reputation/ThreatBookClient.h"
 #include "bulwark/service/reputation/ReputationCurl.h"
+#include "bulwark/service/AtomicFile.h"
+#include "bulwark/service/Logger.h" // programDataDir()
 
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -119,20 +123,85 @@ ThreatBookClient::ThreatBookClient(const BulwarkOptions& options)
                  : options.ThreatBook.IpIntelBaseUrl;
     sceneLimit_ = std::max(1, options.ThreatBook.SceneRequestsPerMonth);
     enabled_ = !apiKey_.isEmpty();           // 有 Key 即可用(与 .NET ThreatBook 一致)
+    loadSceneState();
 }
 
-bool ThreatBookClient::trySceneQuota() {
-    // 场景接口(IP)月配额极低,与文件信誉(300/天)分开计数,避免一次打爆。到月自动归零。
-    QMutexLocker lock(&sceneMutex_);
+namespace {
+QString sceneStatePath() {
+    return QDir(programDataDir()).filePath(QStringLiteral("tb_ip_quota.json"));
+}
+} // namespace
+
+void ThreatBookClient::loadSceneState() {
+    QFile f(sceneStatePath());
+    if (!f.open(QIODevice::ReadOnly))
+        return;                                  // 首次运行:保持 sceneMonth_=-1,下次 roll 会归零
+    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+    f.close();
+    if (!doc.isObject())
+        return;
+    const QJsonObject o = doc.object();
+    const int m = o.value(QLatin1String("month")).toInt(-1);
+    const int used = o.value(QLatin1String("used")).toInt(0);
+    if (m <= 0 || used < 0)
+        return;                                  // 文件坏了就当没有,宁可重新计数
+    sceneMonth_ = m;
+    sceneUsed_ = used;
+}
+
+void ThreatBookClient::saveSceneState() {
+    // 调用方须已持 sceneMutex_。
+    QJsonObject o;
+    o[QStringLiteral("month")] = sceneMonth_;
+    o[QStringLiteral("used")] = sceneUsed_;
+    writeFileAtomically(sceneStatePath(), QJsonDocument(o).toJson(QJsonDocument::Compact),
+                        QStringLiteral("微步 IP 情报月配额计数"));
+}
+
+void ThreatBookClient::rollSceneMonth() {
+    // 调用方须已持 sceneMutex_。
     const QDate today = QDateTime::currentDateTimeUtc().date();
     const int m = today.year() * 100 + today.month();
     if (m != sceneMonth_) {
         sceneMonth_ = m;
         sceneUsed_ = 0;
+        sceneExhaustedLogged_ = false;
     }
-    if (sceneUsed_ >= sceneLimit_)
+}
+
+void ThreatBookClient::noteExhaustedOnce() {
+    // 调用方须已持 sceneMutex_。每月只报一条:原先是每次调用都写一行,配额耗尽后就退化成纯噪声
+    // —— 实测 rep_diag.log 里绝大部分内容都是这一句在反复重复(同一个 IP 一秒内出现 12 次)。
+    // 但也不能一条都不报:上层现在会在入队前就短路,若这里不出声,IP 情报就"静默失效"一整月,
+    // 运维完全看不出来。所以保留恰好一条。
+    if (sceneExhaustedLogged_)
+        return;
+    sceneExhaustedLogged_ = true;
+    ReputationCurl::diag(QStringLiteral("TB ip 本月情报配额已用尽(%1/%2),到下月前不再查询")
+                             .arg(sceneUsed_).arg(sceneLimit_));
+}
+
+bool ThreatBookClient::trySceneQuota() {
+    // 场景接口(IP)月配额极低,与文件信誉(300/天)分开计数,避免一次打爆。到月自动归零。
+    QMutexLocker lock(&sceneMutex_);
+    rollSceneMonth();
+    if (sceneUsed_ >= sceneLimit_) {
+        noteExhaustedOnce();
         return false;
+    }
     ++sceneUsed_;
+    saveSceneState(); // 每月最多 20 次,写盘开销可忽略
+    return true;
+}
+
+bool ThreatBookClient::ipIntelBudgetSpent() {
+    if (!enabled_)
+        return true; // 没配 Key,别让上层白排队
+    QMutexLocker lock(&sceneMutex_);
+    rollSceneMonth();
+    if (sceneUsed_ < sceneLimit_)
+        return false;
+    noteExhaustedOnce(); // 上层就是靠这个短路的,那条"配额用尽"就得从这里发出来
     return true;
 }
 
@@ -143,10 +212,8 @@ bulwark::IpReputation ThreatBookClient::queryIp(const QString& ip) {
     if (!enabled_ || ip.trimmed().isEmpty())
         return unknown;
 
-    if (!trySceneQuota()) {
-        ReputationCurl::diag(QStringLiteral("TB ip %1 => scene quota exhausted").arg(ip));
-        return unknown;
-    }
+    if (!trySceneQuota())
+        return unknown; // trySceneQuota 已按月记录一次,这里不再逐 IP 刷日志
     bucket_.wait();
 
     const QList<QPair<QString, QString>> form{

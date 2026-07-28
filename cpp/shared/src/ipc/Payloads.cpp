@@ -520,4 +520,203 @@ IntelApplyRequestPayload IntelApplyRequestPayload::fromJson(const QJsonObject& o
     return p;
 }
 
+// ---- helpers for int-list (de)serialization ---------------------------------
+namespace {
+QJsonArray intListToArray(const QList<int>& list) {
+    QJsonArray arr;
+    for (int v : list) arr.append(v);
+    return arr;
+}
+QList<int> intListFromArray(const QJsonArray& arr) {
+    QList<int> out;
+    out.reserve(arr.size());
+    for (const QJsonValue& v : arr)
+        if (v.isDouble()) out.append(v.toInt());
+    return out;
+}
+} // namespace
+
+// ===== 事件时间线 =====
+QJsonObject TimelineRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    if (fromUtc.isValid()) o["fromUtc"] = dateTimeToIso(fromUtc);
+    if (toUtc.isValid())   o["toUtc"] = dateTimeToIso(toUtc);
+    if (!types.isEmpty())   o["types"] = intListToArray(types);
+    if (!actions.isEmpty()) o["actions"] = intListToArray(actions);
+    o["minRiskScore"] = minRiskScore;
+    o["pid"] = pid;
+    o["includeProcessTree"] = includeProcessTree;
+    o["text"] = text;
+    o["limit"] = limit;
+    return o;
+}
+TimelineRequestPayload TimelineRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    TimelineRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.fromUtc = dateTimeFromIso(getStr(o, "fromUtc"));
+    p.toUtc = dateTimeFromIso(getStr(o, "toUtc"));
+    p.types = intListFromArray(o.value(QLatin1String("types")).toArray());
+    p.actions = intListFromArray(o.value(QLatin1String("actions")).toArray());
+    p.minRiskScore = getInt(o, "minRiskScore");
+    p.pid = getInt(o, "pid");
+    p.includeProcessTree = getBool(o, "includeProcessTree");
+    p.text = getStr(o, "text");
+    p.limit = getInt(o, "limit", 500);
+    return p;
+}
+
+QJsonObject TimelineResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray arr;
+    for (const EventLogPayload& e : events) arr.append(e.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["events"] = arr;
+    o["scanned"] = scanned;
+    o["matched"] = matched;
+    o["truncated"] = truncated;
+    if (earliestUtc.isValid()) o["earliestUtc"] = dateTimeToIso(earliestUtc);
+    o["message"] = message;
+    return o;
+}
+TimelineResponsePayload TimelineResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    TimelineResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    const QJsonArray arr = o.value(QLatin1String("events")).toArray();
+    p.events.reserve(arr.size());
+    for (const QJsonValue& v : arr)
+        if (v.isObject()) p.events.append(EventLogPayload::fromJson(v.toObject()));
+    p.scanned = getInt(o, "scanned");
+    p.matched = getInt(o, "matched");
+    p.truncated = getBool(o, "truncated");
+    p.earliestUtc = dateTimeFromIso(getStr(o, "earliestUtc"));
+    p.message = getStr(o, "message");
+    return p;
+}
+
+// ===== 攻击图 =====
+QJsonObject AttackGraphRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["seedEventId"] = guidToString(seedEventId);
+    o["rootPid"] = rootPid;
+    o["windowSeconds"] = windowSeconds;
+    return o;
+}
+AttackGraphRequestPayload AttackGraphRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    AttackGraphRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.seedEventId = guidFromString(getStr(o, "seedEventId"));
+    p.rootPid = getInt(o, "rootPid");
+    p.windowSeconds = getInt(o, "windowSeconds", 3600);
+    return p;
+}
+
+QJsonObject AttackGraphResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["success"] = success;
+    o["message"] = message;
+    o["graph"] = graph.toJson();
+    return o;
+}
+AttackGraphResponsePayload AttackGraphResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    AttackGraphResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.success = getBool(o, "success");
+    p.message = getStr(o, "message");
+    p.graph = bulwark::AttackGraph::fromJson(o.value(QLatin1String("graph")).toObject());
+    return p;
+}
+
+// ===== 进程管理 =====
+QJsonObject ProcessListRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["includeCommandLine"] = includeCommandLine;
+    o["resolveOrigin"] = resolveOrigin;
+    return o;
+}
+ProcessListRequestPayload ProcessListRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    ProcessListRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.includeCommandLine = getBool(o, "includeCommandLine", true);
+    p.resolveOrigin = getBool(o, "resolveOrigin", true);
+    return p;
+}
+
+QJsonObject ProcessListResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray arr;
+    for (const bulwark::ProcessEntry& e : processes) arr.append(e.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["snapshotUtc"] = dateTimeToIso(snapshotUtc);
+    o["processes"] = arr;
+    o["message"] = message;
+    return o;
+}
+ProcessListResponsePayload ProcessListResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    ProcessListResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.snapshotUtc = dateTimeFromIso(getStr(o, "snapshotUtc"));
+    for (const QJsonValue& v : o.value(QLatin1String("processes")).toArray())
+        if (v.isObject()) p.processes.append(bulwark::ProcessEntry::fromJson(v.toObject()));
+    p.message = getStr(o, "message");
+    return p;
+}
+
+QJsonObject ProcessActionRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["kind"] = static_cast<int>(kind);
+    o["pid"] = pid;
+    o["imagePath"] = imagePath;
+    return o;
+}
+ProcessActionRequestPayload ProcessActionRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    ProcessActionRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.kind = static_cast<ProcessActionKind>(getInt(o, "kind", 0));
+    p.pid = getInt(o, "pid");
+    p.imagePath = getStr(o, "imagePath");
+    return p;
+}
+
+QJsonObject ProcessActionResultPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["kind"] = static_cast<int>(kind);
+    o["pid"] = pid;
+    o["success"] = success;
+    o["message"] = message;
+    if (!sha256.isEmpty()) o["sha256"] = sha256;
+    return o;
+}
+ProcessActionResultPayload ProcessActionResultPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    ProcessActionResultPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.kind = static_cast<ProcessActionKind>(getInt(o, "kind", 0));
+    p.pid = getInt(o, "pid");
+    p.success = getBool(o, "success");
+    p.message = getStr(o, "message");
+    p.sha256 = getStr(o, "sha256");
+    return p;
+}
+
 } // namespace bulwark::ipc

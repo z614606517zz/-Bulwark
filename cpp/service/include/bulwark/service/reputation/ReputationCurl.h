@@ -41,7 +41,12 @@ public:
 private:
     static QStringList buildArgs(const QString& method, const QString& url, const QStringList& headers,
                                  const QList<QPair<QString, QString>>* form, int timeoutSeconds);
-    static std::pair<int, QString> run(const QStringList& args, int timeoutSeconds);
+    // stdinData 非空时经 curl 的 stdin 送请求体(配合 --data-binary @-)。
+    // 之所以不把 JSON 直接当命令行参数(--data-raw):Windows 上参数里的双引号要经
+    // QProcess -> CRT 两层转义,JSON 体到 curl 手里就坏了,服务端只会回 400 invalid json。
+    // 走 stdin 零转义、零临时文件,也不会把请求体暴露在命令行里(其它进程可见)。
+    static std::pair<int, QString> run(const QStringList& args, int timeoutSeconds,
+                                       const QByteArray& stdinData = QByteArray());
 };
 
 } // namespace bulwark::service::reputation

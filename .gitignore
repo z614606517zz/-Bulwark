@@ -11,6 +11,9 @@ x86/
 build/
 build_drv/
 build-ninja/
+build-ascii/
+build-rt/
+build-fix/
 build_pkg/
 cpp/dist/
 dist/
@@ -104,3 +107,27 @@ Remediate-Threat.ps1
 _cleanup_*.ps1
 _cleanup_*.txt
 运行清理_管理员.bat
+
+# ---- 勒索事件(CLEARWATER, 2026-07-19)的抢救快照,不入库 ----
+# 里面是三份【完整的旧源码树副本】(_gh_original / git-recovered-tree / recovered-src)
+# 外加加密残留与分析脚本,约 1.7k 文件 / 98MB。它们和真源码同名同层级,不排除的话:
+#   * 全文搜索会命中旧副本而不是 Bulwark.Driver\ 下的真文件(实测踩过);
+#   * 编辑器/索引器要多扫 98MB。
+# 保留在磁盘上作为取证与参考,但对 git 与搜索一律不可见。
+bulwark-recovery/
+
+# ---- Python 虚拟环境(13k 文件 / 408MB,占整棵树的绝大多数)----
+ml/.venv/
+.venv/
+__pycache__/
+*.pyc
+
+# ---- 单下划线的一次性调试产物 ----
+# 注意:上面已有的是 __*.txt(双下划线),覆盖不到这些单下划线的。仅限仓库根目录。
+/_probe.txt
+/_probe2.txt
+/_ssh_diag.txt
+/_svc_state.txt
+/_tf_check.txt
+/start
+/nul

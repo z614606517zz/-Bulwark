@@ -13,6 +13,8 @@ add_library(bulwark_shared STATIC
     src/models/ReputationUsage.cpp
     src/models/IpReputation.cpp
     src/models/PersistenceEntry.cpp
+    src/models/AttackGraph.cpp
+    src/models/ProcessEntry.cpp
     src/ipc/IpcMessage.cpp
     src/ipc/Payloads.cpp
 
@@ -30,6 +32,7 @@ add_library(bulwark_shared STATIC
     src/engine/ScriptAnalyzer.cpp
     src/engine/KillChainAnalyzer.cpp
     src/engine/ProcessChainTracker.cpp
+    src/engine/AttackGraphBuilder.cpp
     src/engine/BeaconDetector.cpp
     src/engine/EgressRateMonitor.cpp
     src/engine/BaselineAnalyzer.cpp

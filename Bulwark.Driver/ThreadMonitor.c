@@ -34,41 +34,20 @@ static BOOLEAN g_ThreadCallbackRegistered = FALSE;
 static BOOLEAN
 BlwIsHighValueInjectionTarget(_In_ PCWSTR Path, _In_ USHORT Chars)
 {
-    static const PCWSTR kTargets[] = {
-        L"\\lsass.exe",
-        L"\\winlogon.exe",
-        L"\\csrss.exe",
-        L"\\services.exe",
-        L"\\smss.exe",
-        L"\\WeChat.exe",
-        L"\\Weixin.exe",
-        L"\\WXWork.exe",
-        L"\\QQ.exe",
-        L"\\TIM.exe",
+    static const BLW_NAME_ENTRY kTargets[] = {
+        BLW_NAME(L"lsass.exe"),
+        BLW_NAME(L"winlogon.exe"),
+        BLW_NAME(L"csrss.exe"),
+        BLW_NAME(L"services.exe"),
+        BLW_NAME(L"smss.exe"),
+        BLW_NAME(L"WeChat.exe"),
+        BLW_NAME(L"Weixin.exe"),
+        BLW_NAME(L"WXWork.exe"),
+        BLW_NAME(L"QQ.exe"),
+        BLW_NAME(L"TIM.exe"),
     };
 
-    UNICODE_STRING usPath, usName;
-    ULONG i;
-
-    if (Path == NULL || Chars == 0) return FALSE;
-
-    usPath.Buffer = (PWSTR)Path;
-    usPath.Length = Chars * sizeof(WCHAR);
-    usPath.MaximumLength = usPath.Length;
-
-    for (i = 0; i < RTL_NUMBER_OF(kTargets); i++) {
-        RtlInitUnicodeString(&usName, kTargets[i]);
-        if (usName.Length <= usPath.Length) {
-            UNICODE_STRING tail;
-            tail.Buffer = (PWSTR)((PUCHAR)usPath.Buffer + usPath.Length - usName.Length);
-            tail.Length = usName.Length;
-            tail.MaximumLength = usName.Length;
-            if (RtlCompareUnicodeString(&tail, &usName, TRUE) == 0) {
-                return TRUE;
-            }
-        }
-    }
-    return FALSE;
+    return BlwImageNameIn(kTargets, RTL_NUMBER_OF(kTargets), Path, Chars);
 }
 
 //
@@ -111,7 +90,6 @@ BlwCreateThreadNotify(
     _In_ HANDLE ThreadId,
     _In_ BOOLEAN Create)
 {
-    BLW_EVENT_MESSAGE msg;
     ULONG actorPid;
     ULONG targetPid;
     WCHAR targetImage[BLW_MAX_PATH];
@@ -157,14 +135,9 @@ BlwCreateThreadNotify(
         return;
     }
 
-    RtlZeroMemory(&msg, sizeof(msg));
-    msg.EventId = (ULONG64)InterlockedIncrement64(&g_Blw.NextEventId);
-    msg.Type = BlwEventRemoteThread;
-    msg.ActorPid = actorPid;
-    msg.ParentPid = targetPid;   // 复用字段:被注入的目标进程 PID
-
+    // ParentPid 复用字段:被注入的目标进程 PID。
     // 仅记录上报(无法阻止);用户态据规则处置。
-    BlwReportEvent(&msg);
+    BlwReportEvent(BlwEventRemoteThread, actorPid, targetPid, NULL, NULL, 0, 0);
 }
 
 NTSTATUS

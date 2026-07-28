@@ -41,6 +41,28 @@ bool neutralizeCopy(const QString& src, const QString& dest, unsigned char key) 
     return true;
 }
 
+// XOR-neutralize an in-memory buffer to the vault file. Used when user-mode can't read the
+// original (exclusive lock / mapped image) and the kernel read it for us — we still produce
+// the reversible vault copy in user mode. XOR is its own inverse, so restore works unchanged.
+bool writeNeutralizedBuffer(const QByteArray& raw, const QString& dest, unsigned char key) {
+    QFile out(dest);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+    constexpr qint64 kBuf = 1 << 16; // 64 KB
+    QByteArray buf;
+    buf.resize(kBuf);
+    const qint64 total = raw.size();
+    qint64 pos = 0;
+    while (pos < total) {
+        const qint64 n = qMin<qint64>(kBuf, total - pos);
+        for (qint64 i = 0; i < n; ++i)
+            buf[i] = static_cast<char>(static_cast<unsigned char>(raw[static_cast<int>(pos + i)]) ^ key);
+        if (out.write(buf.constData(), n) != n) return false;
+        pos += n;
+    }
+    out.close();
+    return true;
+}
+
 // Best-effort: schedule deletion on next reboot (payload was quarantined but the
 // original is locked). Mirrors ProcessInspector.TryScheduleDeleteOnReboot.
 void scheduleDeleteOnReboot(const QString& path) {
@@ -135,7 +157,8 @@ void QuarantineManager::saveIndex() {
 }
 
 std::optional<QuarantineEntry> QuarantineManager::quarantine(
-    const QString& filePath, const QString& reason, int actorPid, const QString& sha256) {
+    const QString& filePath, const QString& reason, int actorPid, const QString& sha256,
+    bool waitForUnlock) {
     if (filePath.trimmed().isEmpty()) return std::nullopt;
 
     QMutexLocker lk(&io_);
@@ -158,15 +181,28 @@ std::optional<QuarantineEntry> QuarantineManager::quarantine(
     entry.actorPid = actorPid;
 
     const QString dest = storePathFor(entry.id);
-    if (!neutralizeCopy(filePath, dest, kXorKey)) return std::nullopt;
+    // 1) 制作可逆金库副本(读原文件 -> XOR 中和 -> 写金库)。用户态因共享冲突 / 映像占用打不开读时,
+    //    委托内核以「忽略共享访问检查」读出整文件,用户态照常中和写金库 —— 保住可逆隔离(非驱动
+    //    做不到这一步)。内核不可用 / 旧驱动 / 仍失败则如常返回 nullopt(交后台重试或用户手动重试)。
+    bool vaulted = neutralizeCopy(filePath, dest, kXorKey);
+    if (!vaulted && kernelReader_) {
+        QByteArray raw;
+        if (kernelReader_(filePath, raw))
+            vaulted = writeNeutralizedBuffer(raw, dest, kXorKey);
+    }
+    if (!vaulted) return std::nullopt;
 
-    // Vault copy is safe -> delete the original payload; retry if locked, else
-    // schedule delete on reboot.
+    // 2) 金库副本已就绪 -> 删除原始载荷。先试用户态删除(锁定则重试;waitForUnlock=false 时只试一次
+    //    绝不睡眠,避免卡主线程);仍删不掉且有内核委托时,请内核 POSIX 强制删除(可删被占用 / 已映射
+    //    运行镜像的文件);再不行才回退「计划重启删除」。这一层内核强删正是「避免老是失败」的关键。
     bool deleted = false;
-    for (int attempt = 0; attempt < 5; ++attempt) {
+    const int attempts = waitForUnlock ? 5 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         if (attempt > 0) QThread::msleep(static_cast<unsigned long>(attempt) * 500);
         if (QFile::remove(filePath)) { deleted = true; break; }
     }
+    if (!deleted && kernelDeleter_ && kernelDeleter_(filePath))
+        deleted = true;
     if (!deleted) scheduleDeleteOnReboot(filePath);
 
     entries_.append(entry);

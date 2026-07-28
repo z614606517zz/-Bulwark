@@ -68,6 +68,19 @@ enum class VtRequestKind {
     UsageStats,           // 各源用量统计
 };
 
+// 进程「启动来源」分类:一个进程是被谁拉起来的。用于把 svchost.exe / 计划任务这类
+// 「宿主进程」还原成真实的启动实体(具体服务名 / 具体任务名),否则溯源链上只看到一个
+// 无区分度的 svchost.exe,分析时完全无法定性。仅作【溯源展示与取证】用,不参与风险评分。
+enum class ProcessOriginKind {
+    Unknown = 0,       // 未能判定
+    Interactive,       // 交互式启动(explorer / 终端 / 其它普通父进程)
+    Service,           // Windows 服务(SCM 启动;含 svchost 共享宿主里的具体服务)
+    ScheduledTask,     // 计划任务(任务计划程序启动)
+    WmiProvider,       // WMI 提供者宿主(wmiprvse)派生
+    LogonAutostart,    // 登录自启动(Run 键 / 启动文件夹,由 explorer/userinit 拉起)
+    SystemBoot,        // 系统启动早期(smss/wininit/csrss 一族)
+};
+
 // 拦截的「实际执行结果」——与 VerdictAction(裁决意图)严格区分:裁决为 Block 不代表真的拦住了。
 // UI / 审计据此如实显示处置,杜绝「判了 Block 就显示已拦截、实则毫无动作」的假拦截提示。
 enum class EnforcementOutcome {
@@ -141,6 +154,19 @@ inline QString verdictSourceToString(VerdictSource s) {
         case VerdictSource::DefaultPolicy: return QStringLiteral("DefaultPolicy");
     }
     return QStringLiteral("Rule");
+}
+
+inline QString processOriginKindToString(ProcessOriginKind k) {
+    switch (k) {
+        case ProcessOriginKind::Unknown:        return QStringLiteral("Unknown");
+        case ProcessOriginKind::Interactive:    return QStringLiteral("Interactive");
+        case ProcessOriginKind::Service:        return QStringLiteral("Service");
+        case ProcessOriginKind::ScheduledTask:  return QStringLiteral("ScheduledTask");
+        case ProcessOriginKind::WmiProvider:    return QStringLiteral("WmiProvider");
+        case ProcessOriginKind::LogonAutostart: return QStringLiteral("LogonAutostart");
+        case ProcessOriginKind::SystemBoot:     return QStringLiteral("SystemBoot");
+    }
+    return QStringLiteral("Unknown");
 }
 
 inline QString enforcementOutcomeToString(EnforcementOutcome o) {

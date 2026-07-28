@@ -6,7 +6,10 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
 # WIN32 => GUI subsystem (no console window), matching the .NET WinExe UI.
 qt_add_executable(bulwark_ui WIN32
+    app.rc                     # embeds the brand badge as the exe/Explorer icon
     src/main.cpp
+    src/Bootstrap.h
+    src/Bootstrap.cpp
     src/Theme.h
     src/Theme.cpp
     src/MainWindow.h
@@ -35,6 +38,10 @@ qt_add_executable(bulwark_ui WIN32
     src/dialogs/AiCleanupDialog.cpp
     src/dialogs/AttackTimelineWindow.h
     src/dialogs/AttackTimelineWindow.cpp
+    src/dialogs/AttackGraphWindow.h
+    src/dialogs/AttackGraphWindow.cpp
+    src/dialogs/ProcessDetailDialog.h
+    src/dialogs/ProcessDetailDialog.cpp
     src/dialogs/ToastWindow.h
     src/dialogs/ToastWindow.cpp
     src/dialogs/ToastNotifier.h
@@ -56,6 +63,11 @@ target_include_directories(bulwark_ui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(bulwark_ui PRIVATE
     bulwark_shared
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network)
+
+if(WIN32)
+    # Bootstrap.cpp 用 ShellExecuteExW 提权拉起 bulwark_service.exe --bootstrap。
+    target_link_libraries(bulwark_ui PRIVATE shell32)
+endif()
 
 target_compile_features(bulwark_ui PRIVATE cxx_std_20)
 

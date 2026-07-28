@@ -59,6 +59,18 @@ enum class IpcMessageType {
     EventHistoryClearRequest,   // 47 UI->服务:清空结构化事件历史(活动日志/拦截记录)
     VtDetailRequest,            // 48 UI->服务:请求某哈希的 VT 完整报告(每引擎检出+元数据+行为)
     VtDetailResponse,           // 49 服务->UI:VT 完整报告
+
+    // ---- 事件时间线 / 攻击图(取证回溯)----
+    EventTimelineRequest,       // 50 UI->服务:按时间窗/类型/裁决/风险/PID/关键字查询事件时间线
+    EventTimelineResponse,      // 51 服务->UI:时间线查询结果(含统计)
+    AttackGraphRequest,         // 52 UI->服务:以某事件/某 PID 为种子构建攻击图
+    AttackGraphResponse,        // 53 服务->UI:攻击图(节点 + 边)
+
+    // ---- 进程管理 ----
+    ProcessListRequest,         // 54 UI->服务:请求在跑进程快照(含服务/计划任务溯源)
+    ProcessListResponse,        // 55 服务->UI:进程快照
+    ProcessActionRequest,       // 56 UI->服务:对某进程执行处置(结束/结束进程树/挂起/恢复/隔离/信任)
+    ProcessActionResponse,      // 57 服务->UI:进程处置结果
 };
 
 } // namespace bulwark::ipc

@@ -19,6 +19,11 @@ struct RemediationReport {
     QStringList quarantinedFiles;
     QStringList removedRegistryValues;
     QList<bulwark::ipc::RemediationSkippedItem> skipped;
+    // 持久化反重建:已成功清理的自启动项对应的【内核 RegHardBlock 就绪子串】(controlset/hive 无关的
+    // "键\值" 尾段,如 SOFTWARE\...\Run\Evil、\Services\Evil\)。由 Worker 下发内核注册表硬拦,使恶意
+    // 软件【无法立刻重建】刚被清掉的持久化(补上"清理→守护进程秒级重写"的竞态窗口)。非展示字段,
+    // 不计入 totalActions(展示仍用 removedRegistryValues,那是带中文装饰的人读串)。
+    QStringList hardenedRegTargets;
     int totalActions() const { return quarantinedFiles.size() + removedRegistryValues.size(); }
 };
 

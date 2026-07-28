@@ -22,6 +22,8 @@ ChainEventInfo ChainEventInfo::from(const SecurityEvent& e) {
     c.commandLine = truncate(e.commandLine, 256);
     c.target = e.target;
     c.riskScore = e.riskScore;
+    c.originKind = e.originKind;
+    c.originLabel = e.originLabel();
     return c;
 }
 
@@ -35,6 +37,8 @@ QJsonObject ChainEventInfo::toJson() const {
     if (!commandLine.isEmpty()) o["commandLine"] = commandLine;
     o["target"] = target;
     o["riskScore"] = riskScore;
+    if (originKind != ProcessOriginKind::Unknown) o["originKind"] = static_cast<int>(originKind);
+    if (!originLabel.isEmpty()) o["originLabel"] = originLabel;
     return o;
 }
 
@@ -48,6 +52,8 @@ ChainEventInfo ChainEventInfo::fromJson(const QJsonObject& o) {
     c.commandLine = getStr(o, "commandLine");
     c.target = getStr(o, "target");
     c.riskScore = getInt(o, "riskScore");
+    c.originKind = static_cast<ProcessOriginKind>(getInt(o, "originKind", 0));
+    c.originLabel = getStr(o, "originLabel");
     return c;
 }
 

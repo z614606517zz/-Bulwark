@@ -1,5 +1,6 @@
 #pragma once
 #include <QStringList>
+#include <QUuid>
 #include <QWidget>
 
 class QStackedWidget;
@@ -8,6 +9,7 @@ class QLabel;
 class QVBoxLayout;
 class QCloseEvent;
 class QSystemTrayIcon;
+class QTimer;
 class IpcClient;
 class ToastNotifier;
 
@@ -46,6 +48,7 @@ private:
                  const QString& title, const QString& subtitle, QWidget* page);
     void setupTray();
     void navigateTo(const QString& pageKey);
+    void pingReputation(); // 探测中央信誉服务是否在线,回填侧栏状态灯
 
     QStackedWidget* m_stack = nullptr;
     QButtonGroup* m_navGroup = nullptr;
@@ -53,6 +56,9 @@ private:
     QLabel* m_title = nullptr;
     QLabel* m_subtitle = nullptr;
     QLabel* m_connPill = nullptr;
+    QLabel* m_repPill = nullptr;   // 中央信誉服务在线/离线状态灯
+    QTimer* m_repTimer = nullptr;  // 周期性健康探测
+    QUuid m_repPingId;             // 当前在途健康探测的 requestId(只认自己发起的响应)
     IpcClient* m_ipc = nullptr;
     QSystemTrayIcon* m_tray = nullptr;
     ToastNotifier* m_toasts = nullptr;

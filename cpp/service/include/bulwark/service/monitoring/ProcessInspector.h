@@ -1,6 +1,7 @@
 #pragma once
 #include <QString>
 #include <QDateTime>
+#include <QList>
 
 // 进程取证辅助:Authenticode 签名校验(嵌入式 + 目录/catalog)、文件 SHA-256、
 // 证书画像(指纹/有效期/吊销)、按 PID 读取命令行/父进程、主动处置(结束进程树,
@@ -43,6 +44,8 @@ public:
     static QString tryGetCommandLine(int pid);
     // 取 PID 的父进程 PID(NtQueryInformationProcess.InheritedFromUniqueProcessId)。
     static int     tryGetParentPid(int pid);
+    // 枚举当前所有进程 PID(Toolhelp32 快照;跳过 PID<=4)。供兜底扫描遍历在跑进程。
+    static QList<int> enumeratePids();
 
     // ---- 主动处置 ----------------------------------------------------------
     // 为当前进程启用 SeDebugPrivilege(进程级一次性;返回首次尝试的真实结果)。

@@ -4,9 +4,11 @@
 #include "bulwark/models/Enums.h"
 #include "bulwark/models/SecurityEvent.h"
 
+#include <QDateTime>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QTimer>
 
 using bulwark::SecurityEvent;
 
@@ -42,10 +44,44 @@ QString actorName(const SecurityEvent& e)
 
 } // namespace
 
-ToastNotifier::ToastNotifier(QObject* parent) : QObject(parent) {}
+ToastNotifier::ToastNotifier(QObject* parent) : QObject(parent)
+{
+    // 合并定时器:高频拦截被限流后,每秒汇成一条「又拦截 N 项」摘要 toast(而非逐条建窗)。
+    m_coalesceTimer = new QTimer(this);
+    m_coalesceTimer->setInterval(1000);
+    m_coalesceTimer->setSingleShot(true);
+    connect(m_coalesceTimer, &QTimer::timeout, this, [this] {
+        flushSuppressed();
+        if (m_suppressedBlocks > 0) // 期间又有积压:继续下一轮合并
+            m_coalesceTimer->start();
+    });
+}
 
 void ToastNotifier::showBlock(const SecurityEvent& e)
 {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    // 去重(B):同一威胁 = 同程序 + 同行为 + 同目标。窗口期内只弹一次,重试/循环触发不再刷屏。
+    const QString key = e.actorPath + QLatin1Char('|')
+                      + QString::number(static_cast<int>(e.type)) + QLatin1Char('|') + e.target;
+    auto it = m_recentBlockKeys.find(key);
+    if (it != m_recentBlockKeys.end() && now - it.value() < kDedupWindowMs) {
+        it.value() = now;   // 刷新时间戳,持续压制重复提示
+        return;
+    }
+    m_recentBlockKeys.insert(key, now);
+    pruneRecentKeys(now);
+
+    // 限流合并(C):不同威胁短时间大量涌入(拦截风暴)时不逐条建窗(会卡死 UI)——超过最小间隔的
+    // 拦截只累加计数,由合并定时器每秒汇成一条摘要 toast。完整记录仍进拦截表 / 日志,不丢信息。
+    if (now - m_lastBlockToastMs < kMinBlockGapMs) {
+        ++m_suppressedBlocks;
+        if (m_coalesceTimer && !m_coalesceTimer->isActive())
+            m_coalesceTimer->start();
+        return;
+    }
+    m_lastBlockToastMs = now;
+
     QString program = actorName(e);
     if (e.actorPid > 0)
         program += QStringLiteral(" (PID %1)").arg(e.actorPid);
@@ -132,4 +168,35 @@ void ToastNotifier::remove(ToastWindow* toast)
 {
     m_stack.removeAll(toast);
     reflow();
+}
+
+// 把被限流压制掉的拦截汇成一条摘要 toast(点击可跳到拦截记录)。
+void ToastNotifier::flushSuppressed()
+{
+    if (m_suppressedBlocks <= 0)
+        return;
+    const int n = m_suppressedBlocks;
+    m_suppressedBlocks = 0;
+    m_lastBlockToastMs = QDateTime::currentMSecsSinceEpoch();
+    auto* t = new ToastWindow(ToastWindow::Kind::Block,
+                              u("已批量拦截危险行为"),
+                              u("磐垒已自动处置,无需手动操作"),
+                              u("短时间内共拦截 ") + QString::number(n) + u(" 项(点击查看拦截记录)"),
+                              {}, {}, 6000);
+    present(t, /*isBlock=*/true);
+}
+
+// 去重键集合的有界维护:平时不清(省开销),超阈值才清过期键;极端风暴再兜底整体清空。
+void ToastNotifier::pruneRecentKeys(qint64 nowMs)
+{
+    if (m_recentBlockKeys.size() <= 512)
+        return;
+    for (auto it = m_recentBlockKeys.begin(); it != m_recentBlockKeys.end(); ) {
+        if (nowMs - it.value() > kDedupWindowMs)
+            it = m_recentBlockKeys.erase(it);
+        else
+            ++it;
+    }
+    if (m_recentBlockKeys.size() > 4096)
+        m_recentBlockKeys.clear();
 }

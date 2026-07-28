@@ -57,6 +57,13 @@ public:
     void requestPersistence();
     void requestEventHistory();
     void clearEventHistory();          // 清空服务端事件历史(活动日志/拦截记录共享)
+    // ---- 取证回溯:事件时间线 / 攻击图。服务端异步作答(要扫历史文件),响应经对应信号到达。----
+    void requestTimeline(const bulwark::ipc::TimelineRequestPayload& p);
+    // 返回本次请求的 id:攻击图窗口据此只认自己的那份响应(多个窗口同时开着也不会串)。
+    QUuid requestAttackGraph(const QUuid& seedEventId, int rootPid = 0, int windowSeconds = 3600);
+    // ---- 进程管理:快照 + 处置(结束 / 挂起 / 隔离 / 信任 / 算哈希)----
+    void requestProcesses(bool includeCommandLine = true, bool resolveOrigin = true);
+    void processAction(const bulwark::ipc::ProcessActionRequestPayload& p);
     void requestVtHistory();
     void manualQuarantine(const QString& path); // 清理报告「重试隔离」
     void vtQuery(const bulwark::ipc::VtRequestPayload& p);
@@ -91,6 +98,10 @@ signals:
     void quarantineReceived(const QList<bulwark::ipc::QuarantineItemPayload>& items);
     void quarantineActionResult(const bulwark::ipc::QuarantineActionResultPayload& r);
     void persistenceReceived(const bulwark::ipc::PersistenceListResponsePayload& payload);
+    void timelineReceived(const bulwark::ipc::TimelineResponsePayload& payload);
+    void attackGraphReceived(const bulwark::ipc::AttackGraphResponsePayload& payload);
+    void processListReceived(const bulwark::ipc::ProcessListResponsePayload& payload);
+    void processActionResult(const bulwark::ipc::ProcessActionResultPayload& result);
     void vtResponse(const bulwark::ipc::VtResponsePayload& resp);
     void vtDetailReceived(const bulwark::ipc::VtDetailResponsePayload& detail); // VT 完整报告
     void vtHistoryReceived(const QList<bulwark::VtScanRecord>& records);

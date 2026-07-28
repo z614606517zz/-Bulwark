@@ -16,7 +16,7 @@
 
 由 `appsettings.json` 的 `EventSource` 决定,无论选哪种,决策与 UI 完全一致:
 
-- **`Driver`** —— 加载内核驱动 + ETW 观测。内核对硬拦名单 / 受保护项 / 网络黑名单 / 自我保护做「行为前」原地拦截;进程创建走「遥测 + 启动后结束」补偿模型。
+- **`Driver`** —— 加载内核驱动 + ETW 观测。内核对硬拦名单 / 受保护项 / 网络黑名单 / 自我保护做「行为前」原地拦截;进程创建维度同时具备**内核本地事前拒绝**(命中「禁止执行」名单、或由已封禁的恶意主体派生 → `STATUS_ACCESS_DENIED`)与**遥测 + 启动后补偿结束**两条路径,未命中本地名单的灰区进程走后者。
 - **`Wmi`** —— 仅 ETW 用户态观测(取值名沿用历史「Wmi」,实际是 ETW)。无法在动作前拦截,拦截由「事后结束作恶进程树」补偿。
 
 > 无论哪种事件源,用户态都始终并行一个「持续行为源」(自启动持久化监视 + 勒索诱饵),弥补程序运行「之后」的事后盲区。
@@ -59,10 +59,17 @@ cpp/                     C++ / Qt 实现(顶层 CMake:cpp/CMakeLists.txt,C++20)
 Bulwark.Driver/         内核驱动(R0),与 cpp/ 平级,MSBuild + WDK 构建:Minifilter + 通信端口
 ├─ Driver.c ProcessMonitor.c FileMonitor.c RegistryMonitor.c SelfProtect.c
 ├─ NetMonitor.c ImageMonitor.c ThreadMonitor.c Comms.c
+├─ HashScan.c           内核本地已知恶意 SHA-256 查杀(自带纯 C SHA-256,异步 worker,命中即结束进程)
+├─ Policy.c             内核侧策略/名单容器
 └─ Protocol.h           内核↔服务消息结构(用户态 DriverEventSource 直接复用此头,单一事实来源)
 
-scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测试机签名加载)
+server/bulwark-broker/  可选的中央信誉服务端(broker.py,纯 Python 标准库 + SQLite),见「中央信誉服务」节
+Bulwark.Sandbox/        Windows Sandbox(.wsb)配置与样本投放脚本,用于隔离环境里跑样本
+ml/                     离线训练侧脚本(LightGBM,不参与 C++ 构建、当前产品不加载任何模型)
+scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测试机签名加载)+ 若干本地部署脚本
 ```
+
+> `ml/` 是历史遗留的离线实验目录:**当前代码里没有任何模型推理路径**,产品的检测能力全部来自规则 + 启发式 + 分析器 + 云信誉,不依赖机器学习模型。
 
 ## 决策流程(RuleEngine)
 
@@ -70,15 +77,18 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 
 1. **无条件放行**:本软件自身组件(按映像名 + 安装目录前缀识别)、用户明确信任的文件 / 文件夹(信任 = 完全跳过后续一切检测与后台扫描)。
 2. **已安装的知名安全软件**:共存放行(`TrustPolicy::isTrustedSecurityProduct`)。
-3. **威胁研判**:`ThreatDetector::analyze` 计算风险分并置位「硬恶意指标」(见下)。
-4. **有状态时序检测**:文件写 / 删 → 勒索行为监视器(触碰蜜罐诱饵直接 Block);网络外联 → C2 信标 + DGA 域名 + 外联速率;DNS 查询 → DGA 域名。
-5. **行为基线偏离**(可开关):显著偏离程序自身历史画像时产出软信号,仅与硬指标互证才升格。
-6. **显式规则**:按「层级(精确主体 > 硬覆盖 > 通配)> 具体度 > 动作强度 > 最近创建」排序命中;强可信 OS 组件 / 开发工具对「询问」类规则有豁免。
-7. **强可信主体**直接放行(证书指纹白名单,或微软签名 + 系统目录,且签名健康、无危险行为)。
-8. **签名异常**(证书被吊销 / 用过期证书签名)→ Block。
-9. **健康签名**直接放行(排除硬指标与「空壳新证书」画像)。
-10. **仅当存在硬恶意指标才处置**:风险分 ≥ 高危阈值 → Block,否则 → Ask(弹窗)。
-11. **无硬指标 → 一律放行**(仅记录,软信号绝不单独定罪)。
+3. **已知良性厂商应用**(QQ / 微信 / 企业微信 / TIM):映像名在内置清单**且**持有健康的厂商签名时,**仅对网络外联与 DNS 事件**在时序检测前放行(`TrustPolicy::isTrustedVendorApp`),避免正常心跳保活被信标检测 / IP 情报误判为 C2 回连。**此档不覆盖其它维度**——同一进程的进程创建 / 模块加载 / 文件写 / 注册表写 / 注入事件照常走完整流水线,IM 侧载与群控 hook 模块加载仍会被检测。
+4. **威胁研判**:`ThreatDetector::analyze` 计算风险分并置位「硬恶意指标」(见下)。
+5. **有状态时序检测**:文件写 / 删 → 勒索行为监视器(触碰蜜罐诱饵直接 Block);网络外联 → C2 信标 + DGA 域名 + 外联速率;DNS 查询 → DGA 域名。
+6. **行为基线偏离**(可开关):显著偏离程序自身历史画像时产出软信号,仅与硬指标互证才升格。
+7. **显式规则**:按「层级(精确主体 > 硬覆盖 > 通配)> 具体度 > 动作强度 > 最近创建」排序命中;强可信 OS 组件 / 开发工具对「询问」类规则有豁免。
+8. **强可信主体**直接放行(证书指纹白名单,或微软签名 + 系统目录,且签名健康、无危险行为)。
+9. **签名异常**(证书被吊销 / 用过期证书签名)→ Block。
+10. **健康签名**直接放行(排除硬指标与「空壳新证书」画像)。
+11. **仅当存在硬恶意指标才处置**:风险分 ≥ 高危阈值 → Block,否则 → Ask(弹窗)。
+12. **无硬指标 → 一律放行**(仅记录,软信号绝不单独定罪)。
+
+> **注意信任通道的位置**:上面第 1~3 步的三条信任通道排在**显式规则匹配之前**,威胁研判也排在规则之前。也就是说「写一条 Block 规则」并不能压过这三条通道——被无条件放行 / 安全软件共存 / (网络维度的)厂商应用命中的事件,不会走到第 7 步。
 
 裁决完成后自动追加「最终裁决」证据,并由 `AttackAnnotator` 统一标注 MITRE ATT&CK 技战术。裁决动作为 **Allow / Block / Ask**,来源标记为 命中规则 / 行为研判 / 可信放行 / 用户裁决 / 超时默认 / 默认策略。
 
@@ -114,20 +124,50 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
 
 ## 云信誉、威胁情报与 AI 研判
 
-- **多引擎哈希信誉** —— 经 `curl.exe` 传输、分级缓存(`%ProgramData%\Bulwark\reputation.jsonl`:恶意永久 / 干净 7 天 / 可疑 24 时 / 未知短负缓存,断网时用「最近已知」兜底富化)、限流。聚合 6 个源并取最强结论(恶意 > 可疑 > 干净 > 未知):**VirusTotal(旗舰,支持整文件上传扫描 + 每引擎详情)、微步 ThreatBook(另含 IP 信誉)、MalwareBazaar、OTX、MetaDefender、HybridAnalysis(另含沙箱行为画像)**。全部 opt-in(默认关,须在设置页填入各自 API Key 后开启,申请地址见下节);信誉只加 / 减分,绝不单独处置,断网不影响实时防护。
+- **多引擎哈希信誉** —— 经 `curl.exe` 传输、分级缓存(`%ProgramData%\Bulwark\reputation.jsonl`:恶意永久 / 干净 7 天 / 可疑 24 时 / 未知短负缓存,断网时用「最近已知」兜底富化)、限流。聚合 6 个源并取最强结论(恶意 > 可疑 > 干净 > 未知):**VirusTotal(旗舰,支持整文件上传扫描 + 每引擎详情)、微步 ThreatBook(另含 IP 信誉)、MalwareBazaar、OTX、MetaDefender、HybridAnalysis(另含沙箱行为画像)**。每个源都可单独启停;信誉只加 / 减分,绝不单独处置,断网不影响实时防护。
+- **中央信誉服务(哈希查询默认先走服务器,可关)** —— 见下方独立小节「中央信誉服务」。**这是唯一一项在你没填任何 API Key 时也会产生外发请求的功能**,请先读那一节再决定是否保留默认开启。
 
-> 开源版**不内置任何厂商密钥**——源码与仓库里各 Key 字段一律为空(VirusTotal 的内置 Key 仅支持构建时经 `-DBULWARK_VT_BUILTIN_KEY` 注入,默认不注入)。
+> **代码默认 vs 随包配置**:各情报源在**代码里**的默认值是「关」(`BulwarkOptions.h` 各 `Enabled = false`),但仓库里随服务发的 `cpp/service/appsettings.json` 出于开箱即用把 VirusTotal / MalwareBazaar / OTX / 微步 / MetaDefender / HybridAnalysis / ThreatFox feed / 中央信誉服务**全部置为 `true`**。配置文件覆盖代码默认,所以你直接跑打包产物拿到的是「全开」状态。要真正跑纯本地,请把对应 `Enabled` 改成 `false`,或在 UI 设置页逐项关掉。
+
+> 开源版**不内置任何厂商密钥**——源码与 `cpp/service/appsettings.json` 模板里各 Key 字段一律为空(VirusTotal 的内置 Key 仅支持构建时经 `-DBULWARK_VT_BUILTIN_KEY` 注入,默认不注入)。⚠ 但 `cpp/dist/` 下那份**本地打包产物**不受此约束:它是开发机的运行目录(已被 `.gitignore` 排除、不在版本库里),其 `appsettings.json` 可能残留开发者自己的真实 Key。**不要把 `cpp/dist/` 整目录分发给别人**;要分发就用空 Key 的模板重新生成配置。
 - **威胁情报 feed(ThreatFox / abuse.ch)** —— 定期拉取近期恶意 IOC(按可信度阈值),**自动生成哈希 / IP / 域名拦截规则**(带来源标记与到期时间),也支持在 UI 里手动「立即刷新 / 预览 / 采纳」。
 - **网络外联 IP 情报互证** —— 仅对可疑外联,后台限流查微步 IP 信誉(月配额极低 + 7 天强缓存 + 在途去重),确认恶意再补偿处置(结束外联进程树)。
 - **双击 / 释放载荷病毒扫描** —— 双击启动、dropper 派生、近期落盘的可执行体,以及双击的 MSI/MSP 安装包,后台先按哈希查 VT、未收录则上传整文件云端扫描,进度实时推 UI 卡片、结果落 VT 历史去重,确认恶意即补偿处置。
 - **AI 研判(UI 侧,大模型)** —— OpenAI 兼容接口,异步、任何失败都 fail-open。三种能力:①基于**纯静态内容特征**研判文件恶意性(**绝不执行样本**);②把自然语言安全意图转成 1~5 条可复核的防御规则;③在「云信誉」详情窗口对恶意 / 可疑文件**一键 AI 清理**(把行为画像交给大模型生成清理脚本,详见下节「处置、隔离与足迹清理」)。静态特征由 `StaticFeatureExtractor` 越界安全地提取:PE 头 + 各节香农熵(判壳,熵 > 7.2)、ASCII/UTF-16 字符串里的危险 Win32 API / URL / IP、能力标签(进程注入 / 反调试 / 键盘钩子 / 加密勒索 / 网络下载 / 持久化 / 提权 / 进程发现 / 命令执行)、脚本片段。AI 研判历史落盘于 `%ProgramData%\Bulwark\ai_scan_history.json`。
 - **AI 灰区研判策略** —— 仅对「询问(Ask)」类灰区事件咨询大模型:AI 判恶意 → 升格 Block;AI 判干净且无硬指标 → 降级 Allow(减打扰);其余维持原判。**AI 绝不压制硬指标、也绝不改判确定性拦截或强可信放行。**
 
+## 中央信誉服务(ReputationProxy)
+
+⚠ **这一项默认开启,并且会把本机文件的 SHA-256 发到一台第三方服务器。** 请先读完本节再决定保留还是关闭。
+
+**它是什么** —— 一个「哈希信誉代理」。开启后,哈希查询**优先**走该服务器而不是本机直连各情报源:服务端持有上游 API Key、并为所有接入端点维护一份共享缓存(别的机器查过的哈希,你这里零往返直接命中)。实现是 `ProxyReputationService`,一个套在 `AggregateReputationService` 外面的 proxy-first 装饰器,挂在 `ReputationManager` 这个唯一收口点上——因此**后台信誉队列、内存防护 VT 复核、UI 手动查询走的都是它**。服务端代码在本仓 `server/bulwark-broker/`(`broker.py`,纯 Python 标准库 + SQLite)。
+
+**外发的是什么** —— 只有 **SHA-256 摘要**(以及可选的 Bearer 令牌);**不上传文件内容**。整文件上传扫描仍是本机直连 VirusTotal 的独立功能,不经此代理。
+
+**默认值** —— `cpp/service/appsettings.json` 与 `cpp/dist/appsettings.json` 里均为:
+
+```jsonc
+"ReputationProxy": {
+  "Enabled": true,                              // ← 默认开
+  "BaseUrl": "https://vt.bulwark.icu",          // ← 项目维护者运营的实例
+  "BearerToken": "",                            // 可用 BULWARK_REPPROXY_TOKEN 覆盖
+  "QueryTimeoutSeconds": 8
+}
+```
+
+**怎么关** —— 把 `Enabled` 改成 `false`。关掉后哈希查询完全回退本机直连聚合器,**保护能力不下降**(只是失去共享缓存与服务端 Key)。
+
+**失败行为** —— 任何失败(代理禁用 / 网络 / HTTP / 解析错误 / 服务端给不出权威结论)都**透明回退**本机直连聚合器。离线时客户端熔断跳过这一跳,每 60s 半开重试一次,不会为每次查询白等一个超时。服务端当前只聚合 VirusTotal + 微步,其余四源仍由本机直连兜底。
+
+**想自建** —— `server/bulwark-broker/broker.py` 可直接部署,把 `BaseUrl` 指向自己的实例即可;这样哈希不出自己的基础设施。
+
 ## 情报源与 AI 密钥申请(全部可选,不填也能用)
 
-云信誉、威胁情报 feed、AI 研判都是**锦上添花**:默认全部关闭,不填任何 Key 也能正常跑本地启发式 + 行为检测。想开哪个,就去 UI **设置**页填对应 API Key 再打开开关即可;绝大多数源都有**免费额度**。
+云信誉、威胁情报 feed、AI 研判都是**锦上添花**:不填任何 Key 也能正常跑本地启发式 + 行为检测。想开哪个,就去 UI **设置**页填对应 API Key 再打开开关即可;绝大多数源都有**免费额度**。
 
-> 🔐 **关于密钥安全**:你填的 Key 只保存在本机 `%ProgramData%\Bulwark\settings.json`(或环境变量),**绝不写入源码、绝不上传、绝不进版本库**——开源仓库里的 `appsettings.json` 各 Key 字段一律为空。
+> ⚠ **默认并非「全部关闭」**:随包的 `appsettings.json` 把各情报源与**中央信誉服务**都置为 `Enabled: true`(见上文「代码默认 vs 随包配置」)。没填 Key 的源查询会失败并静默回退,不影响防护;但**中央信誉服务不需要你的 Key 就会工作**,即哈希会外发。真要完全离线,请显式把各 `Enabled` 改为 `false`。
+
+> 🔐 **关于密钥安全**:你填的 Key 只保存在本机 `%ProgramData%\Bulwark\settings.json`(或环境变量),**绝不写入源码、绝不上传、绝不进版本库**——`cpp/service/appsettings.json` 模板里各 Key 字段一律为空。(`cpp/dist/` 是被 `.gitignore` 排除的本地运行目录,可能含开发者自己的 Key,不要整目录分发。)
 
 | 情报 / AI 源 | 用途 | 申请地址 | 备注 |
 |----|------|----------|------|
@@ -174,7 +214,8 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
     "EventSource": "Driver",       // Driver=内核+ETW / Wmi=仅 ETW 观测
     "KernelDriverEnabled": true,   // 启用内核驱动(EventSource=Driver 时等效开启)
     "TrustSignedActors": true,     // 自动放行强可信签名程序
-    "PromptTimeoutSeconds": 30,    // 弹窗超时(超时按默认策略处置)
+    "DefaultAction": "Allow",      // 灰区无规则时的默认动作,也是弹窗超时后的动作(Allow / Block)
+    "PromptTimeoutSeconds": 30,    // 弹窗超时秒数;超时即按上面的 DefaultAction 处置
     "ExportEcsAlerts": false,      // ECS JSON-lines 告警导出(接 SIEM)
     "OnlineCertRevocationCheck": false,  // 证书吊销联网校验(默认仅用本机缓存 CRL,不阻塞富化)
 
@@ -197,12 +238,19 @@ scripts/                build-driver.ps1(编译驱动)/ deploy-driver-vm.ps1(测
     "Otx": { "Enabled": true }, "ThreatBook": { "Enabled": true },
     "MetaDefender": { "Enabled": true }, "HybridAnalysis": { "Enabled": true },
     "ThreatFoxFeed": { "Enabled": true },
+
+    // 中央信誉服务:默认开启,会把本机文件 SHA-256 发到该地址。详见「中央信誉服务」节。
+    "ReputationProxy": { "Enabled": true, "BaseUrl": "https://vt.bulwark.icu",
+                         "BearerToken": "", "QueryTimeoutSeconds": 8 },
+
     "Ai": { "BaseUrl": "https://token-plan-sgp.xiaomimimo.com/v1", "ApiKey": "", "Model": "mimo-v2.5-pro" }
   }
 }
 ```
 
-> 完整默认配置见 `cpp/service/appsettings.json`。每个情报源还有独立的限流(每分钟 / 每天上限)、超时与恶意判定阈值;`Etw` 节另有每进程每分钟上报上限与去重窗口。信誉源与 AI 默认全关,由 UI 逐项开启并可热更 API Key。另可配 `ProxyUrl`(全局代理)、`TrustedDirectories`(整目录信任)、`EnforceUiClientSignature`(仅放行签名 UI 连管道,IPC 自保)。
+> 完整默认配置见 `cpp/service/appsettings.json`。上面只是节选,以下键**代码支持但样例里省略了**:每个情报源各自的限流(`RequestsPerMinute` / `RequestsPerDay`)、超时与恶意判定阈值;`VirusTotal.PriorityDailyReserve`(为优先复核预留的每日配额);`Etw` 节完整有 14 个键(除样例里的开关外,还有 `PerProcessNetPerMinute` / `PerProcessRegPerMinute` / `PerProcessFilePerMinute` / `PerProcessDnsPerMinute` 每进程每分钟上报上限、`DedupWindowSeconds` 去重窗口、`RawChannelCapacity` 原始事件中继容量、`SessionName`);`ProxyUrl`(全局代理)、`TrustedDirectories`(整目录信任)、`EnforceUiClientSignature` 与 `UiClientAllowedThumbprints` / `UiClientAllowedPublishers`(仅放行指定签名的 UI 连管道,IPC 自保)。
+>
+> ⚠ **各情报源与中央信誉服务在随包配置里是打开的**(代码默认为关,配置文件覆盖之),API Key 可在 UI 热更或用环境变量覆盖。要跑纯本地请显式改 `Enabled: false`。
 
 ## 小白上手指南(从零到跑起来)
 
@@ -322,7 +370,7 @@ sc start BulwarkService             # 启动
 
 | 维度 | 内核机制 | 处置 |
 |------|----------|------|
-| **进程(M2)** | `PsSetCreateProcessNotifyRoutineEx` | 遥测上报(不挂起);内核对系统目录 / 关键进程走白名单零延迟放行;裁决 Block 由用户态即时结束进程树 |
+| **进程(M2)** | `PsSetCreateProcessNotifyRoutineEx` + `HashScan.c` | 三条路径:①**事前拒绝**——新进程映像命中「禁止执行」名单、或创建者本身在封禁集里 → 回调内直接置 `CreationStatus = STATUS_ACCESS_DENIED`,样本根本起不来(零用户态往返、无竞态,重启后名单重推仍拦);②**内核本地哈希查杀**——已知恶意 SHA-256 集非空时把 PID 入队,独立系统线程在 PASSIVE_LEVEL 算哈希,命中即 `ZwTerminateProcess`;③**遥测 + 补偿**——其余进程不挂起,上报后由用户态裁决并结束进程树。内核对系统目录 / 关键进程走白名单零延迟放行,且关键系统进程**绝不**进入事前拒绝(防 `CRITICAL_PROCESS_DIED`) |
 | **文件(M3)** | Minifilter 预操作 `IRP_MJ_CREATE`(delete-on-close / 执行映射意图)+ `IRP_MJ_SET_INFORMATION`(改名 / 删除)+ `IRP_MJ_WRITE`(就地加密勒索遥测) | 硬拦名单 / 受保护路径 / 禁止加载名单命中即**内核本地 `STATUS_ACCESS_DENIED`** |
 | **注册表(M4)** | `CmRegisterCallbackEx` | 硬拦名单精确命中即**内核本地拒绝写值 / 删值 / 删键**;受保护键异步上报 |
 | **自我保护(M5)** | `ObRegisterCallbacks` | 非可信进程以危险权限(结束 / 写内存 / 远程线程 / 挂起)打开受保护进程时,**剥离这些权限**;反注入目标(如 lsass.exe)同理 |
@@ -330,7 +378,12 @@ sc start BulwarkService             # 启动
 
 另有 `PsSetLoadImageNotifyRoutine`(映像加载)与 `PsSetCreateThreadNotifyRoutine`(远程线程)两个**通知型**回调,仅上报供研判(无法在回调内阻止加载;禁止加载靠 M3 的执行映射拦截落实)。
 
-**处置模型(稳定性优先)**:进程创建走 **fire-and-forget 遥测 + 启动后补偿结束**——`FltSendMessage` 用 0 超时、绝不阻塞在用户态裁决上,由一个后台发送线程 + 预分配环形缓冲统一发送(队列满即丢弃遥测)。文件 / 注册表硬拦、禁止加载、自我保护、反注入、网络黑名单则在**内核本地 / 高 IRQL 即时阻断**,不走上述补偿路径。受保护路径 / 键、硬拦名单、受保护进程 PID、反注入目标、网络黑名单均由用户态经配置消息下发。
+**处置模型(稳定性优先)**:热路径上**绝不做同步 IPC**——`FltSendMessage` 用 0 超时、从不阻塞等用户态裁决,由一个后台发送线程 + 预分配环形缓冲统一发送(队列满即丢弃遥测)。在此前提下,内核的处置分两类:
+
+- **内核本地即时阻断(不依赖用户态)**:文件 / 注册表硬拦、禁止加载名单、进程「禁止执行」名单、封禁主体派生子进程、自我保护、反注入 / 反凭据转储、网络黑名单。这些判定全在内核本地完成,**服务未安装 / 未启动 / 被杀时依然生效**——`ProcessMonitor.c` 明确把封禁主体与 exec-block 的判定放在「无客户端则快速放行」之前,名单还会持久化到注册表,重启后重推。这是驱动的「自足基线」。
+- **遥测 + 补偿结束**:未命中上述任何本地名单的灰区进程创建,上报后由用户态裁决,判 Block 则结束整棵进程树(先用户态枚举子孙,再对根 PID 追加内核级 `ZwTerminateProcess` 兜底)。
+
+受保护路径 / 键、硬拦名单、禁止执行名单、已知恶意哈希集、受保护进程 PID、反注入目标、网络黑名单均由用户态经配置消息下发。
 
 ```powershell
 # 1) 编译驱动(本机有 WDK 即可)

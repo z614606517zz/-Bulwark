@@ -40,7 +40,11 @@ BlwClearBlockList(void)
 {
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_Blw.NetLock, &oldIrql);
+    // 定序:先清条目,再清布隆位与计数 —— 中间态只会「位还在、条目没了」(读者多取一次锁
+    // 后扫不到,判定正确),绝不会出现「条目还在、位已清」的假否决。
     RtlZeroMemory(g_Blw.BlockList, sizeof(g_Blw.BlockList));
+    InterlockedExchange(&g_Blw.BlockIpCount, 0);
+    InterlockedExchange64(&g_Blw.BlockIpMask, 0);
     KeReleaseSpinLock(&g_Blw.NetLock, oldIrql);
 }
 
@@ -53,29 +57,47 @@ BlwAddBlockIp(_In_ ULONG IpV4, _In_ USHORT Port)
         return;
     }
     KeAcquireSpinLock(&g_Blw.NetLock, &oldIrql);
+    // 定序:先置布隆位,再写条目(读者的位测试在锁外进行,故位必须先可见)。
+    InterlockedOr64(&g_Blw.BlockIpMask, (LONG64)BLW_IP_BIT(IpV4));
     for (i = 0; i < BLW_MAX_PROTECTED; i++) {
         if (!g_Blw.BlockList[i].InUse) {
             g_Blw.BlockList[i].IpV4 = IpV4;
             g_Blw.BlockList[i].Port = Port;
             g_Blw.BlockList[i].InUse = TRUE;
+            InterlockedIncrement(&g_Blw.BlockIpCount);
             break;
         }
     }
     KeReleaseSpinLock(&g_Blw.NetLock, oldIrql);
 }
 
+//
+// 查黑名单。运行在【每一条外发连接】的 WFP classify 上(可能是 DISPATCH_LEVEL)。
+//
+// 先做一次无锁布隆位测试:位未置说明没有任何条目用这个 IP,直接放行 —— 名单为空
+// (绝大多数部署的常态)时掩码恒为 0,连自旋锁都不会取。只有位命中(真命中或极少数
+// 哈希碰撞)才取锁做精确判定,因此最终判定与原实现完全一致。
+//
 static BOOLEAN
 BlwIpIsBlocked(_In_ ULONG IpV4, _In_ USHORT Port)
 {
     ULONG i;
+    LONG  count;
+    LONG  seen = 0;
     BOOLEAN blocked = FALSE;
     KIRQL oldIrql;
 
+    if (((ULONG64)g_Blw.BlockIpMask & BLW_IP_BIT(IpV4)) == 0) {
+        return FALSE;
+    }
+
     KeAcquireSpinLock(&g_Blw.NetLock, &oldIrql);
-    for (i = 0; i < BLW_MAX_PROTECTED; i++) {
+    count = g_Blw.BlockIpCount;
+    for (i = 0; i < BLW_MAX_PROTECTED && seen < count; i++) {
         if (!g_Blw.BlockList[i].InUse) {
             continue;
         }
+        seen++;
         if (g_Blw.BlockList[i].IpV4 == IpV4 &&
             (g_Blw.BlockList[i].Port == 0 || g_Blw.BlockList[i].Port == Port)) {
             blocked = TRUE;
@@ -92,20 +114,11 @@ BlwIpIsBlocked(_In_ ULONG IpV4, _In_ USHORT Port)
 static void
 BlwReportNetBlock(_In_ ULONG actorPid, _In_ ULONG remoteIp, _In_ USHORT remotePort)
 {
-    BLW_EVENT_MESSAGE msg;
-
     if (!g_Blw.Active || KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return;  // 高 IRQL 不上报
     }
 
-    RtlZeroMemory(&msg, sizeof(msg));
-    msg.EventId = (ULONG64)InterlockedIncrement64(&g_Blw.NextEventId);
-    msg.Type = BlwEventNetworkConnect;
-    msg.ActorPid = actorPid;
-    msg.RemoteIpV4 = remoteIp;
-    msg.RemotePort = remotePort;
-
-    BlwReportEvent(&msg);
+    BlwReportEvent(BlwEventNetworkConnect, actorPid, 0, NULL, NULL, remoteIp, remotePort);
 }
 
 //
@@ -134,13 +147,24 @@ BlwClassifyFn(
     // 默认放行
     classifyOut->actionType = FWP_ACTION_PERMIT;
 
-    if (!g_Blw.Active) {
-        return;
-    }
+    // 【自足基线】网络黑名单在无客户端时依旧生效(BlwReportNetBlock 内部自带 Active 判空)。
+    // 黑名单为空时下方查表自然不命中,开销可忽略。
 
     // 若上层已硬性允许或不可改写,直接返回
     if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0) {
         return;
+    }
+
+    // 已封禁主体(情报确认恶意):拒绝其任何外联(不看目标 IP)—— 断其 C2 / 回传 / 下载。
+    // 封禁集非空时才查(空则零开销)。BlwPidIsBanned 为无锁查表,DISPATCH_LEVEL 安全。
+    if (g_Blw.BannedPidCount > 0 && inMetaValues != NULL &&
+        FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_PROCESS_ID)) {
+        ULONG connPid = (ULONG)inMetaValues->processId;
+        if (connPid != 0 && BlwPidIsBanned(connPid)) {
+            classifyOut->actionType = FWP_ACTION_BLOCK;
+            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+            return;
+        }
     }
 
     // 取远端 IP(V4,主机字节序)与端口

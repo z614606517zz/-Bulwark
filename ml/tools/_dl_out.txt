@@ -1,0 +1,103 @@
+12:45:08  START  packages=50  outdir=C:\benign_dl
+12:45:08  GET   Mozilla.Firefox
+12:45:50  OK    Mozilla.Firefox  files=2  exit=0
+12:45:50  GET   Google.Chrome
+12:46:59  FAIL  Google.Chrome  exit=-1978335215
+12:47:00  GET   Brave.Brave
+12:47:18  OK    Brave.Brave  files=2  exit=0
+12:47:18  GET   Opera.Opera
+12:47:34  OK    Opera.Opera  files=2  exit=0
+12:47:34  GET   Python.Python.3.12
+12:47:39  OK    Python.Python.3.12  files=2  exit=0
+12:47:40  GET   OpenJS.NodeJS
+12:47:45  OK    OpenJS.NodeJS  files=2  exit=0
+12:47:45  GET   Git.Git
+12:47:54  OK    Git.Git  files=2  exit=0
+12:47:54  GET   Microsoft.VisualStudioCode
+12:48:12  OK    Microsoft.VisualStudioCode  files=2  exit=0
+12:48:12  GET   Notepad++.Notepad++
+12:48:17  OK    Notepad++.Notepad++  files=2  exit=0
+12:48:17  GET   7zip.7zip
+12:48:21  OK    7zip.7zip  files=2  exit=0
+12:48:21  GET   PuTTY.PuTTY
+12:48:26  OK    PuTTY.PuTTY  files=2  exit=0
+12:48:26  GET   Kitware.CMake
+12:48:34  OK    Kitware.CMake  files=2  exit=0
+12:48:34  GET   GoLang.Go
+12:49:40  OK    GoLang.Go  files=2  exit=0
+12:49:40  GET   WinSCP.WinSCP
+12:49:51  OK    WinSCP.WinSCP  files=2  exit=0
+12:49:51  GET   WiresharkFoundation.Wireshark
+12:50:01  OK    WiresharkFoundation.Wireshark  files=2  exit=0
+12:50:01  GET   Microsoft.PowerShell
+12:50:33  OK    Microsoft.PowerShell  files=2  exit=0
+12:50:33  GET   Microsoft.OpenJDK.21
+12:50:46  OK    Microsoft.OpenJDK.21  files=2  exit=0
+12:50:46  GET   EclipseAdoptium.Temurin.21.JDK
+12:51:05  OK    EclipseAdoptium.Temurin.21.JDK  files=2  exit=0
+12:51:05  GET   Postman.Postman
+12:51:20  OK    Postman.Postman  files=2  exit=0
+12:51:20  GET   HeidiSQL.HeidiSQL
+12:51:25  OK    HeidiSQL.HeidiSQL  files=2  exit=0
+12:51:25  GET   Microsoft.Sysinternals
+12:51:25  FAIL  Microsoft.Sysinternals  exit=-1978335212
+12:51:25  GET   Microsoft.DotNet.DesktopRuntime.8
+12:51:32  OK    Microsoft.DotNet.DesktopRuntime.8  files=2  exit=0
+12:51:32  GET   Microsoft.DotNet.SDK.8
+12:51:50  OK    Microsoft.DotNet.SDK.8  files=2  exit=0
+12:51:50  GET   Microsoft.VCRedist.2015+.x64
+12:51:53  OK    Microsoft.VCRedist.2015+.x64  files=2  exit=0
+12:51:53  GET   VideoLAN.VLC
+12:52:07  OK    VideoLAN.VLC  files=2  exit=0
+12:52:07  GET   Audacity.Audacity
+12:52:12  OK    Audacity.Audacity  files=2  exit=0
+12:52:12  GET   GIMP.GIMP
+12:52:31  OK    GIMP.GIMP  files=2  exit=0
+12:52:31  GET   HandBrake.HandBrake
+12:52:44  OK    HandBrake.HandBrake  files=4  exit=0
+12:52:44  GET   OBSProject.OBSStudio
+12:53:01  OK    OBSProject.OBSStudio  files=2  exit=0
+12:53:01  GET   Inkscape.Inkscape
+12:53:22  OK    Inkscape.Inkscape  files=2  exit=0
+12:53:22  GET   BlenderFoundation.Blender
+12:54:03  OK    BlenderFoundation.Blender  files=2  exit=0
+12:54:03  GET   IrfanSkiljan.IrfanView
+12:54:09  OK    IrfanSkiljan.IrfanView  files=2  exit=0
+12:54:10  GET   dotPDN.PaintDotNet
+12:54:32  OK    dotPDN.PaintDotNet  files=2  exit=0
+12:54:32  GET   TheDocumentFoundation.LibreOffice
+12:55:38  OK    TheDocumentFoundation.LibreOffice  files=4  exit=0
+12:55:39  GET   Mozilla.Thunderbird
+12:55:54  OK    Mozilla.Thunderbird  files=2  exit=0
+12:55:55  GET   SumatraPDF.SumatraPDF
+12:56:04  OK    SumatraPDF.SumatraPDF  files=2  exit=0
+12:56:04  GET   voidtools.Everything
+12:56:09  OK    voidtools.Everything  files=2  exit=0
+12:56:09  GET   RARLab.WinRAR
+12:56:16  OK    RARLab.WinRAR  files=2  exit=0
+12:56:17  GET   Rufus.Rufus
+12:56:22  OK    Rufus.Rufus  files=2  exit=0
+12:56:22  GET   CPUID.CPU-Z
+12:56:29  OK    CPUID.CPU-Z  files=2  exit=0
+12:56:29  GET   REALiX.HWiNFO
+12:56:38  OK    REALiX.HWiNFO  files=2  exit=0
+12:56:38  GET   Microsoft.PowerToys
+12:57:17  OK    Microsoft.PowerToys  files=2  exit=0
+12:57:17  GET   ShareX.ShareX
+12:57:40  OK    ShareX.ShareX  files=2  exit=0
+12:57:40  GET   KeePassXCTeam.KeePassXC
+12:57:55  OK    KeePassXCTeam.KeePassXC  files=4  exit=0
+12:57:55  GET   Greenshot.Greenshot
+12:58:00  OK    Greenshot.Greenshot  files=2  exit=0
+12:58:01  GET   qBittorrent.qBittorrent
+12:58:18  OK    qBittorrent.qBittorrent  files=2  exit=0
+12:58:18  GET   Telegram.TelegramDesktop
+12:58:32  OK    Telegram.TelegramDesktop  files=2  exit=0
+12:58:32  GET   Discord.Discord
+12:58:49  OK    Discord.Discord  files=2  exit=0
+12:58:50  GET   Zoom.Zoom
+12:59:19  OK    Zoom.Zoom  files=2  exit=0
+12:59:19  GET   SlackTechnologies.Slack
+12:59:40  OK    SlackTechnologies.Slack  files=2  exit=0
+12:59:40  DONE  ok=48 fail=2 skip=0
+12:59:40  TOTAL files=103  sizeGB=4.51

@@ -1,0 +1,67 @@
+# Benign PE sources - popular, signed, official installers across many vendors/compilers.
+# One winget package Id per line. Lines starting with # are ignored.
+# Diversity matters more than count: browsers, dev tools, runtimes, media, utilities...
+
+# --- Browsers ---
+Mozilla.Firefox
+Google.Chrome
+Brave.Brave
+Opera.Opera
+
+# --- Dev tools / languages ---
+Python.Python.3.12
+OpenJS.NodeJS
+Git.Git
+Microsoft.VisualStudioCode
+Notepad++.Notepad++
+7zip.7zip
+PuTTY.PuTTY
+Kitware.CMake
+GoLang.Go
+WinSCP.WinSCP
+WiresharkFoundation.Wireshark
+Microsoft.PowerShell
+Microsoft.OpenJDK.21
+EclipseAdoptium.Temurin.21.JDK
+Postman.Postman
+HeidiSQL.HeidiSQL
+Microsoft.Sysinternals
+
+# --- Runtimes / redistributables ---
+Microsoft.DotNet.DesktopRuntime.8
+Microsoft.DotNet.SDK.8
+Microsoft.VCRedist.2015+.x64
+
+# --- Media / creative ---
+VideoLAN.VLC
+Audacity.Audacity
+GIMP.GIMP
+HandBrake.HandBrake
+OBSProject.OBSStudio
+Inkscape.Inkscape
+BlenderFoundation.Blender
+IrfanSkiljan.IrfanView
+dotPDN.PaintDotNet
+
+# --- Productivity ---
+TheDocumentFoundation.LibreOffice
+Mozilla.Thunderbird
+SumatraPDF.SumatraPDF
+
+# --- Utilities ---
+voidtools.Everything
+RARLab.WinRAR
+Rufus.Rufus
+CPUID.CPU-Z
+REALiX.HWiNFO
+Microsoft.PowerToys
+ShareX.ShareX
+KeePassXCTeam.KeePassXC
+Greenshot.Greenshot
+qBittorrent.qBittorrent
+
+# --- Communication ---
+Telegram.TelegramDesktop
+Discord.Discord
+Zoom.Zoom
+SlackTechnologies.Slack

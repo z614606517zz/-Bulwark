@@ -75,6 +75,14 @@ const QStringList& benignPublishers() {
     };
     return s;
 }
+// 已知良性厂商应用(即时通讯 / 常见桌面客户端):正常存在大量周期性心跳保活外联,极易被信标检测 /
+// 外联 IP 情报误判为 C2 回连。按映像名快速识别(仍要求健康厂商签名才放行,见 isTrustedVendorApp)。
+const QSet<QString>& trustedVendorApps() {
+    static const QSet<QString> s = {
+        "qq.exe", "tim.exe", "wechat.exe", "weixin.exe", "wxwork.exe",
+    };
+    return s;
+}
 const QStringList& systemDirs() {
     static const QStringList s = { "\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\winsxs\\" };
     return s;
@@ -96,15 +104,34 @@ const QSet<QString>& lolBinsAndHosts() {
     };
     return s;
 }
-const QStringList& dangerTokens() {
+// 命中【任一】即撤销主体的全部信任档:这些构造在正常软件的命令行里基本不出现,单独出现即
+// 足以定性(内存下载执行、编码命令、凭据转储、删卷影等)。
+const QStringList& hardDangerTokens() {
     static const QStringList s = {
         "-enc", "-encodedcommand", "downloadstring", "downloadfile",
         "invoke-expression", "iex(", "frombase64string", "urlcache",
-        "-w hidden", "-windowstyle hidden", "bypass", "javascript:", "vbscript:",
+        "javascript:", "vbscript:",
         "bitsadmin /transfer", "-decode",
         "comsvcs.dll", "minidump", "sekurlsa", "lsadump", "mimikatz", "invoke-mimikatz",
         "vssadmin delete", "wmic shadowcopy delete", "wbadmin delete",
         "invoke-webrequest", "start-bitstransfer", "reflection.assembly",
+    };
+    return s;
+}
+
+// 软构造:恶意软件常用,但【正常自动化脚本同样普遍使用】,单独出现不足以定性 ——
+//   · "bypass"(-ExecutionPolicy Bypass):几乎每个正经 PowerShell 自动化脚本的标配,
+//     本项目自己的 dev-all.ps1 / package.ps1 / build-driver.ps1 全都用它。以前它在硬名单里,
+//     导致「签名健康的 powershell 跑构建脚本」被撤销全部信任 -> 掉进启发式路径 -> 批量删除
+//     构建目录被勒索监视器当硬信号 -> 直接拦截。即本软件拦自己的构建脚本。
+//   · "-w hidden" / "-windowstyle hidden":大量安装器/更新器/计划任务正常静默运行也用。
+// 按本项目既定原则「软信号绝不单独定罪」,要求【至少两个软构造同时出现】才撤销信任 ——
+// 这样 `-ep bypass -w hidden -enc ...` 这类真实恶意组合照旧被逮住,而单独 -ExecutionPolicy
+// Bypass 不再误伤。单独出现时仍由 ThreatDetector(计 30 分)、ScriptAnalyzer(35 分)与内置
+// Ask 规则 `*-executionpolicy bypass*` 继续计分/询问,检测能力并未丢失。
+const QStringList& softDangerTokens() {
+    static const QStringList s = {
+        "bypass", "-w hidden", "-windowstyle hidden",
     };
     return s;
 }
@@ -136,8 +163,11 @@ bool publisherMatches(const QString& publisher, const QStringList& list) {
 bool hasDangerousCommandLine(const QString& cmd) {
     if (cmd.isEmpty()) return false;
     const QString c = cmd.toLower();
-    for (const QString& t : dangerTokens()) if (c.contains(t)) return true;
-    return false;
+    for (const QString& t : hardDangerTokens()) if (c.contains(t)) return true;
+    // 软构造需互证:两个及以上同时出现才撤销信任(单个如 -ExecutionPolicy Bypass 不定罪)。
+    int soft = 0;
+    for (const QString& t : softDangerTokens()) if (c.contains(t)) ++soft;
+    return soft >= 2;
 }
 bool isLolBinOrScriptHost(const QString& path) {
     const QString name = fileNameLower(path);
@@ -228,6 +258,23 @@ TrustDecision TrustPolicy::isBenignSigner(const bulwark::SecurityEvent& e) {
     if (containsDir(trustedDirs(), pathLower))
         return { true, u("合法签名且位于标准安装目录") };
 
+    return {};
+}
+
+TrustDecision TrustPolicy::isTrustedVendorApp(const bulwark::SecurityEvent& e) {
+    // 仅识别内置清单里的即时通讯客户端映像名;其余一律不经此路放行。
+    const QString name = fileNameLower(e.actorPath);
+    if (name.isEmpty() || !trustedVendorApps().contains(name))
+        return {};
+    // 必须持有健康签名(未失配 / 未吊销 / 未过期后签名),防止同名恶意程序冒用白名单。
+    if (!e.actorSigned || e.signatureMismatch || e.certRevoked || e.signedAfterCertExpiry)
+        return {};
+    // 且由良性发行商签名(如 Tencent):仅凭文件名不足以放行,签名主体必须可信。
+    if (!e.actorPublisher.isEmpty()) {
+        for (const QString& pub : benignPublishers())
+            if (e.actorPublisher.contains(pub, Qt::CaseInsensitive))
+                return { true, u("已知良性厂商应用(") + name + u(")·签名健康(") + pub + u("),检测前放行") };
+    }
     return {};
 }
 

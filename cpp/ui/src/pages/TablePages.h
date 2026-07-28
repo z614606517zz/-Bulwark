@@ -11,6 +11,8 @@ namespace pages {
 
 QWidget* interceptions(IpcClient* ipc); // 拦截记录 — blocked malicious behaviour (event-log fed)
 QWidget* activity(IpcClient* ipc);      // 活动日志 — all structured security events (event-log fed)
+QWidget* timeline(IpcClient* ipc);      // 事件时间线 — 按时间窗/类型/裁决/风险/进程回溯历史 + 攻击图入口
+QWidget* processes(IpcClient* ipc);     // 进程管理 — 在跑进程快照(含服务/计划任务溯源)+ 用户主动处置
 QWidget* rules(IpcClient* ipc);         // 防护规则 — allow / block policy
 QWidget* trust(IpcClient* ipc);         // 信任名单 — trusted programs & directories
 QWidget* quarantine(IpcClient* ipc);    // 隔离区 — quarantined threat files

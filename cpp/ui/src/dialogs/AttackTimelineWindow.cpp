@@ -1,4 +1,5 @@
 #include "dialogs/AttackTimelineWindow.h"
+#include "dialogs/AttackGraphWindow.h"
 #include "dialogs/EventFormat.h"
 #include "widgets/AppIcon.h"
 #include "widgets/Cards.h"
@@ -49,7 +50,8 @@ QWidget* detailRow(const QString& caption, const QString& value, bool mono = fal
 
 } // namespace
 
-AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWidget* parent)
+AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWidget* parent,
+                                          IpcClient* ipc)
     : QDialog(parent)
 {
     setWindowTitle(u("攻击时间线"));
@@ -91,6 +93,37 @@ AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWid
     v->setContentsMargins(20, 18, 20, 18);
     v->setSpacing(14);
 
+    // ---- 启动来源(服务 / 计划任务)----
+    // 单独成块而不是塞进取证详情:溯源链上「父进程是 svchost.exe」这一步本身没有信息量,
+    // 真正需要看到的是「哪个服务 / 哪个计划任务把它拉起来的」。
+    if (e.originKind != bulwark::ProcessOriginKind::Unknown && !e.originLabel().isEmpty()) {
+        auto* box = sectionCard(v, u("启动来源"));
+        auto* row = new QHBoxLayout;
+        row->setSpacing(10);
+        const bool notable = e.originKind == bulwark::ProcessOriginKind::Service
+                          || e.originKind == bulwark::ProcessOriginKind::ScheduledTask;
+        row->addWidget(ui::pill(e.originKind == bulwark::ProcessOriginKind::ScheduledTask
+                                    ? u("计划任务")
+                                    : (e.originKind == bulwark::ProcessOriginKind::Service
+                                           ? u("服务") : u("来源")),
+                                notable ? theme::info() : theme::textMuted()),
+                       0, Qt::AlignTop);
+        auto* col = new QVBoxLayout;
+        col->setSpacing(1);
+        auto* main = ui::label(e.originLabel(), "title");
+        main->setWordWrap(true);
+        main->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        col->addWidget(main);
+        if (!e.originDetail.isEmpty()) {
+            auto* why = ui::label(e.originDetail, "muted");
+            why->setWordWrap(true);
+            col->addWidget(why);
+        }
+        auto* rw = new QWidget; rw->setLayout(col);
+        row->addWidget(rw, 1);
+        box->addLayout(row);
+    }
+
     // ---- 进程溯源链 ----
     {
         auto* box = sectionCard(v, u("进程溯源链"));
@@ -114,6 +147,10 @@ AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWid
                                                   QFileInfo(c.actorPath).fileName().isEmpty()
                                                       ? c.actorPath : QFileInfo(c.actorPath).fileName())
                                              .arg(c.actorPid), "title"));
+                // 链上每一级的启动来源:让 svchost.exe 这一级显示成「服务:Schedule」,
+                // 否则读到这里只能看到一个没有区分度的宿主进程名。
+                if (!c.originLabel.isEmpty())
+                    col->addWidget(ui::label(u("启动来源:") + c.originLabel, "muted"));
                 if (!c.target.isEmpty())
                     col->addWidget(ui::label(u("→ ") + c.target, "muted"));
                 auto* rw = new QWidget; rw->setLayout(col);
@@ -196,6 +233,19 @@ AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWid
     auto* bar = new QHBoxLayout;
     bar->setContentsMargins(20, 0, 20, 16);
     bar->addStretch();
+    if (ipc) {
+        auto* graph = new QPushButton(u("查看攻击关系图"));
+        graph->setProperty("variant", "ghost");
+        graph->setCursor(Qt::PointingHandCursor);
+        const QUuid eventId = e.id;
+        const int actorPid = e.actorPid;
+        const QString name = QFileInfo(e.actorPath).fileName();
+        connect(graph, &QPushButton::clicked, this, [this, ipc, eventId, actorPid, name] {
+            AttackGraphWindow dlg(ipc, eventId, actorPid, name, this);
+            dlg.exec();
+        });
+        bar->addWidget(graph);
+    }
     auto* close = new QPushButton(u("关闭"));
     close->setProperty("variant", "primary");
     close->setCursor(Qt::PointingHandCursor);

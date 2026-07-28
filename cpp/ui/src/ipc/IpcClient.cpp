@@ -181,6 +181,18 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::PersistenceListResponse:
         emit persistenceReceived(msg->payloadAs<PersistenceListResponsePayload>());
         break;
+    case IpcMessageType::EventTimelineResponse:
+        emit timelineReceived(msg->payloadAs<TimelineResponsePayload>());
+        break;
+    case IpcMessageType::AttackGraphResponse:
+        emit attackGraphReceived(msg->payloadAs<AttackGraphResponsePayload>());
+        break;
+    case IpcMessageType::ProcessListResponse:
+        emit processListReceived(msg->payloadAs<ProcessListResponsePayload>());
+        break;
+    case IpcMessageType::ProcessActionResponse:
+        emit processActionResult(msg->payloadAs<ProcessActionResultPayload>());
+        break;
     case IpcMessageType::VtQueryResponse:
         emit vtResponse(msg->payloadAs<VtResponsePayload>());
         break;
@@ -299,6 +311,34 @@ void IpcClient::manualQuarantine(const QString& path)
     ManualQuarantinePayload p;
     p.path = path;
     send(IpcMessage::from(IpcMessageType::ManualQuarantineRequest, p));
+}
+
+void IpcClient::requestTimeline(const TimelineRequestPayload& p)
+{
+    send(IpcMessage::from(IpcMessageType::EventTimelineRequest, p));
+}
+
+QUuid IpcClient::requestAttackGraph(const QUuid& seedEventId, int rootPid, int windowSeconds)
+{
+    AttackGraphRequestPayload p;
+    p.seedEventId = seedEventId;
+    p.rootPid = rootPid;
+    p.windowSeconds = windowSeconds;
+    send(IpcMessage::from(IpcMessageType::AttackGraphRequest, p));
+    return p.requestId;
+}
+
+void IpcClient::requestProcesses(bool includeCommandLine, bool resolveOrigin)
+{
+    ProcessListRequestPayload p;
+    p.includeCommandLine = includeCommandLine;
+    p.resolveOrigin = resolveOrigin;
+    send(IpcMessage::from(IpcMessageType::ProcessListRequest, p));
+}
+
+void IpcClient::processAction(const ProcessActionRequestPayload& p)
+{
+    send(IpcMessage::from(IpcMessageType::ProcessActionRequest, p));
 }
 
 void IpcClient::requestVtHistory()

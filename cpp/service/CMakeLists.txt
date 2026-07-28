@@ -12,6 +12,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Network)
 # Use qt_add_executable (not plain add_executable) so AUTOMOC reliably processes
 # the Q_OBJECT headers (same as the UI target, which links cleanly).
 qt_add_executable(bulwark_service
+    app.rc                     # embeds the brand badge as the exe/Explorer icon
     src/main.cpp
     src/Logger.cpp
     src/BulwarkOptions.cpp
@@ -33,12 +34,18 @@ qt_add_executable(bulwark_service
     src/reputation/ReputationCache.cpp
     src/reputation/HashReputationClients.cpp
     src/reputation/AggregateReputationService.cpp
+    src/reputation/ProxyReputationService.cpp
     src/reputation/ReputationManager.cpp
     src/reputation/VirusTotalClient.cpp
     src/reputation/ThreatBookClient.cpp
     src/reputation/ThreatFoxFeed.cpp
     # monitoring (Authenticode/PE/hash forensics + process control)
     src/monitoring/ProcessInspector.cpp
+    # monitoring: 进程启动来源溯源(PID -> 具体服务名 / 具体计划任务名)+ 在跑进程快照
+    src/monitoring/ProcessOriginResolver.cpp
+    src/monitoring/ProcessEnumerator.cpp
+    # 取证查询:事件时间线过滤 + 攻击图构建(读事件历史,只读)
+    src/ForensicsService.cpp
     # remediation (quarantine malicious files + strip registry/IFEO/service persistence)
     src/ThreatRemediator.cpp
     # persistence audit (read-only enumeration of 7 autostart points + risk scoring)
@@ -91,8 +98,10 @@ target_link_libraries(bulwark_service PRIVATE bulwark_shared Qt6::Core Qt6::Netw
 # (StartTrace/OpenTrace/ProcessTrace/EnableTraceEx2) live in advapi32.
 if(WIN32)
     # fltlib: Filter Manager user-mode API (DriverEventSource <-> Bulwark.sys).
-    # ole32/uuid: COM + IShellLink (UserModeBehaviorSource resolves startup .lnk targets).
-    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid)
+    # ole32/uuid/oleaut32: COM + IShellLink (UserModeBehaviorSource resolves startup .lnk
+    #   targets) + ITaskService (ProcessOriginResolver matches a PID to its scheduled task;
+    #   oleaut32 provides VariantInit/SysFreeString used on that path).
+    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32)
 endif()
 
 target_compile_features(bulwark_service PRIVATE cxx_std_20)

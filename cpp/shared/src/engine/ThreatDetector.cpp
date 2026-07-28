@@ -85,7 +85,13 @@ const QVector<Sig>& commandLineSignals() {
         { "wmic shadowcopy delete", 45, "删除卷影副本(勒索前置,T1490)" },
         { "wbadmin delete", 40, "删除系统备份(勒索前置,T1490)" },
         { "bcdedit", 25, "修改引导配置(勒索常用,T1490)" },
-        { "-noprofile -e", 25, "PowerShell 跳过配置 + 编码执行组合(T1027)" },
+        // 本表是【子串】匹配,原先这里写作 "-noprofile -e",意图是抓 `-NoProfile -e <base64>`
+        //(-e 是 -EncodedCommand 的简写),但它同时命中了 `-NoProfile -ExecutionPolicy Bypass`
+        // —— 后者是几乎所有正经 PowerShell 自动化脚本的标配写法,于是每次跑构建/部署脚本都被
+        // 贴上「编码执行组合」这个并不存在的理由并白加 25 分(实测 36 次误拦均由此参与)。
+        // 拆成两个不会误伤的精确前缀:`-enc`/`-encodedcommand` 与带空格的 `-e <参数>`。
+        { "-noprofile -enc", 25, "PowerShell 跳过配置 + 编码执行组合(T1027)" },
+        { "-noprofile -e ",  25, "PowerShell 跳过配置 + 编码执行组合(T1027)" },
     };
     return s;
 }
@@ -366,14 +372,30 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     }
 
     // 1c) 文件膨胀
+    //
+    // 「未签名 + 体积超大」原先无条件置硬指标(65 分),单这一条就够 Block 线。但 Electron /
+    // Tauri / PyInstaller 打包的正常应用天生就是 150~200MB —— 实测 35 次误拦(占全部拦截 43%)
+    // 全部出自这里:Clash for Windows 150MB、kiro-account-manager 171MB,两者都是 Electron。
+    //
+    // 真正的「文件膨胀规避扫描」是把载荷填充到超过杀软扫描上限,而这类样本的落点特征很稳定:
+    // 投递到用户可写目录(Temp / Downloads / AppData\Roaming / Public / ProgramData / Desktop)。
+    // 反之位于 Program Files / AppData\Local\Programs 之类安装目录的大文件,是安装器(需要管理员
+    // 或走标准安装流程)放进去的,几乎不可能是投递载荷。
+    //
+    // 故:仅当文件位于投递型可写目录时才算硬指标;否则保留分数但降为软信号,交由互证升格 ——
+    // 与本项目「软信号绝不单独定罪」的既定原则一致。
     constexpr qint64 kBloatThreshold = 60LL * 1024 * 1024;
     constexpr qint64 kBloatThresholdHi = 90LL * 1024 * 1024;
     if (e.actorFileSize >= kBloatThresholdHi && !e.actorSigned) {
         Add(65, u("超大未签名可执行文件(") + QString::number(e.actorFileSize / (1024 * 1024)) +
-                u("MB,几乎必为文件膨胀规避扫描)"), true);
+                u("MB,几乎必为文件膨胀规避扫描)") +
+                (inSuspiciousDir ? QString() : u("〔位于安装目录,按软信号计,需互证〕")),
+            inSuspiciousDir);
     } else if (e.actorFileSize >= kBloatThreshold && !e.actorSigned) {
         Add(30, u("异常大的可执行文件(") + QString::number(e.actorFileSize / (1024 * 1024)) +
-                u("MB,疑似文件膨胀)"), true);
+                u("MB,疑似文件膨胀)") +
+                (inSuspiciousDir ? QString() : u("〔位于安装目录,按软信号计,需互证〕")),
+            inSuspiciousDir);
     }
 
     // 2) 可疑目录运行(仅未签名显著加分)

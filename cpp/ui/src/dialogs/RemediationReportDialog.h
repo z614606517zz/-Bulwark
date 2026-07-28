@@ -38,4 +38,5 @@ private:
     QString m_actorName;
     QPoint m_dragOffset;
     bool m_centered = false;
+    int m_autoCloseLeft = 5;   // 全自动:报告为纯通知,倒计时自动关闭(秒)
 };

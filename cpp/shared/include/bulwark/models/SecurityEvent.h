@@ -39,6 +39,15 @@ struct SecurityEvent {
     QString originatorPath;               // 可空
     int parentPid = 0;
     QString parentPath;
+
+    // ---- 启动来源溯源(服务 / 计划任务 / 交互式…)。仅用于溯源展示与取证,不参与评分。----
+    // 解决「父进程是 svchost.exe 就再也追不下去」的盲区:把宿主进程还原成【具体】的服务名
+    // 或计划任务名。由 ProcessOriginResolver 在事件富化阶段填充。
+    ProcessOriginKind originKind = ProcessOriginKind::Unknown;
+    QString originService;                // 服务名(svchost 共享宿主里可能多个,以 ", " 连接)
+    QString originServiceDisplay;         // 服务显示名(第一个服务)
+    QString originTask;                   // 计划任务完整路径(如 \Microsoft\Windows\Foo\Bar)
+    QString originDetail;                 // 判定说明(含置信度/依据,可空)
     QString commandLine;                  // 可空
     QString target;                       // 目标:进程/文件/注册表键/远端地址
     QString detail;                       // 可空:端口/值名等
@@ -54,8 +63,8 @@ struct SecurityEvent {
     bool kernelBlocked = false;           // 该事件对应的操作已被内核在【发生前】真正阻断
                                           //(STATUS_ACCESS_DENIED / 剥权 / WFP BLOCK / 禁止加载),
                                           // 用于如实区分「真前拦」与「事后处置」,避免假拦截显示。
-    bool userTrusted = false;             // 运行时:命中用户明确信任(文件/文件夹),引擎在检测前放行,
-                                          // Worker 据此跳过全部后台扫描(VT/IP/AI)。运行时标记,不序列化。
+    bool userTrusted = false;             // 运行时:命中用户明确信任(文件/文件夹)或内置良性厂商应用白名单,
+                                          // 引擎在检测前放行,Worker 据此跳过全部后台扫描(VT/IP/AI)。运行时标记,不序列化。
     bool memoryInjection = false;         // 内存防护(反注入)命中
     QString fileDescription;              // 可空:FileDescription
     QVector<ChainEventInfo> chainContext; // 进程链上下文
@@ -64,6 +73,10 @@ struct SecurityEvent {
     void addEvidence(const QString& source, EvidenceKind kind,
                      const QString& description, int scoreDelta = 0,
                      bool alsoReason = true);
+
+    // 启动来源的可读标签(如 "服务:Schedule (Task Scheduler)" / "计划任务:\Microsoft\..."),
+    // 无判定则返回空串。UI / 攻击图 / 溯源链共用一份措辞。
+    QString originLabel() const;
 
     QJsonObject toJson() const;
     static SecurityEvent fromJson(const QJsonObject& o);

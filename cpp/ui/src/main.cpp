@@ -3,16 +3,76 @@
 // A single desktop app that connects to the headless service over a named pipe
 // and renders the dashboard / prompts / management pages. Pure Widgets =>
 // QApplication. The global dark theme is applied once via a Qt Style Sheet.
+#include "Bootstrap.h"
 #include "MainWindow.h"
 #include "Theme.h"
 #include "dialogs/PromptDialog.h"
 #include "widgets/AppIcon.h"
 
 #include <QApplication>
+#include <QBuffer>
+#include <QByteArray>
+#include <QDataStream>
+#include <QFile>
 #include <QFont>
+#include <QImage>
+#include <QList>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QPixmap>
 #include <QTimer>
+
+// Write the brand badge (teal shield) to a multi-size Windows .ico file so the
+// build can embed it as the application icon (Explorer / taskbar / shortcuts).
+// Each frame is stored PNG-compressed (Vista+ .ico supports this), so no image
+// plugin beyond Qt's built-in PNG writer is needed. Hidden CLI: --export-icon.
+static bool exportAppIco(const QString& path)
+{
+    const int sizes[] = {16, 20, 24, 32, 48, 64, 128, 256};
+    const QIcon badge = AppIcon::appBadge();
+    QList<QByteArray> frames;
+    QList<int> dims;
+    for (int s : sizes) {
+        QPixmap pm = badge.pixmap(QSize(s, s));
+        if (pm.isNull())
+            continue;
+        QImage img = pm.toImage().convertToFormat(QImage::Format_ARGB32);
+        if (img.width() != s || img.height() != s)
+            img = img.scaled(s, s, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        QByteArray png;
+        QBuffer buf(&png);
+        buf.open(QIODevice::WriteOnly);
+        if (!img.save(&buf, "PNG"))
+            continue;
+        buf.close();
+        frames.append(png);
+        dims.append(s);
+    }
+    if (frames.isEmpty())
+        return false;
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly))
+        return false;
+    QDataStream ds(&f);
+    ds.setByteOrder(QDataStream::LittleEndian);
+    const quint16 count = quint16(frames.size());
+    ds << quint16(0) << quint16(1) << count;         // ICONDIR: reserved, type=icon, count
+    quint32 offset = 6u + 16u * count;               // data starts after all dir entries
+    for (int i = 0; i < frames.size(); ++i) {
+        const int d = dims[i];
+        ds << quint8(d >= 256 ? 0 : d);              // width  (0 => 256)
+        ds << quint8(d >= 256 ? 0 : d);              // height (0 => 256)
+        ds << quint8(0) << quint8(0);                // color count, reserved
+        ds << quint16(1) << quint16(32);             // planes, bit depth
+        ds << quint32(frames[i].size()) << offset;   // bytes in res, offset
+        offset += quint32(frames[i].size());
+    }
+    for (const QByteArray& png : frames)
+        f.write(png);
+    f.close();
+    return true;
+}
 
 int main(int argc, char* argv[])
 {
@@ -20,6 +80,15 @@ int main(int argc, char* argv[])
     app.setApplicationName(QStringLiteral("Bulwark"));
     app.setOrganizationName(QStringLiteral("Bulwark"));
     app.setWindowIcon(AppIcon::appBadge()); // default icon for all windows/dialogs + taskbar
+
+    // Hidden build helper: `--export-icon <path>` renders the brand badge to a
+    // multi-size .ico and exits (used to regenerate the embedded exe icon).
+    {
+        const QStringList args = app.arguments();
+        const int idx = args.indexOf(QStringLiteral("--export-icon"));
+        if (idx >= 0 && idx + 1 < args.size())
+            return exportAppIco(args[idx + 1]) ? 0 : 1;
+    }
 
     // The app lives in the system tray: closing the main window hides it rather
     // than quitting, so protection notifications (and the pipe link) keep
@@ -53,6 +122,13 @@ int main(int argc, char* argv[])
     app.setFont(f);
 
     app.setStyleSheet(theme::styleSheet());
+
+    // ── 双击即用:把后台服务 + 内核驱动带起来,不用再手工 sc start / fltmc load。
+    //    服务已在跑(开机自启)时这里立即返回,零 UAC、零等待;只有没跑起来才提权一次。
+    //    失败/用户拒绝提权也不阻塞 —— 界面照常打开,只显示「未连接」。
+    //    冒烟测试(BULWARK_UI_SMOKE)跳过,免得在构建机上弹 UAC 卡住。
+    if (qEnvironmentVariableIsEmpty("BULWARK_UI_SMOKE"))
+        bulwark::ui::bootstrap::ensureBackendRunning();
 
     MainWindow w;
     w.show();

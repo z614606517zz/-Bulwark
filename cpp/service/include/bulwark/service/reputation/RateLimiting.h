@@ -31,6 +31,10 @@ class DailyQuota {
 public:
     DailyQuota(int dailyLimit, int priorityReserve = 0);
     bool tryConsume(bool priority = false);
+    // 退还一个已消耗的名额(下限 0)。用于「先占用后发现无需占用」的场景:例如中央代理
+    // 预占一个「新鲜查询」名额,但服务端实际命中了共享缓存(未真正消耗上游情报),则退还,
+    // 使缓存命中不计入每日新鲜配额。
+    void release();
     std::pair<int, int> snapshot();   // {今日已用, 每日上限}
 
 private:

@@ -20,6 +20,29 @@ void SecurityEvent::addEvidence(const QString& source, EvidenceKind kind,
         riskReasons << description;
 }
 
+QString SecurityEvent::originLabel() const {
+    switch (originKind) {
+        case ProcessOriginKind::Service: {
+            if (originService.isEmpty())
+                return QString::fromUtf8("服务");
+            QString s = QString::fromUtf8("服务:") + originService;
+            if (!originServiceDisplay.isEmpty()
+                && originServiceDisplay.compare(originService, Qt::CaseInsensitive) != 0)
+                s += QStringLiteral(" (") + originServiceDisplay + QLatin1Char(')');
+            return s;
+        }
+        case ProcessOriginKind::ScheduledTask:
+            return originTask.isEmpty() ? QString::fromUtf8("计划任务")
+                                        : QString::fromUtf8("计划任务:") + originTask;
+        case ProcessOriginKind::WmiProvider:    return QString::fromUtf8("WMI 提供者宿主派生");
+        case ProcessOriginKind::LogonAutostart: return QString::fromUtf8("登录自启动");
+        case ProcessOriginKind::SystemBoot:     return QString::fromUtf8("系统启动");
+        case ProcessOriginKind::Interactive:    return QString::fromUtf8("交互式启动");
+        case ProcessOriginKind::Unknown:        break;
+    }
+    return QString();
+}
+
 QJsonObject SecurityEvent::toJson() const {
     QJsonObject o;
     o["id"] = guidToString(id);
@@ -45,6 +68,11 @@ QJsonObject SecurityEvent::toJson() const {
     o["originatorPath"] = originatorPath;
     o["parentPid"] = parentPid;
     o["parentPath"] = parentPath;
+    if (originKind != ProcessOriginKind::Unknown) o["originKind"] = static_cast<int>(originKind);
+    if (!originService.isEmpty())        o["originService"] = originService;
+    if (!originServiceDisplay.isEmpty()) o["originServiceDisplay"] = originServiceDisplay;
+    if (!originTask.isEmpty())           o["originTask"] = originTask;
+    if (!originDetail.isEmpty())         o["originDetail"] = originDetail;
     o["commandLine"] = commandLine;
     o["target"] = target;
     o["detail"] = detail;
@@ -98,6 +126,11 @@ SecurityEvent SecurityEvent::fromJson(const QJsonObject& o) {
     e.originatorPath = getStr(o, "originatorPath");
     e.parentPid = getInt(o, "parentPid");
     e.parentPath = getStr(o, "parentPath");
+    e.originKind = static_cast<ProcessOriginKind>(getInt(o, "originKind", 0));
+    e.originService = getStr(o, "originService");
+    e.originServiceDisplay = getStr(o, "originServiceDisplay");
+    e.originTask = getStr(o, "originTask");
+    e.originDetail = getStr(o, "originDetail");
     e.commandLine = getStr(o, "commandLine");
     e.target = getStr(o, "target");
     e.detail = getStr(o, "detail");

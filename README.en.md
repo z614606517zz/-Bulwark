@@ -16,7 +16,7 @@ Bulwark is built as three cooperating layers: a **kernel-mode driver (R0)** for 
 
 Chosen via `EventSource` in `appsettings.json`; the decision logic and UI are identical whichever you pick:
 
-- **`Driver`** — kernel driver + ETW observation. The kernel blocks hard-block lists / protected items / the network blocklist / self-protection "before the action"; process creation uses a "telemetry + post-launch kill" compensation model.
+- **`Driver`** — kernel driver + ETW observation. The kernel blocks hard-block lists / protected items / the network blocklist / self-protection "before the action". Process creation has **both** paths: **kernel-local pre-create denial** (image on the "exec-block" list, or the creator itself is a banned malicious actor → `STATUS_ACCESS_DENIED`) and **telemetry + post-launch kill** compensation for gray-zone processes that match no local list.
 - **`Wmi`** — ETW user-mode observation only (the value name "Wmi" is historical; it is actually ETW). Cannot block before the action; blocking is compensated by terminating the offending process tree afterward.
 
 > Whatever the source, user mode always runs a parallel "continuous behavior source" (autostart-persistence watch + ransomware decoys) to cover the blind spot *after* a program is running.
@@ -52,17 +52,24 @@ cpp/                     C++ / Qt implementation (top-level CMake: cpp/CMakeList
 │   ├─ src/PersistenceScanner.cpp  read-only enumeration of 7 autostart persistence classes
 │   └─ src/*Store.cpp              rules / settings / first-seen / baseline / event history / VT history / audit / ECS alerts
 └─ ui/                Desktop UI (builds bulwark_ui.exe): Qt Widgets, connects to the service over a named pipe
-    ├─ src/MainWindow.cpp / pages/  10 feature pages
+    ├─ src/MainWindow.cpp / pages/  12 feature pages
     ├─ src/dialogs/                 behavior prompt / toast / scan progress / cleanup report / attack timeline
     └─ src/ai/                      UI-side AI research (static feature extraction + LLM)
 
 Bulwark.Driver/         Kernel driver (R0), sibling of cpp/, built with MSBuild + WDK: Minifilter + communication port
 ├─ Driver.c ProcessMonitor.c FileMonitor.c RegistryMonitor.c SelfProtect.c
 ├─ NetMonitor.c ImageMonitor.c ThreadMonitor.c Comms.c
+├─ HashScan.c           kernel-local known-bad SHA-256 scan (self-contained pure-C SHA-256, async worker, kill on hit)
+├─ Policy.c             kernel-side policy / list containers
 └─ Protocol.h           kernel↔service message structs (user-mode DriverEventSource reuses this header, single source of truth)
 
-scripts/                build-driver.ps1 (build driver) / deploy-driver-vm.ps1 (sign+load in a test VM)
+server/bulwark-broker/  optional central reputation broker (broker.py, pure Python stdlib + SQLite) — see "Central reputation service"
+Bulwark.Sandbox/        Windows Sandbox (.wsb) configs + sample-drop scripts for running samples in isolation
+ml/                     offline training scripts (LightGBM); not part of the C++ build and **no model is loaded by the product**
+scripts/                build-driver.ps1 (build driver) / deploy-driver-vm.ps1 (sign+load in a test VM) + local deploy scripts
 ```
+
+> `ml/` is a leftover offline experiment directory. **There is no model-inference path anywhere in the current code** — detection comes entirely from rules + heuristics + analyzers + cloud reputation, with no machine-learning model dependency.
 
 ## Decision flow (RuleEngine)
 
@@ -70,15 +77,18 @@ Each event entering `RuleEngine::evaluate` runs a fixed-priority pipeline (not a
 
 1. **Unconditional allow**: Bulwark's own components (by image name + install-dir prefix), and user-trusted files / folders (trust = skip all further detection and background scans).
 2. **Installed known security products**: coexistence allow (`TrustPolicy::isTrustedSecurityProduct`).
-3. **Threat analysis**: `ThreatDetector::analyze` computes a risk score and sets the "hard malicious indicator" flag (below).
-4. **Stateful temporal detection**: file write/delete → ransomware monitor (touching a decoy = immediate Block); network egress → C2 beacon + DGA domain + egress rate; DNS query → DGA domain.
-5. **Behavior-baseline deviation** (toggleable): a soft signal when a program deviates from its own history, escalated only if corroborated by a hard indicator.
-6. **Explicit rules**: matched and sorted by "tier (exact actor > hard-override > wildcard) > specificity > action strength > recency"; strongly-trusted OS components / dev tools are exempt from "ask" rules.
-7. **Strongly-trusted actor** → allow (cert-thumbprint allowlist, or Microsoft-signed + system dir, with a healthy signature and no dangerous behavior).
-8. **Signature anomaly** (revoked cert / signed after cert expiry) → Block.
-9. **Healthy signature** → allow (excludes hard indicators and the "shell-company new cert" profile).
-10. **Act only if a hard indicator exists**: risk score ≥ high-risk threshold → Block, otherwise → Ask (prompt).
-11. **No hard indicator → always allow** (log only; soft signals never convict on their own).
+3. **Known-benign vendor apps** (QQ / WeChat / WeCom / TIM): when the image name is on the built-in list **and** the binary carries a healthy vendor signature, **network-egress and DNS events only** are allowed ahead of the temporal detectors (`TrustPolicy::isTrustedVendorApp`), so normal keep-alive traffic isn't scored as C2 beaconing. **This tier does not cover other dimensions** — process creation / module load / file write / registry write / injection events from the same process still run the full pipeline, so IM sideloading and group-control hook-module loads are still detected.
+4. **Threat analysis**: `ThreatDetector::analyze` computes a risk score and sets the "hard malicious indicator" flag (below).
+5. **Stateful temporal detection**: file write/delete → ransomware monitor (touching a decoy = immediate Block); network egress → C2 beacon + DGA domain + egress rate; DNS query → DGA domain.
+6. **Behavior-baseline deviation** (toggleable): a soft signal when a program deviates from its own history, escalated only if corroborated by a hard indicator.
+7. **Explicit rules**: matched and sorted by "tier (exact actor > hard-override > wildcard) > specificity > action strength > recency"; strongly-trusted OS components / dev tools are exempt from "ask" rules.
+8. **Strongly-trusted actor** → allow (cert-thumbprint allowlist, or Microsoft-signed + system dir, with a healthy signature and no dangerous behavior).
+9. **Signature anomaly** (revoked cert / signed after cert expiry) → Block.
+10. **Healthy signature** → allow (excludes hard indicators and the "shell-company new cert" profile).
+11. **Act only if a hard indicator exists**: risk score ≥ high-risk threshold → Block, otherwise → Ask (prompt).
+12. **No hard indicator → always allow** (log only; soft signals never convict on their own).
+
+> **Mind where the trust channels sit**: steps 1–3 above run **before** explicit rule matching, and threat analysis also runs before rules. Writing a Block rule therefore does **not** override those three channels — an event allowed by own-component / security-product-coexistence / (network-dimension) vendor-app trust never reaches step 7.
 
 After deciding, a "final verdict" evidence entry is appended and `AttackAnnotator` annotates MITRE ATT&CK techniques. Verdict actions are **Allow / Block / Ask**; the source is tagged Rule / Heuristic / Trusted-signer / User-prompt / Timeout / Default-policy.
 
@@ -114,20 +124,50 @@ Stateful temporal monitors (per-PID / per-series sliding windows, thread-safe):
 
 ## Cloud reputation, threat intel and AI research
 
-- **Multi-engine hash reputation** — transported via `curl.exe`, tiered cache (`%ProgramData%\Bulwark\reputation.jsonl`: malicious permanent / clean 7 days / suspicious 24 h / unknown short negative cache, with last-known fallback for enrichment when offline), rate-limited. Aggregates 6 sources and takes the strongest verdict (Malicious > Suspicious > Clean > Unknown): **VirusTotal (flagship, full-file upload+scan + per-engine detail), ThreatBook (微步, plus IP reputation), MalwareBazaar, OTX, MetaDefender, HybridAnalysis (plus sandbox behavior profile)**. All opt-in (off by default; enable each by entering its API key on the Settings page — signup links below); reputation only adds/subtracts score, never acts alone, and going offline does not affect real-time protection.
+- **Multi-engine hash reputation** — transported via `curl.exe`, tiered cache (`%ProgramData%\Bulwark\reputation.jsonl`: malicious permanent / clean 7 days / suspicious 24 h / unknown short negative cache, with last-known fallback for enrichment when offline), rate-limited. Aggregates 6 sources and takes the strongest verdict (Malicious > Suspicious > Clean > Unknown): **VirusTotal (flagship, full-file upload+scan + per-engine detail), ThreatBook (微步, plus IP reputation), MalwareBazaar, OTX, MetaDefender, HybridAnalysis (plus sandbox behavior profile)**. Each source can be toggled independently; reputation only adds/subtracts score, never acts alone, and going offline does not affect real-time protection.
+- **Central reputation service (hash lookups go through a server by default; can be turned off)** — see the dedicated "Central reputation service" section below. **This is the only feature that produces outbound requests even when you have supplied no API keys at all**, so read that section before deciding whether to keep it enabled.
 
-> The open-source build **bundles no vendor keys** — every key field in the source and repo is blank (VirusTotal's built-in key is only injectable at build time via `-DBULWARK_VT_BUILTIN_KEY`, and is not injected by default).
+> **Code default vs shipped config**: in **code**, every intel source defaults to off (`Enabled = false` in `BulwarkOptions.h`). But the `cpp/service/appsettings.json` shipped alongside the service turns VirusTotal / MalwareBazaar / OTX / ThreatBook / MetaDefender / HybridAnalysis / the ThreatFox feed / the central reputation service **all to `true`** for out-of-the-box convenience. The config file overrides the code default, so a packaged build arrives fully enabled. For a genuinely local-only run, set the relevant `Enabled` to `false`, or turn each off on the UI Settings page.
+
+> The open-source build **bundles no vendor keys** — every key field in the source and in the `cpp/service/appsettings.json` template is blank (VirusTotal's built-in key is only injectable at build time via `-DBULWARK_VT_BUILTIN_KEY`, and is not injected by default). ⚠ This does **not** apply to `cpp/dist/`, which is a developer run directory excluded by `.gitignore` and not in version control — its `appsettings.json` may still hold the developer's real keys. **Do not hand out the whole `cpp/dist/` folder**; regenerate the config from the blank-key template before distributing.
 - **Threat-intel feed (ThreatFox / abuse.ch)** — periodically pulls recent malicious IOCs (by confidence threshold) and **auto-generates hash / IP / domain block rules** (source-tagged, with expiry); also manual "refresh / preview / adopt" in the UI.
 - **Network egress IP intel** — only for suspicious egress, a rate-limited background ThreatBook IP-reputation lookup (very low monthly quota + 7-day hard cache + in-flight dedup); on confirmed malice it compensates by terminating the egress process tree.
 - **Double-click / dropped-payload malware scan** — double-click launches, dropper-spawned children, recently-dropped executables, and double-clicked MSI/MSP installers are hash-queried against VT, then the full file is uploaded for a cloud scan if unknown; progress streams to a UI card, results are deduped into VT history, and confirmed malice triggers compensation.
 - **AI research (UI-side LLM)** — OpenAI-compatible, async, fail-open on any error. Two capabilities: (1) judge a file's maliciousness from **static content features only** (**never executes the sample**); (2) turn a natural-language security intent into 1–5 reviewable defense rules. Static features are extracted bounds-safely by `StaticFeatureExtractor`: PE header + per-section Shannon entropy (packing, entropy > 7.2), dangerous Win32 APIs / URLs / IPs in ASCII/UTF-16 strings, capability tags (injection / anti-debug / keylogging / ransomware / download / persistence / privilege escalation / discovery / command exec), script snippet. AI history is persisted at `%ProgramData%\Bulwark\ai_scan_history.json`.
 - **AI gray-zone policy** — consults the model only for "Ask" gray-zone events: AI-malicious → escalate to Block; AI-clean with no hard indicator → downgrade to Allow (less nagging); otherwise keep the original verdict. **AI never suppresses a hard indicator, and never overrides a deterministic block or a strongly-trusted allow.**
 
+## Central reputation service (ReputationProxy)
+
+⚠ **This is enabled by default, and it sends the SHA-256 of files on your machine to a third-party server.** Read this section before deciding whether to keep or disable it.
+
+**What it is** — a hash-reputation proxy. When enabled, hash lookups go to that server **first** instead of directly to each intel source: the server holds the upstream API keys and maintains one shared cache for every endpoint that connects (a hash someone else already looked up is a zero-round-trip hit for you). It is implemented as `ProxyReputationService`, a proxy-first decorator wrapped around `AggregateReputationService` and installed on `ReputationManager`, the single choke point — so **the background reputation queue, memory-protection VT re-verification, and manual UI lookups all go through it**. The server code lives in this repo at `server/bulwark-broker/` (`broker.py`, pure Python stdlib + SQLite).
+
+**What leaves your machine** — only the **SHA-256 digest** (plus an optional bearer token). **File contents are not uploaded.** Full-file upload scanning remains a separate feature that talks directly to VirusTotal and does not go through this proxy.
+
+**Defaults** — identical in `cpp/service/appsettings.json` and `cpp/dist/appsettings.json`:
+
+```jsonc
+"ReputationProxy": {
+  "Enabled": true,                              // ← on by default
+  "BaseUrl": "https://vt.bulwark.icu",          // ← instance run by the project maintainer
+  "BearerToken": "",                            // BULWARK_REPPROXY_TOKEN overrides this
+  "QueryTimeoutSeconds": 8
+}
+```
+
+**How to disable** — set `Enabled` to `false`. Hash lookups then fall back entirely to local direct-to-source aggregation; **protection capability does not degrade** (you only lose the shared cache and the server-side keys).
+
+**Failure behaviour** — any failure (proxy disabled / network / HTTP / parse error / no authoritative answer from the server) falls back **transparently** to local direct aggregation. When offline, a client-side circuit breaker skips the hop and half-open-retries every 60s, so you never pay a timeout per query. The server currently aggregates VirusTotal + ThreatBook only; the other four sources are always served locally.
+
+**Self-hosting** — `server/bulwark-broker/broker.py` can be deployed as-is; point `BaseUrl` at your own instance so hashes never leave your infrastructure.
+
 ## Intel sources & AI keys (all optional — it works without them)
 
-Cloud reputation, the threat-intel feed and AI research are all **enhancements**: off by default, and the local heuristics + behavior detection run fine with no keys at all. To enable one, enter its API key on the UI **Settings** page and flip the switch; most sources have a **free tier**.
+Cloud reputation, the threat-intel feed and AI research are all **enhancements**: the local heuristics + behavior detection run fine with no keys at all. To enable one, enter its API key on the UI **Settings** page and flip the switch; most sources have a **free tier**.
 
-> 🔐 **Key safety**: keys you enter are stored only on your machine at `%ProgramData%\Bulwark\settings.json` (or as environment variables) — they are **never written into source, never uploaded, never committed**. Every key field in the repo's `appsettings.json` is blank.
+> ⚠ **The default is not "everything off"**: the shipped `appsettings.json` sets every intel source **and the central reputation service** to `Enabled: true` (see "Code default vs shipped config" above). Sources with no key simply fail and fall back silently, which does not affect protection — but **the central reputation service works without any key of yours**, meaning hashes do go out. For a fully offline setup, explicitly set each `Enabled` to `false`.
+
+> 🔐 **Key safety**: keys you enter are stored only on your machine at `%ProgramData%\Bulwark\settings.json` (or as environment variables) — they are **never written into source, never uploaded, never committed**. Every key field in the `cpp/service/appsettings.json` template is blank. (`cpp/dist/` is a local run directory excluded by `.gitignore` and may contain the developer's own keys — don't distribute it wholesale.)
 
 | Intel / AI source | Purpose | Sign-up | Notes |
 |----|------|---------|-------|
@@ -167,7 +207,8 @@ The config file must sit next to `bulwark_service.exe`; missing keys keep defaul
     "EventSource": "Driver",       // Driver = kernel + ETW / Wmi = ETW observation only
     "KernelDriverEnabled": true,   // enable the kernel driver (implied when EventSource = Driver)
     "TrustSignedActors": true,     // auto-allow strongly-trusted signed programs
-    "PromptTimeoutSeconds": 30,    // prompt timeout (falls back to the default policy)
+    "DefaultAction": "Allow",      // default action for no-rule gray zone, and the action taken when a prompt times out
+    "PromptTimeoutSeconds": 30,    // prompt timeout in seconds; on timeout the DefaultAction above is applied
     "ExportEcsAlerts": false,      // ECS JSON-lines alert export (SIEM)
     "OnlineCertRevocationCheck": false,  // online cert revocation (default: local cached CRL only, never blocks enrichment)
 
@@ -190,12 +231,19 @@ The config file must sit next to `bulwark_service.exe`; missing keys keep defaul
     "Otx": { "Enabled": true }, "ThreatBook": { "Enabled": true },
     "MetaDefender": { "Enabled": true }, "HybridAnalysis": { "Enabled": true },
     "ThreatFoxFeed": { "Enabled": true },
+
+    // Central reputation service: ON by default; sends file SHA-256 to this address. See its own section.
+    "ReputationProxy": { "Enabled": true, "BaseUrl": "https://vt.bulwark.icu",
+                         "BearerToken": "", "QueryTimeoutSeconds": 8 },
+
     "Ai": { "BaseUrl": "https://token-plan-sgp.xiaomimimo.com/v1", "ApiKey": "", "Model": "mimo-v2.5-pro" }
   }
 }
 ```
 
-> The full default config is in `cpp/service/appsettings.json`. Each intel source also has its own rate limits (per-minute / per-day), timeout and malicious-verdict threshold; the `Etw` section has per-process per-minute report caps and a dedup window. Reputation sources and AI are off by default, enabled per-source from the UI with hot-updatable API keys. You can also set `ProxyUrl` (global proxy), `TrustedDirectories` (whole-directory trust), and `EnforceUiClientSignature` (only a signed UI may connect to the pipe — IPC self-protection).
+> The full default config is in `cpp/service/appsettings.json`. The snippet above is abridged; the following keys **exist in code but are omitted here**: per-source rate limits (`RequestsPerMinute` / `RequestsPerDay`), timeouts and malicious-verdict thresholds; `VirusTotal.PriorityDailyReserve` (daily quota reserved for priority re-verification); the `Etw` section actually has 14 keys (besides the toggles shown: `PerProcessNetPerMinute` / `PerProcessRegPerMinute` / `PerProcessFilePerMinute` / `PerProcessDnsPerMinute` per-process per-minute report caps, `DedupWindowSeconds`, `RawChannelCapacity`, `SessionName`); `ProxyUrl` (global proxy), `TrustedDirectories` (whole-directory trust), and `EnforceUiClientSignature` with `UiClientAllowedThumbprints` / `UiClientAllowedPublishers` (only a UI with the given signature may connect to the pipe — IPC self-protection).
+>
+> ⚠ **Intel sources and the central reputation service are enabled in the shipped config** (code defaults are off; the config file overrides them). API keys are hot-updatable from the UI or overridable via environment variables. Set `Enabled: false` explicitly for a local-only run.
 
 ## Beginner guide (from source to running)
 
@@ -267,26 +315,29 @@ A green status dot at the top of the UI means it is connected. On real process l
 
 > A packaged build already exists under `cpp\dist\` (both exes + Qt runtime), runnable directly as administrator. Diagnostic: `bulwark_service.exe --inspect <path>` read-only prints a file's signature / cert profile / hash forensics without starting any monitoring.
 
-## UI features (10 pages)
+## UI features (12 pages)
 
-The sidebar has 10 pages (in this order); a green status dot means connected, and the sidebar footer shows `v1.0.0 · Qt Edition`. Closing the main window minimizes to the system tray and protection keeps running (tray menu: Show / Scan now / Quit).
+The sidebar has 12 pages (in this order); a green status dot means connected, and the sidebar footer shows `v1.0.0 · Qt Edition`. Closing the main window minimizes to the system tray and protection keeps running (tray menu: Show / Scan now / Quit).
 
 1. **Dashboard** — protected / disconnected banner, kernel connection status, AI Credits monthly usage, four stat cards ALLOWED / BLOCKED / AI SCANS / TOTAL, a scrolling LIVE LOG.
 2. **Intercept log** — deterministic high-risk actions that were blocked outright; double-click an entry to open the "Attack Timeline" and trace the chain.
 3. **Activity log** — the fuller event stream (allows / asks / blocks with risk score and verdict text), persisted and backfilled on restart; double-click for the timeline.
-4. **Rules** — view / manage rules. **+ New rule** (actor auto-recognized as exact path / wildcard / bare file name), **🤖 AI generate** (natural language → 1–5 candidate rules to adopt), refresh / delete; ticking "remember" in a prompt also creates a rule.
-5. **Trust** — trusted programs / directories, allowed directly without further detection. **+ Add trust** (pick an executable **or a whole directory**), remove, refresh.
-6. **Quarantine** — quarantined threat files. Columns: file / reason / date; **Restore** (back to original) or **Delete** (permanent).
-7. **Persistence** — scan to read-only enumerate 7 autostart persistence classes (registry Run/RunOnce, Startup folder, Windows services, scheduled tasks, image hijack IFEO, Winlogon, AppInit_DLLs), each heuristically scored + ATT&CK-annotated, color-coded by risk. **Read-only — never modifies any autostart entry.**
-8. **Reputation** — multi-engine hash-reputation center: per-source enable/connection status + test, manual lookup by file/hash, VirusTotal query history; a malicious/suspicious hit auto-opens a behavior-relationship detail window.
-9. **AI research** — the LLM judges a file from static features (never executes). Scan & trace / scan file / scan folder / stop; stats SCANNED / CLEAN / SUSPICIOUS / MALICIOUS, results with path + SHA256, verdict, confidence, summary, per-row trace.
-10. **Settings** — see below.
+4. **Event timeline** — a *query* view over the on-disk history (`events.jsonl`, far deeper than the 500-entry in-memory ring), so you can go back to "what happened around 3pm yesterday". Filter by time window / event type / verdict / minimum risk / PID (optionally the whole process tree) / free text. A dedicated **launch origin** column shows the concrete service or scheduled task behind a host process. Right-click any row to open the attack graph.
+5. **Processes** — a process view with forensics and provenance, not a Task Manager clone: launch origin (which *service* is inside that `svchost.exe`, which *scheduled task* spawned this process), signature / publisher / signature-mismatch, static hints (unsigned, user-writable directory, system-process name outside the system directory), memory / threads / session / elevation / user, and user-initiated actions (terminate, terminate tree, suspend, resume, terminate + quarantine image, add to trust). Every action requires an explicit click and a confirmation; the service refuses to touch Bulwark's own components (self-protection) and critical system processes, and always reports *why* an action did not go through.
+6. **Rules** — view / manage rules. **+ New rule** (actor auto-recognized as exact path / wildcard / bare file name), **🤖 AI generate** (natural language → 1–5 candidate rules to adopt), refresh / delete; ticking "remember" in a prompt also creates a rule.
+7. **Trust** — trusted programs / directories, allowed directly without further detection. **+ Add trust** (pick an executable **or a whole directory**), remove, refresh.
+8. **Quarantine** — quarantined threat files. Columns: file / reason / date; **Restore** (back to original) or **Delete** (permanent).
+9. **Persistence** — scan to read-only enumerate 7 autostart persistence classes (registry Run/RunOnce, Startup folder, Windows services, scheduled tasks, image hijack IFEO, Winlogon, AppInit_DLLs), each heuristically scored + ATT&CK-annotated, color-coded by risk. **Read-only — never modifies any autostart entry.**
+10. **Reputation** — multi-engine hash-reputation center: per-source enable/connection status + test, manual lookup by file/hash, VirusTotal query history; a malicious/suspicious hit auto-opens a behavior-relationship detail window.
+11. **AI research** — the LLM judges a file from static features (never executes). Scan & trace / scan file / scan folder / stop; stats SCANNED / CLEAN / SUSPICIOUS / MALICIOUS, results with path + SHA256, verdict, confidence, summary, per-row trace.
+12. **Settings** — see below.
 
 **Prompts and notifications:**
 - **Behavior prompt** — shown when no rule matches and the actor is untrusted. Shows actor + signature/publisher, command line, target, SHA256, risk factors, evidence-chain highlights, ATT&CK tags; bottom "remember" + scope (Permanent / Session / 1 hour / 1 day) + Allow / Block; a countdown auto-decides per `PromptTimeoutSeconds`; can open the Attack Timeline.
 - **Corner toasts** — stacked notifications when a deterministic high-risk action is blocked, or when AI research is triggered.
 - **Scan-progress card** — live progress + verdict of a double-click/dropped-payload scan; AI research also finalizes here.
 - **Cleanup report** — pops after malicious-footprint cleanup (quarantined / removed persistence / unhandled items with one-click retry).
+- **Attack graph** — opened from an intercept / activity / timeline row (right-click), from the Attack Timeline window, or from a process row. Given one event (or one PID) as the seed, the *service* reconstructs the events in that time window into a layered directed graph: nodes are processes / files / registry keys / remote endpoints / domains / modules / **services** / **scheduled tasks**; edges are individual actions carrying time, risk score, verdict and the *real* enforcement outcome. Dashed edges are relations *derived* from process parentage or launch origin, visually distinct from observed events. The correlation lives only in the service (`AttackGraphBuilder`) and the whole graph is shipped to the UI, so what the graph shows can never drift from what the engine actually reasoned over.
 
 ### Settings page (all real toggles)
 
@@ -315,7 +366,7 @@ sc start BulwarkService             # start
 
 | Dimension | Kernel mechanism | Handling |
 |-----------|------------------|----------|
-| **Process (M2)** | `PsSetCreateProcessNotifyRoutineEx` | Telemetry only (never suspends); the kernel allowlists system dirs / critical processes with zero-latency allow; a Block verdict is enforced by user mode terminating the process tree |
+| **Process (M2)** | `PsSetCreateProcessNotifyRoutineEx` + `HashScan.c` | Three paths: (1) **pre-create denial** — the new image is on the "exec-block" list, or the creator itself is in the banned set → `CreationStatus = STATUS_ACCESS_DENIED` right in the callback, so the sample never starts (zero user-mode round trip, no race; lists are re-pushed after reboot and still block); (2) **kernel-local hash scan** — when the known-bad SHA-256 set is non-empty the PID is queued and a dedicated system thread hashes the image at PASSIVE_LEVEL, `ZwTerminateProcess` on a hit; (3) **telemetry + compensation** — everything else is not suspended: report, let user mode decide, terminate the process tree on Block. The kernel allowlists system dirs / critical processes with a zero-latency allow, and critical system processes are **never** subject to pre-create denial (guards against `CRITICAL_PROCESS_DIED`) |
 | **File (M3)** | Minifilter pre-op `IRP_MJ_CREATE` (delete-on-close / execute-map intent) + `IRP_MJ_SET_INFORMATION` (rename / dispose) + `IRP_MJ_WRITE` (in-place ransomware-encryption telemetry) | Hard-block list / protected path / no-load list hit → **kernel-local `STATUS_ACCESS_DENIED`** |
 | **Registry (M4)** | `CmRegisterCallbackEx` | Exact hard-block hit → **kernel-local deny of set/delete value/key**; protected keys reported asynchronously |
 | **Self-protection (M5)** | `ObRegisterCallbacks` | When an untrusted process opens a protected process with dangerous rights (terminate / write-memory / remote-thread / suspend), **those rights are stripped**; anti-injection targets (e.g. lsass.exe) likewise |
@@ -323,7 +374,12 @@ sc start BulwarkService             # start
 
 Two more **notification-only** callbacks exist — `PsSetLoadImageNotifyRoutine` (image load) and `PsSetCreateThreadNotifyRoutine` (remote thread) — used for reporting only (a callback can't block a load; "no-load" is enforced via M3's execute-map interception).
 
-**Handling model (stability first)**: process creation is **fire-and-forget telemetry + post-launch kill** — `FltSendMessage` uses a 0 timeout and never blocks on a user-mode verdict; a background sender thread with a preallocated ring buffer does the sending (queue full → drop telemetry). File / registry hard blocks, no-load, self-protection, anti-injection and the network blocklist instead block **immediately in the kernel / at high IRQL**, bypassing that compensation path. Protected paths/keys, hard-block lists, protected process PIDs, anti-injection targets and the network blocklist are all pushed down from user mode via config messages.
+**Handling model (stability first)**: hot paths **never do synchronous IPC** — `FltSendMessage` uses a 0 timeout and never blocks on a user-mode verdict; a background sender thread with a preallocated ring buffer does the sending (queue full → drop telemetry). Within that constraint, kernel handling splits in two:
+
+- **Kernel-local immediate block (no user mode required)**: file / registry hard blocks, the no-load list, the process "exec-block" list, banned-actor child creation, self-protection, anti-injection / anti-credential-dump, and the network blocklist. These are decided entirely in kernel and **stay in force when the service is not installed, not started, or has been killed** — `ProcessMonitor.c` deliberately evaluates banned actors and exec-block *before* the "no client → fast allow" shortcut, and the lists are persisted to the registry and re-pushed after reboot. This is the driver's self-sufficient baseline.
+- **Telemetry + compensating kill**: gray-zone process creations that match none of those local lists are reported, decided by user mode, and on Block the whole process tree is terminated (user mode enumerates descendants first, then a kernel-level `ZwTerminateProcess` on the root PID as a backstop).
+
+Protected paths/keys, hard-block lists, the exec-block list, the known-bad hash set, protected process PIDs, anti-injection targets and the network blocklist are all pushed down from user mode via config messages.
 
 ```powershell
 # 1) Build the driver (a local WDK is enough)

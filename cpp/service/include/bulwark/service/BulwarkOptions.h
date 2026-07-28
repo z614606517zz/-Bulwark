@@ -148,6 +148,41 @@ struct ThreatFoxFeedOptions {
     QString resolveAuthKey(const QString& malwareBazaarFallback) const;
 };
 
+// --- Central reputation proxy ("Bulwark:ReputationProxy") --------------------
+// Optional shared server-side intel cache/aggregator. When Enabled, file-hash
+// lookups go to this proxy FIRST (one shared cache + upstream API keys held
+// server-side for the whole fleet); on ANY failure the client transparently
+// falls back to the direct per-source aggregate, so protection never regresses.
+struct ReputationProxyOptions {
+    static constexpr const char* TokenEnvVar = "BULWARK_REPPROXY_TOKEN";
+    static constexpr const char* UrlEnvVar = "BULWARK_REPPROXY_URL";
+    QString BaseUrl;                 // plaintext endpoint (dev builds); empty => use obfuscated/env
+    QString BaseUrlObfuscated;       // obfuscated endpoint for shipped/portable configs (base64 of XOR);
+                                     // decoded by resolveBaseUrl() so the URL never sits in plaintext config
+    QString BearerToken;             // env var BULWARK_REPPROXY_TOKEN takes precedence
+    bool Enabled = false;
+    int QueryTimeoutSeconds = 8;
+    // Daily budget of *fresh* server-intel lookups (server had to touch its paid upstream,
+    // i.e. the reply was NOT served from the server-side shared cache). <=0 => unlimited
+    // (dev/internal builds). Shipped/portable builds ship a small cap (e.g. 30) so the
+    // package leans on local intel + the server's existing cache and only sparingly spends
+    // the fleet's shared upstream quota. Server-cache hits never count against this.
+    int FreshQueriesPerDay = 0;
+    QString resolveToken() const;    // env var > this field
+    // Effective endpoint, precedence: env var (BULWARK_REPPROXY_URL) > plaintext BaseUrl >
+    // deobfuscated BaseUrlObfuscated. Empty result => proxy disabled (fail-open to local).
+    QString resolveBaseUrl() const;
+    // Host-masked form for logs/diagnostics (e.g. "https://***:8787") so the endpoint is
+    // never emitted in plaintext, matching the "hidden endpoint" intent of shipped builds.
+    static QString maskUrl(const QString& url);
+    // Produce the BaseUrlObfuscated value for a plaintext URL (inverse of the decode in
+    // resolveBaseUrl): XOR with a fixed in-binary key then base64. Used by the
+    // `--obfuscate-url` build helper to generate the value baked into shipped configs.
+    static QString obfuscateUrl(const QString& plain);
+    // Reverse of obfuscateUrl(); empty on malformed input. Exposed for tests/tools.
+    static QString deobfuscateUrl(const QString& obfuscated);
+};
+
 // --- Root options ("Bulwark") ------------------------------------------------
 struct BulwarkOptions {
     static constexpr const char* SectionName = "Bulwark";
@@ -168,6 +203,15 @@ struct BulwarkOptions {
     QStringList FileHardBlocks;          // kernel-deny any write/delete/rename open
     QStringList ProtectedRegistryKeys;   // block set/delete value/key on match
     QStringList RegistryHardBlocks;      // kernel-deny writes (must be precise!)
+    // Command-line hard block: kernel denies process creation when the full command line
+    // matches. Patterns are '+'-separated token conjunctions - EVERY token must appear as a
+    // case-insensitive substring (see BLW_CMD_ADD_CMDBLOCK). This is what stops LOLBin abuse
+    // (vssadmin/wmic/bcdedit ...) BEFORE the command runs, instead of killing the process
+    // afterwards - by which time the damage (deleted shadow copies) is already irreversible.
+    // Keep every token >= 4 chars: tokens are plain substrings, so short ones like "cl"
+    // would hit unrelated words and cause false positives.
+    QStringList CommandHardBlocks;       // extra user patterns, appended to the built-in baseline
+    bool CommandHardBlockBaseline = true;// push the built-in ransomware/credential-theft baseline
     QStringList MemoryProtectionTargets; // anti-injection target process names
     int MemoryProtectionVtVerifyPerHour = 4; // VT verify rate for injection sources
     QStringList BlockedRemoteEndpoints;  // "ip" or "ip:port" egress blacklist
@@ -179,6 +223,7 @@ struct BulwarkOptions {
     MetaDefenderOptions MetaDefender;
     HybridAnalysisOptions HybridAnalysis;
     ThreatFoxFeedOptions ThreatFoxFeed;
+    ReputationProxyOptions ReputationProxy; // central shared intel proxy (proxy-first, fail-open)
 
     QString ProxyUrl;                    // global HTTP proxy for all intel sources
     QStringList TrustedDirectories;      // wildcard dirs whose executables are fully allowed

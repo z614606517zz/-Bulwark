@@ -90,6 +90,72 @@ QString ThreatFoxFeedOptions::resolveAuthKey(const QString& malwareBazaarFallbac
     return malwareBazaarFallback.trimmed();
 }
 
+QString ReputationProxyOptions::resolveToken() const {
+    const QString env = qEnvironmentVariable(TokenEnvVar).trimmed();
+    if (!env.isEmpty()) return env;
+    return BearerToken.trimmed();
+}
+
+namespace {
+// Fixed XOR key for endpoint obfuscation. This is NOT encryption (the key ships in the
+// binary); it only keeps the server URL out of plaintext in shipped/portable appsettings so
+// it can't be grepped/edited casually, matching the "hidden endpoint" intent. The real
+// access control is the server-side token, never the URL's secrecy.
+const QByteArray& obfKey() {
+    static const QByteArray k = QByteArrayLiteral(
+        "\x42\x75\x6C\x77\x61\x72\x6B\x2D\x52\x65\x70\x50\x72\x6F\x78\x79"
+        "\x2D\x4F\x62\x66\x2D\x76\x31\x2D\xA5\x5A\xC3\x3C\x9E\x71\x08\xE4");
+    return k;
+}
+
+QByteArray xorWithKey(const QByteArray& in) {
+    const QByteArray& k = obfKey();
+    QByteArray out(in.size(), Qt::Uninitialized);
+    for (int i = 0; i < in.size(); ++i)
+        out[i] = static_cast<char>(in[i] ^ k[i % k.size()]);
+    return out;
+}
+} // namespace
+
+QString ReputationProxyOptions::obfuscateUrl(const QString& plain) {
+    const QString s = plain.trimmed();
+    if (s.isEmpty()) return QString();
+    return QString::fromLatin1(xorWithKey(s.toUtf8()).toBase64());
+}
+
+QString ReputationProxyOptions::deobfuscateUrl(const QString& obfuscated) {
+    const QString s = obfuscated.trimmed();
+    if (s.isEmpty()) return QString();
+    const QByteArray raw = QByteArray::fromBase64(s.toLatin1());
+    if (raw.isEmpty()) return QString();
+    return QString::fromUtf8(xorWithKey(raw)).trimmed();
+}
+
+QString ReputationProxyOptions::resolveBaseUrl() const {
+    const QString env = qEnvironmentVariable(UrlEnvVar).trimmed();
+    if (!env.isEmpty()) return env;
+    const QString plain = BaseUrl.trimmed();
+    if (!plain.isEmpty()) return plain;
+    return deobfuscateUrl(BaseUrlObfuscated);
+}
+
+QString ReputationProxyOptions::maskUrl(const QString& url) {
+    const QString u = url.trimmed();
+    if (u.isEmpty()) return QStringLiteral("(none)");
+    // Keep scheme + optional :port, replace the host with *** so logs never leak the endpoint.
+    int schemeEnd = u.indexOf(QStringLiteral("://"));
+    const QString scheme = schemeEnd > 0 ? u.left(schemeEnd) : QString();
+    QString rest = schemeEnd > 0 ? u.mid(schemeEnd + 3) : u;
+    // rest = host[:port][/path...]; drop any path, keep :port if present.
+    const int slash = rest.indexOf(QLatin1Char('/'));
+    if (slash >= 0) rest = rest.left(slash);
+    QString port;
+    const int colon = rest.lastIndexOf(QLatin1Char(':'));
+    if (colon >= 0) port = rest.mid(colon); // includes ':'
+    const QString masked = QStringLiteral("***") + port;
+    return scheme.isEmpty() ? masked : (scheme + QStringLiteral("://") + masked);
+}
+
 } // namespace bulwark::service
 
 namespace bulwark::service {
@@ -198,6 +264,15 @@ void bindThreatFox(const QJsonObject& o, ThreatFoxFeedOptions& t) {
     bindInt(o, "QueryTimeoutSeconds", t.QueryTimeoutSeconds);
 }
 
+void bindReputationProxy(const QJsonObject& o, ReputationProxyOptions& p) {
+    bindStr(o, "BaseUrl", p.BaseUrl);
+    bindStr(o, "BaseUrlObfuscated", p.BaseUrlObfuscated);
+    bindStr(o, "BearerToken", p.BearerToken);
+    bindBool(o, "Enabled", p.Enabled);
+    bindInt(o, "QueryTimeoutSeconds", p.QueryTimeoutSeconds);
+    bindInt(o, "FreshQueriesPerDay", p.FreshQueriesPerDay);
+}
+
 } // namespace
 
 bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
@@ -230,6 +305,8 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindStrList(o, "FileHardBlocks", FileHardBlocks);
     bindStrList(o, "ProtectedRegistryKeys", ProtectedRegistryKeys);
     bindStrList(o, "RegistryHardBlocks", RegistryHardBlocks);
+    bindStrList(o, "CommandHardBlocks", CommandHardBlocks);
+    bindBool(o, "CommandHardBlockBaseline", CommandHardBlockBaseline);
     bindStrList(o, "MemoryProtectionTargets", MemoryProtectionTargets);
     bindInt(o, "MemoryProtectionVtVerifyPerHour", MemoryProtectionVtVerifyPerHour);
     bindStrList(o, "BlockedRemoteEndpoints", BlockedRemoteEndpoints);
@@ -248,6 +325,7 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindMetaDefender(sub("MetaDefender"), MetaDefender);
     bindHybridAnalysis(sub("HybridAnalysis"), HybridAnalysis);
     bindThreatFox(sub("ThreatFoxFeed"), ThreatFoxFeed);
+    bindReputationProxy(sub("ReputationProxy"), ReputationProxy);
     bindAi(sub("Ai"), Ai);
     bindEtw(sub("Etw"), Etw);
     return true;

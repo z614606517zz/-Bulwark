@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "Bootstrap.h"
 #include "Theme.h"
 #include "dialogs/PromptDialog.h"
 #include "dialogs/RemediationReportDialog.h"
@@ -30,12 +31,16 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QDateTime>
+#include <QHash>
 #include <QSet>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 namespace {
 
@@ -72,6 +77,8 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     addPage("dashboard", u("仪表盘"), u("仪表盘"), u("系统防护总览"), new DashboardPage(m_ipc));
     addPage("shield-x", u("拦截记录"), u("拦截记录"), u("已阻止的恶意行为"), pages::interceptions(m_ipc));
     addPage("activity", u("活动日志"), u("活动日志"), u("全部安全事件"), pages::activity(m_ipc));
+    addPage("clock", u("事件时间线"), u("事件时间线"), u("按时间回溯 · 攻击关系图"), pages::timeline(m_ipc));
+    addPage("target", u("进程管理"), u("进程管理"), u("在跑进程 · 服务与计划任务溯源"), pages::processes(m_ipc));
     addPage("sliders", u("防护规则"), u("防护规则"), u("自定义放行 / 拦截策略"), pages::rules(m_ipc));
     addPage("trust", u("信任名单"), u("信任名单"), u("受信任的程序与目录"), pages::trust(m_ipc));
     addPage("lock", u("隔离区"), u("隔离区"), u("已隔离的威胁文件"), pages::quarantine(m_ipc));
@@ -130,6 +137,32 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                     m_tray->showMessage(QString::fromUtf8("重试隔离"), r.message,
                                         r.success ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 4000);
             });
+
+    // 中央信誉服务在线状态灯:连接后 + 每 30s 探测一次(source=ReputationProxy 定向探测代理
+    // /health,服务端非阻塞返回),按 requestId 回填侧栏状态。离线仅提示,本地直连情报源照常兜底。
+    m_repTimer = new QTimer(this);
+    m_repTimer->setInterval(30000);
+    connect(m_repTimer, &QTimer::timeout, this, &MainWindow::pingReputation);
+    connect(m_ipc, &IpcClient::vtResponse, this,
+            [this](const bulwark::ipc::VtResponsePayload& resp) {
+                if (m_repPingId.isNull() || resp.requestId != m_repPingId)
+                    return; // 只认本窗口发起的健康探测;各页自身的查询 / 测试连接自动忽略
+                m_repPingId = QUuid();
+                const bool online = resp.success;
+                const bool checking = !online && resp.message.contains(QString::fromUtf8("检测中"));
+                ui::stylePill(m_repPill,
+                              online ? QString::fromUtf8("● 信誉服务在线")
+                                     : (checking ? QString::fromUtf8("○ 信誉服务检测中")
+                                                 : QString::fromUtf8("○ 信誉服务离线")),
+                              online ? theme::success()
+                                     : (checking ? theme::textMuted() : theme::danger()));
+                m_repPill->setToolTip(resp.message.isEmpty()
+                                          ? (online ? QString::fromUtf8("中央信誉服务连接正常")
+                                                    : QString::fromUtf8("中央信誉服务不可达,已回退本地直连"))
+                                          : resp.message);
+                if (checking) // 尚无结论(缓存预热中),稍后再探一次尽快收敛
+                    QTimer::singleShot(4000, this, &MainWindow::pingReputation);
+            });
     m_ipc->start();
 }
 
@@ -160,19 +193,35 @@ QWidget* MainWindow::buildSidebar()
     v->addLayout(brand);
     v->addSpacing(22);
 
-    // nav items host
+    // nav items host。导航项已有 11 项(仪表盘 / 拦截记录 / 活动日志 / 事件时间线 / 进程管理 /
+    // 防护规则 / 信任名单 / 隔离区 / 自启动项 / 云信誉 / AI 研判 / 设置),在最小窗口高度
+    // (620)下会挤不下,故放进一个无边框透明滚动区:窗口够高时看不出区别,不够高时可滚动,
+    // 而不是把底部的连接状态条挤掉。
     auto* navHost = new QWidget;
+    navHost->setStyleSheet(QStringLiteral("background:transparent;"));
     m_navLayout = new QVBoxLayout(navHost);
     m_navLayout->setContentsMargins(0, 0, 0, 0);
     m_navLayout->setSpacing(3);
-    v->addWidget(navHost);
+    m_navLayout->addStretch(); // 末尾留一个弹簧,导航项始终顶部对齐(addPage 插在它之前)
 
-    v->addStretch();
+    auto* navScroll = new QScrollArea;
+    navScroll->setWidgetResizable(true);
+    navScroll->setFrameShape(QFrame::NoFrame);
+    navScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    navScroll->setStyleSheet(QStringLiteral("QScrollArea{background:transparent;}"));
+    navScroll->viewport()->setStyleSheet(QStringLiteral("background:transparent;"));
+    navScroll->setWidget(navHost);
+    v->addWidget(navScroll, 1);
 
     v->addWidget(ui::hDivider());
     v->addSpacing(12);
     m_connPill = ui::pill(QString::fromUtf8("○ 未连接服务"), theme::textMuted());
     v->addWidget(m_connPill, 0, Qt::AlignLeft);
+    v->addSpacing(6);
+    m_repPill = ui::pill(QString::fromUtf8("○ 信誉服务未知"), theme::textMuted());
+    m_repPill->setToolTip(QString::fromUtf8(
+        "中央信誉服务(云端共享缓存 + 多引擎)连接状态。离线时本地直连情报源自动兜底,实时防护不受影响。"));
+    v->addWidget(m_repPill, 0, Qt::AlignLeft);
     v->addSpacing(8);
     v->addWidget(ui::label(QString::fromUtf8("v1.0.0 · Qt Edition"), "muted"));
 
@@ -219,7 +268,8 @@ void MainWindow::addPage(const QString& icon, const QString& nav,
 {
     const int idx = m_stack->count();
     auto* btn = new NavButton(icon, nav);
-    m_navLayout->addWidget(btn);
+    // 插在末尾弹簧之前,保持导航项顶部对齐。
+    m_navLayout->insertWidget(std::max(0, m_navLayout->count() - 1), btn);
     m_navGroup->addButton(btn, idx);
     m_stack->addWidget(page);
     m_titles << title;
@@ -267,8 +317,27 @@ void MainWindow::setConnected(bool connected)
                   connected ? theme::success() : theme::textMuted());
     // Refresh prompt-timeout / default-action the moment the link comes up, so a
     // prompt arriving right after connect already has the correct countdown.
-    if (connected && m_ipc)
+    if (connected && m_ipc) {
         m_ipc->requestSettings();
+        pingReputation();                    // 立即探一次中央信誉服务
+        if (m_repTimer) m_repTimer->start();  // 之后每 30s 复探
+    } else {
+        if (m_repTimer) m_repTimer->stop();
+        m_repPingId = QUuid();
+        if (m_repPill) // 与服务断链时无从得知代理状态,置灰
+            ui::stylePill(m_repPill, QString::fromUtf8("○ 信誉服务未知"), theme::textMuted());
+    }
+}
+
+void MainWindow::pingReputation()
+{
+    if (!m_ipc || !m_ipc->isConnected())
+        return;
+    bulwark::ipc::VtRequestPayload p;
+    p.kind = bulwark::VtRequestKind::TestConnection;
+    p.source = QStringLiteral("ReputationProxy"); // 定向探测中央代理(ProxyReputationService::name())
+    m_repPingId = p.requestId;                    // 记住本次 requestId,回填时只认自己的响应
+    m_ipc->vtQuery(p);
 }
 
 void MainWindow::onBlockNotification(const bulwark::SecurityEvent& event)
@@ -286,6 +355,24 @@ void MainWindow::onAiScanStarted(const bulwark::SecurityEvent& event)
 
 void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayload& report)
 {
+    // 去重(B):同一主体的处置报告在窗口期(30s)内只弹一张卡片,避免高频处置时叠出大量报告窗口
+    // ——既是重复提示,海量建窗也会拖卡 UI。完整报告仍在事件 / 审计日志中,不丢信息。
+    static QHash<QString, qint64> recentReports;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const QString rkey = report.actorPath.isEmpty() ? report.reason : report.actorPath;
+    const auto rit = recentReports.find(rkey);
+    if (rit != recentReports.end() && nowMs - rit.value() < 30000) {
+        rit.value() = nowMs;
+        return;
+    }
+    recentReports.insert(rkey, nowMs);
+    if (recentReports.size() > 512) {
+        for (auto i = recentReports.begin(); i != recentReports.end(); ) {
+            if (nowMs - i.value() > 30000) i = recentReports.erase(i);
+            else ++i;
+        }
+    }
+
     // Surface the "footprint cleanup" transparently: what was quarantined/removed,
     // and how many items couldn't be cleaned. Shown as a tray balloon (the report
     // detail also rides the event/audit log on the service side).
@@ -373,6 +460,13 @@ void MainWindow::showFromTray()
 
 void MainWindow::quitApp()
 {
+    // UI 关闭时自动停止服务和卸载驱动
+    if (!qEnvironmentVariableIsEmpty("BULWARK_UI_SMOKE")) {
+        // 冒烟测试模式不执行关闭清理
+    } else {
+        bulwark::ui::bootstrap::shutdownBackend();
+    }
+    
     m_forceQuit = true;
     qApp->quit();
 }

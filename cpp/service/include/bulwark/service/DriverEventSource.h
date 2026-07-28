@@ -5,6 +5,7 @@
 #include "bulwark/service/BulwarkOptions.h"
 
 class QTimer;
+class QByteArray;
 
 namespace bulwark::service {
 
@@ -38,7 +39,23 @@ public:
     // ---- 运行时配置下发(可在连接后任意时刻调用;未连接时安全 no-op)----------
     void addProtectedPid(int pid);                        // 追加受保护进程 PID(自我保护,如 UI)
     void addBlockedIp(const QString& ip, quint16 port = 0); // 情报确认恶意后固化网络拦截
-    bool blockModuleLoad(const QString& modulePath);      // 已确认恶意侧载 DLL 加入内核禁止加载名单
+    bool blockModuleLoad(const QString& modulePath) override; // 已确认恶意侧载 DLL 加入内核禁止加载名单
+    bool blockExecPath(const QString& imagePath) override;    // 已确认恶意可执行映像加入内核禁止执行名单(执行前拦截)
+    // 加白对账:整表清空 + 从内核写的注册表基线权威读回(协议无查询命令,故读 \Policy 值)。
+    bool clearExecBlock() override;
+    bool clearModuleNoLoad() override;
+    bool clearBannedProcesses() override;
+    QStringList persistedExecBlockList() const override;
+    QStringList persistedModuleNoLoadList() const override;
+    bool hardenRegistryKey(const QString& keyOrValue) override; // 已清理的自启动项加入内核注册表硬拦(持久化反重建)
+
+    // ---- 内核级足迹清理(v6):用户态因共享冲突 / 映像占用「打不开读」或「删不掉」时,委托内核以
+    //      「忽略共享访问检查」读取(供做可逆金库副本)/ POSIX 强制删除。驱动为旧版(不支持该命令)
+    //      或未连接时返回 false,调用方据此回退到用户态清理。----
+    bool readLockedFile(const QString& path, QByteArray& out); // 内核读整文件(供金库副本)
+    bool forceDeleteFile(const QString& path);                 // 内核强制删除被占用/已映射文件
+    bool killProcess(int pid);                                 // 驱动级结束进程(BLW_CMD_KILL_PID)
+    bool banProcess(int pid) override;                         // 封禁主体(BLW_CMD_ADD_BANNED):内核全维拒绝其行为
 
     bool isConnected() const;
     bool protocolMismatch() const;            // 因协议/结构体不一致而拒绝启用内核拦截(需长退避)

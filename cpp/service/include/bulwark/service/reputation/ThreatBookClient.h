@@ -24,6 +24,12 @@ public:
     // 忠实移植自 .NET ThreatBookClient.QueryIpAsync。
     bulwark::IpReputation queryIp(const QString& ip);
 
+    // 本月 IP 情报配额是否已用尽(或压根没 Key)。给上层在【入队之前】短路用。
+    // 为什么需要:配额用尽时 queryIp 返回的 Unknown 带 querySucceeded=false,上层按「失败可重试」
+    // 语义**不会缓存**它 —— 于是同一个 IP 在整月剩余时间里被反复入队、反复唤醒后台线程、反复写
+    // 诊断日志(实测同一 IP 一秒内 12 次)。配额耗尽是个确定状态,提前问一次就能全省掉。
+    bool ipIntelBudgetSpent();
+
 protected:
     bulwark::FileReputation doQuery(const QString& sha256) override;
     std::pair<bool, QString> doTest() override;
@@ -31,7 +37,13 @@ protected:
 private:
     bulwark::FileReputation parse(const QString& sha256, const QString& body) const;
     bulwark::IpReputation parseIp(const QString& ip, const QString& body) const;
-    bool trySceneQuota(); // 本月场景接口(IP)是否还有额度;到月自动归零
+    bool trySceneQuota();      // 本月场景接口(IP)是否还有额度;到月自动归零
+    void rollSceneMonth();     // 需已持 sceneMutex_:跨月则归零计数与「已告知」标记
+    void noteExhaustedOnce();  // 需已持 sceneMutex_:配额用尽每月只记一条(不能一条都不记)
+    // 月配额只有 20 次,而计数原先纯在内存里 —— 服务每重启一次就白送 20 次,开机/升级几轮就把
+    // 微步那边真正的月额度打穿(之后云端直接拒答,IP 情报静默失效)。所以必须落盘。
+    void loadSceneState();     // 构造时读回 {月份, 已用}
+    void saveSceneState();     // 需已持 sceneMutex_
 
     QString reportUrl_;
     QString ipUrl_;
@@ -39,6 +51,7 @@ private:
     QMutex  sceneMutex_;
     int     sceneMonth_ = -1; // 当前计数所属月份键 = year*100 + month(UTC)
     int     sceneUsed_  = 0;
+    bool    sceneExhaustedLogged_ = false; // 配额耗尽每月只记一条,避免刷爆 rep_diag.log
 };
 
 } // namespace bulwark::service::reputation

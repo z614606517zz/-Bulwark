@@ -1,4 +1,5 @@
 #include "bulwark/engine/LolbinAnalyzer.h"
+#include <QRegularExpression>
 #include <QSet>
 
 namespace bulwark::engine {
@@ -25,7 +26,26 @@ ScoreResult LolbinAnalyzer::analyze(const QString& actorPath, const QString& com
 
     const QString cmd = commandLine.toLower();
     auto C = [&](const char* t) { return cmd.contains(QLatin1String(t)); };
-    const bool hasRemote = C("http://") || C("https://") || C("ftp://") || C("\\\\");
+
+    // UNC 远程路径判定。原先直接用 `cmd.contains("\\\\")`,即命令行里出现【任意两个连续反斜杠】
+    // 就算「远程」。这在真实命令行里误报极多:任何被转义的反斜杠、任何以分隔符结尾又被引号包住的
+    // 目录参数都会命中 —— 实测本项目自己的 scripts\build-driver.ps1 传
+    // `"/p:SolutionDir=D:\...\\"`(注释里明确说为了不让反斜杠转义右引号而故意写双反斜杠),
+    // 就让 msbuild 被判成「远程内联任务执行」并记 40 分硬指标。
+    // 真正的 UNC 形如 `\\host\share`:双反斜杠必须出现在参数起始处,后接主机名,再后面还有一个
+    // 反斜杠。按此收紧,顺带修好共用 hasRemote 的 regsvr32 / mshta / certutil / bitsadmin /
+    // rundll32 全部分支。
+    static const QRegularExpression uncRe(
+        QStringLiteral(R"((?:^|[\s"'=;,(])\\\\[a-z0-9][a-z0-9._-]*\\)"));
+    const bool hasRemote =
+        C("http://") || C("https://") || C("ftp://") || uncRe.match(cmd).hasMatch();
+
+    // 命令行是否引用了投递型可写目录 —— 用于区分「开发者在正常目录里编译工程」与
+    // 「样本从 Temp/Downloads 里跑内联任务工程」。
+    const bool refsDropDir =
+        C("\\appdata\\local\\temp\\") || C("\\windows\\temp\\") || C("\\users\\public\\") ||
+        C("\\downloads\\") || C("\\programdata\\") || C("\\appdata\\roaming\\") ||
+        C("\\$recycle.bin\\") || C("\\perflogs\\");
 
     auto hit = [&](int delta, const QString& reason, bool isHard = false) {
         r.score += delta;
@@ -73,8 +93,18 @@ ScoreResult LolbinAnalyzer::analyze(const QString& actorPath, const QString& com
         else if (C("/addfile") || C("/setnotifycmdline"))
             hit(30, u("bitsadmin 配置传输任务/回调命令(T1197)"), C("/setnotifycmdline"));
     } else if (name == QLatin1String("msbuild.exe")) {
-        if (C(".csproj") || C(".xml") || C(".targets") || C(".proj") || hasRemote)
-            hit(40, u("msbuild 执行内联任务工程(无文件 C# 执行,T1127.001)"), true);
+        // T1127.001 真正的滥用形态是「工程文件里塞内联 <UsingTask>/<Task>,从可写目录跑起来」。
+        // 而 `.csproj` / `.proj` / `.targets` / `.xml` 本身就是每个 .NET / C++ 开发者每天编译的
+        // 普通输入 —— 只凭扩展名置硬指标,等于把「在本机编译工程」定性为无文件攻击(实测
+        // cmake --build 调 MSBuild 编 .vcxproj 即被判 91 分拦截)。
+        // 故:远程工程或工程位于投递型可写目录才算硬指标;正常目录里的工程仅记软信号提分。
+        if (C(".csproj") || C(".xml") || C(".targets") || C(".proj") || hasRemote) {
+            const bool abusive = hasRemote || refsDropDir;
+            hit(abusive ? 40 : 12,
+                abusive ? u("msbuild 执行内联任务工程(无文件 C# 执行,T1127.001)")
+                        : u("msbuild 加载工程文件(位于常规目录,按软信号计,需互证)"),
+                abusive);
+        }
     } else if (name == QLatin1String("installutil.exe")) {
         if (C("/logfile=") || C("/u") || C("/logtoconsole=false"))
             hit(38, u("installutil 经卸载钩子执行程序集(T1218.004)"), true);

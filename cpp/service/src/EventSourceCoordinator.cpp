@@ -120,6 +120,50 @@ bool EventSourceCoordinator::blockModuleLoad(const QString& modulePath) {
     return driver_ ? driver_->blockModuleLoad(modulePath) : false;
 }
 
+bool EventSourceCoordinator::blockExecPath(const QString& imagePath) {
+    return driver_ ? driver_->blockExecPath(imagePath) : false;
+}
+
+bool EventSourceCoordinator::clearExecBlock() {
+    return driver_ ? driver_->clearExecBlock() : false;
+}
+
+bool EventSourceCoordinator::clearModuleNoLoad() {
+    return driver_ ? driver_->clearModuleNoLoad() : false;
+}
+
+bool EventSourceCoordinator::clearBannedProcesses() {
+    return driver_ ? driver_->clearBannedProcesses() : false;
+}
+
+QStringList EventSourceCoordinator::persistedExecBlockList() const {
+    return driver_ ? driver_->persistedExecBlockList() : QStringList{};
+}
+
+QStringList EventSourceCoordinator::persistedModuleNoLoadList() const {
+    return driver_ ? driver_->persistedModuleNoLoadList() : QStringList{};
+}
+
+bool EventSourceCoordinator::hardenRegistryKey(const QString& keyOrValue) {
+    return driver_ ? driver_->hardenRegistryKey(keyOrValue) : false;
+}
+
+bool EventSourceCoordinator::readLockedFile(const QString& path, QByteArray& out) {
+    return driver_ ? driver_->readLockedFile(path, out) : false;
+}
+
+bool EventSourceCoordinator::forceDeleteFile(const QString& path) {
+    return driver_ ? driver_->forceDeleteFile(path) : false;
+}
+
+bool EventSourceCoordinator::killProcess(int pid) {
+    return driver_ ? driver_->killProcess(pid) : false;
+}
+
+bool EventSourceCoordinator::banProcess(int pid) {
+    return driver_ ? driver_->banProcess(pid) : false;
+}
+
 void EventSourceCoordinator::onBaseEvent(const bulwark::SecurityEvent& e) {
     // 内核已接管进程事件时,丢弃基础源的进程创建/退出,避免与内核源重复上报。
     if (kernelConnected() &&

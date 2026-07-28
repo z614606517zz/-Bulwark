@@ -1,0 +1,3 @@
+// Embeds the Bulwark brand badge as the service exe icon (shares the same .ico
+// generated for the UI). Path is relative to this .rc file's directory.
+IDI_ICON1 ICON "../ui/app.ico"

@@ -62,6 +62,20 @@ public:
     // 时序监视器判为强勒索信号(canaryHit -> 直接 Block)。转发到内部勒索监视器。
     void addCanaryFile(const QString& path) { ransomware_.addCanaryFile(path); }
 
+    // 按【路径】查用户信任(不需要完整 SecurityEvent):命中用户明确信任(文件精确 / 目录通配)
+    // 或本软件自身组件时返回其备注,否则 nullopt。语义与 matchedUserTrust 一致,只是入口是路径。
+    //
+    // 为什么需要这个:evaluate() 只在事件【当次】把结果记在 e.userTrusted 上,而服务侧有两类
+    // 动作发生在那之后,拿着的是过期快照:
+    //   ① 后台补偿处置(外部信誉 / VirusTotal / 微步 IP 情报 / AI 研判 / 兜底扫描)—— 回执可能
+    //      比事件晚几十秒到几分钟,期间用户完全可能刚把该程序加白;
+    //   ② 向内核下发「禁止执行 / 禁止加载」名单 —— 这两份名单由内核写回注册表持久化
+    //      (\Services\Bulwark\Policy\FileExecBlock / FileNoLoad),跨杀服务与重启由内核独立续拦。
+    //      一旦对已加白的程序下发,用户在 UI 再怎么加白也不生效:内核在进程创建回调就地拒绝,
+    //      事件根本到不了本引擎。
+    // 两处都必须在动手前用本方法重查一次,否则表现就是「加白不彻底、时不时还拦」。
+    std::optional<QString> trustNoteForPath(const QString& path) const;
+
 private:
     Verdict evaluateInternal(SecurityEvent& e);
     void appendDecisionEvidence(SecurityEvent& e, const Verdict& v);

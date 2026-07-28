@@ -228,6 +228,63 @@ void IpcServer::handleLine(QLocalSocket* /*sock*/, const QString& line) {
                 break;
             }
 
+            // ---- 事件时间线(取证回溯):异步 —— 宿主后台扫历史,算完经 sendTimeline 回推 ----
+            case IpcMessageType::EventTimelineRequest: {
+                const auto req = TimelineRequestPayload::fromJson(msg->payloadObject());
+                if (timelineRequested) {
+                    timelineRequested(req);
+                } else {
+                    TimelineResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.message = QStringLiteral("服务未启用事件时间线");
+                    broadcast(IpcMessage::from(IpcMessageType::EventTimelineResponse, res));
+                }
+                break;
+            }
+
+            // ---- 攻击图:同样异步(要取时间窗内全部事件再关联)----
+            case IpcMessageType::AttackGraphRequest: {
+                const auto req = AttackGraphRequestPayload::fromJson(msg->payloadObject());
+                if (attackGraphRequested) {
+                    attackGraphRequested(req);
+                } else {
+                    AttackGraphResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.message = QStringLiteral("服务未启用攻击图");
+                    broadcast(IpcMessage::from(IpcMessageType::AttackGraphResponse, res));
+                }
+                break;
+            }
+
+            // ---- 进程管理:列表异步(首次快照要验签),处置同步 ----
+            case IpcMessageType::ProcessListRequest: {
+                const auto req = ProcessListRequestPayload::fromJson(msg->payloadObject());
+                if (processListRequested) {
+                    processListRequested(req);
+                } else {
+                    ProcessListResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.message = QStringLiteral("服务未启用进程管理");
+                    broadcast(IpcMessage::from(IpcMessageType::ProcessListResponse, res));
+                }
+                break;
+            }
+            case IpcMessageType::ProcessActionRequest: {
+                const auto req = ProcessActionRequestPayload::fromJson(msg->payloadObject());
+                ProcessActionResultPayload res;
+                if (processActionRequested) {
+                    res = processActionRequested(req);
+                } else {
+                    res.success = false;
+                    res.message = QStringLiteral("服务未启用进程管理");
+                }
+                res.requestId = req.requestId;
+                res.kind = req.kind;
+                res.pid = req.pid;
+                broadcast(IpcMessage::from(IpcMessageType::ProcessActionResponse, res));
+                break;
+            }
+
             // ---- 情报订阅(ThreatFox) ----
             case IpcMessageType::IntelRefreshRequest: {
                 const auto req = IntelRefreshRequestPayload::fromJson(msg->payloadObject());
@@ -307,6 +364,18 @@ void IpcServer::sendVtDetail(const bulwark::ipc::VtDetailResponsePayload& detail
 
 void IpcServer::requestAiScan(const bulwark::SecurityEvent& e) {
     broadcast(IpcMessage::create(IpcMessageType::AiScanRequest, e.toJson()));
+}
+
+void IpcServer::sendTimeline(const TimelineResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::EventTimelineResponse, payload));
+}
+
+void IpcServer::sendAttackGraph(const AttackGraphResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::AttackGraphResponse, payload));
+}
+
+void IpcServer::sendProcessList(const ProcessListResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::ProcessListResponse, payload));
 }
 
 // ---- 快照推送 ----

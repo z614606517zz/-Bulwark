@@ -53,6 +53,14 @@ public:
     std::function<bulwark::ipc::PersistenceListResponsePayload()> persistenceListRequested;
     std::function<bulwark::ipc::EventHistoryResponsePayload()>     eventHistoryRequested;
     std::function<void()>                                         eventHistoryClearRequested;
+    // ---- 取证查询(耗时:要解析数万条历史 JSON)。约定为【异步】:宿主在后台线程算完后
+    //      经 sendTimeline / sendAttackGraph 回推,绝不在 IPC 线程上同步等待。----
+    std::function<void(const bulwark::ipc::TimelineRequestPayload&)>    timelineRequested;
+    std::function<void(const bulwark::ipc::AttackGraphRequestPayload&)> attackGraphRequested;
+    // ---- 进程管理。列表同样是异步(首次快照要对几百个映像验签);处置动作很快,同步返回。----
+    std::function<void(const bulwark::ipc::ProcessListRequestPayload&)> processListRequested;
+    std::function<bulwark::ipc::ProcessActionResultPayload(
+        const bulwark::ipc::ProcessActionRequestPayload&)>              processActionRequested;
     std::function<bulwark::ipc::IntelRefreshResultPayload(const bulwark::ipc::IntelRefreshRequestPayload&)> intelRefreshRequested;
     std::function<bulwark::ipc::IntelRefreshResultPayload(const bulwark::ipc::IntelApplyRequestPayload&)>   intelApplyRequested;
     std::function<void(int)>                                 uiProcessConnected;
@@ -69,6 +77,10 @@ public:
     void sendVtScanUpdate(const bulwark::VtScanRecord& record);                       // VtScanUpdate
     void sendVtDetail(const bulwark::ipc::VtDetailResponsePayload& detail);           // VtDetailResponse(异步)
     void requestAiScan(const bulwark::SecurityEvent& e);                              // AiScanRequest
+    // 取证查询 / 进程管理的异步回推(须在主线程调用;后台线程用 QMetaObject::invokeMethod 编组)。
+    void sendTimeline(const bulwark::ipc::TimelineResponsePayload& payload);          // EventTimelineResponse
+    void sendAttackGraph(const bulwark::ipc::AttackGraphResponsePayload& payload);    // AttackGraphResponse
+    void sendProcessList(const bulwark::ipc::ProcessListResponsePayload& payload);    // ProcessListResponse
 
     // 主动推送最新快照(改动后回推,UI 无需再请求)。
     void sendRules();

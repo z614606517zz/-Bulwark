@@ -50,19 +50,24 @@ Write-Host "==== 磐垒 内核驱动 测试签名 + 加载(Minifilter)====" -For
 Write-Host "⚠ 内核回调出错会蓝屏。请确认已在测试机/已建还原点。" -ForegroundColor Red
 
 # 1) 测试签名状态 -------------------------------------------------------------
-$ts = (& bcdedit | Select-String "testsigning") -join " "
+# bcdedit.exe 仅在 64 位 System32;32 位(SysWOW64)进程会被重定向而找不到 -> 用按位数解析的绝对路径。
+$bcdeditExe = if (Test-Path "$env:SystemRoot\Sysnative\bcdedit.exe") { "$env:SystemRoot\Sysnative\bcdedit.exe" } else { "$env:SystemRoot\System32\bcdedit.exe" }
+$ts = (& $bcdeditExe | Select-String "testsigning") -join " "
 if ($ts -notmatch "Yes") {
     Write-Host "[1/6] 测试签名未开启,正在开启(重启后生效)..." -ForegroundColor Yellow
-    & bcdedit /set testsigning on | Out-Host
+    & $bcdeditExe /set testsigning on | Out-Host
     Write-Host "    请【重启】后重新运行本脚本。" -ForegroundColor Yellow
     return
 }
 Write-Host "[1/6] 测试签名已开启。" -ForegroundColor Green
 
 # 2) 测试证书(生成 + 信任)---------------------------------------------------
-$cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$CertName" } | Select-Object -First 1
+# 只复用【有私钥 + 未过期 + 带代码签名用途(EKU 1.3.6.1.5.5.7.3.3)】的证书;否则删掉旧的重建,
+# 避免复用到不可用的残留证书导致 signtool "No certificates were found that met all the given criteria"。
+$cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$CertName" -and $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date) -and ((($_.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId }) -contains '1.3.6.1.5.5.7.3.3')) } | Select-Object -First 1
 if (-not $cert) {
     Write-Host "[2/6] 创建并信任测试证书 CN=$CertName ..." -ForegroundColor Cyan
+    Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq "CN=$CertName" } | ForEach-Object { Remove-Item $_.PSPath -Force -ErrorAction SilentlyContinue }
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=$CertName" `
         -CertStoreLocation Cert:\LocalMachine\My -KeyUsage DigitalSignature `
         -KeySpec Signature -HashAlgorithm SHA256
@@ -71,18 +76,19 @@ if (-not $cert) {
         $st.Open("ReadWrite"); $st.Add($cert); $st.Close()
     }
 } else {
-    Write-Host "[2/6] 复用已有测试证书 CN=$CertName。" -ForegroundColor Green
+    Write-Host "[2/6] 复用已有测试证书 CN=$CertName(有私钥、未过期、含代码签名用途)。" -ForegroundColor Green
 }
 
 # 3) signtool 签名 ------------------------------------------------------------
 $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
 if (-not $signtool) { throw "未找到 signtool.exe(需安装 WDK/SDK)。" }
-Write-Host "[3/6] 签名驱动 ($($signtool.FullName))..." -ForegroundColor Cyan
-& $signtool.FullName sign /v /fd SHA256 /sm /s My /n "CN=$CertName" /t http://timestamp.digicert.com $sys
+Write-Host "[3/6] 签名驱动 ($($signtool.FullName)) 指纹 $($cert.Thumbprint)..." -ForegroundColor Cyan
+# 用证书【指纹】精确指定(比 /n 主体名更可靠,杜绝 "No certificates met criteria")。
+& $signtool.FullName sign /v /fd SHA256 /sm /s My /sha1 $cert.Thumbprint /t http://timestamp.digicert.com $sys
 if ($LASTEXITCODE -ne 0) {
     Write-Host "    带时间戳签名失败,改用无时间戳(测试签名可接受)..." -ForegroundColor Yellow
-    & $signtool.FullName sign /v /fd SHA256 /sm /s My /n "CN=$CertName" $sys
+    & $signtool.FullName sign /v /fd SHA256 /sm /s My /sha1 $cert.Thumbprint $sys
     if ($LASTEXITCODE -ne 0) { throw "signtool 签名失败。" }
 }
 

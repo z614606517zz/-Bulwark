@@ -60,6 +60,9 @@
     <ClCompile Include="SelfProtect.c" />
     <ClCompile Include="NetMonitor.c" />
     <ClCompile Include="Comms.c" />
+    <ClCompile Include="Policy.c" />
+    <ClCompile Include="HashScan.c" />
+    <ClCompile Include="Cleanup.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />

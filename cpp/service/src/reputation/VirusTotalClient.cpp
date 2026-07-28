@@ -24,9 +24,10 @@ namespace {
 // EICAR 测试样本 SHA-256(用于连接/密钥探测)。
 const QString kEicar = QStringLiteral("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f");
 
-// 直传上限:>32MB 需先取一次性专用上传 URL。上传扫描可处理的最大文件(保守 200MB)。
+// 直传上限:>32MB 需先取一次性专用上传 URL。上传扫描可处理的最大文件(VT 大文件上限 650MB,
+// 与中央代理 max_upload_mb 对齐)。
 constexpr qint64 kDirectUploadMaxBytes = 32LL * 1024 * 1024;
-constexpr qint64 kMaxUploadBytes       = 200LL * 1024 * 1024;
+constexpr qint64 kMaxUploadBytes       = 650LL * 1024 * 1024;
 
 int jInt(const QJsonObject& o, const char* k) {
     const QJsonValue v = o.value(QLatin1String(k));

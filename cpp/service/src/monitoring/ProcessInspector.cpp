@@ -460,6 +460,25 @@ QString ProcessInspector::tryGetProcessImagePath(int pid)
     return result;
 }
 
+QList<int> ProcessInspector::enumeratePids()
+{
+    QList<int> pids;
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return pids;
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (::Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID > 4)
+                pids.append(static_cast<int>(pe.th32ProcessID));
+        } while (::Process32NextW(snap, &pe));
+    }
+    ::CloseHandle(snap);
+    return pids;
+}
+
 QString ProcessInspector::tryGetCommandLine(int pid)
 {
     if (pid <= 0)

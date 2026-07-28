@@ -102,7 +102,6 @@ BlwLoadImageNotify(
     _In_ HANDLE ProcessId,
     _In_ PIMAGE_INFO ImageInfo)
 {
-    BLW_EVENT_MESSAGE msg;
     USHORT chars;
     BOOLEAN isKernelModule;
     BOOLEAN report = FALSE;
@@ -117,10 +116,9 @@ BlwLoadImageNotify(
         return;  // 无法安全发送
     }
 
-    chars = FullImageName->Length / sizeof(WCHAR);
-    if (chars > (BLW_MAX_PATH - 1)) {
-        chars = BLW_MAX_PATH - 1;
-    }
+    // 用完整长度做下面的过滤判定(上报时的长度截断由 BlwReportEvent 内部负责)。
+    // 原实现先把 chars 截到 BLW_MAX_PATH-1 再判定,会让超长路径的 ".sys" 后缀判定看错位置。
+    chars = (USHORT)(FullImageName->Length / sizeof(WCHAR));
 
     // ProcessId == 0 表示内核驱动加载(SystemModeImage 亦标识系统模块)。
     isKernelModule = (ProcessId == NULL) || (ImageInfo != NULL && ImageInfo->SystemModeImage);
@@ -148,19 +146,11 @@ BlwLoadImageNotify(
         return;
     }
 
-    RtlZeroMemory(&msg, sizeof(msg));
-    msg.EventId = (ULONG64)InterlockedIncrement64(&g_Blw.NextEventId);
-    msg.Type = BlwEventImageLoad;
-    msg.ActorPid = isKernelModule ? 0 : HandleToULong(ProcessId);
-    msg.ParentPid = 0;
-
     // 被加载的模块路径放入 TargetPath(供规则 TargetPattern 匹配,如 *.sys / *\AppData\*.dll)。
-    RtlCopyMemory(msg.TargetPath, FullImageName->Buffer, chars * sizeof(WCHAR));
-    msg.TargetPath[chars] = L'\0';
-    msg.TargetPathLength = chars;
-
     // 仅记录上报(无法阻止加载);用户态据此处置。
-    BlwReportEvent(&msg);
+    BlwReportEvent(BlwEventImageLoad,
+                   isKernelModule ? 0 : HandleToULong(ProcessId), 0,
+                   FullImageName, NULL, 0, 0);
 }
 
 NTSTATUS

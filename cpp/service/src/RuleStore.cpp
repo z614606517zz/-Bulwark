@@ -1,4 +1,5 @@
 #include "bulwark/service/RuleStore.h"
+#include "bulwark/service/AtomicFile.h"
 #include "bulwark/service/Logger.h"
 
 #include <QDir>
@@ -45,11 +46,10 @@ void RuleStore::save(const QVector<bulwark::DefenseRule>& rules) {
         if (r.sessionOnly || r.isExpired(now)) continue;
         arr.append(r.toJson());
     }
-    QFile f(path_);
+    // 原子落盘:规则库里有用户的加白项,一次截断写就能把它们全弄丢(见 AtomicFile.h)。
     // 环境性写入失败(权限/占用)不应崩溃:内存规则仍生效,仅本次不落盘。
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
-    f.write(QJsonDocument(arr).toJson(QJsonDocument::Indented));
-    f.close();
+    writeFileAtomically(path_, QJsonDocument(arr).toJson(QJsonDocument::Indented),
+                        QStringLiteral("规则库"));
 }
 
 } // namespace bulwark::service

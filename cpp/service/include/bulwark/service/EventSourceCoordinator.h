@@ -6,6 +6,7 @@
 #include <QSet>
 
 class QTimer;
+class QByteArray;
 
 namespace bulwark::service {
 
@@ -42,6 +43,21 @@ public:
     void addProtectedUiPid(int pid);
     void addBlockedIp(const QString& ip, quint16 port = 0);
     bool blockModuleLoad(const QString& modulePath) override; // 转发到内核驱动源(未连接则 no-op)
+    bool blockExecPath(const QString& imagePath) override;    // 执行前拦截:转发到内核驱动源(未连接/旧驱动 no-op)
+    // 加白对账:转发到内核驱动源(未连接则 no-op / 空表)。
+    bool clearExecBlock() override;
+    bool clearModuleNoLoad() override;
+    bool clearBannedProcesses() override;
+    QStringList persistedExecBlockList() const override;
+    QStringList persistedModuleNoLoadList() const override;
+    bool hardenRegistryKey(const QString& keyOrValue) override; // 持久化反重建:转发到内核驱动源(未连接则 no-op)
+
+    // 内核级足迹清理(v6):转发到内核驱动源(以「忽略共享访问检查」读被占用文件 / POSIX 强制删除)。
+    // 内核未连接 / 旧驱动不支持时返回 false,调用方(QuarantineManager)据此回退到用户态清理。
+    bool readLockedFile(const QString& path, QByteArray& out);
+    bool forceDeleteFile(const QString& path);
+    bool killProcess(int pid) override; // 驱动级结束进程:转发到内核驱动源(未连接/旧驱动返回 false)
+    bool banProcess(int pid) override;  // 封禁主体:转发到内核驱动源(未连接/旧驱动 no-op)
 
     // 状态(供设置页回报)。
     bool kernelConnected() const;

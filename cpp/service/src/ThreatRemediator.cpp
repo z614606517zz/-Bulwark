@@ -97,16 +97,37 @@ QStringList enumSubKeyNames(HKEY hk) {
 }
 
 // User-writable "drop zones" (lower-case). Only files here are cleaned.
+// v2.0.2 扩展:增加更多常见恶意软件落地区(用户根目录、C盘根、公共目录)
 const char* const kDropZones[] = {
     "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\appdata\\roaming\\",
     "\\appdata\\local\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
     "\\users\\public\\", "\\programdata\\", "\\$recycle.bin\\", "\\perflogs\\",
+    "\\users\\",        // 用户目录根(如 C:\Users\admin\malware.exe)
+    "c:\\temp\\",       // C盘临时目录
+    "c:\\tmp\\",        // C盘 tmp 目录
+    "\\music\\",        // 音乐文件夹
+    "\\videos\\",       // 视频文件夹
+    "\\pictures\\",     // 图片文件夹
 };
 
 // Protected (never cleaned) zones - system and legit install dirs.
 const char* const kProtectedZones[] = {
     "\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\winsxs\\",
     "\\program files\\", "\\program files (x86)\\",
+};
+
+// System executables that must NEVER be cleaned (even if reported as dropped files).
+// These are critical Windows utilities - deleting them breaks the system.
+const char* const kSystemExecutables[] = {
+    "cmd.exe", "powershell.exe", "pwsh.exe",           // Shells
+    "conhost.exe", "taskmgr.exe", "regedit.exe",       // System tools
+    "notepad.exe", "explorer.exe", "rundll32.exe",     // Core utilities
+    "mshta.exe", "wscript.exe", "cscript.exe",         // Script hosts
+    "reg.exe", "sc.exe", "net.exe", "netsh.exe",       // Admin tools
+    "svchost.exe", "services.exe", "lsass.exe",        // System services
+    "winlogon.exe", "csrss.exe", "smss.exe",           // Critical processes
+    "wininit.exe", "dwm.exe", "taskhostw.exe",         // Desktop
+    "msiexec.exe", "dllhost.exe", "runtimebroker.exe", // Runtime
 };
 
 struct RegLoc { RegHive hive; const char* subKey; };
@@ -221,10 +242,25 @@ bool isInProtectedZone(const QString& path) {
     return false;
 }
 
+bool isSystemExecutable(const QString& path) {
+    const QFileInfo fi(path);
+    const QString fname = fi.fileName().toLower();
+    for (const char* sysExe : kSystemExecutables)
+        if (fname == QLatin1String(sysExe)) return true;
+    return false;
+}
+
 // Safe to clean iff in a user-writable drop zone, not a system/install dir, and
 // (unless the signature guard is bypassed) not trusted-signed.
 bool isSafeToRemove(const QString& path, bool bypassSignatureGuard, QString& reason) {
     reason.clear();
+    
+    // 1) 系统可执行文件白名单 - 绝对不能删（即使被 VT 报告为释放物）
+    if (isSystemExecutable(path)) { 
+        reason = u("系统关键工具,绝对保护"); 
+        return false; 
+    }
+    
     const QString lower = path.toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
     for (const char* z : kProtectedZones)
         if (lower.contains(QLatin1String(z))) { reason = u("位于系统/安装目录,保护不动"); return false; }
@@ -303,13 +339,17 @@ RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& mali
             consider(ev.target);
 
     // 情报画像:把样本「已知释放文件」翻译到本机用户目录后并入清理候选,补齐本地未观测到的
-    // 释放物(例如 Bulwark 在样本落地前就拦下、footprint 为空的情形)。仍受同样的落地区 +
-    // 签名护栏(isSafeToRemove)约束,不会误清系统/签名文件。
+    // 释放物(例如 Bulwark 在样本落地前就拦下、footprint 为空的情形)。
+    // ⚠️ 这些文件虽有签名,但 VT 沙箱已确认为恶意释放物 → 绕过签名保护!
+    QSet<QString> vtDroppedLower; // VT 确认的释放物(绕过签名护栏)
     if (!profile.droppedFilePaths.isEmpty()) {
         const QStringList userProfiles = localUserProfiles();
-        for (const QString& vtPath : profile.droppedFilePaths)
-            for (const QString& cand : localCandidatesForDroppedPath(vtPath, userProfiles))
+        for (const QString& vtPath : profile.droppedFilePaths) {
+            for (const QString& cand : localCandidatesForDroppedPath(vtPath, userProfiles)) {
                 consider(cand);
+                vtDroppedLower.insert(cand.toLower());
+            }
+        }
     }
 
     // 据「已知恶意 sha256」在本机实际定位到的文件(哈希精确确认恶意):并入清理候选并标记。
@@ -323,21 +363,29 @@ RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& mali
         hashConfirmedLower.insert(t.toLower());
     }
 
-    // 2) file cleanup: quarantine (not delete) drop-zone, unsigned files only.
+    // 2) file cleanup: quarantine (not delete) drop-zone files.
+    // 绕过签名保护的 3 种情况:
+    //   1. 主体自身签名异常(revoked/mismatch/signed-after-expiry)
+    //   2. 哈希精确匹配恶意(locatedLocalPaths)
+    //   3. VT 沙箱确认的释放物(droppedFilePaths) ⭐ 新增
     for (const QString& path : maliciousFiles) {
         if (!QFileInfo::exists(path)) continue;
         const bool bypass = (actorSignatureUntrusted && path.compare(actorPath, Qt::CaseInsensitive) == 0)
-                            || hashConfirmedLower.contains(path.toLower());
+                            || hashConfirmedLower.contains(path.toLower())
+                            || vtDroppedLower.contains(path.toLower());
         QString why;
         if (!isSafeToRemove(path, bypass, why)) {
             report.skipped.append(mkSkip(path, why, true));
             continue;
         }
         const QString hash = QuarantineManager::tryComputeSha256(path);
+        // waitForUnlock=false:不在本(可能是主/事件)线程上为被占用文件睡眠重试(否则多个残留会
+        // 累计卡住数秒)。被独占锁定 / 已映射运行的镜像改由 QuarantineManager 内部委托内核
+        // 「忽略共享访问检查」读取(做可逆金库副本)+ POSIX 强制删除即时清除,无需前台多次重试。
         const auto entry = quarantine_.quarantine(
             path,
             u("恶意进程释放/关联文件的足迹清理(主体 PID ") + QString::number(malicious.actorPid) + u(")"),
-            malicious.actorPid, hash);
+            malicious.actorPid, hash, /*waitForUnlock=*/false);
         if (entry.has_value()) {
             report.quarantinedFiles.append(path);
             log_.warning(u("足迹清理:已隔离恶意释放文件 ") + path);
@@ -474,10 +522,12 @@ void ThreatRemediator::removeAutostartPersistence(const QStringList& maliciousFi
             const LSTATUS st = RegDeleteValueW(hk, wstr(valueName));
             if (st == ERROR_SUCCESS) {
                 report.removedRegistryValues.append(full);
+                report.hardenedRegTargets.append(subKey + QLatin1Char('\\') + valueName);
                 log_.warning(u("足迹清理:已删除自启动持久化项 ") + full);
             } else if (st == ERROR_ACCESS_DENIED) {
                 if (RegSurgery::forceDeleteValue(loc.hive, subKey, valueName, view)) {
                     report.removedRegistryValues.append(full + u("(夺取所有权后删除)"));
+                    report.hardenedRegTargets.append(subKey + QLatin1Char('\\') + valueName);
                     log_.warning(u("足迹清理:夺取所有权后删除自启动项 ") + full);
                 } else {
                     report.skipped.append(mkSkip(full, u("受 ACL 保护,夺取所有权仍失败(建议手动删除)"), false));
@@ -511,6 +561,7 @@ void ThreatRemediator::removeIfeoPersistence(const QStringList& maliciousFiles, 
             if (wk) {
                 if (RegDeleteValueW(wk, L"Debugger") == ERROR_SUCCESS) {
                     report.removedRegistryValues.append(full);
+                    report.hardenedRegTargets.append(childPath + u("\\Debugger"));
                     log_.warning(u("足迹清理:已删除映像劫持(IFEO)项 ") + full);
                     done = true;
                 }
@@ -520,6 +571,7 @@ void ThreatRemediator::removeIfeoPersistence(const QStringList& maliciousFiles, 
 
             if (RegSurgery::forceDeleteValue(loc.hive, childPath, QStringLiteral("Debugger"), view)) {
                 report.removedRegistryValues.append(full + u("(夺取所有权后删除)"));
+                report.hardenedRegTargets.append(childPath + u("\\Debugger"));
                 log_.warning(u("足迹清理:夺取所有权后删除映像劫持项 ") + full);
             } else {
                 report.skipped.append(mkSkip(
@@ -552,10 +604,12 @@ void ThreatRemediator::removeServicePersistence(const QStringList& maliciousFile
         const LSTATUS st = RegDeleteTreeW(servicesKey, wstr(svc));
         if (st == ERROR_SUCCESS) {
             report.removedRegistryValues.append(full);
+            report.hardenedRegTargets.append(u("\\Services\\") + svc + QLatin1Char('\\'));
             log_.warning(u("足迹清理:已删除指向恶意文件的服务 ") + full);
         } else if (st == ERROR_ACCESS_DENIED) {
             if (RegSurgery::forceDeleteSubKeyTree(RegHive::LocalMachine, servicesPath, svc, RegView::Default)) {
                 report.removedRegistryValues.append(full + u("(夺取所有权后删除)"));
+                report.hardenedRegTargets.append(u("\\Services\\") + svc + QLatin1Char('\\'));
                 log_.warning(u("足迹清理:夺取所有权后删除恶意服务 ") + full);
             } else {
                 report.skipped.append(mkSkip(full, u("受 ACL 保护,夺取所有权仍失败(建议手动删除该服务)"), false));

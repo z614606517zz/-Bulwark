@@ -23,6 +23,7 @@
 #include <QScrollArea>
 #include <QShowEvent>
 #include <QTemporaryFile>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -355,6 +356,16 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
     footer->addWidget(closeBtn);
     v->addLayout(footer);
+
+    // 全自动:报告为纯通知,倒计时 5 秒后自动关闭(无需人工点「关闭」)。
+    // WA_DeleteOnClose 已设置,accept() 会关闭并销毁本对话框。悬停/拖动不停表。
+    closeBtn->setText(u("关闭 (5)"));
+    auto* autoClose = new QTimer(this);
+    connect(autoClose, &QTimer::timeout, this, [this, closeBtn, autoClose] {
+        if (--m_autoCloseLeft <= 0) { autoClose->stop(); accept(); return; }
+        closeBtn->setText(u("关闭 (") + QString::number(m_autoCloseLeft) + u(")"));
+    });
+    autoClose->start(1000);
 }
 
 void RemediationReportDialog::showEvent(QShowEvent* e)

@@ -14,6 +14,8 @@
 #include "bulwark/models/ReputationUsage.h"
 #include "bulwark/models/PersistenceEntry.h"
 #include "bulwark/models/VtScanRecord.h"
+#include "bulwark/models/AttackGraph.h"
+#include "bulwark/models/ProcessEntry.h"
 
 // IPC payload DTOs. Phase-0 seeds the handshake + verdict payloads to exercise
 // the envelope end-to-end; the remaining ~30 payloads are ported in the
@@ -313,6 +315,112 @@ struct IntelApplyRequestPayload {
     QList<bulwark::DefenseRule> rules;
     QJsonObject toJson() const;
     static IntelApplyRequestPayload fromJson(const QJsonObject& o);
+};
+
+// ===== 事件时间线 =====
+// UI -> 服务:时间线查询。空/零值一律表示「不限」,便于 UI 只填自己关心的条件。
+// 查询走服务端落盘的 events.jsonl(比内存环形缓冲更深),故能回看比实时列表更久的历史。
+struct TimelineRequestPayload {
+    QUuid requestId = QUuid::createUuid();
+    QDateTime fromUtc;                        // 无效 = 不限下界
+    QDateTime toUtc;                          // 无效 = 不限上界
+    QList<int> types;                         // EventType 序号;空 = 全部
+    QList<int> actions;                       // VerdictAction 序号;空 = 全部
+    int minRiskScore = 0;                     // 最低风险分
+    int pid = 0;                              // 只看某进程(含其在时间窗内的进程树)
+    bool includeProcessTree = false;          // pid 是否连带其子孙进程
+    QString text;                             // 关键字(匹配 路径/目标/命令行/发布者)
+    int limit = 500;                          // 返回上限(服务端硬上限 5000)
+    QJsonObject toJson() const;
+    static TimelineRequestPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:时间线查询结果。events 按时间【升序】(与实时推送一致,UI 自行决定倒序展示)。
+struct TimelineResponsePayload {
+    QUuid requestId;
+    QList<EventLogPayload> events;
+    int scanned = 0;                          // 实际扫描过的历史条数
+    int matched = 0;                          // 命中条数(可能大于 events.size(),被 limit 截断)
+    bool truncated = false;
+    QDateTime earliestUtc;                    // 历史里最早一条的时间(供 UI 显示可回溯范围)
+    QString message;
+    QJsonObject toJson() const;
+    static TimelineResponsePayload fromJson(const QJsonObject& o);
+};
+
+// ===== 攻击图 =====
+// UI -> 服务:以某条事件(优先)或某 PID 为种子构建攻击图。
+struct AttackGraphRequestPayload {
+    QUuid requestId = QUuid::createUuid();
+    QUuid seedEventId;
+    int rootPid = 0;
+    int windowSeconds = 3600;                 // 取种子时间前后多久的事件参与关联(默认 1 小时)
+    QJsonObject toJson() const;
+    static AttackGraphRequestPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:攻击图。
+struct AttackGraphResponsePayload {
+    QUuid requestId;
+    bool success = false;
+    QString message;
+    bulwark::AttackGraph graph;
+    QJsonObject toJson() const;
+    static AttackGraphResponsePayload fromJson(const QJsonObject& o);
+};
+
+// ===== 进程管理 =====
+// UI -> 服务:请求在跑进程快照。
+struct ProcessListRequestPayload {
+    QUuid requestId = QUuid::createUuid();
+    bool includeCommandLine = true;           // 读命令行(需要权限,略慢)
+    bool resolveOrigin = true;                // 解析启动来源(具体服务名 / 计划任务名)
+    QJsonObject toJson() const;
+    static ProcessListRequestPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:进程快照。
+struct ProcessListResponsePayload {
+    QUuid requestId;
+    QDateTime snapshotUtc = QDateTime::currentDateTimeUtc();
+    QList<bulwark::ProcessEntry> processes;
+    QString message;
+    QJsonObject toJson() const;
+    static ProcessListResponsePayload fromJson(const QJsonObject& o);
+};
+
+// 进程处置动作。全部由用户在 UI 显式点击触发 —— 这里没有任何「自动」路径。
+enum class ProcessActionKind {
+    Terminate = 0,     // 结束单个进程
+    TerminateTree,     // 结束进程及其全部后代
+    Suspend,           // 挂起(冻结全部线程)
+    Resume,            // 恢复
+    QuarantineImage,   // 结束进程并隔离其映像文件(高危,需 UI 二次确认)
+    TrustImage,        // 把映像加入信任名单
+    ComputeHash,       // 计算映像 SHA-256(详情页按需)
+};
+
+// UI -> 服务:对某进程执行处置。
+struct ProcessActionRequestPayload {
+    QUuid requestId = QUuid::createUuid();
+    ProcessActionKind kind = ProcessActionKind::Terminate;
+    int pid = 0;
+    QString imagePath;                        // TrustImage / QuarantineImage / ComputeHash 用
+    QJsonObject toJson() const;
+    static ProcessActionRequestPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:进程处置结果。failed 时 message 必须说明【为什么没做成】——
+// 关键系统进程、自我保护、权限不足、进程已退出,都要如实回话,不允许静默成功。
+struct ProcessActionResultPayload {
+    QUuid requestId;
+    ProcessActionKind kind = ProcessActionKind::Terminate;
+    int pid = 0;
+    bool success = false;
+    QString message;
+    QString sha256;                           // ComputeHash 的结果
+    QJsonObject toJson() const;
+    static ProcessActionResultPayload fromJson(const QJsonObject& o);
 };
 
 } // namespace bulwark::ipc

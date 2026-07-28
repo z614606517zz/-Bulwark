@@ -551,12 +551,26 @@ void addInjectionRules(QVector<DefenseRule>& list) {
         r.requireUnsigned = reqUnsigned; r.action = a; r.note = note(n); list.append(r);
     };
 
-    proc(list, EventType::RemoteThread, "*\\winlogon.exe", VerdictAction::Block, "向 winlogon 注入远程线程(高危)");
-    at(EventType::RemoteThread, nullptr, "*\\svchost.exe", false, VerdictAction::Block, "向 svchost 注入远程线程(高危,排除 services/wininit 发起)");
+    // 「注入关键系统进程」类 Block 规则:按【目标】匹配,因此任何发起方都会命中 —— 包括
+    // Windows 自己。实测 dwm.exe -> csrss.exe 这类系统内部线程创建被判高危拦截(误报);同理
+    // services/winlogon/svchost 之间也存在合法的跨进程线程创建。故给这几条挂上
+    // exemptTrustedOsComponent:引擎会在命中后回查 TrustPolicy::isTrustedOsComponent —— 要求
+    // 「无硬恶意指标 + 主体不是 LOLBin/脚本宿主 + 微软签名且位于系统目录 + 无危险命令行」,
+    // 只有系统自身组件才满足。未签名注入方、Temp 里的同名程序、带危险命令行的主体照旧被拦。
+    auto injBlock = [&](const char* target, const char* n) {
+        DefenseRule r; r.type = EventType::RemoteThread;
+        r.targetPattern = QLatin1String(target);
+        r.action = VerdictAction::Block;
+        r.exemptTrustedOsComponent = true;
+        r.note = note(n); list.append(r);
+    };
+
+    injBlock("*\\winlogon.exe", "向 winlogon 注入远程线程(高危)");
+    injBlock("*\\svchost.exe", "向 svchost 注入远程线程(高危,排除 services/wininit 发起)");
     at(EventType::RemoteThread, "*\\services.exe", "*\\svchost.exe", false, VerdictAction::Allow, "services.exe 启动 svchost(系统合法行为,放行)");
     at(EventType::RemoteThread, "*\\wininit.exe", "*\\svchost.exe", false, VerdictAction::Allow, "wininit.exe 启动 svchost(系统合法行为,放行)");
-    proc(list, EventType::RemoteThread, "*\\services.exe", VerdictAction::Block, "向 services 注入远程线程(高危)");
-    proc(list, EventType::RemoteThread, "*\\csrss.exe", VerdictAction::Block, "向 csrss 注入远程线程(高危)");
+    injBlock("*\\services.exe", "向 services 注入远程线程(高危)");
+    injBlock("*\\csrss.exe", "向 csrss 注入远程线程(高危)");
 
     // explorer 注入细化
     at(EventType::RemoteThread, "*\\Windows\\*", "*\\explorer.exe", false, VerdictAction::Ask, "系统进程向explorer注入(可能是Shell扩展)");

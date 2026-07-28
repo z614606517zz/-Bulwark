@@ -1,0 +1,5 @@
+// Embeds the Bulwark brand badge as the application icon so Explorer, the
+// taskbar and shortcuts show it (the runtime window icon is set separately in
+// main.cpp via AppIcon::appBadge()). The .ico is generated from that same badge
+// with:  bulwark_ui.exe --export-icon app.ico
+IDI_ICON1 ICON "app.ico"

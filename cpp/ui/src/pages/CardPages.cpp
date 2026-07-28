@@ -486,35 +486,35 @@ QWidget* pages::reputation(IpcClient* ipc)
     qv->addWidget(qresult);
     v->addWidget(q);
 
-    // Source status grid (driven by RuntimeSettings).
-    auto* sc = ui::card();
-    auto* scv = new QVBoxLayout(sc);
-    scv->setContentsMargins(20, 18, 20, 18);
-    scv->setSpacing(12);
-    scv->addWidget(ui::label(u("情报源状态"), "h2"));
-    auto* grid = new QGridLayout;
-    grid->setSpacing(12);
-    struct Src { const char* name; };
-    const Src ss[] = { {"VirusTotal"}, {"MalwareBazaar"}, {"AlienVault OTX"},
-                       {"微步 ThreatBook"}, {"MetaDefender"}, {"Hybrid Analysis"} };
-    auto* pills = new QHash<QString, QLabel*>;
-    int idx = 0;
-    for (const auto& s : ss) {
-        auto* cardw = ui::cardAlt();
-        auto* h = new QHBoxLayout(cardw);
-        h->setContentsMargins(14, 12, 14, 12);
-        h->setSpacing(11);
-        h->addWidget(ui::iconBadge("cloud", theme::textMuted(), 34, 18));
-        h->addWidget(ui::label(u(s.name), "title"));
-        h->addStretch();
-        auto* pill = ui::pill(u("未配置"), theme::textMuted());
-        pills->insert(QString::fromUtf8(s.name), pill);
-        h->addWidget(pill);
-        grid->addWidget(cardw, idx / 3, idx % 3);
-        ++idx;
-    }
-    scv->addLayout(grid);
-    v->addWidget(sc);
+    // Source status grid HIDDEN (portable build: no API keys exposed).
+    // auto* sc = ui::card();
+    // auto* scv = new QVBoxLayout(sc);
+    // scv->setContentsMargins(20, 18, 20, 18);
+    // scv->setSpacing(12);
+    // scv->addWidget(ui::label(u("情报源状态"), "h2"));
+    // auto* grid = new QGridLayout;
+    // grid->setSpacing(12);
+    // struct Src { const char* name; };
+    // const Src ss[] = { {"VirusTotal"}, {"MalwareBazaar"}, {"AlienVault OTX"},
+    //                    {"微步 ThreatBook"}, {"MetaDefender"}, {"Hybrid Analysis"} };
+    auto* pills = new QHash<QString, QLabel*>; // keep for signal handler (no-op)
+    // int idx = 0;
+    // for (const auto& s : ss) {
+    //     auto* cardw = ui::cardAlt();
+    //     auto* h = new QHBoxLayout(cardw);
+    //     h->setContentsMargins(14, 12, 14, 12);
+    //     h->setSpacing(11);
+    //     h->addWidget(ui::iconBadge("cloud", theme::textMuted(), 34, 18));
+    //     h->addWidget(ui::label(u(s.name), "title"));
+    //     h->addStretch();
+    //     auto* pill = ui::pill(u("未配置"), theme::textMuted());
+    //     pills->insert(QString::fromUtf8(s.name), pill);
+    //     h->addWidget(pill);
+    //     grid->addWidget(cardw, idx / 3, idx % 3);
+    //     ++idx;
+    // }
+    // scv->addLayout(grid);
+    // v->addWidget(sc);
 
     // History table.
     v->addWidget(ui::label(u("查询历史"), "h2"));
