@@ -161,8 +161,20 @@ __srvweb/
 /verify_out.txt
 # 本机组策略/注册表快照,含机器专属状态
 bulwark-policy-backup-*.reg
-# 代理会话的一次性脚本(下划线前缀 = 临时)
-scripts/_*.ps1
+# 代理会话的一次性脚本(本机专属:修某次误报 / 清某次残留 / 探一次权限)。
+# 刻意逐条列出而不用 scripts/_*.ps1 通配:
+#   * 通配对【已入库】的文件无效(gitignore 只管未跟踪文件),写成通配会让这条规则
+#     看起来把 scripts/_kiro_*.ps1 那批历史文件也排除了,实际并没有——规则即谎言;
+#   * _kiro_stop_driver.ps1 是 rebuild_full.ps1 第 24 行真正调用的依赖,必须入库,
+#     一条通配会把它一起吞掉,产出一个「脚本引用了仓库里不存在的文件」的坏包。
+scripts/_kiro_build_driver.ps1
+scripts/_kiro_deploy_all.ps1
+scripts/_kiro_drop_execblock_fp.ps1
+scripts/_kiro_elev_probe.ps1
+scripts/_kiro_fix_policy_fp.ps1
+scripts/_kiro_prune_bad_ip_rules.ps1
+scripts/_kiro_remove_beacon_persistence.ps1
+scripts/_check_compile_proxyrep.ps1
 # backup-keys.ps1 的运行日志:会记录密钥文件的路径与长度
 scripts/backup-keys.txt
 # 私有测试包的内部说明(讲的是「本包不脱敏」的流程,对外无意义)
