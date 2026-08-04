@@ -2,15 +2,45 @@
 
 English | [简体中文](README.md)
 
-A Host-based Intrusion Prevention System (HIPS) for Windows, in the same category as antivirus / EDR. **Core idea:** monitor sensitive system behavior → a rule engine decides → prompt the user for a verdict on gray-zone behavior (Allow / Block / Remember). It only acts on genuinely dangerous behavior and tries hard not to nag.
+**An open-source Host-based Intrusion Prevention System (HIPS) for Windows, in the same category as antivirus / EDR. Written in C++ / Qt.**
 
-Bulwark is built as three cooperating layers: a **kernel-mode driver (R0)** for "before-the-action" interception, a **user-mode Windows service (R3)** that hosts all decision and remediation logic, and a **Qt desktop UI** for status, live logs, behavior prompts, rule management and AI research. The driver and service talk over a Filter Manager communication port; the service and UI over a named pipe. Whatever the event source, a single `RuleEngine` is the decision center, backed by threat heuristics, several dedicated analyzers, stateful temporal detection, an **attack-chain combination engine** (accumulates several individually-inconclusive actions into one conclusive piece of evidence), multi-engine hash reputation, a threat-intel feed and AI research.
+It doesn't identify files against a signature database — it watches **what a program does**: monitor sensitive system behavior → the rule engine decides → anything genuinely ambiguous is handed to you as a prompt (Allow / Block / Remember).
 
-> This project is a **C++ / Qt** implementation (ported from an earlier .NET prototype).
-> - **User mode (R3 + UI) compiles and runs directly**: service↔UI named-pipe link, live ETW observation (process / network / DNS / registry / file), user-mode continuous behavior monitoring (autostart + ransomware decoys), Authenticode signature + certificate-profile verification, SHA-256, rule / trust / quarantine management, multi-engine cloud reputation, AI research, SCM service install.
-> - **The kernel driver (R0) builds into `Bulwark.sys`**; its user-mode integration (connect / protocol handshake / event intake / config push / verdict compensation) is complete, and all six protection dimensions are implemented at the code level.
+## What makes it different
 
-> ⚠ **The kernel driver has not yet been validated end-to-end inside a real kernel.** `Bulwark.sys` must be loaded with test-signing enabled inside a **snapshotted test VM** before it can truly enable "before-the-action" kernel interception; a faulty kernel callback can bluescreen (BSOD). The default release artifacts run the **ETW user-mode observation pipeline**.
+- **"Suspicious" is not treated as proof.** Unsigned, running from Temp, first seen on this machine, freshly issued certificate — these **soft signals never trigger a block or a prompt on their own**. They only add score, and must be corroborated by a hard indicator to escalate. The goal is to avoid training the user to click Allow reflexively.
+- **It accumulates scattered actions into evidence.** Writing a Run key, dropping an exe into Temp, adding a Defender exclusion — individually, legitimate software does all of these; **appearing together on one process** is already conclusive. The server counts these combinations out of real sample sandbox records, the client keeps a per-process ledger, and a completed combination convicts. No model, no training, pure table lookup.
+- **Every verdict can be interrogated.** Each event carries a structured **evidence chain** (which analyzer, hard indicator or soft signal, how much each contributed), rendered as a timeline in the prompt rather than handing you a lone score.
+- **Rules can expire.** "Remember" offers Permanent / this session only / 1 hour / 1 day, so a snap decision doesn't become a permanent allow.
+- **Self-protection is never made "unremovable."** This is a legitimate security tool and always keeps a normal, user-driven uninstall path.
+
+## Three layers
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Kernel driver (R0)** `Bulwark.sys` | "Before-the-action" interception in place. Minifilter + documented callbacks, no SSDT hooking, PatchGuard-friendly |
+| **User-mode service (R3)** `bulwark_service.exe` | All decision and remediation logic; runs as SYSTEM |
+| **Desktop UI** `bulwark_ui.exe` | Status, live logs, behavior prompts, rule / trust / quarantine management, AI research |
+
+The driver and service talk over a Filter Manager communication port; the service and UI over a named pipe. Whatever the source, every event funnels into one `RuleEngine`, backed by threat heuristics, dedicated analyzers (LOLBin abuse / credential access / defense evasion / injection & sideloading / command-line obfuscation, and more), stateful temporal detection (ransomware / C2 beaconing / DGA), the attack-chain combination engine, multi-engine hash reputation, a threat-intel feed and AI research.
+
+**The driver holds a self-sufficient baseline**: hard-block lists, the process "exec-block" list, denial of children spawned by banned actors, self-protection, and the kernel-local known-bad SHA-256 scan are all decided in kernel and persisted — so they **stay in force even when the user-mode service isn't installed, isn't running, or has been killed**.
+
+## Keys and privacy (please read this first)
+
+- **No vendor API key ships in this repository.** Every key field in the source and in the `cpp/service/appsettings.json` template is blank, and no key field has ever been committed with a value anywhere in the history.
+- **It works with zero keys**: local heuristics, behavior detection, temporal detection and kernel interception all run normally. Cloud reputation / threat intel / AI research are enhancements — enable one by entering its (free-tier) key on the Settings page.
+- Keys you enter are stored only on your machine at `%ProgramData%\Bulwark\settings.json` (or as environment variables) — **never written into source, never committed**.
+- ⚠ **One feature does reach the network by default**: the central reputation service (`ReputationProxy`) is on out of the box and sends the **SHA-256 digest** of local files (not file contents) to an instance run by the project maintainer. For a fully offline setup set its `Enabled` to `false`; protection does not degrade. See [Central reputation service](#central-reputation-service-reputationproxy).
+- Threat-intel sharing (uploading behavior data) is **off by default** and requires you to turn it on explicitly.
+
+## Current status (candidly)
+
+- **User mode (service + UI) compiles and runs directly**, feature-complete: live ETW observation (process / network / DNS / registry / file), user-mode continuous behavior monitoring (autostart + ransomware decoys), Authenticode signature + certificate-profile verification, rule / trust / quarantine management, multi-engine cloud reputation, AI research, SCM service install.
+- **The kernel driver builds into `Bulwark.sys`**, with all six protection dimensions implemented at the code level and user-mode integration (connect / protocol handshake / event intake / config push / verdict compensation) complete.
+- ⚠ **But the kernel driver has not been validated end-to-end inside a real kernel.** Enabling kernel "before-the-action" interception requires test-signing and loading it inside a **snapshotted test VM**. **A faulty kernel callback will bluescreen (BSOD) — do not run it on your daily machine.** The default release artifacts run the **ETW user-mode observation pipeline**.
+
+> Just want to try it: see the [beginner guide](#beginner-guide-from-source-to-running) — double-click `一键启动-仅用户态.bat`, which loads no driver, touches no test-signing setting, and carries no BSOD risk.
 
 ## Two switchable event sources
 
