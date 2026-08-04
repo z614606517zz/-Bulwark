@@ -61,6 +61,15 @@ public:
     virtual QStringList persistedExecBlockList() const { return {}; }
     virtual QStringList persistedModuleNoLoadList() const { return {}; }
 
+    // 内存防护(反注入 + 凭据反转储)总开关。关闭时内核两份目标 PID 集被清空、此后不再登记,
+    // 防护【真正停止】;重新开启时按当前目标名单重新登记现存进程。
+    // 仅内核驱动源真正实现;纯观测源无内核名单,保持空实现。
+    //
+    // 之所以要有这个接口:RuntimeSettings::memoryProtectionEnabled 此前在服务端从未被读取,
+    // 设置页的开关与仪表盘的维度指示灯都只是摆设 —— 真实反注入完全由 appsettings.json 的
+    // MemoryProtectionTargets 驱动,用户关掉开关后防护照旧生效而指示灯变灰,显示与实际相反。
+    virtual void setMemoryProtectionEnabled(bool /*on*/) {}
+
 signals:
     void eventProduced(const bulwark::SecurityEvent& e);
 };

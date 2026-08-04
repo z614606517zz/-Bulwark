@@ -51,6 +51,10 @@ bool EventSourceCoordinator::kernelProtocolMismatch() const {
     return driver_ && driver_->protocolMismatch();
 }
 
+QStringList EventSourceCoordinator::kernelMissingCapabilities() const {
+    return driver_ ? driver_->missingCapabilities() : QStringList{};
+}
+
 void EventSourceCoordinator::submitVerdict(const bulwark::SecurityEvent& e, bulwark::VerdictAction action) {
     // 仅内核源支持「行为前」回写;其余源为观测,submitVerdict 对它们无意义。内核源的
     // submitVerdict 内部会判断该事件是否为其追踪的等待类事件(否则 no-op)。
@@ -67,6 +71,10 @@ void EventSourceCoordinator::setKernelEnabled(bool on) {
             connect(driver_, &EventSource::eventProduced, this, &EventSourceCoordinator::onDriverEvent);
         }
         DriverControl::ensureLoaded();     // 按需注册 + 加载 Bulwark.sys(幂等)
+        // 内存防护状态必须在 start() 【之前】补给内核源:start() 内的 pushInitialConfig 会调
+        // initMemoryProtection,那时才读这个标志。放到 start() 之后就会先按默认(开)登记一遍,
+        // 用户明明关着开关却仍被登记一次。
+        driver_->setMemoryProtectionEnabled(memProtEnabled_);
         driver_->start();                  // 连接 + 握手(同步)
         for (int pid : protectedPids_)     // 补发受保护 UI PID
             driver_->addProtectedPid(pid);
@@ -90,6 +98,7 @@ void EventSourceCoordinator::onKernelRetry() {
     if (!kernelEnabled_ || !driver_) { kernelRetry_->stop(); return; }
     if (driver_->isAvailable()) { kernelRetry_->stop(); attachFailed_ = false; return; }
     DriverControl::ensureLoaded();
+    driver_->setMemoryProtectionEnabled(memProtEnabled_); // 同上:必须早于 start()
     driver_->start();
     if (driver_->isAvailable()) {
         kernelRetry_->stop();
@@ -104,6 +113,12 @@ void EventSourceCoordinator::configureBehaviorMonitor(bool enabled, bool canaryE
     if (!behavior_) return;
     behavior_->setEnabled(enabled);
     behavior_->setCanaryEnabled(canaryEnabled);
+}
+
+void EventSourceCoordinator::setMemoryProtectionEnabled(bool on) {
+    memProtEnabled_ = on;   // 记住:内核源可能还没创建(懒创建),届时由 setKernelEnabled 补发
+    if (driver_)
+        driver_->setMemoryProtectionEnabled(on);
 }
 
 void EventSourceCoordinator::addProtectedUiPid(int pid) {

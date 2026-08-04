@@ -82,8 +82,12 @@ ScanProgressWindow::ScanProgressWindow(const QString& key, const QString& fileNa
     auto* titleRow = new QHBoxLayout;
     titleRow->setSpacing(8);
     m_title = ui::coloredText(u("正在云端查毒…"), 14, 800, theme::textPrimary());
-    titleRow->addWidget(m_title);
-    titleRow->addStretch();
+    // 标题允许换行:14pt 粗体下,固定 468 宽减去徽标/边距/关闭按钮后留给标题的横向空间有限,
+    // 不换行的 QLabel 会被布局压窄并直接截字(「检测到威胁,已处置」尾字被切)。换行 + relayout
+    // 保证完整显示;宁可多一行,也不要让用户看半句结论。
+    m_title->setWordWrap(true);
+    // 标题吃掉剩余横向空间(关闭按钮固定大小),故不再需要额外的 addStretch。
+    titleRow->addWidget(m_title, 1);
     auto* closeBtn = new QToolButton;
     closeBtn->setIcon(AppIcon::icon(QStringLiteral("close"), theme::textMuted(), 16));
     closeBtn->setCursor(Qt::PointingHandCursor);
@@ -176,10 +180,8 @@ void ScanProgressWindow::showCentered()
 {
     if (m_closing)
         return;
-    adjustSize();
-    QScreen* scr = QGuiApplication::primaryScreen();
-    const QRect area = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
-    move(area.center().x() - width() / 2, area.center().y() - height() / 2);
+    refitHeight(); // 与 relayout() 用同一套高度计算,避免两处口径不一致
+    recenter();
     setWindowOpacity(0.0);
     show();
     auto* fade = new QPropertyAnimation(this, "windowOpacity", this);
@@ -192,6 +194,43 @@ void ScanProgressWindow::showCentered()
     QTimer::singleShot(kFallbackCloseMs, this, [this] {
         if (!m_resultShown && !m_closing) beginClose();
     });
+}
+
+bool ScanProgressWindow::refitHeight()
+{
+    QLayout* l = layout();
+    if (l)
+        l->activate(); // 先把换行结果算进布局,再问高度
+    // 固定宽度 + 自动换行的 QLabel:直接拿 sizeHint().height() 并不可靠 —— 换行标签在宽度
+    // 确定前会低报所需高度,这正是「结论被裁掉」的根因之一。按当前宽度问 heightForWidth 才准,
+    // 拿不到时才退回 sizeHint。
+    int h = -1;
+    if (l && l->hasHeightForWidth())
+        h = l->totalHeightForWidth(width());
+    if (h <= 0)
+        h = sizeHint().height();
+    if (h <= 0 || h == height())
+        return false;
+    resize(width(), h);
+    return true;
+}
+
+void ScanProgressWindow::recenter()
+{
+    QScreen* scr = QGuiApplication::primaryScreen();
+    const QRect area = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
+    move(area.center().x() - width() / 2, area.center().y() - height() / 2);
+}
+
+void ScanProgressWindow::relayout()
+{
+    if (m_closing)
+        return;
+    if (!refitHeight())
+        return;          // 高度没变:不动窗口,免得每条进度更新都抖一下
+    if (!isVisible())
+        return;          // 还没显示:定位由 showCentered() 负责
+    recenter();
 }
 
 void ScanProgressWindow::startCountdown()
@@ -227,6 +266,7 @@ void ScanProgressWindow::applyVt(const bulwark::VtScanRecord& r)
         } else {
             m_bar->setRange(0, 0); // indeterminate
         }
+        relayout(); // 各阶段提示长短不一(分级链路的「正在查询中央服务器…」等),跟着调整高度
         return;
     }
 
@@ -266,6 +306,10 @@ void ScanProgressWindow::applyResult(const QColor& accent, const QString& iconNa
     m_bar->setStyleSheet(barStyle(accent));
     m_status->setText(status);
     m_countdown->setVisible(false);
+    // 结论文案通常比占位文案长(「恶意 · 18/66 · trojan.xxx · 来源 X」会换到第二行),
+    // 且此时倒计时标签刚被隐藏 —— 两者都改变了所需高度,必须重算,否则卡片高度还停在
+    // 建卡时那一行的尺寸,结论会被裁掉。
+    relayout();
 
     m_autoClose->start(qMax(3, autoCloseSecs) * 1000);
 }
@@ -329,6 +373,7 @@ void ScanProgressWindow::aiStart(const bulwark::SecurityEvent& event)
         if (w->m_status->text().isEmpty() || w->m_status->text().startsWith(u("正在查询")))
             w->m_status->setText(u("大模型正在基于静态特征研判…"));
         w->m_bar->setRange(0, 0);
+        w->relayout();
     }
 }
 

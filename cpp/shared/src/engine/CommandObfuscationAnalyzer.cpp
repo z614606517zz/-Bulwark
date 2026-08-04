@@ -94,13 +94,16 @@ ScoreResult CommandObfuscationAnalyzer::analyze(const QString& commandLine) {
     const QString lower = commandLine.toLower();
     int score = 0;
 
+    // 结构性证据单独累计:它决定本分析器是否给出【硬指标】(见函数末尾 hardSignal 的说明)。
     int structuralHits = 0;
+    int structuralScore = 0;
     for (const Sig& sig : structuralSignals()) {
         const int occurrences = countOccurrences(lower, QLatin1String(sig.token));
         if (occurrences > 0) {
             ++structuralHits;
             const int add = sig.score + qMin(occurrences - 1, 3) * (sig.score / 4);
             score += add;
+            structuralScore += add;
             r.reasons << u(sig.reason);
         }
     }
@@ -135,10 +138,42 @@ ScoreResult CommandObfuscationAnalyzer::analyze(const QString& commandLine) {
 
     if (structuralHits >= 3) {
         score += 18;
+        structuralScore += 18;
         r.reasons << (u("叠加 ") + QString::number(structuralHits) + u(" 种混淆手法(高度可疑)"));
     }
 
     r.score = score; // 不封顶(由 ThreatDetector 汇总后统一封顶 100)
+
+    //
+    // 硬指标判定:【必须有结构性混淆证据】。香农熵 / 符号占比 / Base64 长串这三项是纯统计量,
+    // 按本项目原则只能是软信号(加分 + 等互证),绝不单独定罪。
+    //
+    // 这条约束不是理论洁癖,是实测事故:Electron / Chromium 应用的子进程命令行天然同时踩中
+    // 两项统计信号 —— Kiro(Amazon 有效签名的 IDE)的 GPU 进程带
+    //     --gpu-preferences=SAAAAAAAAADgAAAEAAAA……==   (132 字符连续 Base64,+14)
+    // 再加上整条命令行熵 5.1(+16),恰好凑到 30。原实现的判据是「总分 >= 30 即硬指标」,于是
+    // 这两项统计量把 hasThreatIndicator 置真,连带产生三个后果:
+    //   ① TrustPolicy::isHealthySigned 因 hasThreatIndicator 直接失效 —— Amazon 的有效签名
+    //      再也救不了它(RuleEngine 第 9 步的健康签名放行被跳过);
+    //   ② 静默模式把本该是 Ask 的裁决升级成 Block;
+    //   ③ Worker::blacklistExec 把映像路径钉进内核 FileExecBlock,并由驱动写回注册表 ——
+    //      此后只要驱动加载,Kiro 在进程创建回调就被 STATUS_ACCESS_DENIED,【跨重启永久起不来】。
+    // 一条纯统计的巧合,最终表现为「正常软件被永久封杀」,这是最不能接受的一类误报。
+    //
+    // 两条腿都要求结构性构造(它们是刻意混淆的语法证据,不是统计巧合):
+    //   · structuralScore >= 30:单一构造本身已足够重(如 [char] 多次出现、
+    //     [scriptblock] + FromBase64String 组合、[reflection.assembly] 反射加载);
+    //   · structuralHits >= 2 且总分达线:多种构造叠加,顺带覆盖「3 种以上手法」
+    //     (那条 +18 已计入 structuralScore,几乎必然越过 30)。
+    // 单个噪声型 token(命令行里一个 '^'、一个 "-f " )达不到任何一条,只加分不定罪。
+    //
+    // 检测能力没有丢:真正的编码载荷命令行会被【其它硬信号】独立逮住 ——
+    // ThreatDetector::commandLineSignals 的 -enc / -encodedcommand(各 35 分,hard)、
+    // -windowstyle hidden(30,hard);ScriptAnalyzer 会解出 -EncodedCommand 的明文再分析;
+    // TrustPolicy::hardDangerTokens 含 -enc / frombase64string,直接撤销签名信任;
+    // LolbinAnalyzer 覆盖 certutil -decode 等。Chromium 的 --gpu-preferences 一条都不碰。
+    //
+    r.hardSignal = (structuralScore >= 30) || (structuralHits >= 2 && score >= 30);
     return r;
 }
 

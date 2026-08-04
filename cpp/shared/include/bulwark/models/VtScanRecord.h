@@ -3,6 +3,7 @@
 #include <QUuid>
 #include <QDateTime>
 #include <QJsonObject>
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
@@ -28,7 +29,7 @@ struct VtScanRecord {
     QString message;                 // 可空:进度/结论/错误说明
     bool uploaded = false;
     QString source;                  // 双击 / Dropper / 手动
-    QDateTime timestampUtc = QDateTime::currentDateTimeUtc();
+    QDateTime timestampUtc = nowUtc();
 
     bool isTerminal() const { return stage == VtScanStage::Completed || stage == VtScanStage::Error; }
 

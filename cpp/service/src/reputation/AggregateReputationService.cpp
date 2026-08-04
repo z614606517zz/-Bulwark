@@ -4,6 +4,9 @@
 #include <QMutexLocker>
 #include <QStringList>
 
+#include <future>
+#include <vector>
+
 namespace bulwark::service::reputation {
 namespace {
 inline QString u(const char* s) { return QString::fromUtf8(s); }
@@ -74,26 +77,71 @@ bulwark::FileReputation AggregateReputationService::query(const QString& sha256)
 }
 
 bulwark::FileReputation AggregateReputationService::query(const QString& sha256, bool priority) {
+    return queryFiltered(sha256, priority, QString());
+}
+
+bulwark::FileReputation AggregateReputationService::queryExcluding(const QString& sha256, bool priority,
+                                                                   const QString& excludeSource) {
+    return queryFiltered(sha256, priority, excludeSource);
+}
+
+bulwark::FileReputation AggregateReputationService::queryFiltered(const QString& sha256, bool priority,
+                                                                  const QString& excludeSource) {
     bulwark::FileReputation unknown;
     unknown.sha256 = sha256;
     if (sha256.isEmpty())
         return unknown;
 
-    // 顺序查询各已启用源(本方法在 ReputationManager 后台线程调用,阻塞可接受)。
-    // 每个客户端自身 fail-open(失败/超时返回 Unknown),单源异常不影响整体。
-    // priority 透传给各源:VT 会据此占用预留的优先级配额(供内存防护/反注入验证低延迟命中,
-    // 尽量不被双击查杀等普通查询挤占)。不支持优先级的源默认忽略该参数。
-    QVector<bulwark::FileReputation> results;
+    // 先取当前活跃源快照(isActive 持锁读运行时开关),后续查询不再持锁。
+    // excludeSource 非空时跳过同名源(不区分大小写),供分级链路「只查其他源」。
+    std::vector<IHashReputationService*> active;
+    active.reserve(sources_.size());
     for (const auto& s : sources_) {
         if (!isActive(s.get()))
             continue;
-        bulwark::FileReputation r = s->query(sha256, priority);
-        if (r.source.isEmpty())
-            r.source = s->name(); // 记录该结论来自哪个源,供合并后标注命中来源
-        results.append(r);
+        if (!excludeSource.isEmpty() && s->name().compare(excludeSource, Qt::CaseInsensitive) == 0)
+            continue;
+        active.push_back(s.get());
     }
-    if (results.isEmpty())
+    if (active.empty())
         return unknown;
+
+    // 单个源查询(fail-open + 记录命中源名)。priority 透传给各源:VT 会据此占用预留的优先级
+    // 配额(供内存防护/反注入验证低延迟命中,尽量不被双击查杀等普通查询挤占);不支持优先级的
+    // 源忽略该参数。并发路径下任何异常都在此吞掉并降级为 Unknown,绝不跨线程逸出。
+    const auto queryOne = [sha256, priority](IHashReputationService* s) -> bulwark::FileReputation {
+        try {
+            bulwark::FileReputation r = s->query(sha256, priority);
+            if (r.source.isEmpty())
+                r.source = s->name(); // 记录该结论来自哪个源,供合并后标注命中来源
+            return r;
+        } catch (...) {
+            bulwark::FileReputation r;
+            r.sha256 = sha256;
+            r.source = s->name();
+            return r; // Unknown / querySucceeded=false
+        }
+    };
+
+    QVector<bulwark::FileReputation> results;
+    results.reserve(static_cast<int>(active.size()));
+
+    if (active.size() == 1) {
+        // 只有一个活跃源(常见默认:仅 VirusTotal)——直接查,免去起线程的无谓开销。
+        results.append(queryOne(active.front()));
+    } else {
+        // 并行查询各活跃源。串行时总延迟是「各源之和」,最慢一路(超时源)会把「双击云扫描」
+        // 在 VT 未收录、需回退多源时的等待拖成数十秒;并行后总延迟收敛到「最慢的单源」。
+        // 各客户端自身 fail-open、各自独立限流且线程安全(VT 已被多个后台 worker 并发调用),
+        // 彼此无共享可变态;merge 取「最强可信结论」,与完成顺序无关,故并行只改时延不改结论。
+        std::vector<std::future<bulwark::FileReputation>> futures;
+        futures.reserve(active.size());
+        for (IHashReputationService* s : active)
+            futures.push_back(std::async(std::launch::async, queryOne, s));
+        for (auto& f : futures)
+            results.append(f.get()); // get() 逐个等待;queryOne 已吞异常,这里不会抛
+    }
+
     return merge(sha256, results);
 }
 

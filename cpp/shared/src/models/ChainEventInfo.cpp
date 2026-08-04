@@ -14,7 +14,7 @@ QString truncate(const QString& s, int max) {
 
 ChainEventInfo ChainEventInfo::from(const SecurityEvent& e) {
     ChainEventInfo c;
-    c.timestampUtc = e.timestampUtc.isValid() ? e.timestampUtc : QDateTime::currentDateTimeUtc();
+    c.timestampUtc = e.timestampUtc.isValid() ? e.timestampUtc : nowUtc();
     c.type = e.type;
     c.actorPid = e.actorPid;
     c.parentPid = e.parentPid;

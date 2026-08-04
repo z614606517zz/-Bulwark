@@ -549,6 +549,7 @@ int ProcessInspector::tryGetParentPid(int pid)
 namespace {
 
 // 关键系统进程名单(小写);结束它们会触发 0xEF CRITICAL_PROCESS_DIED 蓝屏。
+// 【只有配合下面的 isSystemImageDir 一起用才成立】—— 名字本身不构成豁免理由,见 isCriticalProcess。
 const QSet<QString>& criticalNames()
 {
     static const QSet<QString> names = {
@@ -559,6 +560,17 @@ const QSet<QString>& criticalNames()
         QStringLiteral("fontdrvhost.exe")
     };
     return names;
+}
+
+// 映像是否位于「真正的系统目录」(普通用户写不进去:WRP + 高 ACL)。
+// 刻意不含 \Program Files\ —— 那里普通安装程序能落文件,用它给关键进程发豁免就等于
+// 认可 C:\Program Files\Foo\csrss.exe 也是关键进程。与驱动侧 BlwPathIsSystemImageDir 同义。
+bool isSystemImageDir(const QString& path)
+{
+    const QString lower = path.toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
+    return lower.contains(QLatin1String("\\windows\\system32\\"))
+        || lower.contains(QLatin1String("\\windows\\syswow64\\"))
+        || lower.contains(QLatin1String("\\windows\\winsxs\\"));
 }
 
 // 内核权威的"关键进程"标记(Win8.1+ IsProcessCritical)。
@@ -682,11 +694,34 @@ bool ProcessInspector::isCriticalProcess(int pid)
     if (path.isEmpty())
         return true; // 拿不到映像路径同样保守处理
 
+    // 名字命中关键进程名单【且】映像真的在系统目录里,才算关键进程。
+    //
+    // 只按名字判会把「改名成系统进程」这一最基础的伪装手法变成免杀护身符:实测机器上
+    // C:\Users\<u>\AppData\Local\DBG\csrss.exe(SalatStealer,情报已确认恶意)就是靠这里
+    // 拿到豁免 —— 用户态每 60 秒重试结束一次,连续几十小时"用户态结束 0 个"。
+    // 真系统进程不受影响:它们本就在 System32,且上面的 IsProcessCritical 已经先拦一道。
     const QString name = QFileInfo(path).fileName().toLower();
-    if (criticalNames().contains(name))
+    if (criticalNames().contains(name) && isSystemImageDir(path))
         return true;
 
     return false;
+}
+
+bool ProcessInspector::waitForExit(int pid, int msTimeout)
+{
+    if (pid <= 0)
+        return true;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                           static_cast<DWORD>(pid));
+    if (!h) {
+        // PID 根本不存在 = 已退出并被回收。其余失败(多为拒绝访问)= 无法确认,如实返回 false。
+        return GetLastError() == ERROR_INVALID_PARAMETER;
+    }
+    // 进程对象在进程终止时进入已信号态 —— 即便还有别人持着它的句柄(僵尸)也一样。
+    // 这正是「PID 还在快照里」判不出来的那种情况。
+    const DWORD w = WaitForSingleObject(h, msTimeout < 0 ? 0 : static_cast<DWORD>(msTimeout));
+    CloseHandle(h);
+    return w == WAIT_OBJECT_0;
 }
 
 bool ProcessInspector::tryTerminateProcess(int pid)

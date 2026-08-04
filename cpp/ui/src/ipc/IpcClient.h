@@ -55,6 +55,9 @@ public:
     void quarantineRestore(const QUuid& id);
     void quarantineDelete(const QUuid& id);
     void requestPersistence();
+    // 清理一条自启动持久化项(高危,由用户在自启动项页显式点击触发)。
+    // 结果经 persistenceCleanupDone 回来;服务端带「已加白 / 本产品自身」两道护栏。
+    void requestPersistenceCleanup(const bulwark::PersistenceEntry& entry);
     void requestEventHistory();
     void clearEventHistory();          // 清空服务端事件历史(活动日志/拦截记录共享)
     // ---- 取证回溯:事件时间线 / 攻击图。服务端异步作答(要扫历史文件),响应经对应信号到达。----
@@ -64,6 +67,9 @@ public:
     // ---- 进程管理:快照 + 处置(结束 / 挂起 / 隔离 / 信任 / 算哈希)----
     void requestProcesses(bool includeCommandLine = true, bool resolveOrigin = true);
     void processAction(const bulwark::ipc::ProcessActionRequestPayload& p);
+    // ---- 攻击链:组合表状态 + 命中记录 ----
+    void requestAttackChain();
+    void clearAttackChainHits();       // 清空服务端命中记录(清后服务端会主动回推空列表)
     void requestVtHistory();
     void manualQuarantine(const QString& path); // 清理报告「重试隔离」
     void vtQuery(const bulwark::ipc::VtRequestPayload& p);
@@ -98,8 +104,12 @@ signals:
     void quarantineReceived(const QList<bulwark::ipc::QuarantineItemPayload>& items);
     void quarantineActionResult(const bulwark::ipc::QuarantineActionResultPayload& r);
     void persistenceReceived(const bulwark::ipc::PersistenceListResponsePayload& payload);
+    void persistenceCleanupDone(const bulwark::ipc::PersistenceCleanupResultPayload& payload);
     void timelineReceived(const bulwark::ipc::TimelineResponsePayload& payload);
     void attackGraphReceived(const bulwark::ipc::AttackGraphResponsePayload& payload);
+    void attackChainReceived(const bulwark::ipc::AttackChainResponsePayload& payload);
+    // 攻击链刚命中一次(实时推送,用于右下角 toast);不受静默模式影响。
+    void attackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
     void processListReceived(const bulwark::ipc::ProcessListResponsePayload& payload);
     void processActionResult(const bulwark::ipc::ProcessActionResultPayload& result);
     void vtResponse(const bulwark::ipc::VtResponsePayload& resp);

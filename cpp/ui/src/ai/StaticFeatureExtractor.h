@@ -44,6 +44,28 @@ struct StaticFeatures {
     QString toPromptText() const;
 };
 
+// Extraction bounds. These used to be hardcoded constants while the matching
+// settings (aiScanBinarySampleLimitMb / aiScanScriptTextLimitKb / aiScanMaxStrings)
+// were serialized in RuntimeSettings but read by nobody — three inert knobs.
+// The defaults below are exactly the old hardcoded values, so behaviour is
+// unchanged unless a user actually moves them.
+//
+// Why they are worth honouring rather than deleting: the binary sample cap is a
+// direct cost/latency lever (it bounds how much of a big sample gets read and,
+// for scripts, how much text is shipped to the model), and the string cap bounds
+// prompt size. Those are exactly the things an operator wants to tune.
+struct StaticFeatureLimits {
+    qint64 maxReadBytes   = 12 * 1024 * 1024; // aiScanBinarySampleLimitMb (MB -> bytes)
+    int    scriptCapBytes = 16 * 1024;        // aiScanScriptTextLimitKb   (KB -> bytes)
+    int    maxStrings     = 30;               // aiScanMaxStrings: cap on suspiciousStrings/APIs
+
+    // Clamp to sane bounds. A misconfigured 0 / negative / absurd value must not
+    // turn the extractor into either a no-op or an unbounded read of a malware
+    // sample — this input is untrusted and the process is the UI.
+    void clampToSaneRange();
+};
+
 // Extract static features from a file on disk. Safe to call on any path; if the
 // file can't be read, returns readable=false.
-StaticFeatures extractStaticFeatures(const QString& path);
+StaticFeatures extractStaticFeatures(const QString& path,
+                                     const StaticFeatureLimits& limits = {});

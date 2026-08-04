@@ -15,7 +15,10 @@ class ToastNotifier;
 
 namespace bulwark {
 struct SecurityEvent;
-namespace ipc { struct RemediationReportPayload; }
+namespace ipc {
+struct RemediationReportPayload;
+struct AttackChainHitPayload;
+}
 }
 
 // Top-level application window: a fixed navigation rail on the left and a
@@ -35,6 +38,7 @@ private slots:
     void onNavClicked(int index);
     void onPromptReceived(const bulwark::SecurityEvent& event);
     void onBlockNotification(const bulwark::SecurityEvent& event);
+    void onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
     void onAiScanStarted(const bulwark::SecurityEvent& event);
     void onRemediationReport(const bulwark::ipc::RemediationReportPayload& report);
     void setConnected(bool connected);

@@ -10,6 +10,7 @@
 #include "bulwark/models/Evidence.h"
 #include "bulwark/models/FileReputation.h"
 #include "bulwark/models/ChainEventInfo.h"
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
@@ -17,7 +18,7 @@ namespace bulwark {
 // 对应 .NET Models/SecurityEvent.cs(字段一一对应,camelCase 上线)。
 struct SecurityEvent {
     QUuid id = QUuid::createUuid();
-    QDateTime timestampUtc = QDateTime::currentDateTimeUtc();
+    QDateTime timestampUtc = nowUtc();
     EventType type = EventType::ProcessCreate;
 
     int actorPid = 0;
@@ -67,6 +68,35 @@ struct SecurityEvent {
                                           // 引擎在检测前放行,Worker 据此跳过全部后台扫描(VT/IP/AI)。运行时标记,不序列化。
     bool memoryInjection = false;         // 内存防护(反注入)命中
     QString fileDescription;              // 可空:FileDescription
+
+    // ---- 攻击链组合引擎的贡献 ------------------------------------------------
+    // 必须【单独存放】,不能直接写 riskScore / hasThreatIndicator。
+    // 原因:ThreatDetector::analyze 位于裁决流水线第 3 步,它会
+    //   · 开头把 hasThreatIndicator 复位为 false;
+    //   · 结尾用【赋值】(而非累加)把自己算出的分写进 riskScore。
+    // 而攻击链在 Worker 里、evaluate 之【前】就完成了匹配。于是它写的那两个字段全被无声擦掉 ——
+    // 实测后果:组合表上线后一次都没有生效过,连 hard 级组合也一样被擦成放行。
+    // 现在改为放在这里,由 analyze 显式并入,顺序依赖变成一处明确的契约而不是隐式假设。
+    // 运行时标记,不序列化。
+    int chainScore = 0;                   // 组合命中该加的分(按服务器给的强度换算)
+    bool chainHardIndicator = false;      // 组合命中即互证,按硬指标登记
+
+    // ---- 侧载模块篡改(「白加黑」)---------------------------------------------
+    // 与主体自身的 signatureMismatch 分开:那个说「这个 exe 的签名不对」,这个说
+    // 「这个 exe 的签名没问题,但它目录里有个模块签名后被改过」。
+    //
+    // 补的是一处实测漏检:一套 AOMEI 正规签名的 DigitalUnit.exe 放在
+    // C:\ProgramData\NVI_v4_arm64\,同目录 QtCore4.dll 是 HashMismatch(签名后被篡改),
+    // 外加一个 7.4MB 伪装成 router.json 的混淆载荷,靠计划任务每 19 分钟拉起。
+    // 因为白壳签名健康,TrustPolicy::isHealthySigned 在流水线第 9 步就放行,每次风险分只有 5;
+    // 而被篡改的那个 DLL 从未进入裁决 —— 内核的 ImageLoad 上报只覆盖 \Temp\ 与 \Users\Public\
+    // (刻意为之,防事件风暴),ProgramData 下的侧载看不见。
+    //
+    // 由 Worker::detectSideloadedTamperedModule 在富化阶段填写,ThreatDetector::analyze 消费。
+    // 同样【不能】直接写 riskScore / hasThreatIndicator —— 理由与上面攻击链那段完全一致。
+    // 运行时标记,不序列化。
+    QString tamperedModulePath;           // 非空 = 主体目录内存在「签名后被篡改」的模块
+
     QVector<ChainEventInfo> chainContext; // 进程链上下文
 
     // 记录一条结构化证据,并(默认)同步追加到 riskReasons 保持兼容。

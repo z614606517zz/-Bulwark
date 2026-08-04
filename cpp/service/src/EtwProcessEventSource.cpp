@@ -1,6 +1,7 @@
 #include "bulwark/service/EtwProcessEventSource.h"
 #include "bulwark/service/Logger.h"
 #include "bulwark/engine/DgaDomainAnalyzer.h" // SuspiciousOnly DNS 预过滤
+#include "bulwark/service/monitoring/ProcessInspector.h" // NetworkUntrustedOnly 主体验签(按 PID 记忆)
 
 #include <QTimer>
 #include <QMutex>
@@ -80,6 +81,47 @@ inline bool matchesWatch(const QString& target, const QStringList& watch) {
     for (const QString& w : watch)
         if (!w.isEmpty() && target.contains(w, Qt::CaseInsensitive))
             return true;
+    return false;
+}
+
+// 「往用户可写目录里新建了一个可执行体 / 脚本」—— 投递(dropper)最有辨识度的那一个动作。
+//
+// 为什么要单独一条判据、而不是往 fileWatch_ 里加目录:
+//   * fileWatch_ 是【纯子串】匹配,表达不了「在 \Temp\ 里 且 后缀是 .exe」。往里加
+//     "\Temp\" 会把每个程序的临时文件全量收进来 —— 那是真正的洪泛。
+//   * 而「新建可执行体/脚本」本身是极低频事件:空闲机器上每分钟个位数,安装器/更新器
+//     会有突发,但 EmitGate 的每进程每分钟上限已经压住了。
+// 这条判据补上的是本产品好几处能力的共同前提:攻击链的「往 Public / Temp 落文件」类标记
+// 原先只能靠驱动「偏移 0 写」的全局 1/32 采样(单次落盘约 1/32 概率被看到),而
+// Worker::maybeScanDroppedInstaller(落盘即扫 VT)同样挂在 FileWrite 上,一起形同虚设。
+inline bool isDroppedExecutable(const QString& path) {
+    static const QStringList kExt = {
+        QStringLiteral(".exe"), QStringLiteral(".dll"), QStringLiteral(".sys"),
+        QStringLiteral(".scr"), QStringLiteral(".cpl"), QStringLiteral(".ocx"),
+        QStringLiteral(".msi"), QStringLiteral(".msp"), QStringLiteral(".jar"),
+        QStringLiteral(".bat"), QStringLiteral(".cmd"), QStringLiteral(".ps1"),
+        QStringLiteral(".vbs"), QStringLiteral(".vbe"), QStringLiteral(".js"),
+        QStringLiteral(".jse"), QStringLiteral(".wsf"), QStringLiteral(".wsh"),
+        QStringLiteral(".hta"), QStringLiteral(".lnk"), QStringLiteral(".pif"),
+        QStringLiteral(".com"),
+    };
+    // 用户可写位置。\Users\ 一并覆盖 AppData / Downloads / Desktop / Public;
+    // 另加 ProgramData 与 \Windows\Temp\(服务与提权后的投递常落在那里)。
+    static const QStringList kDirs = {
+        QStringLiteral("\\Users\\"), QStringLiteral("\\ProgramData\\"),
+        QStringLiteral("\\Windows\\Temp\\"), QStringLiteral("\\Temp\\"),
+        QStringLiteral("\\PerfLogs\\"),
+    };
+    bool extOk = false;
+    for (const QString& x : kExt) {
+        if (path.endsWith(x, Qt::CaseInsensitive)) { extOk = true; break; }
+    }
+    if (!extOk)
+        return false;
+    for (const QString& d : kDirs) {
+        if (path.contains(d, Qt::CaseInsensitive))
+            return true;
+    }
     return false;
 }
 
@@ -172,6 +214,36 @@ struct EtwProcessEventSource::Impl {
 
     EtwOptions etw;
     quint32    selfPid = 0; // 跳过本进程 PID,避免自身 curl/查询造成噪声
+
+    // ---- Etw.NetworkUntrustedOnly:只上报「非可信签名主体」的外联 ----
+    //
+    // 该配置项此前只被解析、无人消费(名字承诺的过滤根本不存在,所有外联一律上报)。
+    // 现在生效,但绝不能按连接去验签 —— Authenticode 验签是重操作,而外联事件是高频流。
+    // 故按 PID 记忆:每个进程最多验一次,结果缓存复用。进程退出后 PID 可能复用,这里靠
+    // 「缓存超上限即整表清空」自然过期;误判的后果只是多上报/少上报一条遥测,不影响拦截
+    //(拦截由规则与情报链路决定,不依赖这条预过滤)。
+    QHash<quint32, bool> netTrustCache;   // pid -> 主体是否为可信签名
+    QMutex               netTrustMx;
+
+    bool actorIsTrustedSigned(quint32 pid) {
+        {
+            QMutexLocker lk(&netTrustMx);
+            const auto it = netTrustCache.constFind(pid);
+            if (it != netTrustCache.constEnd())
+                return it.value();
+        }
+        const QString path = monitoring::ProcessInspector::tryGetProcessImagePath(static_cast<int>(pid));
+        // 解析不出映像路径 -> 按【不可信】处理(照常上报)。宁可多上报一条,也不要因为拿不到
+        // 路径就把可能恶意的外联静默丢掉 —— 短命进程恰恰是最需要看到的那一类。
+        const bool trusted = !path.isEmpty() && monitoring::ProcessInspector::isSigned(path);
+        {
+            QMutexLocker lk(&netTrustMx);
+            if (netTrustCache.size() > 4096)
+                netTrustCache.clear();   // 有界 + 顺带让 PID 复用导致的陈旧条目过期
+            netTrustCache.insert(pid, trusted);
+        }
+        return trusted;
+    }
     EmitGate   netGate;
     EmitGate   dnsGate;
     EmitGate   regGate;
@@ -180,9 +252,14 @@ struct EtwProcessEventSource::Impl {
     QStringList fileWatch_;               // 文件监视集(受保护路径 + 硬拦;供后续文件源)
     QHash<quint64, QString> regKeyNames_; // KeyObject -> 键名(create/open 填充,仅 ETW 线程访问)
 
+    // 原始事件中继容量(appsettings 的 Etw.RawChannelCapacity)。此前该配置项只被解析、
+    // 无人消费,容量恒为编译期常量 kQueueMax —— 也就是说这个「可调」的旋钮是假的。
+    // 现在由它决定;<=0 或异常值回退到 kQueueMax。
+    int queueCap = kQueueMax;
+
     void enqueue(bulwark::SecurityEvent&& e) {
         QMutexLocker lock(&mutex);
-        if (queue.size() >= kQueueMax) return; // 满则丢弃,保护内存
+        if (queue.size() >= queueCap) return; // 满则丢弃,保护内存
         queue.push_back(std::move(e));
     }
 };
@@ -194,6 +271,10 @@ EtwProcessEventSource::EtwProcessEventSource(const EtwOptions& etw, QObject* par
     const qint64 dedupMs = static_cast<qint64>(std::max(0, etw.DedupWindowSeconds)) * 1000;
     d_->netGate.perMinCap     = etw.PerProcessNetPerMinute;
     d_->netGate.dedupWindowMs = dedupMs;
+    // 原始事件中继容量:夹到 [256, 65536],避免一个手抖的配置值让队列近乎无效或吃光内存。
+    d_->queueCap = (etw.RawChannelCapacity > 0)
+                       ? std::clamp(etw.RawChannelCapacity, 256, 65536)
+                       : kQueueMax;
     d_->dnsGate.perMinCap     = etw.PerProcessDnsPerMinute;
     d_->dnsGate.dedupWindowMs = dedupMs;
     d_->regGate.perMinCap     = etw.PerProcessRegPerMinute;
@@ -201,12 +282,21 @@ EtwProcessEventSource::EtwProcessEventSource(const EtwOptions& etw, QObject* par
     d_->fileGate.perMinCap     = etw.PerProcessFilePerMinute;
     d_->fileGate.dedupWindowMs = dedupMs;
 
+    // 把消费线程收集的事件搬到主线程。这个间隔是【空闲时第一条事件的延迟地板】,由
+    // Bulwark:EventDrainIntervalMs 统一控制(默认 20ms;原先硬编码 200ms)。突发时不受它影响:
+    // drain() 一次搬有上限的一批,还有积压就立刻再排一批,不等下一个 tick。
     drainTimer_ = new QTimer(this);
-    drainTimer_->setInterval(200); // 每 200ms 把消费线程收集的事件搬到主线程
+    drainTimer_->setInterval(kDefaultDrainMs);
     connect(drainTimer_, &QTimer::timeout, this, &EtwProcessEventSource::drain);
 }
 
 EtwProcessEventSource::~EtwProcessEventSource() { stop(); }
+
+void EtwProcessEventSource::setDrainIntervalMs(int ms) {
+    // 夹到 [1, 1000]:0 会让定时器每次事件循环空转都跑一遍,过大则等于把延迟又加回来。
+    if (drainTimer_)
+        drainTimer_->setInterval(qBound(1, ms, 1000));
+}
 
 void EtwProcessEventSource::setWatchLists(const QStringList& registryKeys, const QStringList& filePaths) {
     d_->regWatch_ = registryKeys;
@@ -282,6 +372,10 @@ void EtwProcessEventSource::start() {
                         const QString target = ipv4ToString(daddr) + QLatin1Char(':')
                             + QString::number(netToHostPort(dport)); // "ip:port",匹配情报 IP 规则 "ip*"
                         if (!impl->netGate.allow(pid, target, static_cast<qint64>(::GetTickCount64())))
+                            return;
+                        // NetworkUntrustedOnly:可信签名主体的外联不上报(压制正常软件的
+                        // 更新/心跳洪泛)。按 PID 记忆验签结果,不会每条连接都验一次。
+                        if (impl->etw.NetworkUntrustedOnly && impl->actorIsTrustedSigned(pid))
                             return;
                         bulwark::SecurityEvent e;
                         e.type     = bulwark::EventType::NetworkConnect;
@@ -403,10 +497,14 @@ void EtwProcessEventSource::start() {
             regOn = true;
         }
 
-        // (5) Kernel-File:受保护路径的新建/删除(可选)。keyword 0x1400 只投递 CreateNewFile(30)与
-        // DeletePath(26)——二者都直接带路径,无需关联,也排除了海量 open/read/write。仅上报命中监视集者。
-        // 空监视集(未配置受保护路径)=> 不上报任何文件事件。
-        if (impl->etw.Enabled && impl->etw.KernelFile && !impl->fileWatch_.isEmpty()) {
+        // (5) Kernel-File:受保护路径的新建/删除 + 用户可写目录下的可执行体投递(可选)。
+        // keyword 0x1400 只投递 CreateNewFile(30)与 DeletePath(26)——二者都直接带路径,无需关联,
+        // 也排除了海量 open/read/write。
+        //
+        // 【不再要求 fileWatch_ 非空】:原先空监视集就整个不开这个提供程序。现在回调里多了一条
+        // 与监视集无关的判据(isDroppedExecutable:往用户可写目录新建可执行体/脚本),那是投递
+        // 动作本身,不该因为「用户没配受保护路径」而看不到。
+        if (impl->etw.Enabled && impl->etw.KernelFile) {
             impl->fileProvider = std::make_unique<krabs::provider<>>(krabs::guid(kKernelFileGuid));
             impl->fileProvider->any(kKeywordFile);
             impl->fileProvider->add_on_event_callback(
@@ -433,8 +531,14 @@ void EtwProcessEventSource::start() {
                             path = deviceToDrive(QString::fromWCharArray(fpath.c_str()));
                             type = bulwark::EventType::FileDelete;
                         }
-                        if (!matchesWatch(path, impl->fileWatch_))
-                            return; // 仅上报命中受保护路径者(避免全量文件事件洪泛)
+                        // 两条放行判据(其一即可):
+                        //   1) 命中受保护路径监视集 —— 原有语义,覆盖启动目录 / hosts / \Tasks\ 等;
+                        //   2) 【新建】了用户可写目录下的可执行体 / 脚本 —— 投递动作本身。
+                        // 第 2 条只对 CreateNewFile 生效:删除一个 exe 不是投递,按原有监视集判就够了,
+                        // 放开会把卸载器 / 更新器的清理动作大量收进来。
+                        if (!matchesWatch(path, impl->fileWatch_)
+                            && !(id == kFileCreateNew && isDroppedExecutable(path)))
+                            return; // 仅上报受保护路径 + 可执行体投递(避免全量文件事件洪泛)
 
                         const uint32_t pid = record.EventHeader.ProcessId;
                         if (pid == 0 || pid == impl->selfPid)

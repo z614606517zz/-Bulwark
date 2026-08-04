@@ -58,7 +58,7 @@ ScoreResult EgressRateMonitor::observe(const SecurityEvent& e) {
     if (e.type != EventType::NetworkConnect || e.actorPid <= 0) return r;
 
     const QString remote = normalizeRemote(e.target);
-    const QDateTime now = e.timestampUtc.isValid() ? e.timestampUtc : QDateTime::currentDateTimeUtc();
+    const QDateTime now = e.timestampUtc.isValid() ? e.timestampUtc : nowUtc();
     int score = 0;
 
     QMutexLocker locker(&gate_);

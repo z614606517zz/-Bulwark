@@ -173,31 +173,88 @@ BlwMatchInListCtx(
 }
 
 //
+// 把一条「未必以 NUL 结尾」的模式串安全地打进调试输出。
+// %wZ 按 UNICODE_STRING::Length 打印,不需要结尾 NUL,正好匹配 (Path, Chars) 这种传参形式。
+//
+static void
+BlwLogPattern(_In_ PCSTR Reason, _In_opt_ PCWSTR Path, _In_ USHORT Chars)
+{
+    UNICODE_STRING s;
+
+    if (Path == NULL || Chars == 0 || Chars >= BLW_MAX_PATH) {
+        RtlInitUnicodeString(&s, L"<invalid>");
+    } else {
+        s.Buffer = (PWCH)Path;
+        s.Length = (USHORT)(Chars * sizeof(WCHAR));
+        s.MaximumLength = s.Length;
+    }
+
+    KdPrint(("[Bulwark] %s: %wZ\n", Reason, &s));
+
+    // Release 构建里 KdPrint 是空宏,这两行避免 C4100/C4189(/WX 下会直接编译失败)。
+    UNREFERENCED_PARAMETER(Reason);
+    UNREFERENCED_PARAMETER(s);
+}
+
+//
 // 向 List 追加一项。调用方需自行持锁。
 // 模式串在此【大写化一次】后存入(见 BLW_PROTECTED_PATH 的存储约定),使热路径上的匹配
 // 不必再做任何大小写归一化。
 //
+// 先去重,再插入 —— 这一点是必需的,不是优化:
+//   各名单都是 BLW_MAX_PROTECTED(64)条的【定长】数组,而「已学习裁决」会在每次服务连接时
+//   整批重新下发一遍,命中时还会再下发一次。原实现只找第一个空槽就插入,于是同一条路径能
+//   重复占掉几十个槽。真实现场:FileNoLoad 里 AUTOIT3.EXE 重复 11 次、64 个槽全部用尽,
+//   FileExecBlock 里同一个 RuntimeBroker.exe 重复 4 次。
+//   槽位一旦耗尽,下面的循环找不到空槽就静默返回,【此后所有新的恶意裁决都被丢弃】——
+//   这是无声的能力退化,比多占一点内存严重得多。
+//   重复项对匹配结果毫无影响(子串匹配命中任一条即返回),所以去重是纯收益。
+//
 void
 BlwAddToList(_In_ BLW_PROTECTED_PATH* List, _In_ PCWSTR Path, _In_ USHORT Length)
 {
-    ULONG i;
+    ULONG  i;
+    ULONG  freeSlot = BLW_MAX_PROTECTED;   // == BLW_MAX_PROTECTED 表示没有空槽
+    USHORT k;
 
     if (Length == 0 || Length > (BLW_MAX_PATH - 1)) {
         return;
     }
 
+    // 一趟扫完:既找重复项,也记下第一个空槽。
     for (i = 0; i < BLW_MAX_PROTECTED; i++) {
         if (!List[i].InUse) {
-            USHORT k;
-            for (k = 0; k < Length; k++) {
-                List[i].Path[k] = BlwUpcaseChar(Path[k]);
+            if (freeSlot == BLW_MAX_PROTECTED) {
+                freeSlot = i;
             }
-            List[i].Path[Length] = L'\0';
-            List[i].Length = Length;
-            List[i].InUse = TRUE;
-            break;
+            continue;
+        }
+        if (List[i].Length != Length) {
+            continue;
+        }
+        // List[i].Path 已是大写形式,故与大写化后的候选逐字符比较即为大小写不敏感比较。
+        for (k = 0; k < Length; k++) {
+            if (List[i].Path[k] != BlwUpcaseChar(Path[k])) {
+                break;
+            }
+        }
+        if (k == Length) {
+            return;   // 已在名单里:不再占用第二个槽
         }
     }
+
+    if (freeSlot == BLW_MAX_PROTECTED) {
+        // 名单已满。明确记录下来,不让「裁决被丢弃」这件事无声发生。
+        BlwLogPattern("List full, entry DROPPED", Path, Length);
+        return;
+    }
+
+    for (k = 0; k < Length; k++) {
+        List[freeSlot].Path[k] = BlwUpcaseChar(Path[k]);
+    }
+    List[freeSlot].Path[Length] = L'\0';
+    List[freeSlot].Length = Length;
+    List[freeSlot].InUse = TRUE;
 }
 
 //
@@ -322,6 +379,145 @@ BlwFileIsSelfGuarded(_In_ PBLW_MATCH_CTX Ctx)
 }
 
 //
+// ===== 系统映像护栏:「禁止执行 / 禁止加载」两份名单的准入校验 =====
+//
+// 真实事故:一次「确认恶意」的裁决把 actor 的映像路径钉进了 FileExecBlock,而那个 actor 是
+// cmd.exe —— 真正的恶意行为是一个 .bat 借 cmd.exe 去跑危险命令。由于本驱动的名单按【去盘符、
+// 大小写不敏感的子串】匹配,`\WINDOWS\SYSTEM32\CMD.EXE` 这一条的实际语义是「禁止任何 cmd.exe
+// 启动」:所有 .bat/.cmd 脚本、绝大多数安装包与编译脚本全部起不来。又因为基线会被写回注册表,
+// 杀服务、重装服务、重启全都救不回来 —— 只能手工改注册表。netsh.exe 也被同样钉过一次。
+//
+// 架构上早有定论(见 BlwCreateProcessNotifyEx 里命令行硬拦那段注释):System32 里那些【本体
+// 可信、常被借用】的 LOLBin,要拦的是「那一次用法」,归 CmdHardBlock(命令行 token 合取匹配)
+// 管;绝不能用 FileExecBlock 去拦「那个程序本身」。本函数把这条约定落成代码里的准入校验。
+//
+// 判据(精确,不过度):仅当待加入的模式串会【连带命中真实的系统二进制】时才拒绝 —— 也就是
+// 该模式串是下表某条完整路径的子串。于是:
+//     `\WINDOWS\SYSTEM32\CMD.EXE`、`\SYSTEM32\CMD.EXE`、`\CMD.EXE`  -> 拒绝(会挡住真 cmd)
+//     `\USERS\X\APPDATA\LOCAL\TEMP\CMD.EXE`                        -> 放行(伪装成 cmd 的样本,
+//                                                                     按子串匹配挡不到真 cmd)
+// 即:「误封系统组件」被堵死,而「拦截改名成系统程序名的样本」这个能力一点没丢。
+// 附带好处:荒谬的超短模式(如单个字符)必然是某条系统路径的子串,也会在此被拒 —— 那种模式
+// 等于「禁止一切程序启动」。
+//
+// 另注:关键系统进程还有一道运行时防 BugCheck 0xEF 的护栏(exec-block 判定处的 !critical,
+// 见 BlwIsCriticalSystemProcess)。这里是更早的一道 —— 根本不让它们进名单,连带把「进了名单
+// 还要被写回注册表」的持久化污染一并挡住。
+//
+// 本表只用于【拒绝执行 / 拒绝加载】两份名单的准入,绝不可用于 ProtectedPaths / FileHardBlock:
+// 那两份是【保护】语义(阻止别人改写 sethc.exe 之类),里面本来就该有系统路径。
+//
+// 表中每条必须是【大写、去盘符】的完整路径:比较时候选串会被大写化,表侧不再做归一化。
+//
+#define BLW_SYS_BOTH(n)  L"\\WINDOWS\\SYSTEM32\\" n, L"\\WINDOWS\\SYSWOW64\\" n
+
+static const PCWSTR kBlwSystemImages[] = {
+    // --- 脚本宿主 / 命令解释器:拦住等于禁掉一整类脚本、安装包与编译脚本 ---
+    BLW_SYS_BOTH(L"CMD.EXE"),
+    BLW_SYS_BOTH(L"WSCRIPT.EXE"),
+    BLW_SYS_BOTH(L"CSCRIPT.EXE"),
+    BLW_SYS_BOTH(L"MSHTA.EXE"),
+    L"\\WINDOWS\\SYSTEM32\\WINDOWSPOWERSHELL\\V1.0\\POWERSHELL.EXE",
+    L"\\WINDOWS\\SYSWOW64\\WINDOWSPOWERSHELL\\V1.0\\POWERSHELL.EXE",
+
+    // --- 其余 LOLBin:滥用归 CmdHardBlock 按「用法」拦,本体绝不禁止执行 ---
+    BLW_SYS_BOTH(L"RUNDLL32.EXE"),
+    BLW_SYS_BOTH(L"REGSVR32.EXE"),
+    BLW_SYS_BOTH(L"NETSH.EXE"),
+    BLW_SYS_BOTH(L"CERTUTIL.EXE"),
+    BLW_SYS_BOTH(L"BITSADMIN.EXE"),
+    BLW_SYS_BOTH(L"SCHTASKS.EXE"),
+    BLW_SYS_BOTH(L"MSIEXEC.EXE"),
+    BLW_SYS_BOTH(L"REG.EXE"),
+    BLW_SYS_BOTH(L"SC.EXE"),
+    BLW_SYS_BOTH(L"WMIC.EXE"),
+    BLW_SYS_BOTH(L"VSSADMIN.EXE"),
+    BLW_SYS_BOTH(L"BCDEDIT.EXE"),
+    BLW_SYS_BOTH(L"WBADMIN.EXE"),
+    BLW_SYS_BOTH(L"FORFILES.EXE"),
+
+    // --- 关键系统进程:拦住 = CRITICAL_PROCESS_DIED(0xEF)/ 系统起不来 ---
+    BLW_SYS_BOTH(L"SVCHOST.EXE"),
+    L"\\WINDOWS\\SYSTEM32\\SMSS.EXE",
+    L"\\WINDOWS\\SYSTEM32\\CSRSS.EXE",
+    L"\\WINDOWS\\SYSTEM32\\WININIT.EXE",
+    L"\\WINDOWS\\SYSTEM32\\WINLOGON.EXE",
+    L"\\WINDOWS\\SYSTEM32\\SERVICES.EXE",
+    L"\\WINDOWS\\SYSTEM32\\LSASS.EXE",
+    L"\\WINDOWS\\SYSTEM32\\LSAISO.EXE",
+    L"\\WINDOWS\\SYSTEM32\\FONTDRVHOST.EXE",
+    L"\\WINDOWS\\SYSTEM32\\DWM.EXE",
+    L"\\WINDOWS\\SYSTEM32\\CONHOST.EXE",
+    L"\\WINDOWS\\SYSTEM32\\DLLHOST.EXE",
+    L"\\WINDOWS\\SYSTEM32\\TASKHOSTW.EXE",
+    L"\\WINDOWS\\SYSTEM32\\SPOOLSV.EXE",
+    L"\\WINDOWS\\SYSTEM32\\WERFAULT.EXE",
+    L"\\WINDOWS\\EXPLORER.EXE",
+
+    // --- 核心运行库:禁止加载会让几乎所有进程都起不来 ---
+    BLW_SYS_BOTH(L"NTDLL.DLL"),
+    BLW_SYS_BOTH(L"KERNEL32.DLL"),
+    BLW_SYS_BOTH(L"KERNELBASE.DLL"),
+    BLW_SYS_BOTH(L"USER32.DLL"),
+    BLW_SYS_BOTH(L"ADVAPI32.DLL"),
+    BLW_SYS_BOTH(L"MSVCRT.DLL"),
+    BLW_SYS_BOTH(L"UCRTBASE.DLL"),
+    BLW_SYS_BOTH(L"COMBASE.DLL"),
+    BLW_SYS_BOTH(L"OLE32.DLL"),
+    BLW_SYS_BOTH(L"RPCRT4.DLL"),
+    BLW_SYS_BOTH(L"SECHOST.DLL"),
+    BLW_SYS_BOTH(L"GDI32.DLL"),
+    BLW_SYS_BOTH(L"SHELL32.DLL"),
+    BLW_SYS_BOTH(L"WS2_32.DLL"),
+    BLW_SYS_BOTH(L"CRYPT32.DLL"),
+    BLW_SYS_BOTH(L"BCRYPT.DLL"),
+    BLW_SYS_BOTH(L"BCRYPTPRIMITIVES.DLL"),
+};
+
+//
+// 模式串是否会连带命中某条真实的系统映像路径(判据见上)。
+//
+// 只在「配置下发 / 基线载入」路径上调用(PASSIVE_LEVEL,频率极低,一次几十条),因此直接朴素
+// 逐条滑窗扫描,不引入任何预处理或额外分配;不要求 Pattern 以 NUL 结尾。
+//
+static BOOLEAN
+BlwPatternHitsSystemImage(_In_opt_ PCWSTR Pattern, _In_ USHORT Chars)
+{
+    ULONG i;
+
+    if (Pattern == NULL || Chars == 0) {
+        return FALSE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(kBlwSystemImages); i++) {
+        PCWSTR sys = kBlwSystemImages[i];
+        USHORT sysChars = 0;
+        USHORT s;
+
+        while (sys[sysChars] != L'\0') {
+            sysChars++;
+        }
+        if (Chars > sysChars) {
+            continue;   // 模式比系统路径长,不可能是它的子串
+        }
+
+        for (s = 0; (USHORT)(s + Chars) <= sysChars; s++) {
+            USHORT k;
+            for (k = 0; k < Chars; k++) {
+                // 表侧已是大写,候选逐字符大写化 -> 等价于大小写不敏感比较。
+                if (sys[s + k] != BlwUpcaseChar(Pattern[k])) {
+                    break;
+                }
+            }
+            if (k == Chars) {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+//
 // ===== 「禁止加载」模块名单管理(命中且执行/映射意图打开即拒绝)=====
 //
 
@@ -337,6 +533,12 @@ BlwClearFileNoLoad(void)
 void
 BlwAddFileNoLoad(_In_ PCWSTR Path, _In_ USHORT Length)
 {
+    // 准入校验:禁止加载核心运行库(ntdll/kernel32/...)等于让系统上几乎所有进程都起不来。
+    if (BlwPatternHitsSystemImage(Path, Length)) {
+        BlwLogPattern("NoLoad entry REJECTED (would block a system image)", Path, Length);
+        return;
+    }
+
     ExAcquireFastMutex(&g_Blw.FileNoLoadLock);
     BlwAddToList(g_Blw.FileNoLoad, Path, Length);
     {
@@ -379,6 +581,13 @@ BlwClearFileExecBlock(void)
 void
 BlwAddFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length)
 {
+    // 准入校验:绝不收录会连带挡住系统组件的模式(cmd.exe / netsh.exe 那次事故就是这么来的)。
+    // LOLBin 的滥用请走 CmdHardBlock —— 那才是按「用法」拦、而不是按「程序」拦的地方。
+    if (BlwPatternHitsSystemImage(Path, Length)) {
+        BlwLogPattern("ExecBlock entry REJECTED (would block a system image)", Path, Length);
+        return;
+    }
+
     ExAcquireFastMutex(&g_Blw.FileExecBlockLock);
     BlwAddToList(g_Blw.FileExecBlock, Path, Length);
     {
@@ -640,12 +849,22 @@ BlwPreCreate(
     // 2) 受保护路径(原逻辑):仅针对 delete-on-close 的删除意图。命中即拒绝。
     //    受保护路径是用户态显式下发的高价值反篡改目标(SAM/hosts/sethc/启动项/任务计划等)。
     //
-    if (needProtCheck && BlwPathIsProtected(&ctx)) {
-        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        Data->IoStatus.Information = 0;
-        BlwReportFileBlock(BlwEventFileDelete, &nameInfo->Name);  // 异步记录,不阻塞
-        FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_COMPLETE;   // 拒绝该操作
+    //    对本产品自身受保护进程豁免 —— 与自保足迹、以及 BlwPreSetInformation 里的同名判定
+    //    保持同一口径。ProtectedPaths 含 "\START MENU\PROGRAMS\STARTUP\" 这类宽目录,不豁免
+    //    就等于连产品自己的足迹清理都删不掉启动目录里的恶意持久化项(详见 BlwPreSetInformation
+    //    处那段说明)。外部进程照旧一律拒绝。
+    //
+    if (needProtCheck) {
+        if (actorPid == 0) {
+            actorPid = HandleToULong(PsGetCurrentProcessId());   // 前面几处判定都没取过才取
+        }
+        if (!BlwPidIsProtected(actorPid) && BlwPathIsProtected(&ctx)) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            BlwReportFileBlock(BlwEventFileDelete, &nameInfo->Name);  // 异步记录,不阻塞
+            FltReleaseFileNameInformation(nameInfo);
+            return FLT_PREOP_COMPLETE;   // 拒绝该操作
+        }
     }
 
     //
@@ -748,14 +967,45 @@ BlwPreSetInformation(
         }
     }
 
+    //
     // 本地裁决:命中文件硬拦截名单 或 受保护路径,即直接拦截删除标记/重命名,不发同步 IPC。
-    if ((g_Blw.FileHardCount > 0 && BlwFileIsHardBlocked(&ctx)) ||
-        (g_Blw.ProtectedPathCount > 0 && BlwPathIsProtected(&ctx))) {
+    //
+    // 【受保护路径对本产品自身进程豁免】—— 与上面自保足迹那条同一口径(owner-aware)。
+    //
+    // 为什么必须豁免:ProtectedPaths 是【宽目录子串】,里面有 "\START MENU\PROGRAMS\STARTUP\"
+    // 这类目录。原实现在这里不看发起方,于是「删除启动目录里的任何文件」对【所有人】都被拒绝,
+    // 包括本产品自己的足迹清理(ThreatRemediator)。后果是:恶意软件往启动目录投个持久化项,
+    // 产品能检测、能告警、却永远清不掉它 —— 防篡改把自己的处置能力一起锁死了。
+    //
+    // 实测(本轮现场):一套「白加黑」侧载(签名壳 DigitalUnit.exe + 被篡改的 QtCore4.dll)
+    // 经 BITS 每 19 分钟往启动目录投一个快捷方式,累计 14 个;连 BITS 自己的临时文件清理都被
+    // 这条拦住,所以它们只堆积、不消失。人工清理也不行,只能先把驱动停掉 —— 这与产品原则
+    // 「始终保留正常的、用户可驱动的处置路径」直接冲突。
+    //
+    // 豁免只给 BlwPidIsProtected(本产品服务 / UI,由用户态在连接时下发 PID),范围与自保足迹
+    // 完全一致。外部进程(含勒索)对受保护路径的删除/改名照旧一律拒绝,防篡改强度不变。
+    //
+    // 文件硬拦截名单(FileHardBlock)【不】给豁免:它的语义是「这个文件绝不允许被改一次」
+    //(hosts / sethc.exe / SAM …),是精确条目而非宽目录,产品自身也没有改它们的正当理由。
+    //
+    if (g_Blw.FileHardCount > 0 && BlwFileIsHardBlocked(&ctx)) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
         BlwReportFileBlock(eventType, &nameInfo->Name);  // 异步记录,不阻塞
         FltReleaseFileNameInformation(nameInfo);
         return FLT_PREOP_COMPLETE;
+    }
+    if (g_Blw.ProtectedPathCount > 0) {
+        if (actorPid == 0) {
+            actorPid = HandleToULong(PsGetCurrentProcessId());   // 前面两处判定都没取过才取
+        }
+        if (!BlwPidIsProtected(actorPid) && BlwPathIsProtected(&ctx)) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            BlwReportFileBlock(eventType, &nameInfo->Name);  // 异步记录,不阻塞
+            FltReleaseFileNameInformation(nameInfo);
+            return FLT_PREOP_COMPLETE;
+        }
     }
 
     //
@@ -832,9 +1082,15 @@ BlwPreSetInformation(
                 if (!deny && g_Blw.FileHardCount > 0 && BlwFileIsHardBlocked(&ctx)) {
                     deny = TRUE;
                 }
-                if (!deny && replaceIfExists &&
-                    g_Blw.ProtectedPathCount > 0 && BlwPathIsProtected(&ctx)) {
-                    deny = TRUE;
+                // 受保护路径同样对本产品自身进程豁免(与源名判定处、以及 BlwPreCreate
+                // 保持同一口径):否则产品的足迹清理连「把恶意启动项改名搬走」都做不到。
+                if (!deny && replaceIfExists && g_Blw.ProtectedPathCount > 0) {
+                    if (actorPid == 0) {
+                        actorPid = HandleToULong(PsGetCurrentProcessId());
+                    }
+                    if (!BlwPidIsProtected(actorPid) && BlwPathIsProtected(&ctx)) {
+                        deny = TRUE;
+                    }
                 }
 
                 if (deny) {

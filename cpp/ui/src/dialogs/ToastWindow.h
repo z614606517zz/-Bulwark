@@ -26,15 +26,22 @@ class ToastWindow : public QWidget
 {
     Q_OBJECT
 public:
-    enum class Kind { Block, AiScan, Info };
+    // AttackChain 单独一档而不是复用 Block:它表达的是「若干动作凑成了已知恶意组合」,
+    // 处置可能是拦截、询问、也可能是放行(静默模式降级)。用 Block 的红色 + "已拦截" 措辞
+    // 会在放行的情况下变成谎报。
+    enum class Kind { Block, AiScan, Info, AttackChain };
 
     // `subtitle` is a small line under the heading ("磐垒已自动处置,无需操作").
     // `detail` is a single free-text line (AI-scan / info toasts). `fields` are
     // structured 标签:值 rows (block toast: 来源/程序/行为/目标). Pass whichever
     // fits the kind; empty ones are simply skipped.
+    // `badgeText` 覆盖右上角那枚徽标的文字。攻击链要用它如实写出处置
+    //(已拦截 / 已询问 / 已放行)—— 处置由数据决定,不由种类决定。
+    // 放在参数表末尾并给默认值,现有调用点不必改。
     ToastWindow(Kind kind, const QString& heading, const QString& subtitle,
                 const QString& detail, const QList<ToastField>& fields,
-                const QStringList& tags, int lifetimeMs, QWidget* parent = nullptr);
+                const QStringList& tags, int lifetimeMs, QWidget* parent = nullptr,
+                const QString& badgeText = QString());
 
     // Move to `topLeft`. The first call fades the toast in at that spot; later
     // calls slide it (used when the stack re-flows as toasts come and go).

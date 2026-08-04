@@ -1,0 +1,15 @@
+[Unit]
+Description=Rebuild Bulwark attack-chain pattern library daily
+
+[Timer]
+# 每天北京时间 00:00 重新挖组合(此时已积累一整天的每小时采集结果,且是访问低谷)。
+# 显式写 Asia/Shanghai 而不是换算成 UTC:服务器本身是 UTC 时区,写死 16:00 UTC 虽等价,
+# 但日后看不出意图、也容易在改动时算错。systemd 255 支持 OnCalendar 带时区。
+OnCalendar=*-*-* 00:00:00 Asia/Shanghai
+# 客户端在北京时间 06:00 来取,这里留出充足余量;顺带把并发错峰。
+RandomizedDelaySec=600
+# 关机/重启错过的那次开机后补跑,避免特征库停更。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

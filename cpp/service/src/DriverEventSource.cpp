@@ -14,6 +14,7 @@
 #include <QFileInfo>
 
 #include <atomic>
+#include <new>      // placement new(护栏里原地重置非法的 chainContext)
 #include <thread>
 #include <vector>
 
@@ -31,9 +32,6 @@
 // 直接复用内核驱动的协议头(单一事实来源:内核与用户态用同一份结构体定义,
 // 彻底消除 .NET DriverStructs 那层手工重声明的内存布局漂移风险)。
 #include "Protocol.h"
-
-// 服务创建「真凶」溯源(SCM 代写服务键时还原真实发起者)。
-#include "bulwark/service/ServiceControlTracer.h"
 
 namespace bulwark::service {
 
@@ -239,21 +237,135 @@ struct DriverEventSource::Impl {
     QSet<int> protectedPids;   // 自我保护:本服务 + UI 等
     QSet<int> pendingPids;     // 连接前排队的受保护 PID
     QSet<QString> memProtNames;// 内存防护(反注入)目标进程名(小写),空=未启用
-    QSet<QString> credProtNames;// 凭据保护(反转储)目标进程名(小写,硬编 lsass.exe;始终启用)
+    QSet<QString> credProtNames;// 凭据保护(反转储)目标进程名(小写,内置 lsass.exe)
+    // 内存防护总开关(RuntimeSettings::memoryProtectionEnabled)。false 时 initMemoryProtection
+    // 只清空内核两份 PID 集就返回,readLoop 的增量登记也一并跳过 —— 见 initMemoryProtection 里
+    // 关于「这个开关此前在服务端从未被读取」的说明。默认 true,与 RuntimeSettings 的默认值一致。
+    bool memProtEnabled = true;
 
     static constexpr int kQueueMax = 4096;
     Logger log{QStringLiteral("bulwark.service.Driver")};
 
+    // ===== 出队前的完整性护栏(见 drain() 里的说明)=====
+    //
+    // 判断事件的 chainContext 是否处于「Qt 不可能产生」的状态。只读原始字节,绝不解引用。
+    // QArrayDataPointer<T> 的布局是 { Data* d; T* ptr; qsizetype size; }(已对 Qt 6.8 源码核对)。
+    // 【必须用 volatile】。否则 /O2 下编译器会「知道」这个 QList 刚默认构造完、d 必为
+    // nullptr,从而把整个判断常量折叠成 false —— 检查被整段消掉,根本不去读内存。
+    // 这一点是实测踩到的:插了 7 个检查点全不命中,而析构函数(经过不可内联的 enqueue 之后
+    // 必须真读内存)却读到了非法值。volatile 强制每次都真正从内存加载。
+    static bool chainLooksCorrupt(const bulwark::SecurityEvent& e) {
+        const volatile quintptr* raw =
+            reinterpret_cast<const volatile quintptr*>(&e.chainContext);
+        const quintptr d = raw[0];
+        const quintptr ptr = raw[1];
+        const qsizetype size = static_cast<qsizetype>(raw[2]);
+        //
+        // Qt 6 下 QList 的合法状态只有三种:
+        //   { 0, 0, 0 }              默认构造 / 被移走
+        //   { d!=0, ptr!=0, size>=0 } 正常持有分配(clear() 后 size 归零但 d/ptr 保留,合法)
+        //   { 0,    ptr!=0, size>=0 } fromRawData(不持有分配)
+        // 于是「非法」等价于:size 为负,或者【没有数据指针却声称有 d 或有长度】。
+        //
+        // 原判据是 `d != 0 && (ptr == 0 || size < 0)`,漏掉了 { d==0, ptr==0, size>0 } ——
+        // 而那正是崩溃栈里的形态:copyAppend 拿 ptr(=0)当源起点去拷 size 个元素,
+        // ChainEventInfo 的 QDateTime 构造读 [rdx] 时 rdx=0 直接访问违规。
+        // 也就是说旧护栏能挡住实测记录到的 {0x850,0,0},却挡不住真正让进程死掉的那一种。
+        if (size < 0)
+            return true;
+        if (ptr == 0)
+            return d != 0 || size != 0;
+        return false;
+    }
+
+
+
+    // 把处于非法状态的 chainContext 原地重置为「空」。
+    // 用 placement-new 而非赋值/clear():后两者会先析构旧值,那会去 deref 那个坏 d 直接崩。
+    // d 本身不是真实分配(ptr/size 都是 0),所以跳过析构不泄漏任何东西。
+    static void resetChainContext(bulwark::SecurityEvent& e) {
+        new (&e.chainContext) QVector<bulwark::ChainEventInfo>();
+    }
+
     void enqueue(bulwark::SecurityEvent&& e) {
+        // 入队是唯一的写入口,所以护栏放在这里:队列里【永远】不存在非法 chainContext 的事件。
+        //
+        // 这条不变量是必须的,原因在崩溃转储里:
+        //   ~SecurityEvent -> QArrayDataPointer<ChainEventInfo>::deref
+        //   -> lock xadd dword ptr [0x850]        访问违规 c0000005
+        //   <- QList<SecurityEvent>::clear <- DriverEventSource::stop
+        // 也就是说,只要有一条坏事件【留在队列里】,任何销毁整队的动作(停机 clear())都会
+        // 把进程打死 —— 而 SCM 看到的就是「服务意外停止」。原先只在 drain() 出队时修,
+        // 停机路径上的 clear() 完全没有保护,那正是实测反复崩掉的那一处。
+        //
+        // buildAndQueue 里已经检出过非法态却只写日志、照旧入队(那份诊断保留,用于定位写坏它
+        // 的真凶),这里做真正的修复:重置为空表再入队。chainContext 本来就由 Worker 在富化
+        // 阶段重建(e.chainContext = chain_.buildContext(e)),内核事件从不携带它,置空不丢信息。
+        if (chainLooksCorrupt(e))
+            resetChainContext(e);
         QMutexLocker lock(&queueMutex);
         if (queue.size() >= kQueueMax) return; // 满则丢弃(遥测可丢,稳定性优先)
         queue.push_back(std::move(e));
     }
 
+    // 清空队列。调用方必须已持有 queueMutex。
+    // 直接 queue.clear() 会逐个析构元素,若有元素带着坏 d 指针就是一次访问违规;入队护栏已
+    // 保证不该出现,但停机是「绝不能崩」的路径(崩了就变成 SCM 眼里的意外停止 + 转储 + 不再
+    // 自动拉起),所以这里再兜一层:先把非法态就地改回空表,再销毁。
+    void clearQueueLocked() {
+        for (auto& e : queue) {
+            if (chainLooksCorrupt(e))
+                resetChainContext(e);
+        }
+        queue.clear();
+    }
+
+    //
+    // ============ 内核能力探测(补协议版本号刻意锁死留下的盲区)============
+    //
+    // 协议自 v9 起【刻意不再升版本号】,理由写在 Protocol.h:v9 之后新增的命令
+    // (BANNED 26/27、SELFGUARD 28/29、CMDBLOCK 30/31)全部复用现有 BLW_CONFIG_MESSAGE,
+    // 三个握手校验结构体的大小一个字节都没变,所以升到 v10 只会让已部署的 v9 服务/驱动因
+    // 版本不符而【整体降级为不拦截】—— 那比"少认识两个命令"严重得多。这个决定是对的。
+    //
+    // 但它留下一个盲区:陈旧的 v9 驱动【一定能通过握手】,而新命令会被它的 default 分支
+    // 以 STATUS_INVALID_PARAMETER 拒掉。原实现只在 sendConfig 里打一条 warning 就继续,
+    // 没有任何汇总 —— 净结果是日志写着「协议握手通过(ver=9)」、UI 显示「内核驱动已连接 ·
+    // 行为前拦截」,而【已封禁主体全维拦截、owner-aware 自保护足迹、命令行硬拦】三项
+    // 静默不存在。其中命令行硬拦正是反勒索最关键的一环(`vssadmin delete shadows` 的
+    // 执行前阻断),它没了却不报,是最不能接受的一类失效。
+    //
+    // 所以这里按维度记录每类新命令是否被内核受理,并在连接完成时汇总;缺失项经
+    // missingCapabilities() 上报到设置页的内核状态文字,不再谎称「行为前拦截」全都在。
+    //
+    // 探测手法刻意选了【零副作用】的调用,而不是加新的命令:
+    //   * ADD_BANNED 传 Pid=4 —— 内核 BlwAddBannedPid 的硬护栏 `if (Pid <= 4) return;`
+    //     会直接返回,什么都不做,但命令分发照常走到 case 分支并回 STATUS_SUCCESS;
+    //   * ADD_EXECBLOCK 传空路径 —— Comms.c 的 `if (cfg.PathLength > 0 && ...)` 不成立,
+    //     不会往名单里加任何东西,同样回 STATUS_SUCCESS。
+    //     (【绝不能】改用 CLEAR_EXECBLOCK 来探测:那会在每次连接时清空内核写回注册表的
+    //      「已学习裁决」名单,把跨重启续拦这个核心性质毁掉。)
+    //   * 其余几类直接复用本来就要发的 CLEAR_* 命令的返回值,不额外发包。
+    //
+    struct Capabilities {
+        bool banned = false;         // BLW_CMD_*_BANNED(26/27):情报确认即全维封杀
+        bool selfGuard = false;      // BLW_CMD_*_SELFGUARD(28/29):owner-aware 自保护足迹(反勒索)
+        bool cmdHardBlock = false;   // BLW_CMD_*_CMDBLOCK(30/31):命令行硬拦(执行前阻断危险命令)
+        bool execBlock = false;      // BLW_CMD_*_EXECBLOCK(22/23):执行前拦截恶意映像
+        bool credProt = false;       // BLW_CMD_*_CREDPROT(24/25):凭据反转储(剥 lsass 的 VM_READ)
+        bool memProt = false;        // BLW_CMD_*_MEMPROT(14/15):反注入
+        bool fileTelemetry = false;  // BLW_CMD_SET_FILETELEMETRY(18):勒索时序聚合的数据源
+    };
+    Capabilities caps;
+    QStringList missingCapabilities() const;   // 人类可读的缺失维度清单(空 = 全部就绪)
+    void logCapabilitySummary() const;
+
     // ---- 实现细节(全部定义在本 .cpp,不出现在头文件)----
     bool connectPort();   // FilterConnectCommunicationPort(带短重试:load 后端口可能略滞后)
     bool handshake();     // 协议握手:校验版本 + 三个关键结构体大小一致,不一致拒绝拦截
-    void sendConfig(ULONG command, const QString& path = QString(),
+    // 返回内核是否【受理】了该命令。旧驱动不认新命令时回 STATUS_INVALID_PARAMETER,
+    // 据此按维度判定能力缺失(见上方 Capabilities 的说明)。
+    bool sendConfig(ULONG command, const QString& path = QString(),
                     ULONG pid = 0, ULONG blockIp = 0, USHORT blockPort = 0);
     void pushInitialConfig();   // 连接后下发受保护路径/键、硬拦名单、命令行硬拦、黑名单、自保 PID、文件遥测
     void initMemoryProtection();// 反注入 + 凭据反转储:登记目标进程名集合 + 现存匹配 PID
@@ -346,8 +458,8 @@ bool DriverEventSource::Impl::handshake() {
     return true;
 }
 
-void DriverEventSource::Impl::sendConfig(ULONG command, const QString& path,
-                                         ULONG pid, ULONG blockIp, USHORT blockPort) {
+bool DriverEventSource::Impl::sendConfig(ULONG command, const QString& path,
+                                        ULONG pid, ULONG blockIp, USHORT blockPort) {
     BLW_CONFIG_MESSAGE cfg;
     ZeroMemory(&cfg, sizeof(cfg));
     cfg.Command = command;
@@ -363,12 +475,45 @@ void DriverEventSource::Impl::sendConfig(ULONG command, const QString& path,
     cfg.Path[copied] = L'\0';
 
     QMutexLocker lock(&portMutex);
-    if (port == nullptr) return;
+    if (port == nullptr) return false;
     DWORD returned = 0;
     const HRESULT hr = ::FilterSendMessage(port, &cfg, sizeof(cfg), nullptr, 0, &returned);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
         log.warning(QStringLiteral("FilterSendMessage(config=%1) 失败 0x%2")
                         .arg(command).arg(static_cast<quint32>(hr), 8, 16, QLatin1Char('0')));
+        return false;
+    }
+    return true;
+}
+
+QStringList DriverEventSource::Impl::missingCapabilities() const {
+    QStringList missing;
+    // 顺序按「缺了之后损失有多大」排,日志与 UI 里读起来一眼能看出严重性。
+    if (!caps.cmdHardBlock)  missing << QStringLiteral("命令行硬拦(反勒索删卷影的执行前阻断)");
+    if (!caps.banned)        missing << QStringLiteral("已封禁主体全维拦截");
+    if (!caps.selfGuard)     missing << QStringLiteral("自保护足迹(反勒索加密本产品)");
+    if (!caps.execBlock)     missing << QStringLiteral("执行前拦截(恶意映像禁止启动)");
+    if (!caps.credProt)      missing << QStringLiteral("凭据反转储(lsass 防读)");
+    if (!caps.memProt)       missing << QStringLiteral("内存防护(反注入)");
+    if (!caps.fileTelemetry) missing << QStringLiteral("文件行为遥测(勒索时序聚合)");
+    return missing;
+}
+
+void DriverEventSource::Impl::logCapabilitySummary() const {
+    const QStringList missing = missingCapabilities();
+    if (missing.isEmpty()) {
+        log.info(QStringLiteral("内核能力探测:全部维度就绪(命令行硬拦 / 封禁主体 / 自保足迹 / "
+                                "执行前拦截 / 凭据反转储 / 反注入 / 文件遥测)。"));
+        return;
+    }
+    // 用 error 而不是 warning:这几乎总是「部署的 Bulwark.sys 比服务旧」,而握手会照常通过,
+    // 表面上一切正常 —— 这种静默失效必须在日志里最高优先级地喊出来,并给出可操作的下一步。
+    log.error(QStringLiteral(
+        "内核能力探测:已连接的驱动【不支持】以下 %1 个维度,这些防护当前实际不生效 —— %2。"
+        "协议握手会通过是因为线布局未变(见 Protocol.h 关于版本号保持 9 的说明),"
+        "所以这几乎总是「System32\\drivers\\Bulwark.sys 比 bulwark_service.exe 旧」。"
+        "请用同源编译的驱动替换后重新加载(停服务 -> fltmc unload Bulwark -> 覆盖 .sys -> 启动服务)。")
+        .arg(missing.size()).arg(missing.join(QStringLiteral("、"))));
 }
 
 void DriverEventSource::Impl::pushInitialConfig() {
@@ -424,7 +569,8 @@ void DriverEventSource::Impl::pushInitialConfig() {
     //   * 命中会被内核直接拒绝且不弹窗,故每一条都必须是「一旦发生基本等同于攻击」的动作。
     //
     {
-        sendConfig(BLW_CMD_CLEAR_CMDBLOCK);
+        // 这条 CLEAR 同时充当命令行硬拦维度的能力探测:旧驱动不认命令 30,会回 STATUS_INVALID_PARAMETER。
+        caps.cmdHardBlock = sendConfig(BLW_CMD_CLEAR_CMDBLOCK);
 
         QStringList patterns;
         if (cmdHardBaseline) {
@@ -503,7 +649,8 @@ void DriverEventSource::Impl::pushInitialConfig() {
     // 必须在受保护 PID 下发【之后】登记,以保证内核属主判定(BlwPidIsProtected)已就绪,不误伤自身写入。
     // owner-aware + 断连即清除:更新/卸载本产品只需停服务(内核随断连清除 SelfGuard)即可,无需先卸载驱动。
     {
-        sendConfig(BLW_CMD_CLEAR_SELFGUARD);
+        // 兼作自保护足迹维度的能力探测(命令 28)。
+        caps.selfGuard = sendConfig(BLW_CMD_CLEAR_SELFGUARD);
         int guarded = 0;
         // 1) 安装目录(本产品全部可执行体 / Qt 运行库 / appsettings.json 等):去盘符的目录子串,
         //    覆盖目录下所有文件;兼容内核 \Device\HarddiskVolumeN\... 与 \??\C:\... 两种规范化形式。
@@ -535,9 +682,23 @@ void DriverEventSource::Impl::pushInitialConfig() {
     initMemoryProtection();
 
     // 文件行为遥测:开启内核对删除/重命名的观测上报(勒索时序聚合数据源)。
-    sendConfig(BLW_CMD_SET_FILETELEMETRY, QString(), 1u);
+    caps.fileTelemetry = sendConfig(BLW_CMD_SET_FILETELEMETRY, QString(), 1u);
+
+    //
+    // ---- 零副作用的能力探测(见 Impl::Capabilities 的说明)----
+    //
+    // 这两个维度在连接时本来没有要发的命令,而它们恰恰是最不能静默缺失的:
+    //   * BANNED:情报一确认即全维封杀,缺了就退回「只能杀进程」,杀不掉/滞后期间样本照样作案;
+    //   * EXECBLOCK:恶意映像禁止启动,缺了就退回「事后 kill,样本先跑几十毫秒」。
+    // 探测参数都选成内核护栏会直接忽略的值,故不产生任何状态变更(Pid=4 被 BlwAddBannedPid 的
+    // `Pid <= 4` 护栏挡回;空路径被 Comms.c 的 `PathLength > 0` 判断挡回),但命令分发照常走到
+    // case 分支,足以区分「认识这条命令」与「落到 default」。
+    //
+    caps.banned = sendConfig(BLW_CMD_ADD_BANNED, QString(), 4u);
+    caps.execBlock = sendConfig(BLW_CMD_ADD_EXECBLOCK, QString());
 
     log.info(QStringLiteral("已向内核下发初始配置(受保护项 / 硬拦名单 / 命令行硬拦 / 黑名单 / 自保 PID / 文件遥测)。"));
+    logCapabilitySummary();
 }
 
 void DriverEventSource::Impl::addMemProtPidToKernel(int pid) {
@@ -551,17 +712,40 @@ void DriverEventSource::Impl::addCredProtPidToKernel(int pid) {
 }
 
 void DriverEventSource::Impl::initMemoryProtection() {
-    sendConfig(BLW_CMD_CLEAR_MEMPROT);
-    sendConfig(BLW_CMD_CLEAR_CREDPROT);
+    // 这两条 CLEAR 兼作能力探测(命令 14 / 24):反注入自 v5 起就有,凭据反转储是 v9 新增,
+    // 后者在陈旧驱动上会落到 default 分支 —— 这正是「lsass 看起来受保护、实际没剥 VM_READ」的来源。
+    caps.memProt = sendConfig(BLW_CMD_CLEAR_MEMPROT);
+    caps.credProt = sendConfig(BLW_CMD_CLEAR_CREDPROT);
     memProtNames.clear();
+    credProtNames.clear();
+
+    //
+    // 用户在设置页关闭「内存防护」时,到此为止:两份内核 PID 集已被上面的 CLEAR 清空,
+    // 且不再登记任何目标,反注入与凭据反转储【真正停止】。
+    //
+    // 在此之前 RuntimeSettings::memoryProtectionEnabled 在服务端从未被读取过:设置页有开关、
+    // 仪表盘还把它当「内存防护」维度指示灯,但真实的内核反注入完全由 appsettings.json 的
+    // MemoryProtectionTargets 驱动。于是用户关掉开关后反注入照旧生效,而仪表盘指示灯变灰 ——
+    // 显示与实际相反。现在开关是真的。
+    //
+    // 刻意的取舍:关闭内存防护会【连带停掉 lsass 凭据反转储】。原来 credProtNames 是硬编码
+    // 「始终启用」的,但把它留在开关之外会造成更糟的认知偏差 —— 用户以为内存防护全关了,
+    // 实际仍在剥离其它进程对 lsass 的句柄权限,一旦与共存杀软产生兼容问题就无从排查。
+    // 一个开关只对应一件事,是可预期的;半开半关不是。
+    //
+    if (!memProtEnabled) {
+        log.warning(QStringLiteral("内存防护已按设置关闭:已清空内核反注入与凭据反转储目标集"
+                                   "(lsass 反转储随之停止)。在设置页重新开启即恢复。"));
+        return;
+    }
+
     for (const QString& t : memProtTargets) {
         const QString name = QFileInfo(t.trimmed()).fileName().toLower();
         if (!name.isEmpty()) memProtNames.insert(name);
     }
-    // 凭据反转储目标(硬编码,始终启用,独立于用户可配的 MemoryProtectionTargets):lsass 是凭据
-    // 存储,永远反转储 —— 在反注入基础上额外剥 PROCESS_VM_READ(挡 mimikatz 读 lsass 内存偷凭据)。
-    // 即便用户清空了反注入名单,lsass 仍受凭据保护。
-    credProtNames.clear();
+    // 凭据反转储目标(内置,独立于用户可配的 MemoryProtectionTargets):lsass 是凭据存储,
+    // 在反注入基础上额外剥 PROCESS_VM_READ(挡 mimikatz 读 lsass 内存偷凭据)。
+    // 即便用户清空了 MemoryProtectionTargets,只要内存防护总开关是开的,lsass 仍受凭据保护。
     credProtNames.insert(QStringLiteral("lsass.exe"));
 
     // 枚举现存进程,按名匹配把命中 PID 下发内核(反注入 + 凭据反转储);新建进程由 readLoop 增量登记。
@@ -627,28 +811,89 @@ void DriverEventSource::Impl::reply(ULONG64 messageId, ULONG64 eventId, ULONG ve
 // 的「轻量部分」;取证部分已下放 Worker。
 void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64 messageId) {
     bulwark::SecurityEvent e;
+
+    // ===== 临时定位:chainContext 何时变成非法 =====
+    //
+    // 【必须 volatile】。否则 /O2 下编译器会「知道」这个 QList 刚默认构造完、三项必为 0,
+    // 把判断整段常量折叠掉,根本不去读内存 —— 早先插了 7 个检查点全不命中就是这么来的。
+    //
+    // 这一版改成【逐点位留快照】而不是只记第一个坏点:一次命中就能看出三个字给出的完整轨迹,
+    // 不必反复部署去二分。同时多留两样上一版没有、但对定性至关重要的信息:
+    //   * chainContext 前面那 24 字节(fileDescription)—— 若它也坏了,说明是【范围覆写】;
+    //     若它完好而只有 d 那 8 字节变了,说明是【单次精确写入】。两者的成因完全不同。
+    //   * &e / &e.chainContext 的绝对地址,以及 readLoop 帧内一个局部的地址(由调用方传入),
+    //     用来判断坏值是否来自调用方帧的复用。
+    struct Snap { quintptr fd[3]; quintptr cc[3]; };
+    Snap snaps[10] = {};
+    int nSnap = 0;
+    const auto snap = [&]() {
+        if (nSnap >= 10) return;
+        const volatile quintptr* r =
+            reinterpret_cast<const volatile quintptr*>(&e.chainContext);
+        const volatile quintptr* f =
+            reinterpret_cast<const volatile quintptr*>(&e.fileDescription);
+        Snap& s = snaps[nSnap++];
+        s.fd[0] = f[0]; s.fd[1] = f[1]; s.fd[2] = f[2];
+        s.cc[0] = r[0]; s.cc[1] = r[1]; s.cc[2] = r[2];
+    };
+    const auto rawOf = [](const bulwark::SecurityEvent& ev2) {
+        const volatile quintptr* r =
+            reinterpret_cast<const volatile quintptr*>(&ev2.chainContext);
+        return QStringLiteral("d=0x%1 ptr=0x%2 size=%3")
+            .arg(static_cast<quintptr>(r[0]), 0, 16)
+            .arg(static_cast<quintptr>(r[1]), 0, 16)
+            .arg(static_cast<qsizetype>(r[2]));
+    };
+    const bool badAtBirth = chainLooksCorrupt(e);
+    if (badAtBirth)
+        log.warning(QStringLiteral("[定位1] 默认构造后即非法:kernelType=%1 %2 (sizeof(e)=%3)")
+                        .arg(ev.Type).arg(rawOf(e)).arg(sizeof(bulwark::SecurityEvent)));
+
+    // 逐语句夹:记录第一个变坏的点位,函数末尾统一报。
+    int firstBad = badAtBirth ? 1 : 0;
+    const auto mark = [&](int pt) {
+        snap();
+        if (!firstBad && chainLooksCorrupt(e)) firstBad = pt;
+    };
+    mark(1);
+
     e.type = mapType(ev.Type);
     e.actorPid = static_cast<int>(ev.ActorPid);
+    mark(2);
 
     const QString imagePath = ev.ImagePathLength > 0
         ? normalizeNtPath(QString::fromWCharArray(ev.ImagePath, ev.ImagePathLength))
         : QString();
-    const QString targetPath = ev.TargetPathLength > 0
-        ? normalizeNtPath(QString::fromWCharArray(ev.TargetPath, ev.TargetPathLength))
+    mark(3);
+    const QString targetRaw = ev.TargetPathLength > 0
+        ? QString::fromWCharArray(ev.TargetPath, ev.TargetPathLength)
         : QString();
+    // 路径类字段要归一(\??\C: / \Device\HarddiskVolumeN -> 盘符);命令行【不能】归一 ——
+    // 它不是路径,归一化会去动引号与参数里的内容。故两份都留着,按事件类型各取所需。
+    const QString targetPath = targetRaw.isEmpty() ? QString() : normalizeNtPath(targetRaw);
+    mark(4);
     // 非进程创建事件:actorPath 先置 "PID n" 占位,Worker::enrich 会按 PID 回填真实映像路径。
     const QString actorPlaceholder = QStringLiteral("PID %1").arg(e.actorPid);
+    mark(5);
 
     switch (ev.Type) {
         case BlwEventProcessCreate:
             // 进程创建(fire-and-forget 遥测)。标记用户态观测:Block 时 Worker 结束进程树。
             e.actorPath = imagePath;
             e.target = imagePath;
+            // 内核在 TargetPath 里带上了完整命令行(见 ProcessMonitor.c 里 BlwReportEvent 处的
+            // 说明)。收进 e.commandLine —— 【不】写 e.target:那会让既有的「ProcessCreate 允许
+            // TargetPattern 回退匹配主体路径」语义变成「拿命令行当目标匹配」,已有规则的含义就变了。
+            // 这一条把命令行从「事后读 PEB、和短命进程赛跑」变成「随事件一起到达」,毫秒级退出的
+            // LOLBin 也不再丢命令行。enrich() 里的 PEB 回填自动退化为兜底(它只在字段为空时才跑)。
+            e.commandLine = targetRaw;
             e.parentPid = static_cast<int>(ev.ParentPid);
             e.detail = QStringLiteral("内核遥测 · 进程创建(父PID %1)").arg(ev.ParentPid);
             e.userModeObserved = true;
             // 内存防护增量登记:命中目标名单的新进程立即获得反注入 / 凭据反转储保护。
-            if (!imagePath.isEmpty()) {
+            // 总开关关闭时 memProtNames / credProtNames 都是空集(initMemoryProtection 提前返回),
+            // 故此处天然不会登记任何 PID;显式再判一次是为了让意图对读代码的人可见。
+            if (memProtEnabled && !imagePath.isEmpty()) {
                 const QString name = QFileInfo(imagePath).fileName().toLower();
                 if (!memProtNames.isEmpty() && memProtNames.contains(name))
                     addMemProtPidToKernel(e.actorPid);
@@ -672,22 +917,31 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
         case BlwEventFileModify:
             // 文件行为遥测(未命中名单的正常删/改名,内核未拦截)。原始操作类型由内核打包在
             // ParentPid 字段(2=删除标记,3=重命名)。映射到引擎可聚合的类型,标记用户态观测。
+            // 【临时】本分支是实测最高频的命中来源(22 次里 17 次),故逐语句夹点位 10~14。
             e.type = (ev.ParentPid == BlwEventFileDelete)
                 ? bulwark::EventType::FileDelete
                 : bulwark::EventType::FileWrite;
+            mark(10);
             e.actorPath = actorPlaceholder;
+            mark(11);
             e.target = targetPath;
+            mark(12);
             e.detail = QStringLiteral("文件行为遥测 · %1")
                            .arg(ev.ParentPid == BlwEventFileDelete ? QStringLiteral("删除")
                                                                    : QStringLiteral("重命名/移动"));
+            mark(13);
             e.userModeObserved = true;
+            mark(14);
             break;
 
         case BlwEventRegistrySetValue:
         case BlwEventRegistryDeleteValue:
         case BlwEventRegistryDeleteKey:
+            mark(20);   // 【临时】注册表分支:实测 22 次里 4 次,且呈整十分钟周期
             e.actorPath = actorPlaceholder;
+            mark(21);
             e.target = targetPath;
+            mark(22);
             // 注意:受保护注册表键(\Run/\Winlogon/\Services 等宽子串)在内核是【上报后放行】
             // (无条件拦截会打死系统),仅「注册表硬拦名单」才真前拦。二者事件类型相同,内核未
             // 附带 blocked 标志,故此处保守标记为「观测」(kernelBlocked 保持 false),由 Worker
@@ -697,17 +951,14 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
                 : (ev.Type == BlwEventRegistryDeleteValue)
                       ? QStringLiteral("内核监控 · 删除受保护注册表值(观测,事后处置)")
                       : QStringLiteral("内核监控 · 删除受保护注册表键(观测,事后处置)");
+            mark(23);
             // 创建服务经 SCM(services.exe)代写服务键,内核归因为 SCM。尝试还原真实 RPC 发起者
             // (发起线程此刻阻塞在 WrLpcReply)。仅高置信唯一候选才改写主体,否则保守留 SCM。
-            if (ServiceControlTracer::isServiceDatabaseKey(targetPath)) {
-                const ServiceOriginator orig = ServiceControlTracer::trace(e.actorPid);
-                if (orig.highConfidence()) {
-                    e.actorPid = orig.originatorPid;
-                    e.actorPath = orig.originatorPath;
-                    e.detail += QStringLiteral(" · 真凶溯源:%1(PID %2)")
-                                    .arg(QFileInfo(orig.originatorPath).fileName()).arg(orig.originatorPid);
-                }
-            }
+            // 真凶溯源【已移到主线程 Worker::enrich】,不在这里做:
+            // ServiceControlTracer::trace() 要做一次 1MB 的全系统进程+线程快照
+            //(NtQuerySystemInformation),再对每个候选 OpenProcess + QueryFullProcessImageNameW。
+            // 这属于本函数头注释明令「交主线程」的昂贵富化 —— 放在读线程,它执行期间整个内核
+            // 事件投递(包括需要前拦的那些)全部积压。
             break;
 
         case BlwEventSelfProtect:
@@ -742,12 +993,16 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
 
         case BlwEventImageLoad: {
             // 映像加载(BYOVD / DLL 侧载)。仅记录型。ActorPid==0 表示内核驱动加载。
+            mark(30);   // 【临时】映像加载分支
             const bool kernelModule = (e.actorPid == 0);
             e.actorPath = kernelModule ? QStringLiteral("内核(驱动加载)") : actorPlaceholder;
+            mark(31);
             e.target = targetPath;
+            mark(32);
             e.detail = kernelModule
                 ? QStringLiteral("内核监控 · 加载驱动模块 %1").arg(QFileInfo(targetPath).fileName())
                 : QStringLiteral("内核监控 · 加载模块 %1").arg(QFileInfo(targetPath).fileName());
+            mark(33);
             break;
         }
 
@@ -827,14 +1082,53 @@ void DriverEventSource::Impl::buildAndQueue(const BLW_EVENT_MESSAGE& ev, ULONG64
             break;
     }
 
+    mark(6);        // 6 = switch 分支之后
+
     // 仅内核实际等待裁决的事件(文件/注册表/结束进程)记录 Id 映射,供 submitVerdict 回写。
     if (needsVerdict(ev.Type)) {
         QMutexLocker lock(&mapMutex);
         eventToDriverId.insert(e.id, ev.EventId);
         driverIdToMsgId.insert(ev.EventId, messageId);
     }
+    mark(7);        // 7 = Id 映射之后
+
+    const bool badBeforeEnqueue = chainLooksCorrupt(e);
+    if (badBeforeEnqueue) {
+        // 点位含义:1 默认构造后 / 2 写type+pid后 / 3 解析ImagePath后 / 4 解析TargetPath后 /
+        //          5 生成占位串后 / 6 switch后 / 7 Id映射后 /
+        //          10~14 FileModify 分支逐语句 / 20~23 注册表分支逐语句 / 30~33 映像加载分支逐语句
+        QStringList traj;
+        for (int i = 0; i < nSnap; ++i) {
+            const Snap& s = snaps[i];
+            traj << QStringLiteral("#%1 fd{%2,%3,%4} cc{%5,%6,%7}")
+                        .arg(i)
+                        .arg(s.fd[0], 0, 16).arg(s.fd[1], 0, 16).arg(s.fd[2])
+                        .arg(s.cc[0], 0, 16).arg(s.cc[1], 0, 16).arg(s.cc[2]);
+        }
+        log.warning(QStringLiteral("[定位2] enqueue 前非法 点位=%1 kernelType=%2 %3")
+                        .arg(firstBad).arg(ev.Type).arg(rawOf(e)));
+        // 地址:用来判断坏值是否落在调用方(readLoop)帧复用出来的位置上。
+        log.warning(QStringLiteral("[定位2·地址] &e=0x%1 &e.chainContext=0x%2 "
+                                   "&e.fileDescription=0x%3 sizeof(e)=%4 偏移=%5")
+                        .arg(reinterpret_cast<quintptr>(&e), 0, 16)
+                        .arg(reinterpret_cast<quintptr>(&e.chainContext), 0, 16)
+                        .arg(reinterpret_cast<quintptr>(&e.fileDescription), 0, 16)
+                        .arg(sizeof(bulwark::SecurityEvent))
+                        .arg(reinterpret_cast<quintptr>(&e.chainContext)
+                             - reinterpret_cast<quintptr>(&e)));
+        log.warning(QStringLiteral("[定位2·轨迹] %1").arg(traj.join(QStringLiteral(" | "))));
+    }
 
     enqueue(std::move(e));
+
+    // 移动之后源对象应为空表。若这里非法,说明是 push_back 的移动没把源置空,
+    // 或源在移动前就已经是坏的 —— 无论哪种,末尾析构都会崩,故就地修回空表。
+    if (chainLooksCorrupt(e)) {
+        log.warning(QStringLiteral("[定位3] enqueue 后源对象非法(出生=%1 入队前=%2)"
+                                   ":kernelType=%3 %4")
+                        .arg(badAtBirth).arg(badBeforeEnqueue).arg(ev.Type).arg(rawOf(e)));
+        resetChainContext(e);
+    }
 }
 
 void DriverEventSource::Impl::readLoop() {
@@ -892,8 +1186,15 @@ DriverEventSource::DriverEventSource(const BulwarkOptions& options, QObject* par
     d_->memProtTargets    = options.MemoryProtectionTargets;
     d_->selfPid           = static_cast<quint32>(::GetCurrentProcessId());
 
+    // 把读线程收集的事件搬到主线程 emit。这个间隔就是【空闲时第一条事件的延迟地板】——
+    // 一条因果链上每一跳都要重付一次,所以它直接决定「行为发生 -> 被拦下/弹窗」的观感延迟。
+    // 原先硬编码 150ms;现在可配(Bulwark:EventDrainIntervalMs,默认 20ms)。空转成本只是
+    // 每秒 50 次「加锁看一眼队列空不空」,可忽略;突发时也不受此值影响 —— drain() 一次搬 32 条,
+    // 还有积压就立刻 singleShot(0) 再排一批,不等下一个 tick。
+    // 夹到 [1, 1000]:0 会变成「每次事件循环空转都跑一遍」,过大则等于把延迟又加回来。
+    const int drainMs = qBound(1, options.EventDrainIntervalMs, 1000);
     drainTimer_ = new QTimer(this);
-    drainTimer_->setInterval(150); // 每 150ms 把读线程收集的事件搬到主线程 emit(裁决路径尽量低延迟)
+    drainTimer_->setInterval(drainMs);
     connect(drainTimer_, &QTimer::timeout, this, &DriverEventSource::drain);
 }
 
@@ -934,7 +1235,7 @@ void DriverEventSource::stop() {
     if (!d_->readThread.joinable()) {
         d_->closePort();
         QMutexLocker lock(&d_->queueMutex);
-        d_->queue.clear();
+        d_->clearQueueLocked();
         return;
     }
 
@@ -972,13 +1273,34 @@ void DriverEventSource::stop() {
     d_->readThreadNative = nullptr;
     d_->closePort();            // 线程已退出,此刻关句柄才是安全的
     // 排空剩余队列(不再 emit,避免停机后触达已失效对象)。
+    // 用 clearQueueLocked 而非 queue.clear():停机时队列里往往还压着上千条积压事件,
+    // 逐个析构其中任何一条的坏 chainContext 都会当场访问违规 —— 崩溃转储里就是这一行。
     QMutexLocker lock(&d_->queueMutex);
-    d_->queue.clear();
+    d_->clearQueueLocked();
 }
 
 bool DriverEventSource::isAvailable() const { return d_->connected.load(); }
 bool DriverEventSource::isConnected() const { return d_->connected.load(); }
 bool DriverEventSource::protocolMismatch() const { return d_->protocolMismatch.load(); }
+
+void DriverEventSource::setMemoryProtectionEnabled(bool on) {
+    if (d_->memProtEnabled == on)
+        return;
+    d_->memProtEnabled = on;
+    // 未连接时只记住状态:连接建立后 pushInitialConfig 会调 initMemoryProtection,届时按此状态生效。
+    if (!d_->connected.load())
+        return;
+    // 已连接:立刻重跑一次登记流程。关 -> 只发两条 CLEAR 就返回;开 -> 重新枚举现存进程登记。
+    d_->initMemoryProtection();
+}
+
+QStringList DriverEventSource::missingCapabilities() const {
+    // 未连接时不报缺失:那是「没连上」而不是「驱动能力不全」,两种状态在设置页有各自的文案,
+    // 混在一起会让用户以为换个驱动就能解决连接问题。
+    if (!d_->connected.load())
+        return {};
+    return d_->missingCapabilities();
+}
 
 void DriverEventSource::submitVerdict(const bulwark::SecurityEvent& e, bulwark::VerdictAction action) {
     // 仅对内核实际等待裁决的事件(文件/注册表/结束进程)回写;其余为 fire-and-forget,
@@ -1273,9 +1595,59 @@ void DriverEventSource::drain() {
         if (d_->queue.isEmpty())
             return;
         const int n = qMin(d_->queue.size(), kMaxPerDrain);
-        batch = d_->queue.mid(0, n);
-        d_->queue.remove(0, n);
+        // 逐个 move 出来,不要用 `batch = queue.mid(0,n); queue.remove(0,n);`。
+        //
+        // Qt 容器是写时复制:mid() 返回的 batch 与 queue 【共享同一数据块】,紧随其后的
+        // remove() 因引用计数>1 必须 detach —— 那会把队列里【剩余的全部】事件逐个【拷贝构造】
+        // 到新块(每个 SecurityEvent 都带一串 QString 和 QVector<ChainEventInfo>)。两个后果:
+        //
+        //   1) 性能:每搬 32 条就深拷贝整个积压(上限 4096 条),事件风暴下退化成平方级 ——
+        //      而事件风暴(勒索批量改文件 / 恶意进程爆发)恰恰是最需要它快的时候。
+        //   2) 稳定性:深拷贝必须逐字段【拷贝构造】每个元素,也就是要去解引用元素内部每个
+        //      Qt 容器的 d 指针并给引用计数加一。实测服务反复崩在这里(同一偏移 9 次):
+        //        copyAppend<SecurityEvent> -> QArrayDataPointer<ChainEventInfo>::ref
+        //        -> lock inc dword ptr [0x850]   访问违规
+        //      即拷贝某个元素的 chainContext 时,其 d 指针是 0x850 这种非法小值。
+        //      源元素本身结构看起来是完整的(QUuid/QDateTime/指针字段都正常),所以更像是
+        //      拷贝范围越过了实际已构造的元素数,读到了相邻内存 —— 根因未完全定死。
+        //
+        // 改成 move 之后:batch 不再与 queue 共享,remove() 时引用计数为 1,只做一次 memmove。
+        // 既不深拷贝、也不再对元素做拷贝构造 —— 这条崩溃路径连同那次无谓的深拷贝一起消失。
+        // (根因若另有其他,转储收集仍开着,会再暴露出来。)
+        batch.reserve(n);
+        for (int i = 0; i < n; ++i)
+            batch.push_back(std::move(d_->queue[i]));
+        d_->queue.remove(0, n);   // 此时被移走的 n 个元素已是空壳,销毁它们不解引用任何内部指针
         more = !d_->queue.isEmpty();
+    }
+
+    // 出队前的完整性护栏。这是【安全网,不是修复】,且要点已经前移:真正的修复在 enqueue()
+    // ——「队列里永不存在非法 chainContext」是那里保证的不变量,因为停机时的整队销毁
+    // (clearQueueLocked)没有第二次机会去挑元素。
+    //
+    // 【勿再采信的旧结论】此处原先写着「根因是读线程里调 ServiceControlTracer::trace 写坏本帧
+    // 事件,已通过移到主线程 Worker::enrich 解决」。那个结论不成立,两点证据:
+    //   1) ServiceControlTracer 通篇只读不写(1MB 快照 + 按偏移解析),没有任何写向调用方栈帧的
+    //      语句,它写不坏本帧的 e;
+    //   2) 调用移走之后,[定位2](enqueue 前非法,出生时正常)在日志里照旧复现。
+    // 写坏它的真凶【仍未定死】。已知事实只有:坏值恒为 { d=0x850, ptr=0, size=0 },而
+    // 0x850 == sizeof(BlwGetMessage)(FILTER_MESSAGE_HEADER 16 + BLW_EVENT_MESSAGE 2112),
+    // 即 readLoop 传给 FilterGetMessage 的那个缓冲区长度 —— 看着像某处把「消息长度」写到了
+    // &e.chainContext 上。buildAndQueue 里的 [定位1/2/3] + 逐语句轨迹就是为抓它留的,别删。
+    //
+    // 留这层出队护栏的理由:万一坏值是在【入队之后】才被写进去的(堆上,入队护栏管不到),
+    // Worker::onEvent 的拷贝构造会直接让整个服务崩掉(实测一天崩 15 次)。安全产品不该因为
+    // 一个字段异常就整体失效,何况这个字段本来就会被 Worker 在富化阶段重建
+    // (e.chainContext = chain_.buildContext(e)),内核事件从不携带它,重置为空不丢任何信息。
+    // 代价是每条事件三次内存读取,可忽略。
+    for (auto& e : batch) {
+        if (Impl::chainLooksCorrupt(e)) {
+            d_->log.warning(
+                QStringLiteral("chainContext 处于非法状态(d 非空而 ptr 为空),已重置为空以免"
+                               "拷贝时崩溃 —— 这不该发生,请排查是谁写坏了它:type=%1 pid=%2 path=%3")
+                    .arg(static_cast<int>(e.type)).arg(e.actorPid).arg(e.actorPath));
+            Impl::resetChainContext(e);
+        }
     }
     for (const auto& e : batch)
         emit eventProduced(e);

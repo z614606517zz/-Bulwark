@@ -70,6 +70,14 @@ $RECYCLE.BIN/
 appsettings.*.local.json
 *.secrets.json
 .env
+# Seed config for the PRIVATE test package. Carries real intel-source keys on
+# purpose (that package is not meant to be sanitized), so it must never enter
+# history -- a committed key is unrecoverable once pushed, unlike one sitting in
+# a local folder. The shareable counterpart, packaging/appsettings.portable.json,
+# is key-free by construction and stays tracked.
+packaging/appsettings.private.json
+packaging/appsettings.json.backup-*
+Bulwark/appsettings.private.json.bak-*
 # 服务主配置含真实情报源 API 密钥,不入库;改用 appsettings.example.json 模板
 Bulwark.Service/appsettings.json
 
@@ -131,3 +139,32 @@ __pycache__/
 /_tf_check.txt
 /start
 /nul
+/_diag.txt
+
+# ---- 服务端网页的本地暂存目录 ----
+# 上面的 __*.txt / __*.ps1 是【文件】通配,匹配不到目录,故单列一条。
+# 这里面是 server/bulwark-intel/ 的一份旧副本(app.py 比仓库里的还旧),
+# 网页文件已归并进 server/bulwark-intel/,此目录只作本地暂存,不入库。
+__srvweb/
+
+# ---- 本机运行/部署脚本与诊断输出(与产品无关,只对开发者这台机器有意义)----
+/START_SERVICE.ps1
+/TEST_CLOUD_SCAN.ps1
+/TEST_REPUTATION_FIX.ps1
+/REPUTATION_FIX.md
+/REPUTATION_FIX_SUMMARY.md
+/deploy_svc_only.ps1
+/diagnose_vt_scan.ps1
+/fix_desktop_trust.ps1
+/restart_bulwark.ps1
+/update_out.txt
+/verify_out.txt
+# 本机组策略/注册表快照,含机器专属状态
+bulwark-policy-backup-*.reg
+# 代理会话的一次性脚本(下划线前缀 = 临时)
+scripts/_*.ps1
+# backup-keys.ps1 的运行日志:会记录密钥文件的路径与长度
+scripts/backup-keys.txt
+# 私有测试包的内部说明(讲的是「本包不脱敏」的流程,对外无意义)
+packaging/readme-keys-private.txt
+.kiro/tmp/

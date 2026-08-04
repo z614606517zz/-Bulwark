@@ -47,6 +47,12 @@ private:
     static void promoteNext(); // show the next queued card when the active one closes
 
     void showCentered();
+    // 文案变化后重算窗口尺寸并保持居中。宽度是固定的(468),所以长文案只能靠换行消化,
+    // 窗口高度必须跟着长 —— 否则多出来的那几行会被裁在卡片外面(结论看不全)。
+    // 尺寸未变时不动窗口,避免每次进度更新都抖一下。
+    void relayout();
+    bool refitHeight(); // 按固定宽度重算高度;返回 true 表示高度确实变了
+    void recenter();    // 按当前尺寸重新居中到主屏
     void startCountdown();
     void setBadge(const QString& iconName, const QColor& color);
     void applyVt(const bulwark::VtScanRecord& record);

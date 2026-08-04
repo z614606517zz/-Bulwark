@@ -357,11 +357,39 @@ BlwImageIsTrustedSystemPath(_In_ PCWSTR Path, _In_ USHORT Chars)
 }
 
 //
+// 「真正的系统映像目录」判定 —— 只有这几处,普通用户写不进去(WRP + 高 ACL)。
+//
+// 【刻意不复用 BlwImageIsTrustedSystemPath】:那份名单里含 \Program Files\ 等常规安装目录,
+// 用它来给「关键系统进程」放行,等于把 C:\Program Files\Foo\csrss.exe 也认成关键进程。
+// 关键进程护栏的语义是「这个文件就是 Windows 自己的那一份」,判据必须收得比可信目录更紧。
+//
+static BOOLEAN
+BlwPathIsSystemImageDir(_In_opt_ PCWSTR Path, _In_ USHORT Chars)
+{
+    if (Path == NULL || Chars == 0) {
+        return FALSE;
+    }
+    return BlwWideContainsCI(Path, Chars, L"\\Windows\\System32\\")
+        || BlwWideContainsCI(Path, Chars, L"\\Windows\\SysWOW64\\")
+        || BlwWideContainsCI(Path, Chars, L"\\Windows\\WinSxS\\");
+}
+
+//
 // 关键系统进程名单:这些进程一旦被拒绝创建/被误杀,系统会立刻 BugCheck
 // (CRITICAL_PROCESS_DIED 0xEF)。无论用户态裁决如何,内核侧绝不阻止它们。
 // 这是防蓝屏的最后一道硬底线 —— 即便协议错位/服务误判/超时,也不能拖垮系统。
 //
-// 按"映像文件名以 \名字 结尾"匹配(大小写不敏感),避免被路径前缀差异绕过。
+// 判据 = 【文件名命中名单】且【映像位于真正的系统目录】,两个条件必须同时成立。
+//
+// 为什么必须加上路径条件:原实现只按"映像文件名以 \名字 结尾"匹配,于是任何目录下改名叫
+// csrss.exe 的样本都自动获得了这道护栏的豁免 —— 既拦不住它启动(exec-block 处的 !critical),
+// 也杀不掉它(BlwKillProcessById 的护栏 3)。这不是理论风险:实测机器上
+// C:\Users\<u>\AppData\Local\DBG\csrss.exe(SalatStealer,已被情报确认恶意)就是靠这个
+// 免疫了内核级结束,用户态每 60 秒重试一次、连续几十小时都杀不掉它。
+// 「改名成系统进程」是最基础的伪装手法,护栏不该按它自己声称的名字给它发豁免。
+//
+// 收紧之后真实系统进程仍有双重保障:一是它们本就住在 System32(路径条件成立),
+// 二是结束路径上另有内核权威的 PsIsProcessCritical 判定(见 BlwKillProcessById 护栏 3)。
 //
 static BOOLEAN
 BlwIsCriticalSystemProcess(_In_opt_ PCWSTR Path, _In_ USHORT Chars)
@@ -383,7 +411,10 @@ BlwIsCriticalSystemProcess(_In_opt_ PCWSTR Path, _In_ USHORT Chars)
         BLW_NAME(L"wermgr.exe"),
     };
 
-    return BlwImageNameIn(kCritical, RTL_NUMBER_OF(kCritical), Path, Chars);
+    if (!BlwImageNameIn(kCritical, RTL_NUMBER_OF(kCritical), Path, Chars)) {
+        return FALSE;
+    }
+    return BlwPathIsSystemImageDir(Path, Chars);
 }
 
 //
@@ -562,7 +593,25 @@ BlwCreateProcessNotifyEx(
         BlwEnqueueHashScan(newPid);
     }
 
-    BlwReportEvent(BlwEventProcessCreate, newPid, parentPid, NULL, image, 0, 0);
+    //
+    // TargetPath 带上【完整命令行】(此前这里传 NULL,命令行被直接丢掉)。
+    //
+    // 为什么必须在这里给:CreateInfo->CommandLine 是内核在进程创建回调里【本来就拿得到】的,
+    // 上面的命令行硬拦已经在用它。而用户态原先只能在收到事件后按 PID 去读目标进程的 PEB
+    // (Worker::enrich -> ProcessInspector::tryGetCommandLine)—— 那是一场必输的竞速:
+    // reg.exe / schtasks.exe / cmstp.exe 这类 LOLBin 常在毫秒级内退出,PEB 读不到,
+    // 于是所有依赖命令行的判定(攻击链的 Set-ExecutionPolicy / Add-MpPreference /
+    // -encodedcommand / \Temp\ 等标记,以及大量 LOLBin 规则)在真机上时灵时不灵。
+    // 实测(--attackchain-check 的可达性诊断):18 条组合里有 6 条因此只能算「稀疏」。
+    //
+    // 【刻意复用 TargetPath 而不新增字段】:BLW_EVENT_MESSAGE 的布局一个字节都不能变 ——
+    // 握手校验按结构体大小逐一比对,改了布局就得升协议版本,已部署的驱动/服务会因版本
+    // 不符而整体降级为不拦截。而 ProcessCreate 的 TargetPath 此前恒为空,是白放着的容量;
+    // BlwEventCommandBlocked 早就是这么用它的(TargetPath=被拦下的命令行),故语义一致。
+    // 用户态侧把它读进 e.commandLine(而不是 e.target),因此既有按 target 写的规则语义不变。
+    //
+    BlwReportEvent(BlwEventProcessCreate, newPid, parentPid,
+                   CreateInfo->CommandLine, image, 0, 0);
 }
 
 NTSTATUS
@@ -599,6 +648,46 @@ BlwUnregisterProcessCallback(void)
 #endif
 
 //
+// PsIsProcessCritical(EPROCESS.BreakOnTermination 的公开读取接口,Win8.1+ 由 ntoskrnl 导出)。
+//
+// 用【运行时解析】而不是直接调用,两个实测理由:
+//   1) 当前 WDK(SDK 10.0.26100)的 ntddk.h 并没有声明它 —— 直接调用报 C4013,而本工程
+//      warning-as-error,编译直接失败;
+//   2) 在本文件里手写原型 + 静态链接,等于把「这套 ntoskrnl.lib 里有没有这个导出」变成
+//      链接期赌注,赌输了是链接错误,赌赢了也仍然要求目标机内核有该导出才能加载驱动。
+// MmGetSystemRoutineAddress 没有这两个问题:解析不到就退回「名单 + 系统目录」判定,
+// 也就是本次修改之前的行为,不会有任何退化。仅在 PASSIVE_LEVEL 调用(该 API 的要求),
+// BlwKillProcessById 本身就跑在 PASSIVE_LEVEL(FltSendMessage 处理路径)。
+//
+// 用 union 转换函数指针而不是直接强转:MSVC 对「数据指针强转函数指针」会报 C4055,
+// 本工程把警告当错误,那条会直接让编译失败。
+//
+typedef BOOLEAN (*BLW_PS_IS_PROCESS_CRITICAL)(_In_ PEPROCESS Process);
+
+static BOOLEAN
+BlwProcessIsKernelCritical(_In_ PEPROCESS Process)
+{
+    static BLW_PS_IS_PROCESS_CRITICAL s_fn = NULL;
+    static BOOLEAN s_resolved = FALSE;
+
+    if (!s_resolved) {
+        union { PVOID p; BLW_PS_IS_PROCESS_CRITICAL fn; } cast;
+        UNICODE_STRING name;
+
+        RtlInitUnicodeString(&name, L"PsIsProcessCritical");
+        cast.p = MmGetSystemRoutineAddress(&name);
+        s_fn = cast.fn;
+        s_resolved = TRUE;   // 解析失败也不重试:结果不会变
+        if (s_fn == NULL) {
+            KdPrint(("[Bulwark] PsIsProcessCritical unavailable; name+path guard only.\n"));
+        }
+    }
+
+    // 解析不到时返回 FALSE = 「这一条判据不表态」,交给下面的名单 + 系统目录判定兜住。
+    return (s_fn != NULL) ? s_fn(Process) : FALSE;
+}
+
+//
 // 驱动级结束进程(BLW_CMD_KILL_PID 的内核实现)。用户态 VT 确认某新进程恶意后下发本命令 ——
 // 内核直接 ZwTerminateProcess,比用户态 OpenProcess+TerminateProcess 更强(不受目标用户态反杀/
 // 权限对抗影响)。
@@ -606,8 +695,14 @@ BlwUnregisterProcessCallback(void)
 // 硬护栏(任一命中即拒绝,绝不结束 —— 防蓝屏/防自杀):
 //   1) PID <= 4:Idle/System,碰即崩。
 //   2) 本软件受保护进程(服务/UI 自身)。
-//   3) 关键系统进程(csrss/wininit/winlogon/services/lsass/smss/svchost...)——
-//      结束会 CRITICAL_PROCESS_DIED(0xEF)蓝屏。复用进程创建放行用的同一名单判定。
+//   3) 关键系统进程,两道独立判据,任一成立即拒绝:
+//      3a) PsIsProcessCritical —— 内核【权威】标记(EPROCESS.BreakOnTermination)。这就是
+//          CRITICAL_PROCESS_DIED(0xEF)的触发条件本身,比任何名单都准:真 csrss / smss /
+//          wininit / winlogon / services / lsass 全都带这个标记,而伪装成同名的样本没有。
+//      3b) 映像名命中关键进程名单【且】位于真正的系统目录(见 BlwIsCriticalSystemProcess)。
+//          覆盖 svchost / dwm / spoolsv 这类"杀了不蓝屏但会搞坏桌面/服务"的进程。
+//      这两条一起,把「真系统进程绝不误杀」和「改名伪装的样本必须能杀」同时满足 ——
+//      原实现只有按名字的 3b,于是 AppData 里叫 csrss.exe 的样本反而杀不掉(实测)。
 // 目标已退出/打不开则安全返回,绝不蓝屏。本函数在 PASSIVE_LEVEL 调用(FltSendMessage 处理路径)。
 //
 NTSTATUS
@@ -634,20 +729,29 @@ BlwKillProcessById(_In_ ULONG Pid)
         return status;
     }
 
-    // 护栏 3:关键系统进程绝不结束(防 CRITICAL_PROCESS_DIED 蓝屏)。用映像名判定,
-    // 复用进程创建放行/兜底用的同一名单(csrss/wininit/winlogon/services/lsass/smss/svchost...)。
+    // 护栏 3a:内核权威的关键进程标记。带此标记的进程一被结束就是 CRITICAL_PROCESS_DIED,
+    // 所以这一条就是防蓝屏的真正底线 —— 它不看名字、不看路径,伪装骗不过它。
+    if (BlwProcessIsKernelCritical(proc)) {
+        KdPrint(("[Bulwark] KILL refused: PID %u is kernel-critical (BreakOnTermination).\n", Pid));
+        ObDereferenceObject(proc);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    // 护栏 3b:映像名命中关键进程名单【且】位于真正的系统目录。覆盖 svchost / dwm / spoolsv
+    // 这类没有 BreakOnTermination、但结束后会搞坏桌面或成片服务的进程。
+    // 注意判定里含路径条件:AppData 里改名成 csrss.exe 的样本【不】受这条豁免(那正是要杀的)。
     status = SeLocateProcessImageName(proc, &imageName);
     if (NT_SUCCESS(status) && imageName != NULL && imageName->Buffer != NULL && imageName->Length > 0) {
         USHORT chars = (USHORT)(imageName->Length / sizeof(WCHAR));
         BOOLEAN critical = BlwIsCriticalSystemProcess(imageName->Buffer, chars);
         ExFreePool(imageName);
         if (critical) {
-            KdPrint(("[Bulwark] KILL refused: PID %u is a critical system process.\n", Pid));
+            KdPrint(("[Bulwark] KILL refused: PID %u is a system process in System32.\n", Pid));
             ObDereferenceObject(proc);
             return STATUS_ACCESS_DENIED;
         }
     }
-    // SeLocateProcessImageName 失败时保守继续(已过 PID/受保护护栏;此类多为普通用户进程)。
+    // SeLocateProcessImageName 失败时保守继续(已过 PID/受保护/内核权威三道护栏)。
 
     // 打开并结束。KernelMode 访问模式绕过 ACL,可结束任意非关键进程。
     status = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,

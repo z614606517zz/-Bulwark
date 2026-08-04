@@ -226,7 +226,7 @@ QString buildMessage(const SecurityEvent& e, const Verdict& v) {
 
 QJsonObject EcsAlertFormatter::format(const bulwark::SecurityEvent& e, const bulwark::Verdict& v) {
     const QDateTime ts = e.timestampUtc.isValid() ? e.timestampUtc.toUTC()
-                                                  : QDateTime::currentDateTimeUtc();
+                                                  : nowUtc();
     QJsonObject doc;
     doc[QStringLiteral("@timestamp")] =
         ts.toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss.zzz")) + QStringLiteral("Z");

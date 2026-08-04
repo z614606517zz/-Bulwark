@@ -7,12 +7,20 @@
 #include "bulwark/service/QuarantineManager.h"
 #include "bulwark/service/ThreatRemediator.h"
 #include "bulwark/service/EventHistoryStore.h"
+#include "bulwark/service/AlertExporter.h"
+#include "bulwark/service/AttackChainEngine.h"
 #include "bulwark/service/reputation/ReputationManager.h"
 #include "bulwark/service/reputation/ThreatBookClient.h"
 #include "bulwark/service/reputation/VirusTotalClient.h"
+#include "bulwark/service/reputation/ProxyReputationService.h"
+#include "bulwark/service/reputation/AggregateReputationService.h"
 #include "bulwark/service/VtScanHistoryStore.h"
+#include "bulwark/service/ThreatIntelContribStore.h"
 #include "bulwark/service/monitoring/ProcessInspector.h"
 #include "bulwark/service/monitoring/ProcessOriginResolver.h"
+#include "bulwark/service/ServiceControlTracer.h"
+// 「这个 IP 能不能整段封禁」的统一判定,与 ThreatFoxFeed 共用同一份名单。
+#include "bulwark/service/IpBlockPolicy.h"
 #include "bulwark/engine/TrustPolicy.h"
 #include "bulwark/engine/ThreatDetector.h"
 #include "bulwark/engine/AiDecisionPolicy.h"
@@ -20,6 +28,7 @@
 #include "bulwark/json/JsonSupport.h"
 
 #include <QDateTime>
+#include <QDir>
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QMutexLocker>
@@ -45,6 +54,9 @@ constexpr int    kVtQueueMax           = 64;                     // 后台 VT �
 constexpr int    kVtWorkerThreads      = 4;                      // 后台 VT 扫描线程池大小(并行处理,避免长耗时上传阻塞其它文件的查询状态推送)
 constexpr int    kRecentDropWindowSecs = 5 * 60;                 // "写出即执行"关联时间窗
 constexpr qint64 kVtUnknownDedupTtlSec = 24LL * 3600;            // 未收录/无结论去重窗(24h)
+// 待用户裁决事件的上限。超出时按默认策略收尾最旧的一条(而不是静默丢弃)——
+// 丢弃会让内核阻塞类事件永远收不到回写,也会让该事件既不出现在拦截记录也不出现在活动日志里。
+constexpr int    kMaxPendingPrompts    = 512;
 
 // 把内部清理报告转成发往 UI 的「足迹清理报告」负载(如实列出已清理项与未能清理项)。
 bulwark::ipc::RemediationReportPayload makeRemediationPayload(
@@ -79,7 +91,16 @@ QVector<bulwark::DefenseRule> buildRulesFromProfile(const bulwark::ThreatBehavio
         rules.append(r);
     }
     // 2) C2 外联 IP -> 禁止外联(整 IP、任意端口)。
+    //
+    // 两道闸,与下面域名分支的口径一致(域名分支一直有,IP 分支原先两道都缺 —— 见
+    // isUnsafeToBlanketBlockIp 的说明,那是「装了防护后一堆软件打不开/登不上」的主因):
+    //   · 共享基础设施 / 非公网 / 畸形地址一律不收;
+    //   · 条数设上限,单个样本连了几百个地址时不至于把规则库灌满(规则库是定长预算,
+    //     被垃圾条目占满会挤掉真正有价值的规则)。
+    constexpr int kMaxIpRules = 50;
+    int ipRules = 0;
     for (const QString& ioc : p.contactedIps) {
+        if (ipRules >= kMaxIpRules) break;
         QString ipOnly = ioc.trimmed();
         const int c = ipOnly.lastIndexOf(QLatin1Char(':'));
         if (c > 0) {
@@ -88,12 +109,14 @@ QVector<bulwark::DefenseRule> buildRulesFromProfile(const bulwark::ThreatBehavio
             if (ok) ipOnly = ipOnly.left(c); // 去掉端口,按整 IP 拦
         }
         if (ipOnly.isEmpty()) continue;
+        if (isUnsafeToBlanketBlockIp(ipOnly)) continue;
         bulwark::DefenseRule r;
         r.type = bulwark::EventType::NetworkConnect;
         r.targetPattern = ipOnly + QStringLiteral(":*");
         r.action = VerdictAction::Block;
         r.note = tag + QStringLiteral(" 已知 C2 外联地址,禁止外联:") + ipOnly;
         rules.append(r);
+        ++ipRules;
     }
     // 2b) C2 外联域名 -> 禁止 DNS 解析/连接(优先级高,拦截在 DNS 阶段,IP 未解析就阻断)。
     // 限制数量避免误报,只收录有明确恶意指向的域名(最多 50 条)。
@@ -190,6 +213,13 @@ Worker::Worker(bulwark::engine::RuleEngine* engine, IpcServer* ipc, EventSource*
     connect(source, &EventSource::eventProduced, this, &Worker::onEvent);
     connect(ipc_, &IpcServer::promptResponse, this, &Worker::onPromptResponse);
     connect(ipc_, &IpcServer::aiScanResponse, this, &Worker::onAiScanResponse);
+
+    // 弹窗超时巡检:1s 粒度足够(超时本身是秒级配置),且空 pending_ 时开销可忽略。
+    // 用定时器而不是给每条事件各起一个 QTimer —— 后者在事件突发时会造成大量定时器对象。
+    promptTimer_ = new QTimer(this);
+    promptTimer_->setInterval(1000);
+    connect(promptTimer_, &QTimer::timeout, this, &Worker::onPromptTimeoutTick);
+    promptTimer_->start();
 }
 
 // unique_ptr<ThreatRemediator> 的析构需在此(完整类型可见处)生成。
@@ -233,7 +263,20 @@ void Worker::setVtScan(reputation::VirusTotalClient* vt, VtScanHistoryStore* his
         vtWorkers_.reserve(kVtWorkerThreads);
         for (int i = 0; i < kVtWorkerThreads; ++i)
             vtWorkers_.emplace_back([this] { vtScanLoop(); });
+        log_.info(QStringLiteral("双击/释放载荷病毒扫描 worker 已启动(%1 个后台线程)。").arg(kVtWorkerThreads));
+    } else if (!vt_) {
+        log_.warning(QStringLiteral("双击/释放载荷病毒扫描未启动:VT 客户端为空。"));
     }
+}
+
+void Worker::setCloudScanChain(reputation::ProxyReputationService* proxy,
+                               reputation::AggregateReputationService* aggregate) {
+    repProxy_ = proxy;
+    repAggregate_ = aggregate;
+    log_.info(QStringLiteral("云扫描分级链路:本地缓存 -> %1 -> VirusTotal -> %2 -> 上传扫描%3。")
+                  .arg(proxy ? QStringLiteral("中央服务器") : QStringLiteral("(无中央服务器)"),
+                       aggregate ? QStringLiteral("其他情报源") : QStringLiteral("(无其他源)"),
+                       proxy ? QStringLiteral(";新结论回传服务器") : QString()));
 }
 
 QString Worker::describe(const SecurityEvent& e, VerdictAction action) const {
@@ -250,13 +293,74 @@ QString Worker::describe(const SecurityEvent& e, VerdictAction action) const {
     return line;
 }
 
+// 零风险放行的文本日志折叠。设计与「为什么必须折叠」见 Worker.h 的 allowBursts_ 段说明。
+bool Worker::shouldLogAllow(const SecurityEvent& e, VerdictAction action, QString* summaryOut) {
+    // 任意一项带调查信号即照常整条记录 —— 折叠的前提是「这条事件完全无话可说」。
+    if (action != VerdictAction::Allow) return true;
+    if (e.riskScore != 0) return true;
+    if (e.hasThreatIndicator) return true;
+    if (!e.matchedRuleNote.isEmpty()) return true;
+
+    // 键 = 主体 + 事件类型。刻意【不含 target】:刷屏的正是同一主体对成千上万个不同临时
+    // 文件做同一件事(swapfs-10031/10032/...),把 target 计入键等于永远都是「首见」,折叠失效。
+    const QString key = e.actorPath.toLower() + QStringLiteral("|")
+                      + QString::number(static_cast<int>(e.type));
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+
+    // 有界:主体种类爆炸时整表清空,不做 LRU。清空的唯一后果是下一条重新算「首见」而多打
+    // 一行日志 —— 偏向「多记」而不是「漏记」。
+    if (allowBursts_.size() > kAllowFoldMaxKeys && !allowBursts_.contains(key))
+        allowBursts_.clear();
+
+    auto it = allowBursts_.find(key);
+    if (it == allowBursts_.end()) {
+        AllowBurst b;
+        b.firstMs = nowMs;
+        allowBursts_.insert(key, b);
+        return true;                    // 首见:整条记录
+    }
+
+    AllowBurst& b = it.value();
+    if (nowMs - b.firstMs >= kAllowFoldWindowMs) {
+        // 窗口到期:先把这一窗折叠掉的条数汇总,再以本条作为新窗口的首条整条记录。
+        if (b.folded > 0 && summaryOut) {
+            // 中文一律走 UTF-8 转义 + fromUtf8,与 describe() 同口径:不依赖源文件编码,
+            // 也不依赖 MSVC 对 u"" 拼接窄字面量的实现定义转码行为。
+            *summaryOut = QString::fromUtf8("[%1] \xe5\xb7\xb2\xe6\x8a\x98\xe5\x8f\xa0 %2 "
+                                            "\xe6\x9d\xa1\xe5\x90\x8c\xe7\xb1\xbb\xe9\x9b\xb6"
+                                            "\xe9\xa3\x8e\xe9\x99\xa9\xe6\x94\xbe\xe8\xa1\x8c"
+                                            "(%3 %4)\xef\xbc\x8c\xe7\xaa\x97\xe5\x8f\xa3 %5 "
+                                            "\xe7\xa7\x92")
+                .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")))
+                .arg(QString::number(b.folded))
+                .arg(bulwark::eventTypeToString(e.type))
+                .arg(e.actorPath)
+                .arg(QString::number((nowMs - b.firstMs) / 1000));
+        }
+        b.firstMs = nowMs;
+        b.folded  = 0;
+        return true;
+    }
+
+    ++b.folded;
+    return false;                       // 窗口内重复:折叠
+}
+
 void Worker::onEvent(const SecurityEvent& incoming) {
     SecurityEvent e = incoming; // evaluate 需要可变引用(写回证据/分数)
 
     // 总开关关闭 / 该维度未启用 -> 直接放行(不富化、不评估、不处置),仅记日志/审计。
     // 对应 .NET Worker.HandleEventAsync 开头的短路;让 UI 的总开关与分项开关真正生效。
     if (settings_ && (!settings_->protectionEnabled || !isDimensionEnabled(e.type))) {
-        ipc_->sendLog(describe(e, VerdictAction::Allow));
+        // 这条路径在总开关/分项开关关闭时对【每一条】事件都成立,是比共存放行更猛的刷屏源
+        // (没有任何过滤),所以同样走折叠。事件未富化,风险恒 0、无硬指标,判定天然命中。
+        // 只发 UI 实时日志、不写 service.log —— 与本路径原有行为保持一致(原本就没有 log_.info)。
+        QString offSummary;
+        const bool emitOff = shouldLogAllow(e, VerdictAction::Allow, &offSummary);
+        if (!offSummary.isEmpty())
+            ipc_->sendLog(offSummary);
+        if (emitOff)
+            ipc_->sendLog(describe(e, VerdictAction::Allow));
         ipc_->sendEventLog(e, VerdictAction::Allow, VerdictSource::DefaultPolicy);
         writeAudit(e, VerdictAction::Allow, VerdictSource::DefaultPolicy);
         return;
@@ -265,6 +369,31 @@ void Worker::onEvent(const SecurityEvent& incoming) {
     enrich(e);                  // 先富化(签名/哈希/命令行/首见/祖先链),规则引擎才有据可判
     chain_.record(e);                        // 记入进程链(供后续事件关联与足迹清理)
     e.chainContext = chain_.buildContext(e); // 合并历史 + 祖先链上下文,喂给杀伤链阶段分析
+
+    // 攻击链组合:给该进程记下本次触发的动作标记,若因此凑齐了某个「服务器从真实样本里数出来的
+    // 组合」,就把它作为证据喂进事件。必须在 evaluate 之前 —— 这样结论由既有裁决流水线产出,
+    // 用户信任 / 自身组件 / 已装杀软那几道放行通道仍在它之前生效,组合命中越不过它们。
+    // 富化之后才调:匹配要用到签名状态与命令行,富化前这些字段还是空的。
+    // 命中留到裁决之后再记录(要记下最终处置是放行/拦截/询问),故先接在局部变量里。
+    //
+    // 自身组件直接跳过记账:它们在裁决流水线【第一步】就被无条件放行,攻击链对它们下的任何结论
+    // 都到不了处置环节 —— 记下来只会把命中表(上限 500 条)灌满自噪声,把真实命中挤出去。
+    // 实测确有此事:本产品的 UI 自己就会命中「系统进程名出现在非常规位置」那条组合。
+    // 这里零检测损失 —— 唯一被排除的是「永远不会被拦」的那一类主体。
+    std::optional<ChainHit> chainHit;
+    if (attackChain_ && !engine_->isSelfComponent(e)) {
+        if (const auto hit = attackChain_->observe(e)) {
+            attackChain_->applyHitToEvent(e, *hit);
+            chainHit = hit;
+            log_.warning(QStringLiteral("攻击链组合命中%1:%2 → %3(%4 个样本作证)")
+                             .arg(attackChain_->isDryRun() ? QStringLiteral("(dry-run 仅记录)")
+                                                           : QString())
+                             .arg(e.actorPath)
+                             .arg(hit->titles.join(QStringLiteral(" + ")))
+                             .arg(hit->pattern.support));
+        }
+    }
+
     const bulwark::Verdict v = engine_->evaluate(e);
     // 用户明确信任(文件/文件夹)命中:信任即「完全不检测」——放行并跳过全部后台扫描
     //(外部信誉 / 微步 IP 情报 / VirusTotal / AI 研判),仅保留记录与放行。
@@ -339,13 +468,57 @@ void Worker::onEvent(const SecurityEvent& incoming) {
 
     bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
     switch (action) {
-        case VerdictAction::Ask:
-            pending_.insert(e.id, e);
+        case VerdictAction::Ask: {
+            // 超量保护:先按默认策略收尾最旧的一条,再放新的进来。绝不静默丢弃 ——
+            // 内核阻塞类事件靠这条回写才能放行/拦截,悄悄扔掉会让它永远等不到裁决。
+            if (pending_.size() >= kMaxPendingPrompts) {
+                QUuid oldestId;
+                QDateTime oldest;
+                for (auto it = pending_.constBegin(); it != pending_.constEnd(); ++it) {
+                    const QDateTime ts = it.value().event.timestampUtc;
+                    if (!oldest.isValid() || ts < oldest) { oldest = ts; oldestId = it.key(); }
+                }
+                const auto victim = pending_.find(oldestId);
+                if (victim != pending_.end()) {
+                    const SecurityEvent old = victim.value().event;
+                    pending_.erase(victim);
+                    resolvePromptByDefault(
+                        old, QStringLiteral("待裁决队列已满(%1 条)").arg(kMaxPendingPrompts));
+                }
+            }
+            const int timeoutSecs = settings_ ? settings_->promptTimeoutSeconds : 0;
+            PendingPrompt p;
+            p.event = e;
+            // <= 0 表示不超时(等用户点到底);> 0 才记截止时间。
+            if (timeoutSecs > 0)
+                p.deadlineUtc = QDateTime::currentDateTimeUtc().addSecs(timeoutSecs);
+            pending_.insert(e.id, p);
             ipc_->sendPrompt(e);
             break;
+        }
         case VerdictAction::Block:
             ipc_->sendBlock(e);
-            enforcement = enforceBlock(e); // 真实处置结果:内核前拦 / 已结束进程 / 加黑名单 / 仅告警
+            //
+            // persistentBlacklist 只在【引擎自己就判了 Block】时为真。
+            //
+            // 静默模式把 Ask 升级来的 Block 属于「被抑制的询问」,不是「已确认恶意」:引擎的原始
+            // 结论是「拿不准,该问用户」(RuleEngine 第 10 步在 riskScore < HighRisk 时给 Ask)。
+            // 这种不确定的结论绝不能钉进内核 FileExecBlock / FileNoLoad —— 那两份名单由驱动写回
+            // 注册表、跨杀服务与重启由内核独立续拦,协议上又没有「删除单条」,一次误判就是
+            // 「该程序永久起不来,且用户在 UI 怎么加白都没用」(事件在进程创建回调就被
+            // STATUS_ACCESS_DENIED,根本到不了规则引擎)。
+            //
+            // 实测事故:Kiro(Amazon 有效签名的 Electron IDE)因两个纯统计信号凑到硬指标、
+            // riskScore 恰好 50 命中 Suspicious 等号,被静默模式升级为 Block 并永久钉入内核禁运,
+            // 重装服务、重启都救不回来 —— 只能手工改注册表。
+            //
+            // 与上面 660 行的超时兜底同一口径(那里已经这么做了):不确定的处置只结束当前进程,
+            // 不留跨重启的持久拦截。真正确定的恶意仍照旧钉死 —— 引擎直接判 Block(高危硬指标 /
+            // 命中 Block 规则 / 吊销签名)、外部信誉确认恶意(onReputationMalicious 单独调
+            // blacklistExec)这些路径都不受本改动影响。
+            //
+            enforcement = enforceBlock(e, /*persistentBlacklist=*/v.action == VerdictAction::Block);
+            maybeQuarantineOnBlock(e);     // 设置「拦截时一并隔离载荷」开启时才动作(带三道护栏)
             // 确定性恶意:隔离载荷 + 清除持久化。用最终裁决(可能被静默模式升级为 Block)驱动,
             // 而非原始 v —— 否则静默升级的高危不会触发隔离(v.action 仍是 Ask)。
             remediateIfMalicious(e, action == v.action ? v
@@ -360,18 +533,58 @@ void Worker::onEvent(const SecurityEvent& incoming) {
     if (source_ && source_->wantsVerdict() && action != VerdictAction::Ask)
         source_->submitVerdict(e, action);
 
-    ipc_->sendLog(describe(e, action));
-    ipc_->sendEventLog(e, action, source, enforcement);
-    if (eventHistory_) { // 落结构化事件历史,供 UI 打开活动日志/拦截记录时回填
-        bulwark::ipc::EventLogPayload p;
-        p.event = e;
-        p.action = action;
-        p.source = source;
-        p.enforcement = enforcement;
-        eventHistory_->add(p);
+    // 文本日志(service.log + UI 实时日志)对「零调查价值的放行」折叠,否则共存安全软件的临时
+    // 文件 churn 会在几秒内滚完 5MB 上限,把启动过程与真实告警全部挤出日志。判定见 shouldLogAllow。
+    QString foldSummary;
+    const bool emitLine = shouldLogAllow(e, action, &foldSummary);
+    if (!foldSummary.isEmpty()) {          // 上一窗口的汇总先落,保持时间顺序
+        ipc_->sendLog(foldSummary);
+        log_.info(foldSummary);
     }
+    if (emitLine) {
+        const QString line = describe(e, action);
+        ipc_->sendLog(line);
+        log_.info(line);
+    }
+    // 走同一个 recordEvent 漏斗(它与这里原本内联的两步完全等价),这样「结构化历史 + 实时推送 +
+    // ECS 告警导出」只有一处实现,不会再出现某条新增路径漏掉其中一项的情况。
+    // 注意:结构化历史与审计【不参与上面的折叠】,仍逐条完整落盘 —— 折叠只压文本滚动面,
+    // 不动统计口径,也不动取证轨迹。
+    recordEvent(e, action, source, enforcement);
     writeAudit(e, action, source);
-    log_.info(describe(e, action));
+
+    // 攻击链命中记录:放在最后,这样能记下【最终】处置(可能被静默模式升级、或被签名信任降级)。
+    // 独立于事件历史保存 —— 一条攻击链跨多个事件,挂在任一条事件上都看不到全貌。
+    if (attackChain_ && chainHit.has_value()) {
+        const QString actionName = action == VerdictAction::Block ? QStringLiteral("Block")
+                                 : action == VerdictAction::Ask   ? QStringLiteral("Ask")
+                                                                  : QStringLiteral("Allow");
+        const service::ChainHitRecord rec = attackChain_->recordHit(*chainHit, e, actionName);
+
+        // 即时通知(右下角自动消失的 toast)。
+        //
+        // 【刻意不看 silentMode】。静默模式的语义是「不要为决策打扰我」—— 它把询问降级成放行。
+        // 但那恰恰造出一个盲区:攻击链凑齐了 N 个动作、有真实样本作证,却被静默放行,而用户
+        // 完全不知道发生过。这是通知而非提问:不带处置按钮、自动消失、不抢焦点,不构成打扰,
+        // 所以不该被静默模式吞掉。要彻底关掉它有独立开关 attackChainToast。
+        //
+        // 也【刻意不复用 BlockNotification】:那条只在真拦下时发,而这里三种处置都要发。
+        if (ipc_ && (!settings_ || settings_->attackChainToast)) {
+            bulwark::ipc::AttackChainHitPayload p;
+            p.whenUtc   = rec.whenUtc;
+            p.actorPath = rec.actorPath;
+            p.actorPid  = rec.actorPid;
+            p.titles    = rec.titles;
+            p.grade     = rec.grade;
+            p.maxLevel  = rec.maxLevel;
+            p.support   = rec.support;
+            p.families  = rec.families;
+            p.dryRun    = rec.dryRun;
+            p.action    = rec.action;
+            p.eventType = rec.eventType;
+            ipc_->sendAttackChainHit(p);
+        }
+    }
 }
 
 bool Worker::isDimensionEnabled(bulwark::EventType type) const {
@@ -402,7 +615,7 @@ void Worker::onPromptResponse(const QUuid& eventId, VerdictAction action,
                               bool remember, bulwark::RememberScope scope) {
     auto it = pending_.find(eventId);
     if (it == pending_.end()) return;
-    SecurityEvent e = it.value();
+    SecurityEvent e = it.value().event;
     pending_.erase(it);
 
     log_.info(QStringLiteral("用户裁决: %1 -> %2%3")
@@ -426,8 +639,10 @@ void Worker::onPromptResponse(const QUuid& eventId, VerdictAction action,
 
     // 用户裁决为拦截:执行真实处置并拿到真实结果(内核前拦 / 已结束进程 / 加黑名单 / 仅告警)。
     bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
-    if (action == VerdictAction::Block)
+    if (action == VerdictAction::Block) {
         enforcement = enforceBlock(e);
+        maybeQuarantineOnBlock(e); // 用户显式裁决拦截时同样尊重「拦截时一并隔离载荷」设置
+    }
     // 阻塞式源(内核驱动):把用户裁决回写内核。仅文件/注册表/结束进程等内核等待类事件真正回复。
     if (source_ && source_->wantsVerdict())
         source_->submitVerdict(e, action);
@@ -437,7 +652,78 @@ void Worker::onPromptResponse(const QUuid& eventId, VerdictAction action,
     writeAudit(e, action, VerdictSource::UserPrompt);
 }
 
+void Worker::onPromptTimeoutTick() {
+    if (pending_.isEmpty())
+        return;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+
+    // 先收集再处置:resolvePromptByDefault 会走 enforceBlock / IPC / 审计,期间不应在
+    // 遍历中改动 pending_。
+    QVector<SecurityEvent> expired;
+    for (auto it = pending_.begin(); it != pending_.end(); ) {
+        const QDateTime& deadline = it.value().deadlineUtc;
+        if (deadline.isValid() && deadline <= now) {
+            expired.append(it.value().event);
+            it = pending_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const SecurityEvent& e : expired)
+        resolvePromptByDefault(e, QStringLiteral("用户未在 %1 秒内裁决")
+                                      .arg(settings_ ? settings_->promptTimeoutSeconds : 0));
+}
+
+void Worker::resolvePromptByDefault(const SecurityEvent& e, const QString& why) {
+    // 默认策略来自 RuntimeSettings::defaultBlock(UI 的「默认拦截未知行为」开关)。
+    // 在此之前该开关在服务端只被打印进一行日志,不参与任何裁决 —— 现在它真正决定超时兜底方向。
+    const bool block = settings_ && settings_->defaultBlock;
+    const VerdictAction action = block ? VerdictAction::Block : VerdictAction::Allow;
+
+    const QString msg = QStringLiteral("弹窗超时按默认策略处置(%1):%2 -> %3")
+                            .arg(why, e.actorPath,
+                                 block ? QStringLiteral("拦截") : QStringLiteral("放行"));
+    log_.warning(msg);
+    ipc_->sendLog(msg);
+
+    bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
+    if (block) {
+        ipc_->sendBlock(e);
+        // persistentBlacklist=false:超时兜底并非「已确认恶意」,不把映像/模块钉进内核持久名单。
+        enforcement = enforceBlock(e, /*persistentBlacklist=*/false);
+    }
+    // 阻塞式源(内核驱动)必须收到回写,否则该操作在内核侧一直悬着。
+    if (source_ && source_->wantsVerdict())
+        source_->submitVerdict(e, action);
+
+    // 这是 VerdictSource::Timeout 唯一的产生点 —— 此前该枚举值从未被产生过。
+    recordEvent(e, action, VerdictSource::Timeout, enforcement);
+    writeAudit(e, action, VerdictSource::Timeout);
+}
+
 void Worker::enrich(SecurityEvent& e) {
+    // 0) 服务创建「真凶」溯源。创建服务走 RPC 交由 services.exe(SCM)代写注册表,内核回调
+    //    归因永远是 SCM 而非真实发起者;此处把它还原成真正调用方。
+    //
+    //    这段原先在 DriverEventSource::buildAndQueue 里(驱动读线程)。搬到这里有两个理由:
+    //    一是 trace() 要做 1MB 全系统进程+线程快照 + 逐候选 OpenProcess,属于该函数注释明令
+    //    「交主线程」的昂贵富化,放在读线程会堵住整个内核事件投递;二是它在读线程的栈帧里会
+    //    写坏待入队事件的 chainContext(详见 buildAndQueue 里的说明),是服务反复崩溃的触发点。
+    //
+    //    必须放在第 1 步【之前】:溯源会改写 actorPid,下面按 PID 反查路径才查的是真凶。
+    if (e.type == bulwark::EventType::RegistryWrite && e.actorPid > 0
+        && ServiceControlTracer::isServiceDatabaseKey(e.target)) {
+        const ServiceOriginator orig = ServiceControlTracer::trace(e.actorPid);
+        // 仅高置信唯一候选才改写主体,否则保守留 SCM —— 绝不据此去结束 services.exe。
+        if (orig.highConfidence()) {
+            e.actorPid = orig.originatorPid;
+            e.actorPath = orig.originatorPath;
+            e.detail += QStringLiteral(" · 真凶溯源:%1(PID %2)")
+                            .arg(QFileInfo(orig.originatorPath).fileName())
+                            .arg(orig.originatorPid);
+        }
+    }
+
     // 1) 补全映像路径:内核/ETW 事件偶尔只带 PID 占位,按 PID 反查完整路径更可靠。
     if ((e.actorPath.isEmpty() || e.actorPath.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
         && e.actorPid > 0) {
@@ -462,6 +748,27 @@ void Worker::enrich(SecurityEvent& e) {
     if (e.parentPath.isEmpty() && e.parentPid > 0)
         e.parentPath = ProcessInspector::tryGetProcessImagePath(e.parentPid);
 
+    //
+    // 3.1) 本软件自身组件:跳过所有【昂贵且对结论毫无影响】的取证。
+    //
+    // 裁决流水线的第 1 步就是 `isSelfComponent -> 无条件放行`,早于威胁检测、时序检测与规则
+    // 匹配,没有任何例外分支。也就是说下面这些取证结果对自身组件的裁决【一个字节都用不上】:
+    //   · 启动来源溯源(3.2):服务枚举 + 计划任务查表;
+    //   · 祖先链回溯(3.5):最多 16 级,每级 OpenProcess + NtQueryInformationProcess +
+    //     QueryFullProcessImageName,且【不带缓存】—— 这是本函数里唯一逐条事件都要付的
+    //     系统调用大头;
+    //   · 证书画像 / 侧载模块扫描 / 首见落盘 / 云信誉查询。
+    //
+    // 而自身组件恰恰是最高频的事件来源:服务自己在持续写 %ProgramData%\Bulwark\ 下的日志、
+    // 规则、信誉缓存、事件历史,这些写入全都经内核文件遥测回到本函数。给「一定会被无条件
+    // 放行」的自己做全套取证,是纯粹自噪声。
+    //
+    // 仍然保留的:映像路径 / 命令行 / 父路径(上面已做,均为单次调用),以及下面第 4 步里
+    // 按文件身份缓存的签名 / 发布者 / 哈希 —— 它们要出现在 UI 的活动日志里,且命中缓存后
+    // 成本可忽略。这里刻意只砍「每条事件都重新付、且结论用不上」的那部分。
+    //
+    const bool selfComponent = engine_ && engine_->isSelfComponent(e);
+
     // 3.2) 启动来源溯源:把「父进程是 svchost.exe / services.exe / 任务宿主」这种到此为止的
     //      溯源链继续往下钉到【具体是哪个服务、哪个计划任务】。这是持久化落地执行这条链上最
     //      关键的一环 —— 没有它,「攻击者装了个服务/计划任务来拉起载荷」在日志上和普通系统
@@ -469,7 +776,7 @@ void Worker::enrich(SecurityEvent& e) {
     //
     //      纯溯源:结论只写入事件的 origin* 字段并记一条 Info 证据(0 分),【不参与风险评分】。
     //      「由计划任务启动」本身完全合法,不该因此提分;它的价值在于分析时能一眼看到因果。
-    if (e.actorPid > 0) {
+    if (e.actorPid > 0 && !selfComponent) {
         const ProcessOrigin origin =
             ProcessOriginResolver::resolve(e.actorPid, e.actorPath, e.parentPid, e.commandLine);
         if (origin.resolved()) {
@@ -495,7 +802,8 @@ void Worker::enrich(SecurityEvent& e) {
 
     // 3.5) 用 OS API 回溯完整父进程祖先链种入 chainContext(即便进程链跟踪器无历史,
     //      刚开机/首个事件时溯源链也完整;buildContext 随后会与历史合并)。
-    seedAncestryChain(e);
+    if (!selfComponent)
+        seedAncestryChain(e);
 
     // 4) 主体取证:映像路径指向真实文件时才做签名/哈希,避免对占位符做无谓 I/O。
     const QString path = e.actorPath;
@@ -513,6 +821,11 @@ void Worker::enrich(SecurityEvent& e) {
     if (!e.actorSigned)
         e.signatureMismatch = ProcessInspector::hasEmbeddedSignature(path);
 
+    // 自身组件到此为止(理由见第 3.1 步):签名 / 发布者 / 哈希已经拿到,足够 UI 如实展示,
+    // 而下面的证书链构建、侧载扫描、首见落盘、云查询对「无条件放行」的结论没有任何影响。
+    if (selfComponent)
+        return;
+
     // 证书画像:指纹 / 有效期 / 吊销 / 过期后签名(证书被吊销即便验签不过仍是硬指标)。
     const ProcessInspector::CertInfo ci = ProcessInspector::getCertInfo(path);
     if (!ci.thumbprint.isEmpty())    e.actorCertThumbprint = ci.thumbprint;
@@ -520,6 +833,10 @@ void Worker::enrich(SecurityEvent& e) {
     if (ci.signingTimeUtc.isValid()) e.signingTimeUtc      = ci.signingTimeUtc;
     e.certRevoked           = ci.revoked;
     e.signedAfterCertExpiry = ci.signedAfterCertExpiry;
+
+    // 侧载模块篡改(「白加黑」):主体签名健康时,顺带看一眼同目录有没有「签名后被改过」的模块。
+    // 放在签名/证书判定【之后】—— 它要先知道主体自己是不是签名健康的壳。按目录缓存,低频。
+    detectSideloadedTamperedModule(e);
 
     // 文件体积:银狐 / 游蛇 惯用「文件膨胀」把样本撑到数十 MB 以规避扫描。
     const QFileInfo fi(path);
@@ -530,12 +847,56 @@ void Worker::enrich(SecurityEvent& e) {
     if (firstSeen_ && !e.actorHash.isEmpty())
         e.isFirstSeen = firstSeen_->markAndCheckFirstSeen(e.actorHash);
 
-    // 外部信誉(同步只读缓存,绝不联网):命中已知结论则挂到事件参与本地评分。
-    // 网络查询由 onEvent 后的 maybeEnqueue 在后台线程完成并回填缓存,下次即命中。
+    // 外部信誉:
+    // 1. 优先读本地缓存(无网络开销);
+    // 2. 若缓存未命中且主体为【未签名 + 高危场景】,发起【有界等待】的云查询,防止已知恶意样本
+    //    首次执行漏网。「高危场景」= 首见 || 可疑目录 || 体积异常 —— 这些软信号单独不触发云查询
+    //    (避免所有首见都联网),但组合出现时足以触发;已签名样本不在此列,由后台异步链路处理。
+    // 3. 其余场景由 onEvent 后的 maybeEnqueue 在后台异步查询并回填缓存,下次即命中。
+    //
+    // 【这里曾是「防护延迟过高」的主因】原实现调的是 reputation_->queryNow —— 那个接口的声明
+    // 上就写着「绝不用于事件热路径」。它在本线程上一路阻塞:中央代理超时(默认 8s)+ 回退本地
+    // 直连聚合(各源并行,收敛到最慢单源,默认 10~15s),最坏二十多秒。而出队 / 富化 / 裁决 /
+    // IPC / 弹窗超时巡检全都在这同一个线程上串行,于是一条事件就能让【全部后续事件】停摆同样
+    // 长的时间:内核事件在 4096 深的队列里堆到丢弃(直接等于漏检)、拦截与询问迟迟不到 UI、
+    // 连每秒一次的弹窗超时巡检都不再跳。触发条件毫不苛刻 —— 代理端口不可达时,每一次缓存未命中
+    // 都要先等满超时才回退。
+    //
+    // 改为 queryNowBounded 后语义只差一点:预算内答复照旧参与本条裁决(服务器正常时 200~800ms,
+    // 常态命中);超预算则放手让流水线继续,查询仍在后台跑完并回填缓存,迟到的恶意结论转由既有
+    // 补偿处置链路(结束进程树 + 隔离 + 内核禁运)兜住。检测能力不减,延迟上限从「秒到数十秒」
+    // 变成一个明确的可配置常数。
     if (reputation_ && !e.actorHash.isEmpty()) {
-        const std::optional<bulwark::FileReputation> rep = reputation_->tryGetCached(e.actorHash);
-        if (rep.has_value())
-            e.reputation = rep;
+        const std::optional<bulwark::FileReputation> cached = reputation_->tryGetCached(e.actorHash);
+        if (cached.has_value()) {
+            e.reputation = cached;
+        } else if (!e.actorSigned) {
+            // 快速判定是否属于高危未签名场景(避免对所有未签名文件都同步查询):
+            // 1) 首见;2) 可疑目录;3) 体积异常(>60MB)。
+            const QString pathLower = e.actorPath.toLower();
+            const bool inSuspiciousDir = pathLower.contains(QLatin1String("\\temp\\")) ||
+                                         pathLower.contains(QLatin1String("\\public\\")) ||
+                                         pathLower.contains(QLatin1String("\\programdata\\")) ||
+                                         pathLower.contains(QLatin1String("\\desktop\\")) ||
+                                         pathLower.contains(QLatin1String("\\downloads\\"));
+            const bool oversized = e.actorFileSize >= 60LL * 1024 * 1024;
+            const bool suspicious = e.isFirstSeen || inSuspiciousDir || oversized;
+            if (suspicious) {
+                // 有界等待的云查询(限流仍在客户端内部控制)。超预算即返回 Unknown 放行本条,
+                // 查询本身继续在后台跑完;详见上方说明与 queryNowBounded。
+                const bulwark::FileReputation rep =
+                    reputation_->queryNowBounded(e, inlineRepBudgetMs_);
+                if (rep.querySucceeded && rep.verdict != bulwark::ReputationVerdict::Unknown) {
+                    e.reputation = rep;
+                    log_.info(QStringLiteral("高危未签名场景同步云查命中:%1(%2/%3 · %4)")
+                                  .arg(e.actorPath)
+                                  .arg(rep.malicious).arg(rep.totalEngines)
+                                  .arg(rep.verdict == bulwark::ReputationVerdict::Malicious ? QStringLiteral("恶意")
+                                     : rep.verdict == bulwark::ReputationVerdict::Suspicious ? QStringLiteral("可疑")
+                                     : QStringLiteral("干净")));
+                }
+            }
+        }
     }
 }
 
@@ -617,11 +978,38 @@ bool Worker::killMalicious(int pid) {
         source_->banProcess(pid);
     const int killed = ProcessInspector::terminateProcessTree(pid);   // 用户态结束整树(枚举子孙)
     const bool kkill = source_ && source_->killProcess(pid);           // 驱动级兜底(内核 ZwTerminateProcess)
-    if (killed > 0 || kkill)
+
+    // 以【目标是否真的退出了】为准来判定成败,而不是以「命令是否被受理」为准。
+    //
+    // 为什么必须实测:驱动对 BLW_CMD_KILL_PID 是 fire-and-forget,Comms.c 对该命令
+    // 【一律回 STATUS_SUCCESS】(被内核护栏拒绝也算成功,见其注释),所以 killProcess()
+    // 的 true 只说明"内核收下了这条命令",完全不代表进程死了。原实现据此就打出
+    // 「+ 驱动级内核结束」并返回成功 —— 实测出现过连续几十小时每 60 秒打一次这条日志、
+    // 而目标进程一直活着的情况(兜底扫描每分钟重来一遍,却没人报告失败)。
+    // 安全产品不能把"命令已发出"说成"威胁已清除"。
+    //
+    // 判定用 waitForExit 而不是「PID 还在不在进程快照里」:结束是异步的(线程要收尾),
+    // 且被别人持有句柄的僵尸进程会一直留在快照里。用快照判会把刚刚杀成功的目标误报成
+    // 「未能终结」—— 那是把一个假消息换成另一个假消息。300ms 上限只花在处置路径上
+    // (仅对已确认恶意的主体走一次),不碰任何热路径。
+    const bool gone = ProcessInspector::waitForExit(pid, 300);
+    if (gone) {
         log_.info(QStringLiteral("恶意进程终结:PID=%1(用户态结束 %2 个%3)。")
                       .arg(pid).arg(killed)
                       .arg(kkill ? QStringLiteral(" + 驱动级内核结束") : QString()));
-    return killed > 0 || kkill;
+        return true;
+    }
+
+    // 没死。如实报出来,并带上排障需要的两条信息:是否被"关键进程"护栏挡住、映像路径。
+    // (封禁主体已在上面下发,所以即便杀不掉,它的文件/注册表/网络/子进程也已被内核全维拒绝。)
+    log_.warning(QStringLiteral("恶意进程未能终结:PID=%1 仍在运行(用户态结束 %2 个,内核结束命令%3)。"
+                                "关键进程护栏=%4,映像=%5。已封禁主体,其行为仍被内核全维拒绝。")
+                     .arg(pid).arg(killed)
+                     .arg(kkill ? QStringLiteral("已受理") : QStringLiteral("未受理"))
+                     .arg(ProcessInspector::isCriticalProcess(pid) ? QStringLiteral("命中(按此判定不予结束)")
+                                                                   : QStringLiteral("未命中"))
+                     .arg(ProcessInspector::tryGetProcessImagePath(pid)));
+    return false;
 }
 
 void Worker::blacklistExec(const QString& imagePath) {
@@ -668,6 +1056,95 @@ bool Worker::abortIfTrustedNow(const SecurityEvent& e, const QString& stage) {
     log_.info(msg);
     ipc_->sendLog(msg);
     return true;
+}
+
+std::pair<bool, QString> Worker::forceQuarantine(const QString& path) {
+    if (!remediator_)
+        return { false, QStringLiteral("清理器不可用(隔离区未就绪)") };
+    const std::pair<bool, QString> r = remediator_->forceQuarantine(path);
+    if (r.first)
+        ipc_->sendQuarantineList();   // 成功即回推,隔离区页面无需再请求
+    return r;
+}
+
+bulwark::ipc::PersistenceCleanupResultPayload Worker::cleanupPersistence(
+    const bulwark::ipc::PersistenceCleanupRequestPayload& req) {
+    bulwark::ipc::PersistenceCleanupResultPayload res;
+    res.requestId = req.requestId;
+    res.entryId = req.entry.id;
+
+    if (!remediator_) {
+        res.message = QStringLiteral("清理器不可用(隔离区未就绪)");
+        return res;
+    }
+    const bulwark::PersistenceEntry& entry = req.entry;
+    if (entry.id.trimmed().isEmpty() || entry.location.trimmed().isEmpty()) {
+        res.message = QStringLiteral("条目信息不完整,已放弃清理(未做任何处置)");
+        return res;
+    }
+
+    // 护栏:已加白的目标不清理。自启动项页把「已加白」也列出来供审计,但清理必须尊重信任语义 ——
+    // 否则用户刚加白的开机自启程序会被这里清掉,与加白的承诺直接冲突。
+    if (!entry.imagePath.trimmed().isEmpty()) {
+        if (const std::optional<QString> note = engine_->trustNoteForPath(entry.imagePath)) {
+            res.message = QStringLiteral("该项目标已加白(%1),按信任语义放弃清理").arg(*note);
+            log_.info(res.message + QStringLiteral(":") + entry.imagePath);
+            return res;
+        }
+        // 护栏:本产品自身的自启动项绝不清理(否则用户一键把自己的防护开机自启删了)。
+        if (isSweepExemptPath(entry.imagePath)) {
+            res.message = QStringLiteral("系统组件 / 本产品自身的自启动项不允许从此处清理");
+            log_.warning(res.message + QStringLiteral(":") + entry.imagePath);
+            return res;
+        }
+    }
+
+    const RemediationReport report = remediator_->cleanupPersistenceEntry(entry);
+    // 持久化反重建:刚清掉的项立刻加入内核注册表硬拦,挡住守护进程秒级重写(与自动清理同一处置)。
+    applyRegHardening(report);
+
+    res.quarantinedFiles = report.quarantinedFiles;
+    res.removedRegistryValues = report.removedRegistryValues;
+    res.skipped = report.skipped;
+    res.success = report.totalActions() > 0;
+    res.message = res.success
+        ? QStringLiteral("已清理:隔离文件 %1 个,移除持久化 %2 项%3")
+              .arg(report.quarantinedFiles.size())
+              .arg(report.removedRegistryValues.size())
+              .arg(report.skipped.isEmpty()
+                       ? QString()
+                       : QStringLiteral(",另有 %1 项未能处理").arg(report.skipped.size()))
+        : (report.skipped.isEmpty()
+               ? QStringLiteral("未产生任何动作(该项可能已被移除)")
+               : QStringLiteral("清理失败:%1").arg(report.skipped.first().reason));
+
+    const QString msg = QStringLiteral("自启动项清理[%1] %2 -> %3")
+                            .arg(entry.name, entry.location, res.message);
+    log_.warning(msg);
+    ipc_->sendLog(msg);
+    if (!report.quarantinedFiles.isEmpty())
+        ipc_->sendQuarantineList();   // 有文件进隔离区,主动回推让隔离区页面即时可见
+
+    // 审计留痕(与自动足迹清理同一 action=Remediate 口径,便于事后统一检索)。
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["timestampUtc"] = dateTimeToIso(QDateTime::currentDateTimeUtc());
+    o["type"] = QStringLiteral("Persistence");
+    o["actorPath"] = entry.imagePath;
+    o["actorPid"] = 0;
+    o["target"] = entry.location + QStringLiteral(" \\ ") + entry.name;
+    o["action"] = QStringLiteral("Remediate");
+    o["source"] = QStringLiteral("UserPrompt");
+    o["riskScore"] = entry.riskScore;
+    QStringList details;
+    for (const QString& f : report.quarantinedFiles) details << (QStringLiteral("隔离文件:") + f);
+    for (const QString& r : report.removedRegistryValues) details << (QStringLiteral("移除持久化:") + r);
+    for (const bulwark::ipc::RemediationSkippedItem& s : report.skipped)
+        details << (QStringLiteral("未清理:") + s.target + QStringLiteral("(") + s.reason + QStringLiteral(")"));
+    o["reasons"] = strListToJson(details);
+    audit_->writeRecord(o);
+
+    return res;
 }
 
 void Worker::reconcileKernelBlocksAfterTrust() {
@@ -773,7 +1250,7 @@ void Worker::applyRegHardening(const RemediationReport& report) {
             QStringLiteral("持久化反重建:已把 %1 条已清理的自启动项加入内核注册表硬拦(阻止恶意软件立刻重建)。").arg(n));
 }
 
-bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e) {
+bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e, bool persistentBlacklist) {
     using bulwark::EnforcementOutcome;
 
     // (a) 内核已在【动作发生前】真正阻断(文件/注册表硬拦名单、受保护路径删除/改名、禁止加载、
@@ -786,7 +1263,8 @@ bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e) {
     //     软注册表/远程线程/网络观测):内核无法在发生前阻断,唯一真实的处置是【立即结束作恶
     //     进程】。对侧载模块额外加入内核禁止加载名单,使【下次】加载被内核前拦(白加黑防护)。
     bool blacklisted = false;
-    if (e.type == bulwark::EventType::ImageLoad && source_ && !e.target.trimmed().isEmpty()) {
+    if (persistentBlacklist && e.type == bulwark::EventType::ImageLoad
+        && source_ && !e.target.trimmed().isEmpty()) {
         // 与 blacklistExec 同理:「禁止加载」名单也由内核写回注册表持久化、只加不减,故已加白的
         // 模块(或落在已加白目录下的模块)绝不下发,否则用户加白后该 DLL 仍会被内核拒绝映射。
         const QString mod = e.target.trimmed();
@@ -799,7 +1277,8 @@ bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e) {
 
     // 进程创建类的确认恶意主体:加入内核「禁止执行」名单,使其【被守护进程/持久化/重启后规则命中
     // 拉起时】的再次启动被内核前拦(与下面结束进程配对——kill 收拾正在跑的,exec-block 挡再次启动)。
-    if (e.type == bulwark::EventType::ProcessCreate)
+    // persistentBlacklist=false 的路径(超时兜底 / AI 不可用)跳过 —— 见声明处的说明。
+    if (persistentBlacklist && e.type == bulwark::EventType::ProcessCreate)
         blacklistExec(e.actorPath);
 
     // 优先结束 RPC 真凶(如经 svchost 代发的请求),否则结束事件主体本身。
@@ -819,6 +1298,55 @@ bulwark::EnforcementOutcome Worker::enforceBlock(const SecurityEvent& e) {
     log_.warning(QStringLiteral("拦截处置:PID=%1 未能结束任何进程(已退出/受保护/关键进程),"
                                 "该事件仅告警、未实际拦截。").arg(pid));
     return EnforcementOutcome::AlertedOnly;
+}
+
+void Worker::maybeQuarantineOnBlock(const SecurityEvent& e) {
+    //
+    // RuntimeSettings::quarantineOnBlock(「拦截时一并隔离主体载荷」)。此前该字段只有 JSON
+    // 读写两行,服务端与 UI 都没有任何消费点 —— 是个纯挂着的死字段。这里是它唯一的生效点。
+    //
+    // 与 remediateIfMalicious 的分工:那个只对「确定性恶意」(命中规则 / 启发式)的进程主体做
+    // 完整足迹清理(隔离释放物 + 清持久化 + 反重建硬拦);这个是用户显式打开的更激进策略 ——
+    // 【任何】成功拦截都把主体可执行体移进隔离区。故必须自带护栏,否则一次误判就搬走系统文件。
+    //
+    if (!settings_ || !settings_->quarantineOnBlock || !quarantine_)
+        return;
+
+    const QString path = e.actorPath.trimmed();
+    if (path.isEmpty() || path.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
+        return;   // 占位符路径(内核源解析不出映像时会填 "PID 1234"),无从隔离
+
+    // 护栏 1:已加白的主体绝不隔离(与所有后台处置路径同一口径)。
+    if (const std::optional<QString> note = engine_->trustNoteForPath(path)) {
+        log_.info(QStringLiteral("拦截时隔离已跳过(该主体已加白:%1):%2").arg(*note, path));
+        return;
+    }
+    // 护栏 2:系统目录 / 本产品自身绝不隔离。isSweepExemptPath 覆盖 System32 / SysWOW64 /
+    // WinSxS 与含 "bulwark" 的路径 —— 把系统组件或自己搬进隔离区等于自毁。
+    if (isSweepExemptPath(path)) {
+        log_.info(QStringLiteral("拦截时隔离已跳过(系统目录 / 本产品自身):%1").arg(path));
+        return;
+    }
+    // 护栏 3:带健康签名的主体不隔离。走到 Block 的签名主体多半是 LOLBin 用法问题
+    // (powershell 跑了危险命令行),隔离 powershell.exe 本体是灾难性的误伤。
+    if (bulwark::engine::TrustPolicy::isHealthySigned(e).ok) {
+        log_.info(QStringLiteral("拦截时隔离已跳过(主体持健康签名,拦的是用法而非文件):%1").arg(path));
+        return;
+    }
+    if (!QFileInfo::exists(path))
+        return;
+
+    const QString hash = QuarantineManager::tryComputeSha256(path);
+    const auto entry = quarantine_->quarantine(
+        path, QStringLiteral("拦截时自动隔离(设置:拦截时一并隔离载荷)"), e.actorPid, hash);
+    if (entry.has_value()) {
+        const QString msg = QStringLiteral("拦截时隔离:已把主体载荷移入隔离区(可还原):%1").arg(path);
+        log_.warning(msg);
+        ipc_->sendLog(msg);
+        ipc_->sendQuarantineList();   // 主动回推,UI 隔离区页面无需再请求
+    } else {
+        log_.warning(QStringLiteral("拦截时隔离失败(文件被占用或权限不足):%1").arg(path));
+    }
 }
 
 void Worker::remediateIfMalicious(const SecurityEvent& e, const bulwark::Verdict& v) {
@@ -899,9 +1427,25 @@ void Worker::confirmReputationMaliciousAsync(const SecurityEvent& e, const bulwa
         if (!hashTargets.isEmpty())
             profile.locatedLocalPaths = ThreatRemediator::locateDroppedFilesByHash(hashTargets);
     }
+    // 威胁情报共享(默认关):行为画像此刻已在手上,顺路留一份脱敏副本等夜间上传 ——
+    // 不额外发一次 behaviour_summary 请求,不多花 VT 配额。注意必须在 locatedLocalPaths
+    // 填好【之后】也无妨:ContribStore 刻意不取该字段(本机路径),脱敏在它内部执行。
+    retainThreatIntel(rep, profile);
     QMetaObject::invokeMethod(
         this, [this, e, rep, profile] { onReputationMalicious(e, rep, profile); },
         Qt::QueuedConnection);
+}
+
+void Worker::retainThreatIntel(const bulwark::FileReputation& rep,
+                               const bulwark::ThreatBehaviorProfile& profile) {
+    if (!intelContrib_)
+        return;
+    if (!settings_ || !settings_->cloudBehaviorUploadEnabled)
+        return; // 用户未开启共享 -> 一个字节都不收集
+    ThreatIntelContribStore::Record rec;
+    if (!ThreatIntelContribStore::fromScan(rep, profile, &rec))
+        return; // 非恶意/可疑,或无有效哈希 -> 不收集
+    intelContrib_->append(rec);
 }
 
 void Worker::onReputationMalicious(const SecurityEvent& e, const bulwark::FileReputation& rep,
@@ -1021,7 +1565,8 @@ void Worker::onAiScanResponse(const bulwark::ipc::AiScanResponsePayload& resp) {
     // 把 AI 研判视为对该观测事件的灰区会诊,按 AiDecisionPolicy 折叠:恶意 -> 补偿处置。
     const bulwark::engine::AiDecisionPolicy::Outcome outcome =
         bulwark::engine::AiDecisionPolicy::apply(e, VerdictAction::Ask, resp.available,
-                                                 resp.recommendation, resp.summary);
+                                                 resp.recommendation, resp.summary,
+                                                 settings_ && settings_->aiScanBlockOnFailure);
     const QString verdictText = !resp.available
         ? QStringLiteral("不可用")
         : (resp.recommendation == VerdictAction::Block ? QString::fromUtf8("恶意")
@@ -1030,8 +1575,32 @@ void Worker::onAiScanResponse(const bulwark::ipc::AiScanResponsePayload& resp) {
                   .arg(e.actorPath, verdictText,
                        resp.summary.trimmed().isEmpty() ? QString()
                                                         : (QStringLiteral(" · ") + resp.summary)));
-    if (outcome.action == VerdictAction::Block)
+    if (outcome.action != VerdictAction::Block)
+        return;
+
+    // 分流:必须区分「AI 确实判定恶意」与「因为问不到 AI 而按设置 fail-closed 拦截」。
+    // outcome.rememberMalicious 只在前者为真(见 AiDecisionPolicy)。
+    if (outcome.rememberMalicious) {
         onAiMalicious(e, resp.summary);
+        return;
+    }
+
+    // fail-closed 路径(aiScanBlockOnFailure):按拦截处置,但【绝不】做那些以「已确认恶意」
+    // 为前提的动作 —— 不记住哈希、不隔离载荷、不清持久化、更不把映像钉进内核禁止执行名单。
+    // 后者会被内核写回注册表持久化、跨重启续拦,只因一次网络抖动就把用户的正常程序永久钉死,
+    // 是完全不可接受的。这里只做可逆的当次处置。
+    if (abortIfTrustedNow(e, QStringLiteral("AI 不可用(按设置拦截)")))
+        return;
+    SecurityEvent ev = e;
+    const QString reason =
+        QStringLiteral("AI 研判不可用,按设置(AI 不可用时按拦截处理)拦截本次灰区行为");
+    log_.warning(reason + QStringLiteral(" [") + ev.actorPath + QStringLiteral("]"));
+    ipc_->sendLog(reason);
+    ev.riskReasons.append(reason);
+    ipc_->sendBlock(ev);
+    const bulwark::EnforcementOutcome enf = enforceBlock(ev, /*persistentBlacklist=*/false);
+    recordEvent(ev, VerdictAction::Block, VerdictSource::Timeout, enf);
+    writeAudit(ev, VerdictAction::Block, VerdictSource::Timeout);
 }
 
 void Worker::onAiMalicious(const SecurityEvent& e, const QString& summary) {
@@ -1212,6 +1781,16 @@ void Worker::recordEvent(const SecurityEvent& e, VerdictAction action, VerdictSo
         p.enforcement = enforcement;
         eventHistory_->add(p);
     }
+    // ECS/SIEM 告警导出(appsettings 的 ExportEcsAlerts,默认关)。
+    //
+    // 这是 AlertExporter 唯一的调用点。在此之前整条链是孤岛:AlertExporter 从未被构造、
+    // ExportEcsAlerts 只被 bindBool 解析一次就没人读、而 EcsAlertFormatter(11 KB 的完整 ECS
+    // 字段映射)唯一的调用方就是 AlertExporter —— 三者互相引用,却没有任何外部入口。
+    //
+    // 放在 recordEvent 而不是 onEvent:所有终态路径(同步派发、用户裁决、超时兜底、信誉/AI/
+    // IP 情报确认恶意、兜底扫描)都经过这里,导出才不会只覆盖一部分事件。
+    if (alertExporter_)
+        alertExporter_->exportAlert(e, bulwark::Verdict::forEvent(e, action, source));
 }
 
 QString Worker::extractRemoteIpv4(const QString& target) {
@@ -1233,6 +1812,85 @@ QString Worker::extractRemoteIpv4(const QString& target) {
             return QString();
     }
     return host;
+}
+
+//
+// 侧载模块篡改检测(「白加黑」):主体目录里有没有「内嵌厂商签名但校验不过」的模块。
+//
+// 这条判据补的是一处实测漏检 —— 详见 SecurityEvent::tamperedModulePath 的说明:
+// AOMEI 正规签名的 DigitalUnit.exe 当白壳,同目录被篡改的 QtCore4.dll 是黑件,靠计划任务
+// 每 19 分钟拉起,而每次的裁决都是「签名健康 -> 放行,风险 5」。内核的 ImageLoad 上报只覆盖
+// \Temp\ 与 \Users\Public\(为防事件风暴刻意收窄),所以那个 DLL 的加载根本没产生过事件。
+// 与其去放宽内核侧的宽口径上报(会重新引入事件风暴),不如在这条【低频】路径上主动看一眼。
+//
+// 成本控制,四道:
+//   1) 只在主体【签名且签名健康】时才扫 —— 这正是「白加黑」的前提。未签名主体本来就会被
+//      无签名 / 可疑目录 / 首见等一堆信号顶起来,不需要额外 I/O;
+//   2) 跳过标准安装目录(Program Files / Windows)—— 那里写入需要管理员,不是投递落点;
+//   3) 单目录最多验 kMaxVerify 个模块,避免撞上带几百个 DLL 的大应用时线性铺开;
+//   4) 结果【按目录缓存】—— 那个样本每 19 分钟起一次,不缓存就等于每 19 分钟重扫一遍。
+//
+void Worker::detectSideloadedTamperedModule(bulwark::SecurityEvent& e) {
+    constexpr int kMaxVerify = 40;       // 单目录最多验签这么多个模块
+    constexpr int kMaxCache  = 512;      // 缓存目录数上限(超了整体清空,避免无界增长)
+
+    // 「白加黑」的前提:壳是签名健康的。主体自己就失配 / 无签名的,交给既有判据。
+    if (!e.actorSigned || e.signatureMismatch)
+        return;
+    const QString path = e.actorPath;
+    if (path.isEmpty() || path.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
+        return;
+
+    const QString dir = QFileInfo(path).absolutePath();
+    if (dir.isEmpty())
+        return;
+
+    // 标准安装目录跳过:普通用户写不进去,不是投递落点(与 ThreatDetector 文件膨胀那条
+    // 「位于安装目录的大文件是安装器放的」同一判断)。
+    QString dirLower = dir.toLower();
+    dirLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    if (dirLower.contains(QLatin1String("\\program files\\")) ||
+        dirLower.contains(QLatin1String("\\program files (x86)\\")) ||
+        dirLower.startsWith(QLatin1String("c:\\windows\\")))
+        return;
+
+    const QString key = dirLower;
+    const auto cached = tamperScanCache_.constFind(key);
+    if (cached != tamperScanCache_.constEnd()) {
+        if (!cached.value().isEmpty())
+            e.tamperedModulePath = cached.value();
+        return;
+    }
+
+    QString found;
+    QDir d(dir);
+    const QStringList filters{ QStringLiteral("*.dll"), QStringLiteral("*.exe"),
+                               QStringLiteral("*.ocx"), QStringLiteral("*.cpl") };
+    const QFileInfoList entries = d.entryInfoList(filters, QDir::Files | QDir::NoSymLinks, QDir::Name);
+    int verified = 0;
+    for (const QFileInfo& fi : entries) {
+        if (verified >= kMaxVerify)
+            break;
+        // 主体自己已经单独验过了(上面的 actorSigned / signatureMismatch)。
+        if (fi.absoluteFilePath().compare(path, Qt::CaseInsensitive) == 0)
+            continue;
+        ++verified;
+        if (ProcessInspector::isSignatureMismatch(fi.absoluteFilePath())) {
+            found = fi.absoluteFilePath();
+            break;
+        }
+    }
+
+    if (tamperScanCache_.size() >= kMaxCache)
+        tamperScanCache_.clear();
+    tamperScanCache_.insert(key, found);   // 空串 = 扫过且干净,下次直接跳过
+
+    if (!found.isEmpty()) {
+        e.tamperedModulePath = found;
+        log_.warning(QStringLiteral("侧载模块篡改:主体 %1 签名健康,但同目录 %2 内嵌签名校验不通过"
+                                    "(签名壳 + 被篡改模块 = 白加黑)。")
+                         .arg(path, found));
+    }
 }
 
 bool Worker::isPrivateOrReserved(const QString& ipv4) {
@@ -1574,34 +2232,108 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     record.fileName = QFileInfo(e.actorPath).fileName();
     record.source = QStringLiteral("\xe5\x8f\x8c\xe5\x87\xbb"); // 双击
     record.stage = bulwark::VtScanStage::Querying;
-    record.message = QStringLiteral("正在查询 VirusTotal 是否已收录…");
+    record.message = QStringLiteral("正在查询中央服务器是否已收录…");
     publishVtRecord(record);
 
-    // 1) 先按哈希查(秒级,省去对已收录文件的重复上传)。
+    // 云扫描分级链路(顺序刻意如此,先便宜/覆盖广的,再贵的):
+    //   0) 本地分级缓存  —— 零往返、零配额
+    //   1) 中央服务器    —— 机队共享缓存 + 服务端持有的 Key,不消耗本机任何源配额
+    //   2) VirusTotal    —— 70+ 引擎,单源覆盖最广
+    //   3) 其他情报源    —— 仅在 VT 未收录/失败时才查(已排除 VT,不重复扣它的额度)
+    //   4) 上传整文件    —— 只有以上全都答不出、且文件在手时才做(最贵,分钟级)
+    //   5) 回传服务器    —— 把本地新查到的结论同步回去,让整个机队共享
     bulwark::FileReputation rep;
     rep.sha256 = hash;
     rep.verdict = bulwark::ReputationVerdict::Unknown;
-    if (!hash.isEmpty()) {
-        rep = vt_->query(hash, false);
-        if (rep.source.isEmpty()) rep.source = QStringLiteral("VirusTotal");
-    }
-    bool foundByHash = rep.querySucceeded && rep.verdict != bulwark::ReputationVerdict::Unknown;
+    // 「已有结论」判据:权威成功且不是 Unknown。Unknown 一律继续往下走(直到上传)。
+    bool foundByHash = false;
+    // 结论是否已在服务器那边(服务器直接给的,或本地缓存里那条此前就来自/已同步给服务器):
+    // 决定收尾时要不要回传。刻意不为「缓存命中」再发一次回传 —— 否则每次双击同一个程序都要
+    // 白发一遍。代价是:若当初回传恰好失败(服务器离线),这条结论要等缓存过期后才有机会重传。
+    bool alreadyShared = false;
 
-    // 1b) VirusTotal 未收录 / 查询失败(配额·网络)时,按哈希回退到其他已启用情报源
-    //     (MalwareBazaar / OTX / 微步 / MetaDefender / HybridAnalysis),由聚合器合并取最强
-    //     结论。这些源只能按哈希查(无法扫描未知文件),故放在昂贵的 VT 上传【之前】:一旦
-    //     命中就无需上传;即便 VT 挂了也仍能拿到结论。
-    if (!foundByHash && reputation_ && !hash.isEmpty()) {
-        record.message = QStringLiteral("VirusTotal 未收录,正在查询其他情报源…");
+    // 0) 本地分级 TTL 缓存(含此前经服务器/VT/其他源得到并缓存的结论)。命中即刻出结论,
+    //    连一次网络往返都不用。注意只在「确有结论」时短路:缓存里的 Unknown 负缓存不作数,
+    //    否则未收录文件会永远走不到上传那一步(上传的去重另由 vtHistory 那层负责)。
+    if (!hash.isEmpty() && reputation_) {
+        const auto cached = reputation_->tryGetFresh(hash);
+        if (cached.has_value() && cached->querySucceeded
+            && cached->verdict != bulwark::ReputationVerdict::Unknown) {
+            rep = *cached;
+            foundByHash = true;
+            alreadyShared = true;
+        }
+    }
+
+    // 1) 先问中央服务器有没有收录(只问服务器,不触发它的本地回退 —— 本地各级由下面自己按
+    //    顺序编排)。服务器命中的好处:整个机队共享一份情报,且完全不消耗本机 VT/其他源配额。
+    //
+    //    这一步有三种结局,必须分开记,不能都讲成「服务器没有」:
+    //      · 已收录     -> 直接采用,后面每一级都跳过,一个本地密钥都不动;
+    //      · 权威未收录 -> 服务器确实答了、确实没有这条哈希 -> 这才轮到本地密钥;
+    //      · 没问到     -> 未启用 / 熔断冷却中 / 本机请求预算用尽 / HTTP·JSON 失败
+    //                     (判据见 queryServerOnly 的 answered 出参)。照样回退本地密钥
+    //                     (保护不能退化),但【绝不能对外讲成「服务器未收录」】—— 两件事
+    //                     混成一句之后,「这次到底有没有走服务器」在日志和卡片上就再也查不清了,
+    //                     而「云扫描是否真的服务器优先」恰恰只能从这里看出来。
+    bool serverAnswered = false; // 服务器给出了可采信的权威回复(未必有实据)
+    if (!foundByHash && !hash.isEmpty() && repProxy_) {
+        bool hasRecord = false;
+        const bulwark::FileReputation srv =
+            repProxy_->queryServerOnly(hash, /*priority=*/false, &hasRecord, &serverAnswered);
+        if (hasRecord) {
+            rep = srv;
+            if (rep.source.isEmpty()) rep.source = QStringLiteral("Proxy");
+            foundByHash = true;
+            alreadyShared = true;
+        }
+        log_.info(QStringLiteral("云扫描 %1:中央服务器%2")
+                      .arg(hash.left(12),
+                           hasRecord
+                               ? QStringLiteral("已收录(%1/%2 源=%3),本地密钥一个都不动")
+                                     .arg(srv.malicious).arg(srv.totalEngines)
+                                     .arg(srv.source.isEmpty() ? QStringLiteral("-") : srv.source)
+                               : serverAnswered
+                                     ? QStringLiteral("未收录,转本地密钥查询")
+                                     : QStringLiteral("未应答(未启用/熔断/请求预算用尽/查询失败),转本地密钥查询")));
+    }
+
+    // 2) 服务器没有收录(或这次没问到)-> 用本机密钥查 VirusTotal(按哈希,秒级;省去对已收录
+    //    文件的重复上传)。卡片文案按上一步的真实结局区分,别把「没问到」写成「未收录」。
+    bool vtAnswered = false; // VT 权威作答(区别于配额/网络/鉴权失败),供下一级文案用
+    if (!foundByHash && !hash.isEmpty()) {
+        record.message = serverAnswered
+            ? QStringLiteral("服务器未收录,正在查询 VirusTotal…")
+            : QStringLiteral("服务器暂未应答,正在查询 VirusTotal…");
         publishVtRecord(record);
-        const bulwark::FileReputation alt = reputation_->queryNow(hash);
+        const bulwark::FileReputation vtRep = vt_->query(hash, false);
+        vtAnswered = vtRep.querySucceeded;
+        if (vtRep.querySucceeded && vtRep.verdict != bulwark::ReputationVerdict::Unknown) {
+            rep = vtRep;
+            if (rep.source.isEmpty()) rep.source = QStringLiteral("VirusTotal");
+            foundByHash = true;
+        }
+    }
+
+    // 3) VirusTotal 未收录 / 查询失败(配额·网络)时,按哈希回退到其他已启用情报源
+    //    (MalwareBazaar / OTX / 微步 / MetaDefender / HybridAnalysis),由聚合器并行查询并
+    //    合并取最强结论。刻意【排除 VirusTotal】:聚合器里的 VT 与上一级用的是同一个客户端
+    //    实例,再查一遍会真的扣两次额度、还多等一次往返。这些源只能按哈希查(无法扫描未知
+    //    文件),故放在昂贵的 VT 上传【之前】:一旦命中就无需上传;即便 VT 挂了也仍有结论。
+    if (!foundByHash && !hash.isEmpty() && repAggregate_) {
+        record.message = vtAnswered
+            ? QStringLiteral("VirusTotal 未收录,正在查询其他情报源…")
+            : QStringLiteral("VirusTotal 查询未成功,正在查询其他情报源…");
+        publishVtRecord(record);
+        const bulwark::FileReputation alt =
+            repAggregate_->queryExcluding(hash, false, QStringLiteral("VirusTotal"));
         if (alt.querySucceeded && alt.verdict != bulwark::ReputationVerdict::Unknown) {
             rep = alt;            // 采用回退结论(alt.source 已标注命中源)
             foundByHash = true;
         }
     }
 
-    // 2) 未收录 -> 上传整文件云端多引擎扫描,进度经回调推 UI。
+    // 4) 全都未收录 -> 上传整文件云端多引擎扫描,进度经回调推 UI。
     if (!foundByHash && !e.actorPath.isEmpty() && QFileInfo::exists(e.actorPath)) {
         const auto progress = [this, &record](bulwark::VtScanStage stage, int pct) {
             record.stage = stage;
@@ -1618,6 +2350,30 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
         rep = vt_->uploadAndScan(e.actorPath, hash, progress);
         if (rep.source.isEmpty()) rep.source = QStringLiteral("VirusTotal");
         record.uploaded = true;
+    }
+
+    // 5) 回填 + 回传。
+    //    · 本地分级缓存:本链路自行编排了各级查询(没走 queryNow),故须显式回填,否则同一
+    //      哈希的后续事件与后台信誉队列会把整条链路重跑一遍。
+    //    · 中央服务器:把「服务器当时没有、本地查到/上传扫出来」的结论同步回去,让整个机队
+    //      共享。上传扫描得到的结论尤其值钱 —— 服务器凭哈希查不到,只有拿到文件的端点才能
+    //      产出。alreadyShared 为真时不回传(那本来就是服务器给的)。回传是 fire-and-forget,
+    //      内部派线程发送,不拖慢这次扫描的收尾;只回传确有实据的结论(0 引擎的 clean 与
+    //      Unknown 会被 maybeSyncToServer 挡掉)。
+    if (!rep.sha256.isEmpty() && rep.querySucceeded) {
+        if (reputation_)
+            reputation_->storeResult(rep);
+        if (!alreadyShared && repProxy_)
+            repProxy_->maybeSyncToServer(rep);
+    }
+
+    // 6) 威胁情报共享(默认关):这里只处理【可疑】样本 —— 恶意样本走
+    //    confirmReputationMaliciousAsync(见下方),那条路上行为画像本来就要拉,
+    //    在那里顺路留一份即可,不必在这里重复请求一次 behaviour_summary 白花 VT 配额。
+    if (settings_ && settings_->cloudBehaviorUploadEnabled && intelContrib_ && reputation_
+        && rep.querySucceeded && rep.verdict == bulwark::ReputationVerdict::Suspicious
+        && !hash.isEmpty()) {
+        retainThreatIntel(rep, reputation_->fetchBehaviorProfile(hash));
     }
 
     finalizeVtRecord(record, rep); // 落终态 + 推 UI + 落历史(去重)
@@ -1652,9 +2408,17 @@ void Worker::finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::File
                        : rep.verdict == bulwark::ReputationVerdict::Clean      ? bulwark::VtScanOutcome::Clean
                                                                                : bulwark::VtScanOutcome::Unknown;
         // 命中来源标注:非 VirusTotal 的回退源附「· 来源 X」;命中型源(无引擎计数)省略 N/M。
-        const bool fromVt = rep.source.isEmpty() || rep.source == QStringLiteral("VirusTotal");
+        // 经中央服务器命中时 rep.source 形如 "Proxy:VirusTotal" —— 「Proxy:」只是取数管路的细节,
+        // 对用户没有意义。展示前剥掉:服务器转来的 VT 结论就和本地直连 VT 一样不带来源后缀,
+        // 其他源只显示源名本身。不剥的话这条消息会长出一行,把居中查毒卡片的结论挤到卡片外面。
+        QString srcName = rep.source.trimmed();
+        if (srcName.startsWith(QLatin1String("Proxy:"), Qt::CaseInsensitive))
+            srcName = srcName.mid(6).trimmed();
+        else if (srcName.compare(QLatin1String("Proxy"), Qt::CaseInsensitive) == 0)
+            srcName.clear(); // 服务器未标注底层源:说不清是谁给的结论,那就不标
+        const bool fromVt = srcName.isEmpty() || srcName == QStringLiteral("VirusTotal");
         const QString srcSuffix = fromVt ? QString()
-                                         : QStringLiteral(" · 来源 ") + rep.source;
+                                         : QStringLiteral(" · 来源 ") + srcName;
         const QString engines = rep.totalEngines > 0
                                     ? QStringLiteral(" · %1/%2").arg(rep.malicious).arg(rep.totalEngines)
                                     : QString();

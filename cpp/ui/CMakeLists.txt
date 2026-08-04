@@ -42,6 +42,8 @@ qt_add_executable(bulwark_ui WIN32
     src/dialogs/AttackGraphWindow.cpp
     src/dialogs/ProcessDetailDialog.h
     src/dialogs/ProcessDetailDialog.cpp
+    src/dialogs/AttackChainDetailDialog.h
+    src/dialogs/AttackChainDetailDialog.cpp
     src/dialogs/ToastWindow.h
     src/dialogs/ToastWindow.cpp
     src/dialogs/ToastNotifier.h

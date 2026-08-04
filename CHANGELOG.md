@@ -4,9 +4,66 @@
 
 > ⚠ **阅读须知:2026-07-02 及更早的条目属 .NET 原型时期**,其中引用的路径(`Bulwark.Core/`、
 > `Bulwark.Core.Tests/`、`Bulwark.Service/`、`tools/`)在当前 C++ / Qt 代码树中**已不存在**。
-> 这些条目保留作为历史记录,但**不能据此判断当前代码状态**——尤其是其中提到的规则单元测试:
-> C++ 迁移后测试基建尚未重建(`cpp/CMakeLists.txt` 里 `enable_testing()` 仍为注释),
-> 当前仓库**没有任何自动化测试**。规则本身已随 `cpp/shared/src/engine/DefaultRules.cpp` 迁移过来。
+> 这些条目保留作为历史记录,但**不能据此判断当前代码状态**。规则本身已随
+> `cpp/shared/src/engine/DefaultRules.cpp` 迁移过来;其中提到的 .NET 规则单元测试没有迁移,
+> 当前的自动化测试是 `cpp/tests/` 的两条 ctest(`verdict_snapshot` 裁决快照回归 +
+> `builtin_ruleset_ids` 规则 id 唯一性),用 `ctest --test-dir cpp/build -C Release` 跑。
+
+---
+
+## [v2.0.4] - 2026-08-05 (GitHub 同步发布)
+
+### 新增 ✨
+- **攻击链组合引擎**(`cpp/service/src/AttackChainEngine.cpp`)
+  - 中央服务器从每日采集的真实样本沙箱记录里数出「哪几个动作凑在一起就是病毒」,客户端下载组合表并给每个进程记账,凑齐即定性。**无模型、无训练,纯查表**
+  - 补的是「一条事件一条事件单独判」留下的灰区:写 Run 键 / 落个 exe / 加 Defender 排除项各自都不够定性,同时出现在一个进程身上时已足以定性
+  - 匹配复用 `DefenseRule`(不写第二套通配逻辑);只喂证据不改裁决流程,信任通道仍在其之前生效
+  - 装载期剔除「主体冲突」与「证据重复」的组合(后者会把软信号提拔成处置依据)
+  - 贡献走 `SecurityEvent::chainScore` / `chainHardIndicator` 专用字段,由 `ThreatDetector::analyze` 显式并入 —— 直接写 `riskScore` / `hasThreatIndicator` 会被 analyze 无声擦掉(实测:组合表上线后一次都没生效过,而组合自测始终全绿)
+  - `--attackchain-check`:组合逻辑自测 + **裁决路径自测**(防上述擦除类回归)+ **实机可达性诊断**(把每个标记判为可达 / 稀疏 / 结构性死路,量化「自测全绿」与「真机能点亮」的差距)
+  - 新增「攻击链」页面 + 命中角标通知(**独立于静默模式**,避免「凑齐 N 个动作却被静默放行而用户毫不知情」的盲区);命中落盘 `attackchain_hits.jsonl`
+- **控制管道客户端认证**(`cpp/service/src/IpcClientAuth.cpp`)
+  - 此前服务对任何连入客户端零校验,**任意本地低权限进程都能一条消息关掉整套防护**;配置里那三个签名相关键虽已解析但代码中从无一处消费,README 宣称的能力实际不存在
+  - 强制层(不可关闭):客户端映像须在服务安装目录下且名为 `bulwark_ui.exe`,与内核 SelfGuard(写不进安装目录)+ ObCallbacks(注入不了合法 UI)咬合成立
+  - 可选加固层:`EnforceUiClientSignature` + 指纹 / 发布者白名单。取不到 PID 或映像路径时 **fail-closed**
+- **威胁情报共享**(`ThreatIntelContribStore` + `ThreatIntelUploader`,**默认关闭**)
+  - 云查确认恶意 / 可疑的样本,其「病毒信息 + 行为数据」本机暂存,每天凌晨批量上传 `/v1/intel/contribute`
+  - 脱敏在**写盘之前**执行(唯一执行点):剔除本机落地路径、沙箱内完整路径、被扫文件路径与文件名;从不收集文件内容 / 计算机名 / 用户名。关闭开关即清空暂存
+- **`server/bulwark-intel/`**:完整情报服务端(信誉聚合 + 攻击链组合挖掘 `engine_build.py` + 情报共享接收 + per-IP 限流 + 网页端 + systemd 单元)。密钥全部读 `/etc/bulwark-intel/config.json`,代码内无任何密钥
+- **`cpp/tests/`**:两条 ctest 入库 —— `verdict_snapshot`(裁决快照回归,语料全为合成事件)+ `builtin_ruleset_ids`(规则 id 唯一性)
+- **`packaging/`**:便携包制作(空密钥模板 `appsettings.portable.json`、行为规则集、启动 / 卸载脚本)
+
+### 修复 🐛
+- **IP 整段封禁误伤共享基础设施**(新增 `IpBlockPolicy.h`,两处生成规则的地方共用同一判据)
+  - **实测**(现场 `rules.json`):68 个学到的「C2 地址」里 **48 个是公共基础设施(71%)** —— 8.8.8.8 / 1.1.1.1、23 个 Cloudflare、6 个 Fastly、3 个 Akamai、Telegram、一个内网地址,以及两条非法 IPv6
+  - 用户侧表现:装了防护后一堆软件打不开 / 登不上 / 更新不了,且规则落盘、重启依旧
+  - 现在私网 / 环回 / CGNAT / 组播、公共 DNS 解析器、共享 CDN 与反代前端段、非 IPv4 一律不生成规则;云厂商**通用计算段**(EC2 / GCE / 通用 Azure)刻意不排除 —— 那些确实常被用来架 C2
+- **侧载模块篡改漏检(「白加黑」)**:主体自身签名健康、同目录 DLL 签名后被改过的情形此前完全看不见(白壳在流水线第 10 步就放行,而内核 ImageLoad 只上报 `\Temp\` 与 `\Users\Public\`)。新增 `SecurityEvent::tamperedModulePath`,在富化阶段填写、由 `ThreatDetector` 消费
+
+### 变更 🔧
+- **防护链路延迟改为可配**:新增 `EventDrainIntervalMs`(默认 20,原硬编码 150ms)与 `InlineReputationBudgetMs`(默认 800)。后者是热路径同步云查的硬上限 —— 整条链路在同一线程串行,无上限时一次缓存未命中可能等满「代理超时 8s + 本地最慢单源 10~15s」,期间内核事件堆积到丢弃(等于漏检)。超预算不取消查询,迟到结论转由既有补偿处置兜住
+- **中央信誉服务新增客户端请求数预算** `RequestsPerMinute` / `RequestsPerHour`:服务端按来源 IP 滑窗限流,超限回 `429` + `retry_after_seconds=3600`,**整整一小时**退回纯本地且状态灯来回跳。这与 `FreshQueriesPerDay` 是两条不同的线(命中服务端共享缓存不计后者,却照样占 IP 名额)
+- **`SyncResultsToServer`**:把本机查到、服务器尚无记录的权威结论回传(最有价值的是本机首见文件上传 VT 扫出的结论),只带结论、不含文件内容 / 路径 / 机器标识
+- **`TrustedDirectories`**:部署期预置的整目录信任,语义等同 UI 里手动加白文件夹
+- 清理若干误入库的命令残片文件(`delete` / `qc` / `queryex` / `stop` / `_alive.txt`),并把本机运行 / 诊断脚本移出版本库
+
+---
+
+## [v2.0.4-dev] - 2026-07-29
+
+### 修复 🐛
+- **云查询拦截失效** - 服务器已收录恶意样本但客户端首次执行时不拦截
+  - **问题**: 异步查询要求「未签名 + 首见 + 风险分≥50」，导致低分恶意样本漏查
+  - **修复**: 放宽为「未签名 + 首见」即查，配额由限流器保护（4次/小时）
+  - **增强**: 同步云查新增桌面、下载目录（原只有 Temp/Public/ProgramData）
+  - 影响文件: `cpp/service/src/Worker.cpp`, `cpp/service/src/reputation/ReputationManager.cpp`
+
+### 技术细节
+**修复后行为**:
+- 桌面/下载目录未签名首见文件 → **同步云查**（阻塞式，启动前拦截）✅
+- Temp/Public/ProgramData → **同步云查** + 异步兜底 ✅
+- 其他目录未签名首见 → **异步云查**（后台，首次可能放行，缓存后拦截）
+- 已签名文件 → 异步云查（不阻塞）
 
 ---
 

@@ -248,6 +248,37 @@ struct PersistenceListResponsePayload {
     static PersistenceListResponsePayload fromJson(const QJsonObject& o);
 };
 
+// UI -> 服务:清理某条自启动持久化项(高危,由用户在自启动项页显式点击触发)。
+//
+// 这条链路此前是断的:IpcMessageType 里早就留了 PersistenceCleanupRequest/Response 两个消息号,
+// ThreatRemediator 也把 8 类持久化点的清理动作全实现了(removeRunValue / removeIfeoDebugger /
+// resetWinlogonValue / clearAppInitDlls / quarantineStartupFile / deleteScheduledTask /
+// disableService / tryQuarantinePayload),但【服务端没有 handler、UI 端没有发送方、页面上
+// 连按钮都没有】—— 那 200 行成品代码一行都到不了,用户在自启动项页只能看不能清。
+//
+// 整条 PersistenceEntry 回传(而不是只传 id):清理动作要按 category 分派、要拿 location /
+// name / imagePath 定位目标,而服务端不保存上一次扫描的结果(扫描是无状态的按需枚举)。
+struct PersistenceCleanupRequestPayload {
+    QUuid requestId = QUuid::createUuid();
+    bulwark::PersistenceEntry entry;
+    QJsonObject toJson() const;
+    static PersistenceCleanupRequestPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:自启动项清理结果。复用足迹清理的三段式(已隔离 / 已移除 / 未能处理),
+// UI 可据 skipped 里的 isFile 提供「重试隔离」。
+struct PersistenceCleanupResultPayload {
+    QUuid requestId;
+    bool success = false;              // 是否产生了至少一个实际动作
+    QString entryId;                   // 对应请求里的 PersistenceEntry::id,供 UI 定位行
+    QString message;                   // 可直接展示的结论
+    QStringList quarantinedFiles;
+    QStringList removedRegistryValues;
+    QList<RemediationSkippedItem> skipped;
+    QJsonObject toJson() const;
+    static PersistenceCleanupResultPayload fromJson(const QJsonObject& o);
+};
+
 // ===== AI 病毒扫描 =====
 // UI -> 服务:AI 病毒扫描结果(以事件 Id 关联请求)。
 struct AiScanResponsePayload {
@@ -421,6 +452,45 @@ struct ProcessActionResultPayload {
     QString sha256;                           // ComputeHash 的结果
     QJsonObject toJson() const;
     static ProcessActionResultPayload fromJson(const QJsonObject& o);
+};
+
+// ---- 攻击链组合引擎 --------------------------------------------------------- #
+// 服务器从每日采集的真实样本沙箱记录里数出「哪几个动作凑在一起就足以定性」,客户端
+// 下载该组合表并给每个进程记账。这里把「表的状态」与「命中记录」一起回给 UI。
+
+// 一条命中记录(与服务端 ChainHitRecord 一一对应;此处独立定义以免 shared 依赖 service)。
+struct AttackChainHitPayload {
+    QDateTime whenUtc;
+    QString actorPath;
+    int actorPid = 0;
+    QStringList titles;      // 凑齐的那几个动作(可读)
+    QString grade;           // hard / strong / ask
+    QString maxLevel;        // medium / high / critical
+    int support = 0;         // 有多少真实样本作证
+    QString families;        // 常见家族
+    bool dryRun = true;      // 命中当时是否处于「只记录不拦截」
+    QString action;          // 最终裁决 Allow / Block / Ask
+    QString eventType;       // 触发补齐的那条事件类型
+    QJsonObject toJson() const;
+    static AttackChainHitPayload fromJson(const QJsonObject& o);
+};
+
+// 服务 -> UI:组合表状态 + 命中记录。
+struct AttackChainResponsePayload {
+    bool enabled = false;        // 引擎是否启用
+    bool dryRun = true;          // 当前是否「只记录不拦截」
+    int version = 0;             // 组合表【内部】版本号(0 = 尚未装载)。整数、单调递增,
+                                 // 是客户端判断「要不要重新拉表」的唯一依据,不作展示。
+    QString versionLabel;        // 给人看的版本号,如 "0.3"(服务器侧 0.1 起、每次内容变化 +0.1)。
+                                 // 老服务器不下发时为空,界面回退显示 "v<内部版本号>"。
+    int patterns = 0;            // 组合条数
+    int markers = 0;             // 可观测标记数
+    int trackedProcesses = 0;    // 当前正在记账的进程数
+    QString endpoint;            // 掩码后的端点(绝不回明文地址)
+    QString updateSchedule;      // 可读的更新计划(如「每天 06:00」)
+    QList<AttackChainHitPayload> hits;   // 最新在前
+    QJsonObject toJson() const;
+    static AttackChainResponsePayload fromJson(const QJsonObject& o);
 };
 
 } // namespace bulwark::ipc

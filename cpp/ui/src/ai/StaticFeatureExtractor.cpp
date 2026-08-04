@@ -133,7 +133,7 @@ QStringList collectPrintableStrings(const QByteArray& buf)
 }
 
 // Scan collected strings for URLs / IPv4 / suspicious tokens -> f.suspiciousStrings.
-void scanSuspicious(const QStringList& strings, StaticFeatures& f)
+void scanSuspicious(const QStringList& strings, StaticFeatures& f, int maxStrings)
 {
     static const QRegularExpression reUrl(
         QStringLiteral("(?:https?|ftp)://[^\\s\"'<>()]{4,}"), QRegularExpression::CaseInsensitiveOption);
@@ -143,13 +143,13 @@ void scanSuspicious(const QStringList& strings, StaticFeatures& f)
     QSet<QString> seen;
     auto add = [&](const QString& s) {
         const QString t = s.trimmed();
-        if (t.isEmpty() || seen.contains(t) || f.suspiciousStrings.size() >= kMaxSusStrings) return;
+        if (t.isEmpty() || seen.contains(t) || f.suspiciousStrings.size() >= maxStrings) return;
         seen.insert(t);
         f.suspiciousStrings.append(t.left(160)); // clip very long lines
     };
 
     for (const QString& s : strings) {
-        if (f.suspiciousStrings.size() >= kMaxSusStrings) break;
+        if (f.suspiciousStrings.size() >= maxStrings) break;
 
         // URLs (skip the ubiquitous benign schema/namespace URLs).
         auto mu = reUrl.match(s);
@@ -262,8 +262,20 @@ QString decodeSnippet(const QByteArray& head)
 
 } // namespace
 
-StaticFeatures extractStaticFeatures(const QString& path)
+void StaticFeatureLimits::clampToSaneRange()
 {
+    // 下限保证特征仍有意义(读得太少等于什么都没分析),上限保证不会因为一个手抖的配置值
+    // 就把整个样本读进 UI 进程的内存 —— 这份输入是【不可信的恶意样本】。
+    maxReadBytes   = qBound<qint64>(64 * 1024, maxReadBytes, 256LL * 1024 * 1024);
+    scriptCapBytes = qBound(1024, scriptCapBytes, 1024 * 1024);
+    maxStrings     = qBound(5, maxStrings, 500);
+}
+
+StaticFeatures extractStaticFeatures(const QString& path, const StaticFeatureLimits& limitsIn)
+{
+    StaticFeatureLimits lim = limitsIn;
+    lim.clampToSaneRange();
+
     StaticFeatures f;
     const QFileInfo fi(path);
     if (!fi.exists() || !fi.isFile())
@@ -275,16 +287,16 @@ StaticFeatures extractStaticFeatures(const QString& path)
         f.notes.append(u("无法读取文件(可能被占用或权限不足)"));
         return f;
     }
-    const QByteArray buf = file.read(kMaxRead);
+    const QByteArray buf = file.read(lim.maxReadBytes);
     file.close();
     f.readable = true;
-    if (f.fileSize > kMaxRead)
-        f.notes.append(u("文件较大,仅分析前 %1 MB").arg(kMaxRead / (1024 * 1024)));
+    if (f.fileSize > lim.maxReadBytes)
+        f.notes.append(u("文件较大,仅分析前 %1 MB").arg(lim.maxReadBytes / (1024 * 1024)));
 
     const bool looksPe = buf.size() >= 2 && quint8(buf[0]) == 'M' && quint8(buf[1]) == 'Z';
     if (isScriptExt(fi.suffix()) && !looksPe) {
         f.kind = u("脚本/文本");
-        f.scriptSnippet = decodeSnippet(buf.left(kScriptCapBytes));
+        f.scriptSnippet = decodeSnippet(buf.left(lim.scriptCapBytes));
     } else if (looksPe) {
         parsePe(buf, f); // sets kind = "PE 可执行" on success
     }
@@ -292,8 +304,9 @@ StaticFeatures extractStaticFeatures(const QString& path)
         f.kind = u("其他");
 
     // Dangerous API presence (exact ASCII bytes anywhere in the image).
+    // 同一个 maxStrings 也约束 API 条数:两者都是直接进 prompt 的列表,是同一种成本。
     for (const ApiEntry& a : kApiWatch) {
-        if (f.dangerousApis.size() >= kMaxApis) break;
+        if (f.dangerousApis.size() >= lim.maxStrings) break;
         if (buf.contains(a.name)) {
             const QString name = QString::fromLatin1(a.name);
             if (!f.dangerousApis.contains(name)) f.dangerousApis.append(name);
@@ -303,7 +316,7 @@ StaticFeatures extractStaticFeatures(const QString& path)
     }
 
     // URLs / IPs / suspicious tokens from printable strings.
-    scanSuspicious(collectPrintableStrings(buf), f);
+    scanSuspicious(collectPrintableStrings(buf), f, lim.maxStrings);
 
     return f;
 }

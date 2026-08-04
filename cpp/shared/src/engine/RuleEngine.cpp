@@ -66,7 +66,7 @@ std::optional<QString> RuleEngine::trustNoteForPath(const QString& path) const {
     // 本软件自身组件:任何情况下都不该被自己的内核名单钉死(否则一次误判即自锁,且跨重启)。
     if (matchesSelf(p)) return QStringLiteral("本软件自身组件");
 
-    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime now = nowUtc();
     QReadLocker locker(&rulesLock_);
     for (auto it = rules_.constBegin(); it != rules_.constEnd(); ++it) {
         const DefenseRule& r = it.value();
@@ -115,7 +115,7 @@ void RuleEngine::loadRules(const QVector<DefenseRule>& rules) {
 }
 
 QVector<DefenseRule> RuleEngine::getRules() const {
-    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime now = nowUtc();
     QReadLocker locker(&rulesLock_);
     QVector<DefenseRule> out;
     out.reserve(rules_.size());
@@ -125,7 +125,7 @@ QVector<DefenseRule> RuleEngine::getRules() const {
 }
 
 int RuleEngine::pruneExpired() {
-    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime now = nowUtc();
     QWriteLocker locker(&rulesLock_);
     int removed = 0;
     for (auto it = rules_.begin(); it != rules_.end(); ) {
@@ -254,7 +254,28 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
                 e.hasThreatIndicator = true;
                 return Verdict::forEvent(e, VerdictAction::Block, VerdictSource::Heuristic);
             }
+            //
+            // 签名健康判定【必须与 hasThreatIndicator 解耦】。
+            //
+            // isHealthySigned / isCleanSigned 开头都有 `if (e.hasThreatIndicator) return {};`,
+            // 而上面第 3 步的 ThreatDetector::analyze 早已跑过。于是只要该事件在【任何别的维度】
+            // 上置了一个硬指标,这里的「签名健康 -> 勒索特征按误报抑制」就整体失效 —— 一个与
+            // 勒索毫无关系的指标,级联决定了「要不要把批量写文件当成加密」。
+            //
+            // 实测这条级联真的发生了:MSBuild.exe(.NET 签名)编译时短时间内改写十几个文件,
+            // 而同一事件上有一条「威胁情报:0/0 个引擎判为可疑」(零实据却被登记为硬指标,已在
+            // ThreatDetector 第 9 节修掉)。硬指标一置,签名抑制失效,82 分直接拦 —— 编译器被
+            // 当成勒索。构建工具、打包器、解压程序天生就是短时间写大量文件,这类误伤只能靠
+            // 「主体签名健康」来兜。
+            //
+            // 所以这里直接读签名字段,不经过那两个带耦合的判定。安全性由蜜罐兜底:真正的勒索
+            // 一旦触到诱饵文件,上面 rm.canaryHit 那条无条件 Block,不受本抑制影响 —— 这也正是
+            // 原注释「未触蜜罐诱饵」想表达的取舍,只是原实现被那层耦合弄丢了。
+            //
+            const bool signatureHealthy = e.actorSigned && !e.signatureMismatch &&
+                                          !e.certRevoked && !e.signedAfterCertExpiry;
             const bool trustedActor =
+                signatureHealthy ||
                 TrustPolicy::isStronglyTrusted(e).ok ||
                 TrustPolicy::isHealthySigned(e).ok ||
                 (e.actorSigned && TrustPolicy::isBenignSigner(e).ok);
@@ -279,12 +300,18 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
     else if (e.type == EventType::NetworkConnect) {
         const ScoreResult b = beacon_.observe(e);
         const bool beaconHit = b.score > 0;
-        // 信标检测分两档(见 BeaconDetector):CV ≤ kCvRegular 记 55 分(抖动极低,几乎只有程序化
-        // 回连才有这种规律),CV ≤ kCvSemiRegular 记 35 分(「近周期性」)。原先两档都无条件置硬指标,
-        // 但「近周期性」这一档对正常软件的定时轮询几乎必然误报 —— 代理客户端拉订阅、更新器查版本、
-        // 云盘同步全是几分钟一次的准周期外联(实测 clash-win64 每 ≈160s 拉一次订阅即被判 C2 回连)。
-        // 故只把低抖动高置信档当硬指标,近周期档降为软信号交互证升格。
-        const bool beaconHard = b.score >= 55;
+        // 信标检测分两档(见 BeaconDetector):CV ≤ kCvRegular 抖动极低(几乎只有程序化回连才有
+        // 这种规律)-> 硬指标;CV ≤ kCvSemiRegular 「近周期性」-> 仅软信号,因为正常软件的定时轮询
+        // 几乎必然落在这一档(代理客户端拉订阅、更新器查版本、云盘同步;实测 clash-win64 每 ≈160s
+        // 拉一次订阅即被判 C2 回连)。
+        //
+        // 【必须读 hardSignal,不能再用 `b.score >= 55` 推档位】BeaconDetector 在给出档位基线分
+        // (55 / 35)之后还会按「未签名 +15」「脚本宿主 +20」继续加分,所以最终分数区分不了档位:
+        // 近周期档 35 + 脚本宿主 20 = 55,与低抖动档基线分撞在一起。按分数判断的话,任何脚本宿主
+        // (powershell / cmd / rundll32 / mshta / certutil ...)的准周期轮询都会被误升格为硬指标 ——
+        // 而计划任务里的 PowerShell 巡检脚本正是这种形态,在真实系统上极常见。档位由唯一知道 CV 的
+        // BeaconDetector 显式上报。
+        const bool beaconHard = b.hardSignal;
         if (beaconHit) {
             e.riskScore = qMin(100, e.riskScore + b.score);
             bool first = true;
@@ -383,7 +410,17 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
                 if (sa != sb) return sa > sb;
                 const int pa = rulePriority(a.action), pb = rulePriority(b.action);
                 if (pa != pb) return pa > pb;
-                return a.createdUtc > b.createdUtc;
+                if (a.createdUtc != b.createdUtc) return a.createdUtc > b.createdUtc;
+                // 兜底:按 id 定序,使本比较成为【全序】。
+                //
+                // 原先到 createdUtc 就结束了,于是两条在「层级/具体度/动作强度/创建时刻」上
+                // 全部打平的规则之间,胜出者由 std::sort(不稳定)在 QHash 的迭代顺序上任意挑选;
+                // 而 Qt 6 的 QHash 每进程随机化种子 —— 结果是【同一条事件在两次运行里可能得到
+                // 不同裁决】。内置规则集里同类规则常常只差 targetPattern,打平并不罕见。
+                //
+                // 加上这一级之后选择变得确定:同一份规则集 + 同一条事件恒定产出同一个裁决。
+                // 这既是裁决快照测试可成立的前提,也消除了生产环境里一个真实的抖动来源。
+                return a.id < b.id;
             });
             const DefenseRule hit = matches.first();
 

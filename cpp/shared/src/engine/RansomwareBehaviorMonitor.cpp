@@ -114,7 +114,7 @@ RansomwareBehaviorMonitor::Result RansomwareBehaviorMonitor::observe(const Secur
     target.replace(QLatin1Char('/'), QLatin1Char('\\'));
     if (target.isEmpty()) return r;
 
-    const QDateTime now = e.timestampUtc.isValid() ? e.timestampUtc : QDateTime::currentDateTimeUtc();
+    const QDateTime now = e.timestampUtc.isValid() ? e.timestampUtc : nowUtc();
     int score = 0;
     bool hardSignal = false;
 

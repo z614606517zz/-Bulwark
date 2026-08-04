@@ -4,6 +4,7 @@
 #include "bulwark/service/Logger.h"
 
 #include <QSet>
+#include <QStringList>
 
 class QTimer;
 class QByteArray;
@@ -40,6 +41,8 @@ public:
     // 运行时控制(由 main 据设置调用)。
     void setKernelEnabled(bool on);                 // 启停内核驱动源
     void configureBehaviorMonitor(bool enabled, bool canaryEnabled);
+    // 内存防护总开关:转发到内核源,并记住状态以便内核源(重)创建后补发。
+    void setMemoryProtectionEnabled(bool on) override;
     void addProtectedUiPid(int pid);
     void addBlockedIp(const QString& ip, quint16 port = 0);
     bool blockModuleLoad(const QString& modulePath) override; // 转发到内核驱动源(未连接则 no-op)
@@ -63,6 +66,10 @@ public:
     bool kernelConnected() const;
     bool kernelAttachFailed() const { return attachFailed_; }
     bool kernelProtocolMismatch() const;
+    // 已连接驱动不支持的防护维度(空 = 全就绪 / 未连接)。转发到内核源;
+    // 用于把「驱动比服务旧 -> 若干维度静默失效」这一状态如实反映到设置页,详见
+    // DriverEventSource::missingCapabilities 的说明。
+    QStringList kernelMissingCapabilities() const;
 
 private slots:
     void onBaseEvent(const bulwark::SecurityEvent& e);
@@ -80,6 +87,9 @@ private:
     bool kernelEnabled_ = false;
     bool attachFailed_ = false;
     bool started_ = false;
+    // 内存防护总开关的当前状态。内核源是懒创建的,故这里必须自己记一份,
+    // 在内核源(重)创建 / 重连时补发 —— 否则用户关掉的开关会在下次重连时悄悄恢复。
+    bool memProtEnabled_ = true;
     Logger log_{QStringLiteral("bulwark.service.Coordinator")};
 };
 

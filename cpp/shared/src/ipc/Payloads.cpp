@@ -395,6 +395,49 @@ PersistenceListResponsePayload PersistenceListResponsePayload::fromJson(const QJ
     return p;
 }
 
+QJsonObject PersistenceCleanupRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["entry"] = entry.toJson();
+    return o;
+}
+PersistenceCleanupRequestPayload PersistenceCleanupRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    PersistenceCleanupRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.entry = bulwark::PersistenceEntry::fromJson(o.value(QLatin1String("entry")).toObject());
+    return p;
+}
+
+QJsonObject PersistenceCleanupResultPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray skippedArr;
+    for (const auto& s : skipped) skippedArr.append(s.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["success"] = success;
+    o["entryId"] = entryId;
+    o["message"] = message;
+    o["quarantinedFiles"] = strListToJson(quarantinedFiles);
+    o["removedRegistryValues"] = strListToJson(removedRegistryValues);
+    o["skipped"] = skippedArr;
+    return o;
+}
+PersistenceCleanupResultPayload PersistenceCleanupResultPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    PersistenceCleanupResultPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.success = o.value(QLatin1String("success")).toBool();
+    p.entryId = getStr(o, "entryId");
+    p.message = getStr(o, "message");
+    p.quarantinedFiles = getStrList(o, "quarantinedFiles");
+    p.removedRegistryValues = getStrList(o, "removedRegistryValues");
+    for (const auto& v : o.value(QLatin1String("skipped")).toArray())
+        if (v.isObject()) p.skipped.append(RemediationSkippedItem::fromJson(v.toObject()));
+    return p;
+}
+
 // ===== AI 病毒扫描 =====
 QJsonObject AiScanResponsePayload::toJson() const {
     using namespace bulwark::json;
@@ -716,6 +759,77 @@ ProcessActionResultPayload ProcessActionResultPayload::fromJson(const QJsonObjec
     p.success = getBool(o, "success");
     p.message = getStr(o, "message");
     p.sha256 = getStr(o, "sha256");
+    return p;
+}
+
+// ---- 攻击链组合引擎 --------------------------------------------------------- #
+
+QJsonObject AttackChainHitPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["whenUtc"] = dateTimeToIso(whenUtc);
+    o["actorPath"] = actorPath;
+    o["actorPid"] = actorPid;
+    o["titles"] = strListToJson(titles);
+    o["grade"] = grade;
+    o["maxLevel"] = maxLevel;
+    o["support"] = support;
+    o["families"] = families;
+    o["dryRun"] = dryRun;
+    o["action"] = action;
+    o["eventType"] = eventType;
+    return o;
+}
+
+AttackChainHitPayload AttackChainHitPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    AttackChainHitPayload h;
+    h.whenUtc = dateTimeFromIso(getStr(o, "whenUtc"));
+    h.actorPath = getStr(o, "actorPath");
+    h.actorPid = getInt(o, "actorPid");
+    h.titles = getStrList(o, "titles");
+    h.grade = getStr(o, "grade");
+    h.maxLevel = getStr(o, "maxLevel");
+    h.support = getInt(o, "support");
+    h.families = getStr(o, "families");
+    h.dryRun = getBool(o, "dryRun", true);
+    h.action = getStr(o, "action");
+    h.eventType = getStr(o, "eventType");
+    return h;
+}
+
+QJsonObject AttackChainResponsePayload::toJson() const {
+    QJsonObject o;
+    o["enabled"] = enabled;
+    o["dryRun"] = dryRun;
+    o["version"] = version;
+    o["versionLabel"] = versionLabel;
+    o["patterns"] = patterns;
+    o["markers"] = markers;
+    o["trackedProcesses"] = trackedProcesses;
+    o["endpoint"] = endpoint;
+    o["updateSchedule"] = updateSchedule;
+    QJsonArray arr;
+    for (const AttackChainHitPayload& h : hits)
+        arr.append(h.toJson());
+    o["hits"] = arr;
+    return o;
+}
+
+AttackChainResponsePayload AttackChainResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    AttackChainResponsePayload p;
+    p.enabled = getBool(o, "enabled");
+    p.dryRun = getBool(o, "dryRun", true);
+    p.version = getInt(o, "version");
+    p.versionLabel = getStr(o, "versionLabel");   // 老服务端不带此键 -> 空串,界面自行回退
+    p.patterns = getInt(o, "patterns");
+    p.markers = getInt(o, "markers");
+    p.trackedProcesses = getInt(o, "trackedProcesses");
+    p.endpoint = getStr(o, "endpoint");
+    p.updateSchedule = getStr(o, "updateSchedule");
+    for (const QJsonValue& v : o.value(QLatin1String("hits")).toArray())
+        p.hits.append(AttackChainHitPayload::fromJson(v.toObject()));
     return p;
 }
 

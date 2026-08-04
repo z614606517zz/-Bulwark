@@ -25,6 +25,9 @@ add_subdirectory(shared)
 add_subdirectory(service)   # phase B: daemon (IPC server, ETW source, storage)
 add_subdirectory(ui)        # phase 7: Qt Widgets front-end (redesigned)
 
-# --- Future phases (uncomment as each is implemented) -------------------------
-# enable_testing()
-# add_subdirectory(tests)     # oracle/parity tests against the .NET reference
+# 裁决快照测试 —— 「12 步决策管线的行为没被改坏」的唯一形式化判据:
+# 一份固定语料(tests/data/corpus.json)+ 一份黄金裁决(tests/data/golden.json),
+# 回放后逐字段比对。管线里任何一处改动只要改变了既有裁决,这条测试立刻变红。
+# 见 tests/SnapshotTool.cpp 顶部说明。
+enable_testing()
+add_subdirectory(tests)

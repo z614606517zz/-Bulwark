@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include <QString>
+#include <QStringList>
 #include "bulwark/service/EventSource.h"
 #include "bulwark/service/BulwarkOptions.h"
 
@@ -39,6 +40,10 @@ public:
     // ---- 运行时配置下发(可在连接后任意时刻调用;未连接时安全 no-op)----------
     void addProtectedPid(int pid);                        // 追加受保护进程 PID(自我保护,如 UI)
     void addBlockedIp(const QString& ip, quint16 port = 0); // 情报确认恶意后固化网络拦截
+    // 内存防护总开关(反注入 + lsass 凭据反转储)。运行时可切换:关 -> 清空内核两份目标 PID 集
+    // 并停止增量登记;开 -> 按当前目标名单重新枚举现存进程登记。未连接内核时只记住状态,
+    // 待连接后由 pushInitialConfig -> initMemoryProtection 生效。
+    void setMemoryProtectionEnabled(bool on) override;
     bool blockModuleLoad(const QString& modulePath) override; // 已确认恶意侧载 DLL 加入内核禁止加载名单
     bool blockExecPath(const QString& imagePath) override;    // 已确认恶意可执行映像加入内核禁止执行名单(执行前拦截)
     // 加白对账:整表清空 + 从内核写的注册表基线权威读回(协议无查询命令,故读 \Policy 值)。
@@ -59,6 +64,14 @@ public:
 
     bool isConnected() const;
     bool protocolMismatch() const;            // 因协议/结构体不一致而拒绝启用内核拦截(需长退避)
+
+    // 已连接驱动【不支持】的防护维度(人类可读)。空 = 全部就绪。
+    //
+    // 存在的意义:协议自 v9 起刻意不再升版本号(见 Protocol.h),因此一个比服务旧的
+    // Bulwark.sys【一定能通过握手】,只是新命令会被它的 default 分支拒掉。若不单独暴露,
+    // 表现就是「日志说握手通过、UI 说行为前拦截已启用」,而命令行硬拦(反勒索删卷影的
+    // 执行前阻断)、已封禁主体全维拦截、自保护足迹这三项静默不存在 —— 必须让它可见。
+    QStringList missingCapabilities() const;
 
 private:
     void drain();                             // 主线程:出队 -> emit eventProduced

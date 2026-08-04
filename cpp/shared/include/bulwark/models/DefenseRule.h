@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <optional>
 #include "bulwark/models/Enums.h"
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
@@ -30,7 +31,7 @@ struct DefenseRule {
     QSet<QString> actorHashes;      // 哈希黑/白名单(SHA-256),空=不限
     VerdictAction action = VerdictAction::Allow;
     QString note;                   // 备注/来源说明
-    QDateTime createdUtc = QDateTime::currentDateTimeUtc();
+    QDateTime createdUtc = nowUtc();
     std::optional<QDateTime> expiresUtc; // 到期时间,nullopt=永久
     bool sessionOnly = false;       // 仅本次会话有效(不落盘)
     bool enabled = true;

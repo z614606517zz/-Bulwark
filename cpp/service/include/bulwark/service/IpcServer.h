@@ -31,6 +31,9 @@ public:
     bool start();   // 监听控制管道;成功返回 true
     void stop();
     int clientCount() const { return buffers_.size(); }
+    // 被拒的未授权连接累计数(诊断用)。持续增长意味着有进程在反复尝试连管道 ——
+    // 那本身就是一条值得看的安全信号,不该只散落在日志行里。
+    quint64 rejectedConnectionCount() const { return rejectedConnections_; }
 
     // ---- 请求处理回调(由 Worker/main 绑定;对应 .NET 的 Func/Action)----
     // 未绑定的回调按「服务未启用该功能」优雅降级,绝不崩溃或断开连接。
@@ -51,6 +54,10 @@ public:
     std::function<std::pair<bool, QString>(const QString&)>   manualQuarantineRequested;
     std::function<bulwark::ipc::VtHistoryResponsePayload()>   vtHistoryRequested;
     std::function<bulwark::ipc::PersistenceListResponsePayload()> persistenceListRequested;
+    // 自启动项清理(高危,用户在自启动项页显式点击)。同步返回:清理动作是本机注册表/文件操作,
+    // 毫秒级完成,不需要像取证查询那样异步。未绑定时优雅降级为「服务未启用该功能」。
+    std::function<bulwark::ipc::PersistenceCleanupResultPayload(
+        const bulwark::ipc::PersistenceCleanupRequestPayload&)> persistenceCleanupRequested;
     std::function<bulwark::ipc::EventHistoryResponsePayload()>     eventHistoryRequested;
     std::function<void()>                                         eventHistoryClearRequested;
     // ---- 取证查询(耗时:要解析数万条历史 JSON)。约定为【异步】:宿主在后台线程算完后
@@ -63,11 +70,16 @@ public:
         const bulwark::ipc::ProcessActionRequestPayload&)>              processActionRequested;
     std::function<bulwark::ipc::IntelRefreshResultPayload(const bulwark::ipc::IntelRefreshRequestPayload&)> intelRefreshRequested;
     std::function<bulwark::ipc::IntelRefreshResultPayload(const bulwark::ipc::IntelApplyRequestPayload&)>   intelApplyRequested;
+    // ---- 攻击链组合引擎。读的是内存里的表状态与有上限的命中记录,微秒级,故同步返回。----
+    std::function<bulwark::ipc::AttackChainResponsePayload()> attackChainRequested;
+    std::function<void()>                                    attackChainClearRequested;
     std::function<void(int)>                                 uiProcessConnected;
 
     // ---- 服务 -> UI 广播 ----
     void sendPrompt(const bulwark::SecurityEvent& e);   // PromptRequest(payload=事件 JSON)
     void sendBlock(const bulwark::SecurityEvent& e);    // BlockNotification
+    // 攻击链命中即时通知。无论最终处置是 Block / Ask / Allow 都发 —— 见 IpcMessageType 处说明。
+    void sendAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
     void sendLog(const QString& line);                  // LogEntry(纯字符串)
     void sendEventLog(const bulwark::SecurityEvent& e,
                       bulwark::VerdictAction action, bulwark::VerdictSource source,
@@ -87,6 +99,7 @@ public:
     void sendSettings();
     void sendTrustList();
     void sendQuarantineList();
+    void sendAttackChain();
 
 signals:
     void helloReceived(int processId, const QString& role);
@@ -105,7 +118,8 @@ private:
     void handleLine(QLocalSocket* sock, const QString& line);
 
     QLocalServer* server_ = nullptr;
-    QHash<QLocalSocket*, QByteArray> buffers_; // 每连接的行缓冲
+    QHash<QLocalSocket*, QByteArray> buffers_; // 每连接的行缓冲(仅【已通过认证】的连接入表)
+    quint64 rejectedConnections_ = 0;          // 被拒的未授权连接累计数
 };
 
 } // namespace bulwark::service

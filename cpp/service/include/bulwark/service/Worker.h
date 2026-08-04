@@ -7,6 +7,7 @@
 #include <QMutex>
 #include <QWaitCondition>
 #include <QDateTime>
+#include <QTimer>
 #include <QPair>
 #include <QString>
 #include <memory>
@@ -34,10 +35,19 @@ class AuditLog;
 class FirstSeenStore;
 class QuarantineManager;
 class ThreatRemediator;
+class AlertExporter;
 struct RemediationReport; // 定义在 ThreatRemediator.h;此处仅需前置声明以按 const 引用传参(.cpp 已含完整定义)
 class VtScanHistoryStore;
 class EventHistoryStore;
-namespace reputation { class ReputationManager; class ThreatBookClient; class VirusTotalClient; }
+class ThreatIntelContribStore;
+class AttackChainEngine;
+namespace reputation {
+class ReputationManager;
+class ThreatBookClient;
+class VirusTotalClient;
+class ProxyReputationService;
+class AggregateReputationService;
+}
 
 // 精简编排器:事件源 -> 富化(签名/哈希/命令行/首见)-> RuleEngine 评估 -> 按裁决路由到
 // IPC(放行记日志 / 拦截通知 / 询问弹窗),并对用户态观测源的拦截执行补偿性处置(结束
@@ -60,8 +70,30 @@ public:
     // 由 main 在构造后调用(上传扫描是接口外的 VT 专有方法,不经聚合器)。
     void setVtScan(reputation::VirusTotalClient* vt, VtScanHistoryStore* history);
 
+    // 注入云扫描分级链路的两个具体句柄:中央信誉代理 + 本地直连聚合器。二者都为空时,
+    // 云扫描退化为「VT 按哈希查 -> 上传扫描」(仍可用,只是没有服务器优先与其他源兜底)。
+    // 需要具体类型而非 IHashReputationService:分级链路要「只问服务器不回退」
+    //(queryServerOnly)、「排除 VT 只查其他源」(queryExcluding)、「回传结论」
+    //(maybeSyncToServer)这三个接口外的能力。
+    void setCloudScanChain(reputation::ProxyReputationService* proxy,
+                           reputation::AggregateReputationService* aggregate);
+
+    // 注入威胁情报共享的本机暂存队列。为空则不收集。真正是否收集还要看运行时开关
+    // cloudBehaviorUploadEnabled(默认关),故注入本身不改变默认行为。
+    void setIntelContribStore(ThreatIntelContribStore* store) { intelContrib_ = store; }
+
     // 注入结构化事件历史存储:每条已处置事件都落库,供 UI 打开活动日志/拦截记录时回填。为空则不落库。
     void setEventHistory(EventHistoryStore* history) { eventHistory_ = history; }
+
+    // 事件热路径上「同步云信誉查询」的等待预算(毫秒)。<=0 = 热路径一律不联网,全交后台。
+    // 见 enrich 第 6 步与 ReputationManager::queryNowBounded 的说明:这个预算是整条防护链路
+    // 延迟的硬上限,原实现没有它,一条事件就能把流水线堵住二十多秒。
+    void setInlineReputationBudgetMs(int ms) { inlineRepBudgetMs_ = ms; }
+
+    // 注入 ECS 告警导出器(appsettings 的 ExportEcsAlerts 开启时才由 main 构造并注入)。
+    // 为空则不导出。此前 AlertExporter / EcsAlertFormatter / ExportEcsAlerts 三者互相引用但
+    // 没有任何外部入口,整条 SIEM 导出链是死的 —— 这个 setter 是它接入产品的唯一途径。
+    void setAlertExporter(AlertExporter* exporter) { alertExporter_ = exporter; }
 
     // 注入「情报行为规则」注入器:确认恶意后据行为画像 IOC 生成的拦截规则经此加入引擎并落盘
     // (累加去重)。返回新增规则数。由 main 在主线程侧接线(内部触碰引擎/规则库须在主线程)。
@@ -69,10 +101,27 @@ public:
         injectIntelRules_ = std::move(fn);
     }
 
+    // 注入攻击链组合引擎:给每个进程记「它触发过哪些动作」的账,凑齐服务器下发的某个组合即定性。
+    // 为空则该能力不参与(与未启用等价)。引擎内部记账表是主线程亲和的 —— 只在 onEvent 里用。
+    void setAttackChainEngine(AttackChainEngine* engine) { attackChain_ = engine; }
+
     // 启动「兜底扫描」后台线程:定期枚举在跑进程,按【已确认恶意情报】(引擎记住的恶意哈希 +
     // 信誉缓存判恶意)比对,漏网的补封禁+结束+隔离 —— 防实时链路漏检(遥测丢包 / 云端确认迟到 /
     // 进程在防护启动前就在跑)。由 main 在接线完成后调用。
     void startMaliciousSweep();
+
+    // 手动强制隔离某文件(UI 在清理报告里点「重试隔离」)。
+    // 转发到 ThreatRemediator::forceQuarantine —— 那个方法原本无人调用,而 main 里另写了一份
+    // 逐行相同的逻辑,是纯重复实现。统一走这里,隔离动作只有一份代码、日志口径也一致。
+    std::pair<bool, QString> forceQuarantine(const QString& path);
+
+    // 清理一条自启动持久化项(UI 在自启动项页显式点击 -> IPC -> 此处)。
+    //
+    // 走 Worker 而不是让 main 自己建一个 ThreatRemediator:隔离区、清理器、内核注册表反重建
+    // (applyRegHardening)本来就都挂在 Worker 上,另建一份会出现两个 QuarantineManager 视图、
+    // 也拿不到内核硬拦下发通道。必须在主线程调用(触碰隔离区与内核下发)。
+    bulwark::ipc::PersistenceCleanupResultPayload cleanupPersistence(
+        const bulwark::ipc::PersistenceCleanupRequestPayload& req);
 
     // 加白后与内核名单对账:内核「禁止执行(FileExecBlock)/ 禁止加载(FileNoLoad)」两份名单由
     // 【内核自己】写回注册表持久化,跨杀服务与重启由内核独立续拦,且协议上只有「追加 / 整表清空」
@@ -90,6 +139,8 @@ private slots:
     void onEvent(const bulwark::SecurityEvent& e);
     void onPromptResponse(const QUuid& eventId, bulwark::VerdictAction action,
                           bool remember, bulwark::RememberScope scope);
+    // 弹窗超时巡检(每秒):把超过 promptTimeoutSeconds 仍未回执的待裁决事件按默认策略收尾。
+    void onPromptTimeoutTick();
     // UI 回传的 AI 研判结果:按 AiDecisionPolicy 折叠,恶意则补偿处置(结束进程树 + 隔离)。
     void onAiScanResponse(const bulwark::ipc::AiScanResponsePayload& resp);
 
@@ -101,7 +152,14 @@ private:
     // 拦截的实际执行,并【返回真实结果】。内核已前拦的事件(kernelBlocked)直接如实返回
     // KernelBlocked 不再补杀;观测型事件(动作已发生)结束作恶进程树(带关键进程防护),对侧载
     // 模块额外加入内核禁止加载名单。返回值供 UI 如实显示处置,杜绝假拦截。
-    bulwark::EnforcementOutcome enforceBlock(const bulwark::SecurityEvent& e);
+    //
+    // persistentBlacklist=false 时【跳过】两份会被内核写回注册表、跨重启续拦的持久名单
+    // (禁止执行 / 禁止加载),只做当次可逆处置(结束进程树 + 运行期封禁 PID)。
+    // 用于「并非已确认恶意、只是按策略拦这一次」的路径:弹窗超时兜底、AI 不可用 fail-closed。
+    // 那些路径若也钉进内核名单,等于用户离开键盘一会儿、或网络抖动一次,就把正常程序永久拦死 ——
+    // 而协议上没有「删除单条」,只能整表清空重下发,代价极不对称。
+    bulwark::EnforcementOutcome enforceBlock(const bulwark::SecurityEvent& e,
+                                            bool persistentBlacklist = true);
     // 恶意进程终结:用户态结束进程树 + 驱动级(内核 ZwTerminateProcess)兜底补刀(难被反杀)。
     // 返回是否已结束。关键系统进程由内核+用户态双重护栏保护。
     bool killMalicious(int pid);
@@ -115,6 +173,9 @@ private:
     // 重查一次,命中就放弃本次处置并记一条日志。返回 true = 已加白,调用方应立即 return。
     // 不这么做的话,「加白之前排队的扫描」回来照样结束进程,还会顺手把路径钉进内核禁运名单。
     bool abortIfTrustedNow(const bulwark::SecurityEvent& e, const QString& stage);
+    // 「拦截时一并隔离主体载荷」(RuntimeSettings::quarantineOnBlock)。带加白 / 系统目录 /
+    // 健康签名三道护栏,详见 .cpp。此前该设置项在服务端与 UI 都无任何消费点。
+    void maybeQuarantineOnBlock(const bulwark::SecurityEvent& e);
     // 持久化反重建:把本次清理产出的 hardenedRegTargets(已清掉的恶意自启动项)去重+长度护栏后
     // 下发内核注册表硬拦,使恶意软件无法立刻重建刚被清掉的持久化(补「清理→守护进程秒级重写」竞态)。
     void applyRegHardening(const RemediationReport& report);
@@ -143,6 +204,14 @@ private:
     static QString extractRemoteIpv4(const QString& target); // "ip"/"ip:port" -> IPv4;非 IPv4 返回空
     static bool isPrivateOrReserved(const QString& ipv4);     // 私网/环回/保留:不查云端情报
 
+    // ---- 侧载模块篡改检测(「白加黑」)---------------------------------------
+    // 主体目录内是否存在「内嵌厂商签名但校验不过」的模块。命中即写
+    // e.tamperedModulePath,由 ThreatDetector 记为硬指标(见该字段的说明)。
+    // 只在主体位于【非标准安装目录】时才扫,结果按目录缓存 —— 详见实现处的成本说明。
+    void detectSideloadedTamperedModule(bulwark::SecurityEvent& e);
+    // 目录 -> 该目录内被篡改模块的路径(空串 = 扫过且干净)。避免每 19 分钟拉起一次就重扫一遍。
+    QHash<QString, QString> tamperScanCache_;
+
     // ---- 双击 / 释放载荷 VirusTotal 病毒扫描(后台上传扫描 + 恶意即补偿)----
     // 用户双击启动或释放器派生的可疑新样本:后台先按哈希查 VT,未收录则上传整文件云端多引擎
     // 扫描,进度经 sendVtScanUpdate 推 UI 卡片、结果落 VtScanHistoryStore 去重;确认恶意再补偿
@@ -156,7 +225,12 @@ private:
     void maybeScanDroppedInstaller(const bulwark::SecurityEvent& e);  // 落盘即扫:写入用户目录的安装包/可执行体送 VT(PID 清零,只隔离不杀进程)
     void maybeVerifyMemoryInjection(const bulwark::SecurityEvent& e); // 内存防护:限流查 VT 确认注入源恶意性
     void vtScanLoop();                                                 // 后台线程:逐个跑扫描
-    void runVtScan(bulwark::SecurityEvent e);                          // 后台:去重->冻结->查/传->落结论
+    void runVtScan(bulwark::SecurityEvent e);
+    // 威胁情报共享:把一次云查杀确认的「病毒信息 + 行为数据」脱敏后存入本机暂存队列,
+    // 等夜间上传。仅在开关开启且判定为恶意/可疑时收集;脱敏与筛选由 ContribStore 执行。
+    // 在后台线程调用(不碰 Qt 对象)。
+    void retainThreatIntel(const bulwark::FileReputation& rep,
+                           const bulwark::ThreatBehaviorProfile& profile);                          // 后台:去重->冻结->查/传->落结论
     void publishVtQueued(const bulwark::SecurityEvent& e);             // 入队即推「排队中」卡片(双击后即时反馈)
     void finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::FileReputation& rep); // 映射终态
     // persistTerminal=false:只推 UI 不落历史(命中去重收尾卡片时用——结论已在历史里,不重复落盘)。
@@ -185,12 +259,68 @@ private:
     std::unique_ptr<ThreatRemediator> remediator_;
     reputation::ReputationManager* reputation_ = nullptr;
     EventHistoryStore* eventHistory_ = nullptr;          // 结构化事件历史(落库,供 UI 回填)
+    AlertExporter* alertExporter_ = nullptr;             // ECS/SIEM 告警导出(可空 = 未启用)
     std::function<int(const QVector<bulwark::DefenseRule>&)> injectIntelRules_; // 情报行为规则注入器(主线程)
     const bulwark::RuntimeSettings* settings_ = nullptr; // 实时设置(主线程只读:总开关/维度/静默)
     bulwark::engine::ProcessChainTracker chain_; // 进程链关联(溯源上下文 + 足迹清理)
-    QHash<QUuid, bulwark::SecurityEvent> pending_;
+    int inlineRepBudgetMs_ = 800;                // 热路径同步云查的等待预算(见 setter 说明)
+
+    // ---- 待用户裁决的事件 ----
+    //
+    // 【为什么必须带截止时间并在服务端超时】原实现只有 insert(onEvent)与用户回执时的 erase,
+    // 既无上限也无超时,于是:
+    //   * UI 未启动 / 已退出 / 崩了 / 用户就是不点 -> 条目永久滞留。每条 SecurityEvent 带完整
+    //     证据链与进程链上下文,不是小结构,属于单向增长的泄漏(对比同文件的 aiPending_ 明确
+    //     写了 `if (size > 256) clear()`,这里什么护栏都没有);
+    //   * 配置项 PromptTimeoutSeconds 与 RuntimeSettings::defaultBlock 在服务端【从未被使用】,
+    //     超时兜底只存在于 UI 的 PromptDialog 倒计时里 —— 也就是说 UI 不在场时根本没有兜底;
+    //   * 枚举值 VerdictSource::Timeout 全仓仅出现在 RuleEngine 的显示文案 switch 中,
+    //     从未被产生过,是个永远走不到的分支。
+    // 现在由服务端自己按截止时间收尾,上述三点一并落地:UI 在不在场都有确定性的兜底行为。
+    struct PendingPrompt {
+        bulwark::SecurityEvent event;
+        QDateTime deadlineUtc;   // 无效 = 不超时(promptTimeoutSeconds <= 0,等用户点到底)
+    };
+    QHash<QUuid, PendingPrompt> pending_;
+    QTimer* promptTimer_ = nullptr;                  // 每秒巡检 pending_ 的截止时间
+    // 按默认策略(defaultBlock ? Block : Allow)收尾一条待裁决事件,来源标 Timeout。
+    // 供超时巡检与超量驱逐共用,保证两条路径的处置与记录完全一致。
+    void resolvePromptByDefault(const bulwark::SecurityEvent& e, const QString& why);
+
     QHash<QUuid, bulwark::SecurityEvent> aiPending_; // 已请求 UI AI 研判、等待回执的事件
     Logger log_{QStringLiteral("Worker")};
+
+    // ---- 零风险放行的文本日志折叠 ----
+    //
+    // 【起因·实测】共存放行的第三方安全软件会产生极高频的临时文件行为:火绒 HipsDaemon 每秒
+    // 几十次创建/删除 C:\Windows\Temp\swapfs-*。这些事件在管线第 2 步(已安装安全软件共存放行)
+    // 就被判成 Allow / 风险 0,没有任何调查价值,但每一条都照写 service.log 与 UI 实时日志。
+    // 后果不是「日志变长」而是【日志失效】:5MB 的滚动上限几秒钟就被刷满,启动过程、驱动握手、
+    // 真实告警全部被挤出文件 —— 出问题时最需要的那几行恰好永远读不到。
+    //
+    // 【折叠条件】只在完全没有调查信号时生效:Allow + 风险 0 + 无硬指标 + 未命中规则。
+    // 首次出现整条记录,窗口内的重复只累加计数,窗口结束补一条带次数的汇总。于是:
+    //   · 换主体、换事件类型、风险非 0、命中任意规则 —— 任一项变化都立刻整条记录,
+    //     攻击者无法把一个新行为藏在别人的折叠窗口后面;
+    //   · churn 规模仍然可查(汇总行带条数与窗口长度),信息是被压缩而不是被丢弃。
+    //
+    // 【刻意不折叠的】结构化事件历史(recordEvent)与审计日志(writeAudit)仍逐条完整落盘:
+    // 前者是 UI 统计与「活动日志」回填的数据源,折叠会让 ALLOWED 计数变小;后者是取证/合规
+    // 轨迹,悄悄变稀不可接受。本折叠只作用于两个纯文本滚动面:service.log 与 UI 实时日志。
+    struct AllowBurst {
+        qint64  firstMs = 0;  // 本窗口首条的时间戳
+        quint32 folded  = 0;  // 窗口内被折叠掉的条数(不含首条)
+    };
+    static constexpr qint64 kAllowFoldWindowMs = 60000; // 折叠窗口:60 秒
+    static constexpr int    kAllowFoldMaxKeys  = 512;   // 有界上限,超出即整表清空
+    QHash<QString, AllowBurst> allowBursts_;
+    // 返回 true = 本条应写入文本日志;false = 已折叠(仅累加计数)。
+    // 若上一窗口刚到期且有折叠积压,汇总文本写入 summaryOut(调用方先落汇总再落本条)。
+    bool shouldLogAllow(const bulwark::SecurityEvent& e, bulwark::VerdictAction action,
+                        QString* summaryOut);
+
+    // 攻击链组合引擎(可空 = 不参与)。仅在 onEvent 主线程路径上使用。
+    AttackChainEngine* attackChain_ = nullptr;
 
     // ---- 网络外联 IP 情报互证(微步场景 API)。C# 侧内联 await(驱动挂起动作);ETW 用户态
     // 观测源只能事后观测,故改为后台限流查询、确认恶意再补偿处置(结束外联进程树)。月配额
@@ -208,6 +338,12 @@ private:
     // ---- 双击 / 释放载荷 VirusTotal 病毒扫描后台 worker ----
     reputation::VirusTotalClient* vt_ = nullptr;
     VtScanHistoryStore* vtHistory_ = nullptr;
+    // 云扫描分级链路句柄(可空 = 该级跳过):服务器优先查 + 排除 VT 的其他源兜底 + 结论回传。
+    reputation::ProxyReputationService* repProxy_ = nullptr;
+    reputation::AggregateReputationService* repAggregate_ = nullptr;
+    // 威胁情报共享的本机暂存队列(可空 = 功能未接入)。是否真的收集由运行时开关
+    // cloudBehaviorUploadEnabled 决定(默认关);夜间上传由 ThreatIntelUploader 负责。
+    ThreatIntelContribStore* intelContrib_ = nullptr;
     // 多个后台扫描线程(线程池):单个未收录文件的「上传 + 轮询」最长阻塞约 4 分钟,若只有
     // 一条线程,期间其它双击文件只能在队列里干等,导致「VT 查询中」状态数分钟后才出现。用一个
     // 小线程池并行处理,长耗时上传不再饿死其它文件的状态推送。

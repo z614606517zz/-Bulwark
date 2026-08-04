@@ -1,6 +1,7 @@
 #include "bulwark/models/DefenseRule.h"
 #include "bulwark/models/SecurityEvent.h"
 #include "bulwark/json/JsonSupport.h"
+#include "bulwark/Clock.h"
 #include <QJsonArray>
 
 namespace bulwark {
@@ -13,7 +14,7 @@ QString DefenseRule::trustNoteTag() {
 bool DefenseRule::matches(const SecurityEvent& e) const {
     if (!enabled) return false;
     // 到期规则视为失效(存储侧也会清理,这里是运行时兜底)。
-    if (expiresUtc.has_value() && *expiresUtc <= QDateTime::currentDateTimeUtc()) return false;
+    if (expiresUtc.has_value() && *expiresUtc <= nowUtc()) return false;
 
     if (type.has_value() && *type != e.type) return false;
 

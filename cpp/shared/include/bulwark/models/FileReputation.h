@@ -4,6 +4,7 @@
 #include <QJsonObject>
 #include <optional>
 #include "bulwark/models/Enums.h"
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
@@ -16,7 +17,7 @@ struct FileReputation {
     int totalEngines = 0;                        // 参与引擎总数
     QString threatLabel;                         // 建议威胁名(可空)
     QString source;                              // 给出该结论的情报源名(VirusTotal / MalwareBazaar / …,可空)
-    QDateTime fetchedUtc = QDateTime::currentDateTimeUtc();
+    QDateTime fetchedUtc = nowUtc();
     std::optional<QDateTime> lastAnalysisUtc;    // VT 最近分析时间(可空)
     bool querySucceeded = false;                 // 查询是否权威完成
 

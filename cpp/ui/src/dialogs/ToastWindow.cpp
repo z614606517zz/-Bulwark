@@ -29,6 +29,9 @@ Look lookFor(ToastWindow::Kind k)
     case ToastWindow::Kind::Block:  return {theme::danger(),  QStringLiteral("shield-x")};
     case ToastWindow::Kind::AiScan: return {theme::accent(),  QStringLiteral("sparkles")};
     case ToastWindow::Kind::Info:   return {theme::info(),    QStringLiteral("alert")};
+    // 攻击链用琥珀而不是拦截的红:它表达「若干动作凑成了已知恶意组合」,处置可能是拦截、
+    // 询问、也可能是放行(静默模式降级)。用红色会在放行的情况下让人误以为已经拦下了。
+    case ToastWindow::Kind::AttackChain: return {theme::warning(), QStringLiteral("link")};
     }
     return {theme::info(), QStringLiteral("alert")};
 }
@@ -37,7 +40,8 @@ Look lookFor(ToastWindow::Kind k)
 
 ToastWindow::ToastWindow(Kind kind, const QString& heading, const QString& subtitle,
                          const QString& detail, const QList<ToastField>& fields,
-                         const QStringList& tags, int lifetimeMs, QWidget* parent)
+                         const QStringList& tags, int lifetimeMs, QWidget* parent,
+                         const QString& badgeText)
     : QWidget(parent), m_lifetimeMs(lifetimeMs)
 {
     // Frameless, on-top, and — crucially for a security notification — never
@@ -47,7 +51,9 @@ ToastWindow::ToastWindow(Kind kind, const QString& heading, const QString& subti
     setAttribute(Qt::WA_ShowWithoutActivating);
     // The block toast carries structured detail (来源/程序/行为/目标), so it's a
     // touch wider; the lighter info / AI toasts stay compact.
-    setFixedWidth(kind == Kind::Block ? 430 : 392);
+    // 攻击链与拦截一样带结构化明细(程序/动作链/处置),动作链还常有两三个动作名要并排,
+    // 所以同样用宽版;轻量的 info / AI 提示保持紧凑。
+    setFixedWidth((kind == Kind::Block || kind == Kind::AttackChain) ? 430 : 392);
 
     const Look look = lookFor(kind);
 
@@ -75,7 +81,12 @@ ToastWindow::ToastWindow(Kind kind, const QString& heading, const QString& subti
     head->setSpacing(8);
     head->addWidget(ui::coloredText(heading, 12, 700, theme::textPrimary()));
     head->addStretch();
-    head->addWidget(ui::pill(kind == Kind::Block ? u("已拦截") : u("处理中"), look.color),
+    // 右上角徽标:调用方给了就用它(攻击链要如实写「已拦截 / 已询问 / 已放行」——
+    // 这条通知的处置是数据决定的,不是种类决定的),没给才退回按种类推断。
+    head->addWidget(ui::pill(!badgeText.isEmpty() ? badgeText
+                                                  : (kind == Kind::Block ? u("已拦截")
+                                                                         : u("处理中")),
+                             look.color),
                     0, Qt::AlignVCenter);
     col->addLayout(head);
 

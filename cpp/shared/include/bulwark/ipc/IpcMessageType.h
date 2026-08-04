@@ -71,6 +71,16 @@ enum class IpcMessageType {
     ProcessListResponse,        // 55 服务->UI:进程快照
     ProcessActionRequest,       // 56 UI->服务:对某进程执行处置(结束/结束进程树/挂起/恢复/隔离/信任)
     ProcessActionResponse,      // 57 服务->UI:进程处置结果
+
+    // ---- 攻击链组合引擎 ----
+    AttackChainRequest,         // 58 UI->服务:请求组合表状态 + 命中记录
+    AttackChainResponse,        // 59 服务->UI:组合表状态 + 命中记录
+    AttackChainClearRequest,    // 60 UI->服务:清空命中记录
+    AttackChainHitNotification, // 61 服务->UI:攻击链命中即时通知(右下角自动消失的 toast)
+                                //    与 BlockNotification 分开的理由:后者只在【真拦下】时发,
+                                //    而攻击链命中可能以 Block / Ask / Allow 三种处置收尾 ——
+                                //    最需要告知用户的恰是 Allow 那种(静默模式降级、或被信任
+                                //    通道放行),那时既没有拦截通知也没有询问弹窗,完全无声。
 };
 
 } // namespace bulwark::ipc

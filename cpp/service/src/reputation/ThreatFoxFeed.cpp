@@ -1,5 +1,7 @@
 #include "bulwark/service/reputation/ThreatFoxFeed.h"
 #include "bulwark/service/reputation/ReputationCurl.h"
+// 「这个 IP 能不能整段封禁」的统一判定,与 Worker::buildRulesFromProfile 共用同一份名单。
+#include "bulwark/service/IpBlockPolicy.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -122,8 +124,24 @@ QVector<bulwark::DefenseRule> generateIntelRules(const QVector<ThreatFoxIoc>& io
             const int colon = ip.lastIndexOf(QLatin1Char(':'));
             if (colon > 0)
                 ip = ip.left(colon); // 去 :port,拦该 IP 任意端口
+            ip = ip.trimmed();
+            //
+            // 共享基础设施不做整段封禁(与 Worker::buildRulesFromProfile 同一判定)。
+            // feed 给出的置信度是「这个 IOC 与该家族相关」的置信度,不是「整段封掉这个 IP
+            // 是安全的」的置信度 —— C2 面板套在 Cloudflare / Edgecast 后面很常见,按 IP 封会
+            // 把该前端上成千上万个无关站点一起打死。实测本机就有 4 条 192.229.115.x
+            //(Edgecast)的 PureRAT 规则,属于这种情况。
+            //
+            if (isUnsafeToBlanketBlockIp(ip))
+                continue;
             rule.type = bulwark::EventType::NetworkConnect;
-            rule.targetPattern = ip.trimmed() + QLatin1Char('*');
+            //
+            // 【必须带冒号】。原来是 ip + '*',而 '*' 紧跟在末段数字之后 —— "154.12.94.16*"
+            // 除了 154.12.94.16 还会一并匹配 154.12.94.160 ~ 154.12.94.169,凭空多封 10 个
+            // 无关地址。加上 ':' 把通配锚定在「端口」位置,语义才是「该 IP 的任意端口」,
+            // 也与行为画像分支产出的 "<ip>:*" 保持一致。
+            //
+            rule.targetPattern = ip + QStringLiteral(":*");
             rule.action = bulwark::VerdictAction::Block;
             ok = true;
         } else if (i.iocType == QLatin1String("domain") && opt.GenerateDomainRules) {

@@ -1,0 +1,1112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bulwark 威胁分析</title>
+<style>
+  :root{
+    --bg:#eef1f7; --card:#ffffff; --soft:#f6f8fc; --line:#e4e8f0; --line2:#eef1f6;
+    --ink:#1b2230; --ink2:#3b475c; --muted:#6b7688; --dim:#98a2b3;
+    --brand:#6366f1; --brand2:#8b5cf6;
+    --mal:#e5484d; --malbg:#fdecec; --susp:#e08600; --suspbg:#fdf3e2;
+    --clean:#0f9d58; --cleanbg:#e7f6ec; --unk:#8a94a6; --unkbg:#eef1f6;
+    --mono:"SFMono-Regular","Cascadia Mono","Consolas",Menlo,monospace;
+    --sans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+    --sh:0 1px 2px rgba(16,24,40,.05),0 8px 24px rgba(16,24,40,.06);
+    --sh2:0 12px 40px rgba(16,24,40,.14);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);font:14.5px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  a{color:var(--brand);text-decoration:none}
+  ::selection{background:rgba(99,102,241,.18)}
+  .top{position:sticky;top:0;z-index:30;background:rgba(255,255,255,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+  .top .in{max-width:1080px;margin:0 auto;display:flex;align-items:center;gap:14px;padding:12px 20px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:750;font-size:16px}
+  .brand .logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));
+    display:grid;place-items:center;color:#fff;font-size:16px;box-shadow:0 6px 16px rgba(99,102,241,.35)}
+  .grow{flex:1}
+  .metrics{color:var(--muted);font-size:12.5px}.metrics b{color:var(--ink)}
+  .histbtn{border:1px solid var(--line);background:var(--card);color:var(--ink2);border-radius:10px;padding:8px 13px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:flex;gap:7px;align-items:center}
+  .histbtn:hover{border-color:var(--brand);color:var(--brand)}
+  .wrap{max-width:1080px;margin:0 auto;padding:26px 20px 60px}
+  /* hero scan card */
+  .hero{background:linear-gradient(180deg,#fff, #fbfcfe);border:1px solid var(--line);border-radius:18px;box-shadow:var(--sh);padding:26px;margin-bottom:20px}
+  .hero h1{margin:0 0 6px;font-size:22px;letter-spacing:-.3px}
+  .hero .lead{margin:0 0 18px;color:var(--muted);font-size:13.5px}
+  .scan{display:flex;gap:10px}
+  .scan .field{flex:1;position:relative}
+  .scan input{width:100%;padding:14px 15px;border:1.5px solid var(--line);border-radius:12px;font:inherit;font-family:var(--mono);font-size:14px;background:var(--soft);transition:.15s}
+  .scan input:focus{outline:none;border-color:var(--brand);background:#fff;box-shadow:0 0 0 4px rgba(99,102,241,.14)}
+  .btn{border:none;border-radius:12px;padding:0 22px;font:inherit;font-weight:700;color:#fff;background:linear-gradient(135deg,var(--brand),var(--brand2));cursor:pointer;transition:.12s;white-space:nowrap}
+  .btn:hover{filter:brightness(1.06)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.5;cursor:default;filter:none}
+  .or{display:flex;align-items:center;gap:12px;color:var(--dim);font-size:12px;margin:16px 0}
+  .or::before,.or::after{content:"";height:1px;background:var(--line);flex:1}
+  .drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+    border:1.5px dashed #cdd4e2;border-radius:14px;padding:26px 20px;text-align:center;cursor:pointer;transition:.15s;background:var(--soft)}
+  .drop:hover,.drop.drag{border-color:var(--brand);background:#f3f2ff}
+  .drop .ic{font-size:30px;line-height:1}.drop b{font-weight:650}.drop small{color:var(--dim);font-size:12px;max-width:560px;line-height:1.5}
+  #fileinput{display:none}
+  .status{min-height:22px;margin:0 0 18px;font-size:13.5px;color:var(--muted);display:flex;gap:9px;align-items:center}
+  .status.err{color:var(--mal)}.status.ok{color:var(--clean)}
+  .spin{width:15px;height:15px;border:2px solid var(--line);border-top-color:var(--brand);border-radius:50%;animation:sp .7s linear infinite;flex:none}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--sh)}
+  .placeholder{padding:70px 20px;text-align:center;color:var(--dim)}.placeholder .big{font-size:44px;opacity:.4}
+  /* verdict banner */
+  .vbanner{border-radius:16px 16px 0 0;padding:22px 24px;display:flex;gap:22px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+  .v-malicious .vbanner{background:linear-gradient(180deg,var(--malbg),#fff)} .v-suspicious .vbanner{background:linear-gradient(180deg,var(--suspbg),#fff)}
+  .v-clean .vbanner{background:linear-gradient(180deg,var(--cleanbg),#fff)} .v-unknown .vbanner{background:linear-gradient(180deg,var(--unkbg),#fff)}
+  .ring{--pct:0;--c:var(--unk);width:96px;height:96px;border-radius:50%;flex:none;display:grid;place-items:center;background:conic-gradient(var(--c) calc(var(--pct)*1%), #e7ebf2 0)}
+  .ring::after{content:"";position:absolute;width:74px;height:74px;border-radius:50%;background:#fff}
+  .ring{position:relative}.ring .n{position:relative;text-align:center;line-height:1.05}.ring .n b{font-size:24px;font-weight:800}.ring .n small{display:block;color:var(--muted);font-size:11px}
+  .v-malicious .ring{--c:var(--mal)}.v-suspicious .ring{--c:var(--susp)}.v-clean .ring{--c:var(--clean)}.v-unknown .ring{--c:var(--unk)}
+  .vmain{flex:1;min-width:250px}
+  .chip{display:inline-block;padding:4px 13px;border-radius:20px;font-weight:800;font-size:12.5px}
+  .v-malicious .chip{background:var(--mal);color:#fff}.v-suspicious .chip{background:var(--susp);color:#fff}.v-clean .chip{background:var(--clean);color:#fff}.v-unknown .chip{background:var(--unk);color:#fff}
+  .vlabel{margin-left:10px;font-weight:600;color:var(--ink2)}
+  .vname{font-size:17px;font-weight:700;margin:9px 0 3px;word-break:break-all}
+  .vmeta{color:var(--muted);font-size:12.5px}
+  .hashes{margin-top:11px;display:flex;flex-direction:column;gap:3px}
+  .hrow{font-family:var(--mono);font-size:12px;color:var(--muted);cursor:pointer;word-break:break-all}
+  .hrow:hover{color:var(--ink)}.hrow span{color:var(--dim);width:56px;display:inline-block}
+  .vside{font-size:12.5px;color:var(--muted);text-align:right;min-width:150px}.vside .k{color:var(--dim)}
+  /* segmented control */
+  .seg{display:flex;gap:6px;padding:14px 20px 0;flex-wrap:wrap}
+  .seg .s{padding:8px 16px;border-radius:10px;background:var(--soft);border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer;transition:.12s}
+  .seg .s:hover{color:var(--ink)}.seg .s.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  .seg .s .c{opacity:.7;font-weight:500;margin-left:5px}
+  .pane{display:none;padding:18px 20px 22px}.pane.on{display:block}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line2);vertical-align:top}
+  th{color:var(--dim);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  tbody tr:hover td{background:var(--soft)}
+  .mono{font-family:var(--mono)}
+  .kv{display:grid;grid-template-columns:170px 1fr;gap:8px 16px;font-size:13px}.kv .k{color:var(--muted)}.kv .v{word-break:break-all;font-family:var(--mono);font-size:12px}
+  .pill{font-size:11.5px;padding:3px 10px;border-radius:20px;background:var(--soft);border:1px solid var(--line);color:var(--ink2);margin:0 6px 7px 0;display:inline-block}
+  .pill.mal{background:var(--malbg);color:var(--mal);border-color:transparent}.pill.susp{background:var(--suspbg);color:var(--susp);border-color:transparent}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .bx{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .bx h4{margin:0;padding:10px 13px;font-size:12.5px;background:var(--soft);border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+  .bx h4 .n{color:var(--dim);font-weight:500}
+  .bx ul{margin:0;padding:0;list-style:none;font-family:var(--mono);font-size:11.5px;max-height:260px;overflow:auto}
+  .bx li{padding:5px 13px;border-bottom:1px solid var(--line2);color:var(--ink2);word-break:break-all}
+  .empty{color:var(--dim);font-size:13px;padding:10px 2px}
+  .fbtns{display:flex;gap:7px;margin-bottom:12px}
+  .fbtn{font-size:12.5px;padding:5px 12px;border-radius:8px;background:var(--soft);border:1px solid var(--line);color:var(--muted);cursor:pointer}
+  .fbtn.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  /* history modal — threat archive */
+  .hmodal{position:fixed;inset:0;background:rgba(16,24,40,.42);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s,visibility .2s;z-index:40;
+    display:flex;align-items:flex-start;justify-content:center;padding:40px 20px}
+  .hmodal.open{opacity:1;visibility:visible;pointer-events:auto;backdrop-filter:blur(3px)}
+  .hpanel{background:var(--bg);width:100%;max-width:1080px;max-height:calc(100vh - 80px);border-radius:18px;box-shadow:var(--sh2);
+    display:flex;flex-direction:column;overflow:hidden;transform:translateY(14px);transition:transform .24s cubic-bezier(.4,0,.2,1)}
+  .hmodal.open .hpanel{transform:none}
+  .hhead{display:flex;align-items:center;justify-content:space-between;padding:17px 22px;background:var(--card);border-bottom:1px solid var(--line)}
+  .htitle{font-size:17px;font-weight:750;display:flex;align-items:center;gap:9px}
+  .htitle .hsub{font-size:12.5px;color:var(--muted);font-weight:500}
+  .hhead .x{border:none;background:var(--soft);border-radius:9px;width:32px;height:32px;cursor:pointer;font-size:16px;color:var(--muted)}
+  .hhead .x:hover{background:var(--line);color:var(--ink)}
+  .hstats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:18px 22px 4px}
+  .hstat{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:12px 15px}
+  .hstat .v{font-size:23px;font-weight:800;line-height:1.1}
+  .hstat .k{font-size:12px;color:var(--muted);margin-top:3px}
+  .hstat.mal .v{color:var(--mal)}.hstat.susp .v{color:var(--susp)}
+  .hbar{display:flex;align-items:center;gap:10px;padding:14px 22px 10px;flex-wrap:wrap}
+  .hfilters{display:flex;gap:7px}
+  .hchip{padding:7px 14px;border-radius:9px;background:var(--card);border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer;transition:.12s}
+  .hchip:hover{color:var(--ink)}
+  .hchip.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  .hchip b{font-weight:800;margin-left:4px}
+  .hspace{flex:1}
+  .hsort{padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--card);font:inherit;font-size:13px;color:var(--ink2);cursor:pointer}
+  .hsearch{padding:8px 13px;border:1px solid var(--line);border-radius:9px;font:inherit;font-size:13px;background:var(--card);width:230px;max-width:46vw}
+  .hsearch:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+  .hlist{overflow:auto;padding:4px 22px 22px;display:flex;flex-direction:column;gap:9px}
+  .hcard{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:12px 15px;cursor:pointer;transition:.12s;flex:none}
+  .hcard:hover{box-shadow:var(--sh);transform:translateY(-1px)}
+  .hcard.malicious{border-left-color:var(--mal)}.hcard.suspicious{border-left-color:var(--susp)}
+  .hcard .hv{flex:none;width:56px;text-align:center}
+  .hcard .hv .chip{display:inline-block;padding:3px 10px;border-radius:20px;font-weight:800;font-size:11.5px;color:#fff}
+  .hcard.malicious .hv .chip{background:var(--mal)}.hcard.suspicious .hv .chip{background:var(--susp)}
+  .hcard .hmain{flex:1;min-width:0}
+  .hcard .hnm{font-weight:650;font-size:14px;word-break:break-all;line-height:1.3}
+  .hcard .hfam{margin-top:4px}
+  .hcard .hmeta{margin-top:4px;font-size:11.5px;color:var(--dim);font-family:var(--mono);word-break:break-all}
+  .hcard .hdet{flex:none;width:160px;text-align:right}
+  .hcard .hratio{font-size:15px;font-weight:800}
+  .hcard.malicious .hratio{color:var(--mal)}.hcard.suspicious .hratio{color:var(--susp)}
+  .hcard .hratio small{color:var(--dim);font-weight:600;font-size:11px}
+  .hcard .hbarwrap{height:5px;background:var(--soft);border-radius:3px;margin-top:6px;overflow:hidden}
+  .hcard .hbarfill{height:100%;border-radius:3px}
+  .hcard.malicious .hbarfill{background:var(--mal)}.hcard.suspicious .hbarfill{background:var(--susp)}
+  .hcard .hdate{font-size:11px;color:var(--dim);margin-top:6px}
+  @media(max-width:640px){.hstats{grid-template-columns:repeat(2,1fr)}.hcard .hdet{display:none}.hsearch{width:140px}}
+  /* landing dashboard (idle state) */
+  .dstats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
+  .dgrid{display:grid;grid-template-columns:1fr 322px;gap:16px;align-items:start}
+  .dsec{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--sh);padding:16px 18px;margin-bottom:16px}
+  .dsec:last-child{margin-bottom:0}
+  .dsec-h{display:flex;align-items:center;justify-content:space-between;font-weight:700;font-size:14px;margin-bottom:13px}
+  .dsec-h .ic{margin-right:7px}
+  .dmore{font-size:12.5px;color:var(--brand);cursor:pointer;font-weight:600}
+  .dmore:hover{text-decoration:underline}
+  .drecent{display:flex;flex-direction:column;gap:9px}
+  .dempty{color:var(--dim);font-size:13px;padding:26px 0;text-align:center}
+  .dsrc-i{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line2);font-size:13px}
+  .dsrc-i:last-child{border-bottom:none}
+  .dsrc-i .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .dsrc-i .dot.on{background:var(--clean);box-shadow:0 0 0 3px rgba(15,157,88,.15)}
+  .dsrc-i .dot.off{background:var(--dim)}
+  .dsrc-i .nm{flex:1;font-weight:600}
+  .dsrc-i .ks{font-size:11.5px;color:var(--muted)}
+  .dfam{display:flex;flex-direction:column;gap:2px}
+  .dfam-i{display:flex;align-items:center;justify-content:space-between;padding:5px 0;cursor:pointer;border-radius:8px}
+  .dfam-i:hover{background:var(--soft)}
+  .dfam-i b{font-weight:800;color:var(--muted);font-size:12.5px;padding-right:2px}
+  @media(max-width:820px){.dstats{grid-template-columns:repeat(2,1fr)}.dgrid{grid-template-columns:1fr}}
+  /* 银狐情报 page */
+  .sfhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .sftitle{font-size:19px;font-weight:750;display:flex;align-items:center;gap:10px}
+  .sftitle .hsub{font-size:12.5px;color:var(--muted);font-weight:500}
+  .sfbar{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px}
+  .sflist{display:flex;flex-direction:column;gap:9px}
+  /* behaviour report — domain grouped */
+  .beh-sum{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+  .beh-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;background:var(--soft);border:1px solid var(--line);font-size:12.5px;font-weight:600;color:var(--ink2)}
+  .beh-chip .i{font-size:13px}
+  .beh-chip b{font-weight:800;color:var(--ink);margin-left:2px}
+  .beh-chip.proc{background:#f2f0ff;border-color:#e6e1ff}
+  .beh-chip.file{background:#eefaf1;border-color:#d6f0dd}
+  .beh-chip.reg{background:#fff7e8;border-color:#fbe8c4}
+  .beh-chip.net{background:#eef4ff;border-color:#d9e6ff}
+  .beh-chip.sys{background:#f3f5f8;border-color:#e3e8f0}
+  .beh-chip.mitre{background:var(--malbg);border-color:transparent;color:var(--mal)}.beh-chip.mitre b{color:var(--mal)}
+  .beh-tags{margin-bottom:14px;line-height:2}
+  .beh-sec{border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:14px}
+  .beh-h{display:flex;align-items:center;justify-content:space-between;padding:11px 15px;background:var(--soft);border-bottom:1px solid var(--line)}
+  .beh-h .t{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13.5px}
+  .beh-h .i{font-size:15px}
+  .beh-h .cbadge{font-size:12px;font-weight:800;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:20px;padding:2px 11px}
+  .beh-sec.proc .beh-h{background:#f4f2ff}.beh-sec.file .beh-h{background:#eefaf1}.beh-sec.reg .beh-h{background:#fff7e8}.beh-sec.net .beh-h{background:#eef4ff}
+  .beh-sec.proc{border-left:3px solid var(--brand2)}.beh-sec.file{border-left:3px solid var(--clean)}.beh-sec.reg{border-left:3px solid var(--susp)}.beh-sec.net{border-left:3px solid var(--brand)}.beh-sec.sys{border-left:3px solid var(--unk)}
+  .beh-body{padding:4px 15px 13px}
+  .beh-cat{margin-top:11px}
+  .beh-cat-h{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}
+  .beh-cat-h span{font-weight:800;color:var(--dim);background:var(--soft);border-radius:20px;padding:1px 8px;font-size:10.5px}
+  .beh-items{display:flex;flex-direction:column;max-height:300px;overflow:auto;border:1px solid var(--line2);border-radius:9px;background:var(--card)}
+  .beh-item{font-family:var(--mono);font-size:11.5px;color:var(--ink2);padding:5px 11px;word-break:break-all;border-bottom:1px solid var(--line2)}
+  .beh-item:last-child{border-bottom:none}
+  .beh-item:hover{background:var(--soft)}
+  .beh-item.more{color:var(--dim);font-family:var(--sans);text-align:center}
+  .mitre{display:flex;flex-direction:column}
+  .mitre-row{display:flex;align-items:center;gap:12px;padding:9px 15px;border-bottom:1px solid var(--line2)}
+  .mitre-row:last-child{border-bottom:none}
+  .mitre-row .mid{font-family:var(--mono);font-size:12px;color:var(--brand);font-weight:700;flex:none;width:76px}
+  .mitre-row .mdesc{flex:1;font-size:12.5px;color:var(--ink2)}
+  .mitre-row .pill{flex:none}
+  /* behaviour graph (图谱) — node-link tree */
+  /* horizontal (left-to-right) tree: root on the left, each level flows right */
+  .g-tree{overflow:auto;max-height:72vh;padding:14px 8px;cursor:grab}
+  .g-tree.panning{cursor:grabbing}
+  .g-tree.panning *{cursor:grabbing!important}
+  .g-canvas{width:max-content;transform-origin:0 0}
+  .g-tree ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;flex:0 0 auto}
+  .g-tree li{position:relative;display:flex;align-items:center;padding:5px 0;flex:0 0 auto}
+  .g-tree li>ul{margin-left:36px;position:relative;flex:0 0 auto}
+  /* connector from a parent node into its children's vertical spine */
+  .g-tree li>ul::before{content:"";position:absolute;top:50%;left:-36px;width:18px;height:2px;background:var(--line)}
+  /* per-child horizontal stub from the spine to the child node */
+  .g-tree li>ul>li::before{content:"";position:absolute;left:-18px;top:50%;width:18px;height:2px;background:var(--line)}
+  /* vertical spine linking siblings */
+  .g-tree li>ul>li::after{content:"";position:absolute;left:-18px;top:0;bottom:0;width:2px;background:var(--line)}
+  .g-tree li>ul>li:first-child::after{top:50%}
+  .g-tree li>ul>li:last-child::after{bottom:50%}
+  .g-tree li>ul>li:only-child::after{display:none}
+  .g-node{display:inline-flex;flex:0 0 auto;align-items:center;gap:9px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:7px 12px;box-shadow:var(--sh);width:max-content;max-width:420px;vertical-align:top;cursor:default}
+  .g-node .g-ic{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;flex:none;font-size:13px;background:var(--soft)}
+  .g-node .g-tx{min-width:0}
+  .g-node .g-t{font-weight:650;font-size:13px;word-break:break-all;line-height:1.25}
+  .g-node .g-s{font-size:11px;color:var(--muted);font-family:var(--mono);word-break:break-all;margin-top:1px}
+  .g-node.root{border-color:var(--brand);box-shadow:0 4px 14px rgba(99,102,241,.16)}
+  .g-node.root .g-ic,.g-node.proc .g-ic,.g-node.net .g-ic{background:rgba(99,102,241,.14)}
+  .g-node.hub{background:linear-gradient(135deg,#f59e0b,#f97316);border-color:transparent}
+  .g-node.hub .g-t{color:#fff}.g-node.hub .g-s{color:rgba(255,255,255,.9)}.g-node.hub .g-ic{background:rgba(255,255,255,.25)}
+  .g-node.file .g-ic{background:var(--cleanbg)}
+  .g-node.reg .g-ic{background:var(--suspbg)}
+  .g-node.sys .g-ic{background:var(--unkbg)}
+  .g-node.cat{font-weight:700}
+  .g-node.leaf{padding:5px 11px;box-shadow:none;background:var(--soft)}
+  .g-node.leaf .g-ic{width:20px;height:20px;font-size:11px}
+  .g-node.leaf .g-t{font-weight:500;font-size:12px}
+  .g-node.more{border-style:dashed;background:transparent;box-shadow:none;color:var(--muted)}
+  .g-node.more .g-ic{background:transparent}
+  .g-tools{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;position:sticky;left:0}
+  .g-btn{font-size:12px;padding:5px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink2);cursor:pointer;font-weight:600}
+  .g-btn:hover{border-color:var(--brand);color:var(--brand)}
+  .g-zoom{display:inline-flex;align-items:center;gap:4px;margin-left:auto}
+  .g-zoom .g-btn{padding:5px 10px;min-width:30px}
+  .g-zlabel{font-size:12px;color:var(--muted);min-width:44px;text-align:center;font-variant-numeric:tabular-nums}
+  .g-hint{font-size:11px;color:var(--dim);margin-top:7px}
+  .g-caret{font-size:9px;color:var(--dim);transition:transform .15s;display:inline-block;width:9px}
+  .g-node.hub .g-caret{color:rgba(255,255,255,.85)}
+  .g-collapsible{cursor:pointer}
+  .g-tree li.collapsed>.g-node .g-caret{transform:rotate(-90deg)}
+  .g-tree li.collapsed>ul{display:none}
+  .ipq{color:var(--brand);cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}
+  .ipq:hover{color:var(--brand2)}
+  .ipq-load{opacity:.5}
+  .ipv{font-size:10.5px;font-weight:700;padding:0 7px;border-radius:20px;background:var(--unkbg);color:var(--unk)}
+  .ipv.mal{background:var(--mal);color:#fff}.ipv.susp{background:var(--susp);color:#fff}.ipv.clean{background:var(--clean);color:#fff}
+  /* multi-source consensus strip */
+  .srcstrip{padding:14px 20px 0}
+  .srcstrip-h{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.4px;margin-bottom:9px}
+  .srcstrip-h span{color:var(--muted)}
+  .srcstrip-b{display:flex;flex-wrap:wrap;gap:8px}
+  .src-item{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:5px 12px;font-size:12px}
+  .src-nm{font-weight:700}
+  .src-v{font-weight:800;font-size:11px;padding:1px 8px;border-radius:20px;background:var(--unkbg);color:var(--unk)}
+  .src-v.mal{background:var(--mal);color:#fff}.src-v.susp{background:var(--susp);color:#fff}.src-v.clean{background:var(--clean);color:#fff}
+  .src-x{color:var(--muted);font-size:11px}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,10px);background:var(--ink);color:#fff;padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;transition:.2s;z-index:60;box-shadow:var(--sh2)}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+  @media(max-width:560px){.scan{flex-direction:column}.btn{padding:13px}}
+</style>
+</head>
+<body>
+<div class="top"><div class="in">
+  <div class="brand"><span class="logo">🛡️</span> Bulwark 威胁分析</div>
+  <div class="grow"></div>
+  <div class="metrics" id="metrics"></div>
+  <button class="histbtn" id="sfbtn">🦊 银狐情报 <b id="sfcount">0</b></button>
+  <a class="histbtn" href="/api/docs" target="_blank" style="text-decoration:none">🔌 API</a>
+  <a class="histbtn" href="/engine" style="text-decoration:none">🧬 攻击链引擎 <b id="enginecount">0</b></a>
+  <a class="histbtn" href="/online" style="text-decoration:none">📡 在线客户端 <b id="onlinecount">0</b></a>
+  <button class="histbtn" id="histbtn">🗄️ 威胁档案 <b id="rcount">0</b></button>
+</div></div>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>文件 / 哈希 威胁分析</h1>
+    <p class="lead">基于 VirusTotal 的完整检测与沙箱行为报告。输入哈希查询,或拖入文件(浏览器本地计算 SHA-256,不上传原文件)。</p>
+    <div class="scan">
+      <div class="field"><input id="hash" type="text" placeholder="粘贴 SHA-256 / SHA-1 / MD5,回车查询" autocomplete="off" spellcheck="false"></div>
+      <button class="btn" id="go">分析</button>
+    </div>
+    <div class="or">或</div>
+    <label class="drop" id="drop" for="fileinput">
+      <div class="ic">📥</div><b>拖拽文件到此,或点击选择(支持多选批量)</b>
+      <small>VT 已收录 → 直接出报告;未收录 → 可一键送检(样本会共享给安全社区,勿传机密文件)<span id="uplimit"></span></small>
+    </label>
+    <input id="fileinput" type="file" multiple>
+  </section>
+
+  <div class="status" id="status"></div>
+  <div id="report"></div>
+</div>
+
+<div class="hmodal" id="hmodal">
+  <div class="hpanel">
+    <div class="hhead">
+      <div class="htitle">🗄️ 威胁档案库 <span class="hsub" id="hsub"></span></div>
+      <button class="x" id="hclose">✕</button>
+    </div>
+    <div class="hstats" id="hstats"></div>
+    <div class="hbar">
+      <div class="hfilters" id="hfilters">
+        <span class="hchip on" data-f="all">全部 <b>0</b></span>
+        <span class="hchip" data-f="malicious">恶意 <b>0</b></span>
+        <span class="hchip" data-f="suspicious">可疑 <b>0</b></span>
+      </div>
+      <div class="hspace"></div>
+      <select class="hsort" id="hsort">
+        <option value="recent">最近保存</option>
+        <option value="detections">检出最多</option>
+        <option value="name">名称</option>
+      </select>
+      <input class="hsearch" id="rfilter" type="text" placeholder="搜索名称 / 哈希 / 家族…">
+    </div>
+    <div class="hlist" id="reports"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const VMAP={malicious:"恶意",suspicious:"可疑",clean:"安全",unknown:"未知"};
+const CATMAP={trojan:"木马",ransomware:"勒索软件",worm:"蠕虫",backdoor:"后门",virus:"病毒",adware:"广告软件",pua:"潜在有害",grayware:"灰色软件",downloader:"下载器",dropper:"释放器",spyware:"间谍软件",banker:"银行木马",coinminer:"挖矿木马",miner:"挖矿木马",rootkit:"Rootkit",exploit:"漏洞利用",keylogger:"键盘记录",rat:"远控木马",stealer:"窃密木马",botnet:"僵尸网络",phishing:"钓鱼",installer:"捆绑安装",packed:"加壳",virtool:"病毒工具",hacktool:"黑客工具"};
+const catName=c=>CATMAP[c]||c||"未分类";
+let allReports=[];
+let MAXUP=650;  // max upload MB; refreshed from /stats
+let hFilter="all",hSort="recent";  // threat-archive view state
+let sfFilter="all";                // 银狐 sub-family filter
+let statsData=null;let archStats=null,sfReports=[];  /* whole-DB counters + full SilverFox list */               // last /stats payload
+let viewMode="dashboard";         // dashboard | report | batch
+
+function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),2400);}
+function setStatus(m,k){const el=$("#status");if(!m){el.innerHTML="";el.className="status";return;}
+  el.innerHTML=(k==="busy"?'<span class="spin"></span>':"")+"<span>"+esc(m)+"</span>";el.className="status"+(k==="err"?" err":k==="ok"?" ok":"");}
+function fmtDate(ep){if(!ep)return"—";try{return new Date(ep*1000).toISOString().replace("T"," ").slice(0,19)+" UTC";}catch(e){return String(ep);}}
+function fmtSize(n){if(n==null||n==="")return"—";const u=["B","KB","MB","GB"];let i=0,v=Number(n);while(v>=1024&&i<u.length-1){v/=1024;i++;}return(i?v.toFixed(1):v)+" "+u[i];}
+function verdictOf(f){const s=f.last_analysis_stats||{};const m=s.malicious||0,su=s.suspicious||0;return m>=5?"malicious":(m>0||su>0?"suspicious":(Object.keys(s).length?"clean":"unknown"));}
+async function jget(p){const r=await fetch(p);return r.json();}
+async function jpost(p,o){const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});return r.json();}
+
+// history modal — threat archive
+function openHistory(v){$("#hmodal").classList.toggle("open",v);if(v)drawReports();}
+$("#histbtn").onclick=()=>openHistory(!$("#hmodal").classList.contains("open"));
+$("#sfbtn").onclick=()=>renderSilverfox();
+$("#hclose").onclick=()=>openHistory(false);
+$("#hmodal").addEventListener("click",e=>{if(e.target===$("#hmodal"))openHistory(false);});
+$("#hsort").addEventListener("change",e=>{hSort=e.target.value;drawReports();});
+document.querySelectorAll("#hfilters .hchip").forEach(c=>c.onclick=()=>{hFilter=c.dataset.f;drawReports();});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")openHistory(false);});
+
+async function refreshMetrics(){try{const d=await jget("/stats");statsData=d;const q=d.quota_today||{};
+  if(d.max_upload_mb)MAXUP=d.max_upload_mb;
+  const ul=$("#uplimit");if(ul)ul.textContent=" · 单文件上限 "+MAXUP+"MB";
+  $("#metrics").innerHTML=`今日 VT <b>${q.VirusTotal||0}</b> · 微步 <b>${q.ThreatBook||0}</b>`;
+  const oc=$("#onlinecount");if(oc&&d.clients)oc.textContent=(d.clients.online||0);
+  const ec=$("#enginecount");if(ec&&d.engine)ec.textContent=(d.engine.patterns||0);
+  if(viewMode==="dashboard")renderDashboard();}catch(e){}}
+async function loadReports(){try{const d=await jget("/vt/reports");allReports=d.reports||[];
+  archStats=d.stats||null;sfReports=d.silverfox||[];
+  $("#rcount").textContent=((archStats&&archStats.total)||d.count||0);
+  const sfc=$("#sfcount");if(sfc)sfc.textContent=(archStats?archStats.silverfox:sfReports.length);
+  if($("#hmodal").classList.contains("open"))drawReports();if(viewMode==="silverfox")renderSilverfox();await refreshMetrics();}catch(e){}}
+function drawReports(){
+  /* Cards report the whole database (archStats) so they stop drifting every
+     time the hourly harvester rotates rows out of the capped list. */
+  const now=Date.now();
+  const winTotal=allReports.length;
+  const total=archStats?archStats.total:winTotal;
+  const nMal=archStats?archStats.malicious:allReports.filter(x=>x.verdict==="malicious").length;
+  const nSusp=archStats?archStats.suspicious:allReports.filter(x=>x.verdict==="suspicious").length;
+  const nRecent=archStats?archStats.recent:allReports.filter(x=>{const t=Date.parse(x.stored_at||"");return t&&(now-t)<7*864e5;}).length;
+  const hs=$("#hsub");if(hs)hs.textContent="\u5171 "+total+" \u6761\u5a01\u80c1\u8bb0\u5f55"+(winTotal<total?" \u00b7 \u5217\u8868\u663e\u793a\u6700\u8fd1 "+winTotal+" \u6761":"");
+  const st=$("#hstats");if(st)st.innerHTML=
+    `<div class="hstat"><div class="v">${total}</div><div class="k">威胁总数</div></div>
+     <div class="hstat mal"><div class="v">${nMal}</div><div class="k">恶意</div></div>
+     <div class="hstat susp"><div class="v">${nSusp}</div><div class="k">可疑</div></div>
+     <div class="hstat"><div class="v">${nRecent}</div><div class="k">近 7 天新增</div></div>`;
+  const fc={all:winTotal,malicious:allReports.filter(x=>x.verdict==="malicious").length,suspicious:allReports.filter(x=>x.verdict==="suspicious").length};
+  document.querySelectorAll("#hfilters .hchip").forEach(c=>{const f=c.dataset.f;c.classList.toggle("on",f===hFilter);
+    const b=c.querySelector("b");if(b)b.textContent=(fc[f]!=null?fc[f]:0);});
+  const q=($("#rfilter").value||"").toLowerCase().trim();
+  let l=allReports.slice();
+  if(hFilter!=="all")l=l.filter(x=>x.verdict===hFilter);
+  if(q)l=l.filter(x=>(x.name||"").toLowerCase().includes(q)||(x.sha256||"").includes(q)||(x.md5||"").includes(q)
+    ||(x.threat_label||"").toLowerCase().includes(q)||(x.category||"").toLowerCase().includes(q)||catName(x.category).includes(q)||(VMAP[x.verdict]||"").includes(q));
+  if(hSort==="detections")l.sort((a,b)=>(b.malicious-a.malicious)||(b.total_engines-a.total_engines));
+  else if(hSort==="name")l.sort((a,b)=>(a.name||a.sha256||"").localeCompare(b.name||b.sha256||""));
+  else l.sort((a,b)=>Date.parse(b.stored_at||"")-Date.parse(a.stored_at||""));
+  const box=$("#reports");
+  if(!l.length){box.innerHTML='<div class="empty" style="padding:50px 0;text-align:center">'+(total?"无匹配结果":"暂无威胁记录")+'</div>';return;}
+  box.innerHTML=l.map(x=>{const v=x.verdict||"unknown";const t=x.total_engines||0,m=x.malicious||0;const pct=t?Math.round(m/t*100):0;
+    const catTag=x.category?`<span class="pill susp" style="margin-right:5px">${esc(catName(x.category))}</span>`:"";
+    const fam=(x.threat_label||x.category)?`<div class="hfam">${catTag}${x.threat_label?`<span class="pill ${v==='malicious'?'mal':'susp'}">${esc(x.threat_label)}</span>`:""}</div>`:"";
+    return `<div class="hcard ${esc(v)}" data-id="${esc(x.sha256)}">
+      <div class="hv"><span class="chip">${esc(VMAP[v]||v)}</span></div>
+      <div class="hmain"><div class="hnm">${esc(x.name||x.sha256.slice(0,32))}</div>${fam}<div class="hmeta">${esc(x.sha256)}</div></div>
+      <div class="hdet"><div class="hratio">${m}<small>/${t}</small></div>
+        <div class="hbarwrap"><div class="hbarfill" style="width:${pct}%"></div></div>
+        <div class="hdate">${esc((x.stored_at||"").replace("T"," ").slice(0,16))}</div></div>
+    </div>`;}).join("");
+  
+}
+
+// ---- landing dashboard (idle state) ----
+function renderDashboard(){
+  viewMode="dashboard";
+  const total=allReports.length;
+  const nMal=allReports.filter(x=>x.verdict==="malicious").length;
+  const nSusp=allReports.filter(x=>x.verdict==="suspicious").length;
+  const q=(statsData&&statsData.quota_today)||{};
+  const todayVT=q.VirusTotal||0;
+  const recent=allReports.slice(0,6);
+  const famCount={};allReports.forEach(x=>{const f=x.threat_label||"";if(f)famCount[f]=(famCount[f]||0)+1;});
+  const fams=Object.entries(famCount).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const typeCount={};allReports.forEach(x=>{const c=x.category||"";if(c)typeCount[c]=(typeCount[c]||0)+1;});
+  const types=Object.entries(typeCount).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const sources=(statsData&&statsData.sources)||[];
+  const liveN=sources.filter(s=>s.enabled&&s.has_key).length;
+  const stat=(v,k,cls)=>`<div class="hstat ${cls||''}"><div class="v">${v}</div><div class="k">${k}</div></div>`;
+  const recentHtml=recent.length?recent.map(x=>{const v=x.verdict||"unknown";const t=x.total_engines||0,m=x.malicious||0;const pct=t?Math.round(m/t*100):0;
+    const catTag=x.category?`<span class="pill susp" style="margin-right:5px">${esc(catName(x.category))}</span>`:"";
+    const fam=(x.threat_label||x.category)?`<div class="hfam">${catTag}${x.threat_label?`<span class="pill ${v==='malicious'?'mal':'susp'}">${esc(x.threat_label)}</span>`:""}</div>`:"";
+    return `<div class="hcard ${esc(v)}" data-id="${esc(x.sha256)}">
+      <div class="hv"><span class="chip">${esc(VMAP[v]||v)}</span></div>
+      <div class="hmain"><div class="hnm">${esc(x.name||x.sha256.slice(0,32))}</div>${fam}<div class="hmeta">${esc(x.sha256)}</div></div>
+      <div class="hdet"><div class="hratio">${m}<small>/${t}</small></div><div class="hbarwrap"><div class="hbarfill" style="width:${pct}%"></div></div>
+      <div class="hdate">${esc((x.stored_at||"").replace("T"," ").slice(0,16))}</div></div></div>`;}).join("")
+    :'<div class="dempty">暂无威胁记录 — 拖入文件或粘贴哈希即可开始分析</div>';
+  const srcHtml=sources.length?sources.map(s=>{const ok=s.enabled&&s.has_key;
+    return `<div class="dsrc-i"><span class="dot ${ok?'on':'off'}"></span><span class="nm">${esc(s.name)}</span>
+      <span class="ks">${ok?(s.keys>1?(s.keys+" keys"):"就绪"):"未配置"}</span></div>`;}).join("")
+    :'<div class="dempty">加载中…</div>';
+  const famHtml=fams.length?fams.map(([f,c])=>`<div class="dfam-i" data-fam="${esc(f)}"><span class="pill mal">${esc(f)}</span><b>${c}</b></div>`).join("")
+    :'<div class="dempty">暂无</div>';
+  const typeHtml=types.length?types.map(([c,n])=>`<div class="dfam-i" data-cat="${esc(c)}"><span class="pill susp">${esc(catName(c))}</span><b>${n}</b></div>`).join("")
+    :'<div class="dempty">暂无</div>';
+  $("#report").innerHTML=`<div class="dash">
+    <div class="dstats">
+      ${stat(total,"威胁库样本")}${stat(nMal,"恶意","mal")}${stat(nSusp,"可疑","susp")}${stat(todayVT,"今日 VT 查询")}
+    </div>
+    <div class="dgrid">
+      <div class="dmain">
+        <div class="dsec"><div class="dsec-h"><span><span class="ic">🕒</span>最近威胁</span><span class="dmore" id="dallthreats">查看全部 →</span></div>
+          <div class="drecent">${recentHtml}</div></div>
+      </div>
+      <div class="dside">
+        <div class="dsec"><div class="dsec-h"><span><span class="ic">🛰️</span>情报源</span><span style="font-size:12px;color:var(--muted);font-weight:500">${liveN}/${sources.length||6} 在线</span></div>
+          ${srcHtml}</div>
+        <div class="dsec"><div class="dsec-h"><span class="ic">🏷️</span>威胁类型</div>
+          <div class="dfam">${typeHtml}</div></div>
+        <div class="dsec"><div class="dsec-h"><span class="ic">🧬</span>常见家族</div>
+          <div class="dfam">${famHtml}</div></div>
+      </div>
+    </div>
+  </div>`;
+  const rep=$("#report");
+  rep.querySelectorAll(".drecent .hcard").forEach(el=>el.onclick=()=>openStored(el.dataset.id));
+  const da=$("#dallthreats");if(da)da.onclick=()=>openHistory(true);
+  rep.querySelectorAll(".dfam-i[data-fam]").forEach(el=>el.onclick=()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.fam;drawReports();});
+  rep.querySelectorAll(".dfam-i[data-cat]").forEach(el=>el.onclick=()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.cat;drawReports();});
+}
+
+// ---- 银狐情报 page ----
+function renderSilverfox(){
+  viewMode="silverfox";setStatus("","");
+  const sf=(sfReports&&sfReports.length)?sfReports.slice():allReports.filter(x=>x.silverfox);
+  const famCount={};sf.forEach(x=>{famCount[x.silverfox]=(famCount[x.silverfox]||0)+1;});
+  const fams=Object.entries(famCount).sort((a,b)=>b[1]-a[1]);
+  const nMal=sf.filter(x=>x.verdict==="malicious").length;
+  const now=Date.now();const nRecent=sf.filter(x=>{const t=Date.parse(x.stored_at||"");return t&&(now-t)<7*864e5;}).length;
+  const stat=(v,k,cls)=>`<div class="hstat ${cls||''}"><div class="v">${v}</div><div class="k">${k}</div></div>`;
+  let chips=`<span class="hchip ${sfFilter==='all'?'on':''}" data-sf="all">全部 <b>${sf.length}</b></span>`;
+  chips+=fams.map(([f,n])=>`<span class="hchip ${f===sfFilter?'on':''}" data-sf="${esc(f)}">${esc(f)} <b>${n}</b></span>`).join("");
+  let l=sfFilter==="all"?sf.slice():sf.filter(x=>x.silverfox===sfFilter);
+  l.sort((a,b)=>Date.parse(b.stored_at||"")-Date.parse(a.stored_at||""));
+  const rows=l.length?l.map(x=>{const v=x.verdict||"unknown";const t=x.total_engines||0,m=x.malicious||0;const pct=t?Math.round(m/t*100):0;
+    return `<div class="hcard ${esc(v)}" data-id="${esc(x.sha256)}">
+      <div class="hv"><span class="chip">${esc(VMAP[v]||v)}</span></div>
+      <div class="hmain"><div class="hnm">${esc(x.name||x.sha256.slice(0,32))}</div>
+        <div class="hfam"><span class="pill mal">🦊 ${esc(x.silverfox)}</span>${x.threat_label?`<span class="pill ${v==='malicious'?'mal':'susp'}" style="margin-left:5px">${esc(x.threat_label)}</span>`:""}</div>
+        <div class="hmeta">${esc(x.sha256)}</div></div>
+      <div class="hdet"><div class="hratio">${m}<small>/${t}</small></div>
+        <div class="hbarwrap"><div class="hbarfill" style="width:${pct}%"></div></div>
+        <div class="hdate">${esc((x.stored_at||"").replace("T"," ").slice(0,16))}</div></div>
+    </div>`;}).join("")
+    :'<div class="dempty" style="padding:50px 0;text-align:center">暂无银狐样本。用上方「分析」查询或拖入疑似样本(ValleyRAT / Winos / SilverFox / Gh0st 等),命中后会自动归入此页。</div>';
+  $("#report").innerHTML=`<div class="sfpage">
+    <div class="sfhead"><div class="sftitle">🦊 银狐情报 <span class="hsub">共 ${sf.length} 个样本 · 自动分类</span></div></div>
+    <div class="dstats" style="margin-bottom:14px">
+      ${stat(sf.length,"银狐样本")}${stat(fams.length,"子家族")}${stat(nMal,"恶意","mal")}${stat(nRecent,"近 7 天","")}
+    </div>
+    <div class="sfbar">${chips}</div>
+    <div class="sflist">${rows}</div>
+  </div>`;
+  const rep=$("#report");
+  rep.querySelectorAll(".sfbar .hchip").forEach(c=>c.onclick=()=>{sfFilter=c.dataset.sf;renderSilverfox();});
+  rep.querySelectorAll(".sflist .hcard").forEach(el=>el.onclick=()=>openStored(el.dataset.id));
+}
+async function openStored(id){setStatus("加载已保存报告…","busy");
+  try{const d=await jget("/vt/report/"+encodeURIComponent(id));if(!d.ok){setStatus(d.error||"未找到","err");return;}
+    render(d.report,d.stored_at,true);setStatus("已保存报告 · "+(d.stored_at||""),"ok");}catch(e){setStatus("加载失败:"+e.message,"err");}}
+
+async function lookupHash(h,r){return jpost("/vt/lookup",{hash:h,refresh:!!r});}
+async function doLookup(){const h=$("#hash").value.trim().toLowerCase();
+  if(!/^([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$/.test(h)){setStatus("请输入合法的 MD5 / SHA-1 / SHA-256 哈希。","err");return;}
+  $("#go").disabled=true;setStatus("正在查询 VirusTotal(含沙箱行为报告)…","busy");
+  try{const d=await lookupHash(h,false);
+    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,不留存"),"ok");loadReports();}
+    else setStatus(d.error||"查询失败","err");}catch(e){setStatus("查询失败:"+e.message,"err");}finally{$("#go").disabled=false;}
+}
+async function sha256File(f){const b=await f.arrayBuffer();const d=await crypto.subtle.digest("SHA-256",b);return Array.from(new Uint8Array(d)).map(x=>x.toString(16).padStart(2,"0")).join("");}
+async function onFile(f){if(!f)return;if(!crypto.subtle){setStatus("需要 HTTPS 才能本地算哈希。","err");return;}
+  setStatus("计算 SHA-256:"+f.name+" ("+fmtSize(f.size)+")…","busy");
+  try{const sha=await sha256File(f);$("#hash").value=sha;setStatus("SHA-256 "+sha.slice(0,20)+"… · 查询 VT 中…","busy");
+    const d=await lookupHash(sha,false);
+    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("已查到报告","ok");loadReports();}
+    else uploadPrompt(f,sha,d.error||"VT 未收录");}catch(e){setStatus("处理文件失败:"+e.message,"err");}}
+function uploadPrompt(f,sha,why){setStatus("VirusTotal 未收录此文件("+why+")","err");
+  $("#report").innerHTML=`<div class="card"><div class="pane on" style="display:block">
+    <div style="font-size:16px;font-weight:700;margin-bottom:8px">🆕 VT 未收录该文件</div>
+    <div class="kv"><div class="k">文件</div><div class="v">${esc(f.name)} · ${fmtSize(f.size)}</div><div class="k">SHA-256</div><div class="v">${esc(sha)}</div></div>
+    <p style="color:var(--muted);margin:14px 0">可将样本上传到 VirusTotal 分析(数分钟出结果,自动轮询)。<b style="color:var(--susp)">VT 会把样本共享给安全社区,勿传机密文件。</b></p>
+    <button class="btn" id="upbtn" style="padding:12px 20px">⬆️ 上传样本到 VirusTotal 扫描</button></div></div>`;
+  $("#upbtn").onclick=()=>uploadSample(f,sha);}
+async function uploadSample(f,sha){if(f.size>MAXUP*1024*1024){setStatus("文件 "+fmtSize(f.size)+" 超过上传上限 "+MAXUP+"MB,无法送检(可用哈希查询)","err");return;}
+  const b=$("#upbtn");if(b)b.disabled=true;setStatus("上传样本到 VirusTotal…("+fmtSize(f.size)+")","busy");
+  try{const r=await fetch("/vt/upload?name="+encodeURIComponent(f.name),{method:"POST",body:f});const d=await r.json();
+    if(!d.ok){setStatus("上传失败:"+(d.error||""),"err");if(b)b.disabled=false;return;}
+    if(d.found){render(d.report,d.stored_at,d.cached);setStatus("VirusTotal 已有该文件报告","ok");loadReports();return;}
+    setStatus("已提交分析,自动轮询中…","busy");poll(sha,0);}catch(e){setStatus("上传失败:"+e.message,"err");if(b)b.disabled=false;}}
+function poll(sha,n){const MAX=24,MS=20000;if(n>=MAX){setStatus("分析仍在进行,已停止轮询,稍后用该哈希再查即可。","err");return;}
+  setTimeout(async()=>{try{const d=await lookupHash(sha,true);
+    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("VT 分析完成"+(d.stored?",威胁报告已留存":",安全文件不留存"),"ok");loadReports();}
+    else{setStatus("VT 分析中…(第 "+(n+1)+" 次 · 约 "+((n+1)*MS/1000)+"s)","busy");poll(sha,n+1);}}catch(e){poll(sha,n+1);}},MS);}
+
+// ---- batch upload ----
+let batch=null;
+const BST={queued:"排队",hashing:"计算哈希",looking:"查询中",done:"完成",notfound:"未收录",uploading:"上传中",analyzing:"分析中",error:"错误",timeout:"超时"};
+function statsOf(report){const f=(report&&report.file)||{};const s=f.last_analysis_stats||{};
+  const mal=s.malicious||0,susp=s.suspicious||0;const total=Object.values(s).reduce((a,c)=>a+(+c||0),0);
+  if(!Object.keys(s).length){
+    const ok=((report&&report.sources)||[]).filter(x=>x.querySucceeded);
+    if(ok.length){
+      const vs=ok.map(x=>x.verdict);
+      const rated=ok.filter(x=>(+x.total_engines||0)>0);
+      const best=rated.length?rated.reduce((a,x)=>((+x.malicious||0)>(+a.malicious||0)?x:a),rated[0]):null;
+      return {mal:best?(+best.malicious||0):0,susp:0,total:best?(+best.total_engines||0):0,
+              verdict:vs.includes("malicious")?"malicious":(vs.includes("suspicious")?"suspicious":(vs.includes("clean")?"clean":"unknown"))};
+    }
+  }
+  const verdict=mal>=5?"malicious":((mal>0||susp>0)?"suspicious":(Object.keys(s).length?"clean":"unknown"));
+  return {mal,susp,total,verdict};}
+function onFiles(files){const arr=Array.from(files||[]);if(!arr.length)return;
+  if(arr.length===1)return onFile(arr[0]);
+  runBatch(arr);}
+function runBatch(arr){
+  if(!crypto.subtle){setStatus("需要 HTTPS 才能本地算哈希。","err");return;}
+  batch={items:arr.map(f=>({file:f,name:f.name,size:f.size,sha:"",status:"queued",verdict:"",mal:0,total:0,stored:"",err:""}))};
+  setStatus("批量分析 "+arr.length+" 个文件…","busy");renderBatch();
+  let i=0,active=0;const LIM=3;
+  const next=()=>{
+    if(i>=batch.items.length&&active===0){onBatchLookupDone();return;}
+    while(active<LIM&&i<batch.items.length){const idx=i++;active++;processItem(idx).finally(()=>{active--;next();});}
+  };next();
+}
+async function processItem(idx){const it=batch.items[idx];
+  try{it.status="hashing";updateRow(idx);
+    it.sha=await sha256File(it.file);it.status="looking";updateRow(idx);
+    const d=await lookupHash(it.sha,false);
+    if(d.ok){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";}
+    else{it.status="notfound";it.err=d.error||"VT 未收录";}
+  }catch(e){it.status="error";it.err=e.message;}
+  updateRow(idx);updateBatchBar();}
+function onBatchLookupDone(){updateBatchBar();
+  const done=batch.items.filter(x=>x.status==="done").length;
+  const nf=batch.items.filter(x=>x.status==="notfound").length;
+  setStatus("批量查询完成:"+done+" 有报告"+(nf?(" · "+nf+" 未收录,可送检"):""),"ok");loadReports();}
+function submitAllUnknown(){batch.items.forEach((x,i)=>{if(["notfound","error","timeout"].includes(x.status))submitItem(i);});}
+async function submitItem(idx){const it=batch.items[idx];if(!["notfound","error","timeout"].includes(it.status))return;
+  if(it.size>MAXUP*1024*1024){it.status="error";it.err="超过上限 "+MAXUP+"MB";updateRow(idx);return;}
+  it.status="uploading";it.err="";updateRow(idx);
+  try{const r=await fetch("/vt/upload?name="+encodeURIComponent(it.name),{method:"POST",body:it.file});const d=await r.json();
+    if(!d.ok){it.status="notfound";it.err=d.error||"上传失败";updateRow(idx);return;}
+    if(d.found){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";updateRow(idx);loadReports();return;}
+    it.status="analyzing";updateRow(idx);pollItem(idx,0);
+  }catch(e){it.status="notfound";it.err=e.message;updateRow(idx);}}
+function pollItem(idx,n){const it=batch.items[idx];const MAX=24,MS=20000;
+  if(n>=MAX){it.status="timeout";it.err="分析超时,稍后重试";updateRow(idx);return;}
+  setTimeout(async()=>{try{const d=await lookupHash(it.sha,true);
+    if(d.ok){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";updateRow(idx);loadReports();}
+    else{it.status="analyzing";it.err="分析中("+(n+1)+")";updateRow(idx);pollItem(idx,n+1);}}catch(e){pollItem(idx,n+1);}},MS);}
+function rowHtml(it,idx){const busy=["hashing","looking","uploading","analyzing"].includes(it.status);
+  const vd=it.status==="done"?`<span class="pill ${it.verdict==='malicious'?'mal':it.verdict==='suspicious'?'susp':''}">${VMAP[it.verdict]||it.verdict}</span>`:"—";
+  const cnt=it.status==="done"?`${it.mal}/${it.total}`:"";
+  const act=(["notfound","error","timeout"].includes(it.status))?`<button class="fbtn" data-sub="${idx}">送检</button>`:
+    ((it.status==="done"&&it.stored)?`<button class="fbtn" data-open="${esc(it.sha)}">报告</button>`:"");
+  const stt=(busy?'<span class="spin" style="width:12px;height:12px"></span> ':"")+(BST[it.status]||it.status)+(it.err?(' <span style="color:var(--dim)">'+esc(it.err)+'</span>'):"");
+  return `<tr data-row="${idx}"><td>${idx+1}</td><td class="mono" style="max-width:280px;word-break:break-all">${esc(it.name)}</td>
+    <td>${fmtSize(it.size)}</td><td>${stt}</td><td>${vd}</td><td class="mono">${cnt}</td><td>${act}</td></tr>`;}
+function renderBatch(){viewMode="batch";const its=batch.items;
+  $("#report").innerHTML=`<div class="card"><div class="pane on" style="display:block">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+      <div style="font-size:16px;font-weight:700">📦 批量分析 <span id="bcount" class="mono" style="color:var(--muted);font-weight:500;font-size:13px"></span></div>
+      <div style="flex:1"></div>
+      <button class="btn" id="bsubmit" style="padding:9px 16px;font-size:13px">送检全部未收录</button>
+    </div>
+    <table><thead><tr><th>#</th><th>文件</th><th>大小</th><th>状态</th><th>判定</th><th>检出</th><th></th></tr></thead>
+    <tbody id="btbody">${its.map((it,i)=>rowHtml(it,i)).join("")}</tbody></table>
+    <p style="color:var(--susp);font-size:12px;margin-top:10px">送检会把样本上传到 VirusTotal 并共享给安全社区,勿传机密文件。分析为分钟级,页面会自动轮询。</p></div></div>`;
+  bindBatch();updateBatchBar();}
+function bindBatch(){const rep=$("#report");
+  rep.querySelectorAll("[data-sub]").forEach(b=>b.onclick=()=>submitItem(+b.dataset.sub));
+  rep.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>showReportFor(b.dataset.open));
+  const bs=$("#bsubmit");if(bs)bs.onclick=submitAllUnknown;}
+function updateRow(idx){const tb=$("#btbody");if(!tb)return;const tr=tb.querySelector(`tr[data-row="${idx}"]`);
+  if(tr){tr.outerHTML=rowHtml(batch.items[idx],idx);bindBatch();}}
+function updateBatchBar(){if(!batch)return;const c=$("#bcount");
+  if(c)c.textContent=batch.items.filter(x=>x.status==="done").length+"/"+batch.items.length+" 完成";
+  const nf=batch.items.filter(x=>["notfound","error","timeout"].includes(x.status)).length;
+  const bs=$("#bsubmit");if(bs){bs.style.display=nf?"":"none";bs.textContent="送检全部未收录 ("+nf+")";}}
+async function showReportFor(sha){setStatus("加载报告…","busy");
+  try{const d=await jget("/vt/report/"+encodeURIComponent(sha));if(!d.ok){setStatus("未找到","err");return;}
+    render(d.report,d.stored_at,true);
+    const rep=$("#report");const back=document.createElement("button");back.className="histbtn";
+    back.textContent="← 返回批量结果";back.style.margin="0 0 12px";back.onclick=renderBatch;
+    rep.insertBefore(back,rep.firstChild);setStatus("","");}catch(e){setStatus("加载失败:"+e.message,"err");}}
+
+// ---- render ----
+function asText(v){if(v==null)return"";if(typeof v==="string"||typeof v==="number")return String(v);
+  if(v.hostname)return v.hostname+(v.resolved_ips?(" → "+[].concat(v.resolved_ips).join(", ")):"");
+  if(v.destination_ip)return v.destination_ip+(v.destination_port?(":"+v.destination_port):"")+(v.transport_layer_protocol?(" "+v.transport_layer_protocol):"");
+  if(v.url)return(v.request_method?v.request_method+" ":"")+v.url+(v.response_status_code?(" ["+v.response_status_code+"]"):"");
+  if(v.path)return v.path+(v.sha256?("  ("+String(v.sha256).slice(0,16)+"…)"):"");
+  if(v.key!==undefined)return v.key+(v.value!=null?(" = "+v.value):"");
+  if(v.process_name)return(v.process_id?("["+v.process_id+"] "):"")+v.process_name;
+  if(v.name)return v.name;return JSON.stringify(v);}
+function box(t,a){a=a||[];if(!a.length)return"";const N=200,s=a.slice(0,N);
+  return `<div class="bx"><h4>${esc(t)}<span class="n">${a.length}</span></h4><ul>${s.map(x=>`<li>${esc(asText(x))}</li>`).join("")}${a.length>N?`<li style="color:var(--dim)">… 其余 ${a.length-N} 项省略</li>`:""}</ul></div>`;}
+function pills(a,c){a=a||[];return a.map(t=>`<span class="pill ${c||''}">${esc(asText(t))}</span>`).join("");}
+
+function render(report,storedAt,cached){
+  viewMode="report";
+  const f=(report&&report.file)||{},b=(report&&report.behaviour)||{};
+  const st=f.last_analysis_stats||{};const mal=st.malicious||0,susp=st.suspicious||0;
+  const total=Object.values(st).reduce((a,c)=>a+(+c||0),0);const verdict=verdictOf(f);const pct=total?Math.round(mal/total*100):0;
+  const names=f.names||[],ptc=f.popular_threat_classification||{},sig=f.signature_info||{},votes=f.total_votes||{};
+  const res=f.last_analysis_results||{};const rows=Object.keys(res).map(k=>res[k]).filter(Boolean);
+  const flagged=rows.filter(x=>x.category==="malicious"||x.category==="suspicious");
+  const mitre=b.mitre_attack_techniques||[];
+  const groups=[["进程创建",b.processes_created],["进程注入",b.processes_injected],["进程结束",b.processes_terminated],["命令执行",b.command_executions],
+    ["写入文件",b.files_written],["释放文件",b.files_dropped],["删除文件",b.files_deleted],["打开文件",b.files_opened],
+    ["注册表写入",b.registry_keys_set],["注册表删除",b.registry_keys_deleted],["注册表打开",b.registry_keys_opened],
+    ["DNS 请求",b.dns_lookups],["IP 连接",b.ip_traffic],["HTTP 请求",b.http_conversations],
+    ["互斥体",b.mutexes_created],["服务创建",b.services_created],["加载模块",b.modules_loaded],["高危调用",b.calls_highlighted],["签名命中",b.signature_matches]];
+  const behCount=groups.reduce((a,g)=>a+((g[1]||[]).length),0)+mitre.length;
+  const hr=(l,v)=>v?`<div class="hrow" data-copy="${esc(v)}"><span>${l}</span>${esc(v)}</div>`:"";
+
+  $("#report").innerHTML=`<div class="card v-${verdict}">
+    <div class="vbanner">
+      <div class="ring" style="--pct:${pct}"><div class="n"><b>${mal}</b><small>/ ${total}</small></div></div>
+      <div class="vmain">
+        <div><span class="chip">${VMAP[verdict]}</span>${ptc.suggested_threat_label?`<span class="vlabel">${esc(ptc.suggested_threat_label)}</span>`:""}</div>
+        <div class="vname">${esc(f.meaningful_name||names[0]||"(无文件名)")}</div>
+        <div class="vmeta">${esc(f.type_description||f.type_tag||"未知类型")} · ${fmtSize(f.size)} · 首见 ${fmtDate(f.first_submission_date)}</div>
+        <div class="hashes">${hr("SHA256",f.sha256)}${hr("SHA1",f.sha1)}${hr("MD5",f.md5)}</div>
+      </div>
+      <div class="vside">
+        <div><span class="k">检出</span> ${mal} 恶意 / ${susp} 可疑</div>
+        <div><span class="k">社区</span> 恶意 ${votes.malicious||0} · 无害 ${votes.harmless||0}</div>
+        <div><span class="k">数据</span> ${report.behaviour_available?"VT + 沙箱":"VT"}</div>
+        <div><span class="k">保存</span> ${esc((storedAt||"").slice(0,19))}${cached?" · 缓存":""}</div>
+      </div>
+    </div>
+    ${renderSources(report)}
+    <div class="seg">
+      <div class="s on" data-t="det">检测<span class="c">${flagged.length}/${rows.length}</span></div>
+      <div class="s" data-t="beh">行为<span class="c">${behCount||0}</span></div>
+      <div class="s" data-t="graph">图谱</div>
+      <div class="s" data-t="meta">详情</div>
+    </div>
+    <div class="pane on" data-p="det">${renderDet(flagged,rows)}</div>
+    <div class="pane" data-p="beh">${renderBeh(b,mitre,groups)}</div>
+    <div class="pane" data-p="graph">${renderGraph(report,f,b)}</div>
+    <div class="pane" data-p="meta">${renderMeta(f,sig,ptc,names)}</div>
+  </div>`;
+
+  const rep=$("#report");
+  rep.querySelectorAll(".seg .s").forEach(s=>s.onclick=()=>{rep.querySelectorAll(".seg .s").forEach(x=>x.classList.toggle("on",x===s));
+    rep.querySelectorAll(".pane").forEach(p=>p.classList.toggle("on",p.dataset.p===s.dataset.t));});
+  rep.querySelectorAll(".hrow").forEach(h=>h.onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(h.dataset.copy);toast("已复制哈希");});
+  const fb=rep.querySelectorAll(".fbtn");fb.forEach(x=>x.onclick=()=>{fb.forEach(y=>y.classList.toggle("on",y===x));
+    const m=x.dataset.f;rep.querySelectorAll("tr[data-cat]").forEach(r=>{r.style.display=(m==="all"||r.dataset.cat==="malicious"||r.dataset.cat==="suspicious")?"":"none";});});
+  // graph: single-click toggles one level, double-click toggles the whole branch
+  rep.querySelectorAll(".g-tree li").forEach(li=>{
+    const node=li.querySelector(":scope > .g-node"),sub=li.querySelector(":scope > ul");
+    if(!(node&&sub))return;
+    node.classList.add("g-collapsible");
+    node.insertAdjacentHTML("afterbegin",'<span class="g-caret">▾</span>');
+    let ct=null;
+    node.addEventListener("click",e=>{if(e.target.closest(".ipq"))return;
+      if(ct)return;ct=setTimeout(()=>{ct=null;li.classList.toggle("collapsed");},210);});
+    node.addEventListener("dblclick",e=>{if(e.target.closest(".ipq"))return;
+      if(ct){clearTimeout(ct);ct=null;}e.preventDefault();
+      const expand=li.classList.contains("collapsed");
+      [li].concat(Array.from(li.querySelectorAll("li"))).forEach(n=>{
+        if(n.querySelector(":scope > ul"))n.classList.toggle("collapsed",!expand);});});
+  });
+  const gcanvas=rep.querySelector(".g-canvas"),gzl=rep.querySelector(".g-zlabel");
+  let gz=1;const applyZoom=()=>{if(gcanvas)gcanvas.style.zoom=gz;if(gzl)gzl.textContent=Math.round(gz*100)+"%";};
+  rep.querySelectorAll(".g-btn").forEach(btn=>{const a=btn.dataset.gact;
+    if(a==="expand")btn.onclick=()=>rep.querySelectorAll(".g-tree li.collapsed").forEach(li=>li.classList.remove("collapsed"));
+    else if(a==="collapse")btn.onclick=()=>rep.querySelectorAll(".g-tree .g-cat-li").forEach(li=>li.classList.add("collapsed"));
+    else if(a==="zoomin")btn.onclick=()=>{gz=Math.min(2,Math.round((gz+0.1)*10)/10);applyZoom();};
+    else if(a==="zoomout")btn.onclick=()=>{gz=Math.max(0.4,Math.round((gz-0.1)*10)/10);applyZoom();};
+    else if(a==="zoomreset")btn.onclick=()=>{gz=1;applyZoom();};});
+  const gtreeEl=rep.querySelector(".g-tree");
+  if(gtreeEl)gtreeEl.addEventListener("wheel",e=>{if(!e.ctrlKey)return;e.preventDefault();
+    gz=Math.min(2,Math.max(0.4,Math.round((gz+(e.deltaY<0?0.1:-0.1))*10)/10));applyZoom();},{passive:false});
+  // graph: drag empty space to pan the canvas
+  if(gtreeEl){let pan=false,sx,sy,sl,st,pid=null;
+    gtreeEl.addEventListener("pointerdown",e=>{if(e.button!==0)return;
+      if(e.target.closest(".g-node")||e.target.closest(".g-btn"))return;
+      pan=true;sx=e.clientX;sy=e.clientY;sl=gtreeEl.scrollLeft;st=gtreeEl.scrollTop;pid=e.pointerId;
+      try{gtreeEl.setPointerCapture(pid);}catch(_){}gtreeEl.classList.add("panning");});
+    gtreeEl.addEventListener("pointermove",e=>{if(!pan)return;
+      gtreeEl.scrollLeft=sl-(e.clientX-sx);gtreeEl.scrollTop=st-(e.clientY-sy);});
+    const endpan=()=>{if(pan){pan=false;gtreeEl.classList.remove("panning");if(pid!=null){try{gtreeEl.releasePointerCapture(pid);}catch(_){}}}};
+    gtreeEl.addEventListener("pointerup",endpan);gtreeEl.addEventListener("pointercancel",endpan);}
+  // graph: click an IP to look up its reputation (ThreatBook)
+  rep.querySelectorAll(".ipq").forEach(el=>el.addEventListener("click",async e=>{
+    e.stopPropagation();if(el.dataset.done)return;const ip=el.dataset.ip;el.classList.add("ipq-load");
+    try{const d=await jget("/v1/reputation/ip/"+encodeURIComponent(ip));const v=d.verdict||"unknown";
+      el.classList.remove("ipq-load");el.dataset.done="1";
+      el.insertAdjacentHTML("afterend",` <span class="ipv ${v==='malicious'?'mal':v==='suspicious'?'susp':v==='clean'?'clean':''}">${esc(VMAP[v]||v)}${d.threatLabel?" · "+esc(d.threatLabel):""}</span>`);
+      toast("IP "+ip+":"+(VMAP[v]||v)+(d.source?(" · "+d.source):""));
+    }catch(err){el.classList.remove("ipq-load");toast("IP 查询失败");}}));
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+function renderDet(flagged,rows){if(!rows.length)return'<div class="empty">无引擎检测数据。</div>';
+  const o={malicious:0,suspicious:1,undetected:2,harmless:3},list=rows.slice().sort((a,b)=>(o[a.category]??9)-(o[b.category]??9));
+  const cls=c=>c==="malicious"?"mal":c==="suspicious"?"susp":"";
+  return `<div class="fbtns"><span class="fbtn on" data-f="flagged">仅报毒 (${flagged.length})</span><span class="fbtn" data-f="all">全部 (${rows.length})</span></div>
+    <table><thead><tr><th>引擎</th><th>结论</th><th>检测结果</th></tr></thead><tbody>
+    ${list.map(x=>`<tr data-cat="${esc(x.category||'')}" ${(x.category==='malicious'||x.category==='suspicious')?'':'style="display:none"'}>
+      <td>${esc(x.engine_name||'')}</td><td><span class="pill ${cls(x.category)}">${esc(x.category||'')}</span></td><td class="mono">${esc(x.result||'—')}</td></tr>`).join("")}
+    </tbody></table>`;}
+function renderBeh(b,mitre,groups){
+  b=b||{};mitre=mitre||[];
+  const dm=[
+    ["🧠","进程","proc",[["创建",b.processes_created],["注入",b.processes_injected],["命令执行",b.command_executions],["结束",b.processes_terminated]]],
+    ["📄","文件","file",[["写入",b.files_written],["释放",b.files_dropped],["删除",b.files_deleted],["打开",b.files_opened]]],
+    ["🗝️","注册表","reg",[["写入",b.registry_keys_set],["删除",b.registry_keys_deleted],["打开",b.registry_keys_opened]]],
+    ["🌐","网络","net",[["DNS 请求",b.dns_lookups],["IP 连接",b.ip_traffic],["HTTP 请求",b.http_conversations]]],
+    ["⚙️","系统","sys",[["互斥体",b.mutexes_created],["服务",b.services_created],["加载模块",b.modules_loaded],["高危调用",b.calls_highlighted],["签名命中",b.signature_matches]]]
+  ];
+  const cnt=cats=>cats.reduce((a,c)=>a+((c[1]||[]).length),0);
+  const bv=b.verdicts||[],bt=b.tags||[];
+  let sum=dm.filter(d=>cnt(d[3])>0).map(d=>`<span class="beh-chip ${d[2]}"><span class="i">${d[0]}</span>${d[1]}<b>${cnt(d[3])}</b></span>`).join("");
+  if(mitre.length)sum+=`<span class="beh-chip mitre"><span class="i">🎯</span>ATT&CK<b>${mitre.length}</b></span>`;
+  let h="";
+  if(sum)h+=`<div class="beh-sum">${sum}</div>`;
+  if(bv.length||bt.length)h+=`<div class="beh-tags">${pills(bv,"mal")}${pills(bt)}</div>`;
+  if(mitre.length){
+    h+=`<div class="beh-sec"><div class="beh-h"><span class="t"><span class="i">🎯</span>MITRE ATT&CK</span><span class="cbadge">${mitre.length}</span></div>
+      <div class="mitre">${mitre.slice(0,200).map(m=>{const sev=(m.severity||"").toLowerCase();const sc=/high|critical/.test(sev)?"mal":(/med/.test(sev)?"susp":"");
+        return `<div class="mitre-row"><span class="mid">${esc(m.id||"")}</span><span class="mdesc">${esc(m.signature_description||m.description||"")}</span>${m.severity?`<span class="pill ${sc}">${esc(m.severity)}</span>`:""}</div>`;}).join("")}</div></div>`;
+  }
+  dm.forEach(d=>{const tot=cnt(d[3]);if(!tot)return;
+    const cats=d[3].filter(c=>(c[1]||[]).length);
+    const body=cats.map(c=>{const arr=c[1]||[];const N=120,shown=arr.slice(0,N);
+      return `<div class="beh-cat"><div class="beh-cat-h">${esc(c[0])}<span>${arr.length}</span></div>
+        <div class="beh-items">${shown.map(x=>`<div class="beh-item">${esc(asText(x))}</div>`).join("")}${arr.length>N?`<div class="beh-item more">… 其余 ${arr.length-N} 项</div>`:""}</div></div>`;}).join("");
+    h+=`<div class="beh-sec ${d[2]}"><div class="beh-h"><span class="t"><span class="i">${d[0]}</span>${d[1]}</span><span class="cbadge">${tot}</span></div><div class="beh-body">${body}</div></div>`;
+  });
+  // catch-all: any other list-valued behaviour categories VT returned (so nothing is hidden)
+  const covered=new Set(["processes_created","processes_injected","command_executions","processes_terminated",
+    "files_written","files_dropped","files_deleted","files_opened",
+    "registry_keys_set","registry_keys_deleted","registry_keys_opened",
+    "dns_lookups","ip_traffic","http_conversations",
+    "mutexes_created","services_created","modules_loaded","calls_highlighted","signature_matches",
+    "verdicts","tags","mitre_attack_techniques"]);
+  const other=Object.keys(b).filter(k=>Array.isArray(b[k])&&b[k].length&&!covered.has(k));
+  if(other.length){
+    const body=other.map(k=>{const arr=b[k]||[];const N=120,shown=arr.slice(0,N);
+      return `<div class="beh-cat"><div class="beh-cat-h">${esc(k.replace(/_/g," "))}<span>${arr.length}</span></div>
+        <div class="beh-items">${shown.map(x=>`<div class="beh-item">${esc(asText(x))}</div>`).join("")}${arr.length>N?`<div class="beh-item more">… 其余 ${arr.length-N} 项</div>`:""}</div></div>`;}).join("");
+    const tot=other.reduce((a,k)=>a+(b[k].length||0),0);
+    h+=`<div class="beh-sec sys"><div class="beh-h"><span class="t"><span class="i">📦</span>其他</span><span class="cbadge">${tot}</span></div><div class="beh-body">${body}</div></div>`;
+  }
+  if(!h)h=`<div class="empty">${Object.keys(b).length?"此样本暂无可展示的行为条目。":"无沙箱行为数据(VT 未运行动态分析)。"}</div>`;
+  return h;}
+
+// ---- behaviour graph (图谱) ----
+function gBase(p){p=String(p==null?"":p);const i=Math.max(p.lastIndexOf("\\"),p.lastIndexOf("/"));return i>=0?p.slice(i+1):p;}
+function gShort(h){h=String(h==null?"":h);return h.length>20?h.slice(0,20)+"…":h;}
+function gLeaf(x){
+  if(x==null)return {t:"(空)",s:""};
+  if(typeof x==="string"||typeof x==="number"){const s=String(x);const bn=gBase(s);return {t:bn||s,s:(bn&&bn!==s)?s:""};}
+  if(x.hostname)return {t:x.hostname,s:[].concat(x.resolved_ips||[]).join(", ")};
+  if(x.destination_ip)return {t:x.destination_ip+(x.destination_port?(":"+x.destination_port):""),s:x.transport_layer_protocol||""};
+  if(x.url)return {t:(x.request_method?x.request_method+" ":"")+x.url,s:x.response_status_code?("HTTP "+x.response_status_code):""};
+  if(x.path)return {t:gBase(x.path)||x.path,s:x.sha256?("SHA256 "+gShort(x.sha256)):String(x.path)};
+  if(x.key!==undefined)return {t:String(x.key),s:(x.value!=null?String(x.value):"")};
+  if(x.process_name||x.name)return {t:String(x.name||x.process_name),s:x.process_id?("PID "+x.process_id):""};
+  return {t:asText(x),s:""};
+}
+function gNode(cls,ic,t,s){return `<div class="g-node ${cls}"><span class="g-ic">${ic}</span><div class="g-tx"><div class="g-t">${esc(t)}</div>${s?`<div class="g-s">${esc(s)}</div>`:""}</div></div>`;}
+function ipChip(ip){return `<span class="ipq" data-ip="${esc(ip)}" title="点击查询该 IP 信誉">${esc(ip)}</span>`;}
+function gNetLeaf(x){
+  if(x&&x.hostname){const ips=[].concat(x.resolved_ips||[]);
+    return `<li><div class="g-node leaf net"><span class="g-ic">🌐</span><div class="g-tx"><div class="g-t">${esc(x.hostname)}</div>${ips.length?`<div class="g-s">${ips.map(ipChip).join("  ")}</div>`:""}</div></div></li>`;}
+  if(x&&x.destination_ip){return `<li><div class="g-node leaf net"><span class="g-ic">🔌</span><div class="g-tx"><div class="g-t">${ipChip(String(x.destination_ip))}${x.destination_port?esc(":"+x.destination_port):""}</div>${x.transport_layer_protocol?`<div class="g-s">${esc(x.transport_layer_protocol)}</div>`:""}</div></div></li>`;}
+  const L=gLeaf(x);return `<li>${gNode("leaf net","🌐",L.t||"(空)",L.s)}</li>`;
+}
+function gProc(node,extra){extra=extra||"";
+  const ch=(node.children||[]).slice(0,80).map(k=>gProc(k,"")).join("")+extra;
+  return `<li>${gNode("proc","🧠",node.name||node.process_name||"进程",node.process_id?("PID "+node.process_id):"")}${ch?`<ul>${ch}</ul>`:""}</li>`;}
+function gCat(ic,cls,label,items,leafFn){const N=8,shown=items.slice(0,N);
+  const leaves=shown.map(x=>leafFn?leafFn(x):`<li>${gNode("leaf "+cls,ic,(gLeaf(x).t||"(空)"),gLeaf(x).s)}</li>`).join("");
+  const more=items.length>N?`<li>${gNode("more","➕","其余 "+(items.length-N)+" 项","")}</li>`:"";
+  return `<li class="g-cat-li">${gNode("cat "+cls,ic,label,items.length+" 项")}<ul>${leaves}${more}</ul></li>`;}
+function renderGraph(report,f,b){
+  f=f||{};b=b||{};
+  if(!report||!report.behaviour_available||!Object.keys(b).length)
+    return `<div class="empty">无沙箱行为数据,暂无法生成行为图谱(VT 未运行动态分析)。</div>`;
+  const cats=[
+    ["📄","file","释放文件",b.files_dropped],
+    ["📝","file","写入文件",b.files_written],
+    ["🗑️","file","删除文件",b.files_deleted],
+    ["🗝️","reg","注册表",[].concat(b.registry_keys_set||[],b.registry_keys_deleted||[],b.registry_keys_opened||[])],
+    ["🌐","net","网络",[].concat(b.dns_lookups||[],b.http_conversations||[],b.ip_traffic||[])],
+    ["⌨️","proc","命令执行",b.command_executions],
+    ["➕","proc","进程创建",b.processes_created],
+    ["🧩","sys","加载模块",b.modules_loaded],
+    ["🔒","sys","互斥体",b.mutexes_created],
+    ["🛠️","sys","服务",b.services_created],
+  ].filter(c=>(c[3]||[]).length);
+  if(!cats.length)return `<div class="empty">此样本暂无可展示的行为条目。</div>`;
+  const catHtml=cats.map(c=>c[1]==="net"?gCat(c[0],c[1],c[2],c[3],gNetLeaf):gCat(c[0],c[1],c[2],c[3])).join("");
+  const hubLi=`<li>${gNode("hub","⚡","行为分析",cats.length+" 类动态行为")}<ul>${catHtml}</ul></li>`;
+  const ptree=b.processes_tree||[];
+  let inner;
+  if(ptree.length){inner=ptree.slice(0,40).map((n,i)=>gProc(n,i===0?hubLi:"")).join("");}
+  else if((b.processes_created||[]).length){const p0=b.processes_created[0];const L=gLeaf(p0);
+    inner=`<li>${gNode("proc","🧠",L.t||"进程",(p0&&p0.process_id)?("PID "+p0.process_id):"")}<ul>${hubLi}</ul></li>`;}
+  else inner=hubLi;
+  const rootSub=f.md5?("MD5 "+f.md5):(f.sha256?("SHA256 "+gShort(f.sha256)):"");
+  const root=`<li>${gNode("root","📦",f.meaningful_name||(f.names&&f.names[0])||"样本文件",rootSub)}<ul>${inner}</ul></li>`;
+  return `<div class="g-wrap"><div class="g-tools"><button class="g-btn" data-gact="expand">展开全部</button><button class="g-btn" data-gact="collapse">折叠全部</button><span class="g-zoom"><button class="g-btn" data-gact="zoomout" title="缩小">−</button><span class="g-zlabel">100%</span><button class="g-btn" data-gact="zoomin" title="放大">＋</button><button class="g-btn" data-gact="zoomreset" title="重置">重置</button></span></div><div class="g-tree"><div class="g-canvas"><ul>${root}</ul></div></div><div class="g-hint">提示:Ctrl + 滚轮 可缩放</div></div>`;
+}
+function renderSources(report){
+  const s=(report&&report.sources)||[];
+  if(!s.length)return "";
+  const cls=v=>v==="malicious"?"mal":v==="suspicious"?"susp":v==="clean"?"clean":"";
+  const items=s.map(x=>{const v=x.verdict||"unknown";
+    const extra=x.querySucceeded?(x.threat_label?esc(x.threat_label):(x.total_engines?(x.malicious+"/"+x.total_engines):"")):"无数据";
+    return `<div class="src-item"><span class="src-nm">${esc(x.source)}</span><span class="src-v ${cls(v)}">${VMAP[v]||v}</span>${extra?`<span class="src-x">${extra}</span>`:""}</div>`;}).join("");
+  return `<div class="srcstrip"><div class="srcstrip-h">多源情报 <span>${s.length} 源</span></div><div class="srcstrip-b">${items}</div></div>`;
+}
+function renderMeta(f,sig,ptc,names){
+  const rows=[["类型",f.type_description],["类型标签",f.type_tag],["大小",fmtSize(f.size)],["SSDEEP",f.ssdeep],["TLSH",f.tlsh],["Vhash",f.vhash],
+    ["首次提交",fmtDate(f.first_submission_date)],["最近提交",fmtDate(f.last_submission_date)],["最近分析",fmtDate(f.last_analysis_date)],
+    ["威胁标签",ptc.suggested_threat_label],["签名验证",sig.verified],["签名产品",sig.product],["签名主体",sig.signers],["信誉分",f.reputation]];
+  let h=`<div class="kv">${rows.filter(r=>r[1]!=null&&r[1]!=="").map(r=>`<div class="k">${esc(r[0])}</div><div class="v">${esc(r[1])}</div>`).join("")}</div>`;
+  if(names&&names.length)h+=`<div style="margin-top:16px"><div class="k" style="color:var(--muted);margin-bottom:6px">曾用文件名 (${names.length})</div>${pills(names.slice(0,40))}</div>`;
+  if(f.tags&&f.tags.length)h+=`<div style="margin-top:12px"><div class="k" style="color:var(--muted);margin-bottom:6px">标签</div>${pills(f.tags)}</div>`;
+  return h;}
+
+$("#go").onclick=doLookup;
+$("#hash").addEventListener("keydown",e=>{if(e.key==="Enter")doLookup();});
+$("#fileinput").addEventListener("change",e=>{if(e.target.files&&e.target.files.length)onFiles(e.target.files);e.target.value="";});
+let _rfTmr;$("#rfilter").addEventListener("input",()=>{clearTimeout(_rfTmr);_rfTmr=setTimeout(drawReports,180);});
+$("#reports").addEventListener("click",e=>{var c=e.target.closest&&e.target.closest(".hcard");if(c&&c.dataset.id){openStored(c.dataset.id);openHistory(false);}});
+const dz=$("#drop");
+["dragenter","dragover"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add("drag");}));
+["dragleave","drop"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove("drag");}));
+dz.addEventListener("drop",e=>{const ff=e.dataTransfer.files;if(ff&&ff.length)onFiles(ff);});
+const brand=$(".brand");if(brand){brand.style.cursor="pointer";brand.title="返回首页";brand.onclick=()=>{setStatus("","");renderDashboard();};}
+renderDashboard();
+loadReports();
+</script>
+<script>
+/* Degraded-mode banner: when VirusTotal is unavailable the backend answers from
+   the other feeds and marks the report degraded. Wrap render() so every entry
+   point (lookup, batch, stored report) shows why the VT panel is empty.
+   Text uses \u escapes so the file stays pure ASCII. */
+(function(){
+  if (typeof render !== "function") return;
+  var orig = render;
+  window.render = function(report, storedAt, cached){
+    var out = orig.apply(this, arguments);
+    try{
+      var host = document.getElementById("report");
+      if (report && report.degraded && host && !host.querySelector(".degbanner")){
+        var ok = (report.sources || []).filter(function(x){ return x.querySucceeded; })
+                                       .map(function(x){ return x.source; });
+        var div = document.createElement("div");
+        div.className = "degbanner";
+        div.style.cssText = "display:flex;gap:9px;align-items:flex-start;"
+          + "margin:0 0 12px;padding:9px 13px;border-radius:10px;font-size:12.5px;"
+          + "line-height:1.55;background:rgba(251,191,36,.13);"
+          + "border:1px solid rgba(217,119,6,.30);color:#8a5a00";
+        var reason = report.degraded_reason || "unavailable";
+        div.textContent = "\u26a0 VirusTotal \u6682\u4e0d\u53ef\u7528\uff1a" + reason
+          + " \u2014 \u4ee5\u4e0b\u7ed3\u8bba\u6765\u81ea\u5176\u4ed6\u60c5\u62a5\u6e90"
+          + (ok.length ? "\uff1a" + ok.join(", ") : "");
+        host.insertBefore(div, host.firstChild);
+      }
+    }catch(e){}
+    return out;
+  };
+})();
+</script>
+<style>
+/* ---- Bulwark UI motion layer (appended; no existing rule modified) -------- */
+@keyframes bwa-up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes bwa-pop{0%{transform:scale(.94);opacity:0}60%{transform:scale(1.02)}100%{transform:scale(1);opacity:1}}
+@keyframes bwa-slide{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+@keyframes bwa-shake{0%,100%{transform:translateX(0)}15%{transform:translateX(-5px)}30%{transform:translateX(4px)}45%{transform:translateX(-3px)}60%{transform:translateX(2px)}}
+@keyframes bwa-flash{0%{background:rgba(34,197,94,.20)}100%{background:transparent}}
+@keyframes bwa-pulse{0%,100%{opacity:1}50%{opacity:.55}}
+@keyframes bwa-ripple{to{transform:scale(2.8);opacity:0}}
+@keyframes bwa-glow{0%{box-shadow:0 0 0 0 rgba(99,102,241,.35)}100%{box-shadow:0 0 0 10px rgba(99,102,241,0)}}
+
+.bwa-anim{animation:bwa-up .34s cubic-bezier(.22,.7,.25,1) both}
+.bwa-row{animation:bwa-slide .28s ease both}
+.bwa-pop{animation:bwa-pop .30s cubic-bezier(.22,.7,.25,1) both}
+.pane.on{animation:bwa-up .26s ease both}
+
+#status.bwa-st{animation:bwa-up .22s ease both}
+#status.bwa-err{animation:bwa-shake .38s ease both}
+#status.bwa-ok{animation:bwa-flash .9s ease both;border-radius:8px}
+#status.bwa-busy span:last-child{animation:bwa-pulse 1.2s ease-in-out infinite}
+
+.btn,.fbtn,.seg .s,.hchip,.hcard{position:relative;overflow:hidden}
+.btn:hover,.fbtn:hover{transform:translateY(-1px);filter:brightness(1.06)}
+.btn:active,.fbtn:active,.seg .s:active,.hchip:active{transform:translateY(1px) scale(.985)}
+.hcard:hover{transform:translateY(-2px)}
+.scan input:focus{animation:bwa-glow .7s ease both}
+.bwa-rip{position:absolute;border-radius:50%;pointer-events:none;background:rgba(255,255,255,.45);
+  width:14px;height:14px;margin:-7px 0 0 -7px;animation:bwa-ripple .55s ease-out forwards}
+.hcard .bwa-rip,.seg .s .bwa-rip,.hchip .bwa-rip{background:rgba(99,102,241,.28)}
+
+#drop.bwa-drag{animation:bwa-pulse 1s ease-in-out infinite}
+#drop.bwa-drop{animation:bwa-pop .32s ease both}
+#toast.bwa-t{animation:bwa-pop .3s cubic-bezier(.22,.7,.25,1) both}
+
+@media (prefers-reduced-motion: reduce){
+  .bwa-anim,.bwa-row,.bwa-pop,.pane.on,#status.bwa-st,#status.bwa-err,#status.bwa-ok,
+  #status.bwa-busy span:last-child,#drop.bwa-drag,#drop.bwa-drop,#toast.bwa-t,
+  .scan input:focus{animation:none!important}
+  .btn:hover,.fbtn:hover,.hcard:hover,.btn:active,.fbtn:active{transform:none;filter:none}
+  .bwa-rip{display:none}
+}
+</style>
+<script>
+/* Motion layer: hooks every user action (query, upload, batch, tabs, history,
+   status changes) without touching the existing markup or handlers.
+   Animation classes are removed on animationend so :hover transforms keep
+   working (an animation with fill-mode:both would otherwise pin transform). */
+(function(){
+  var D = document;
+  var RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+  function stagger(nodes, cls, step, cap){
+    if (RM || !nodes) return;
+    step = step || 45; cap = (cap == null ? 12 : cap);
+    /* Animate only the first cap+1 nodes. Past the cap every node received the
+       SAME delay (Math.min(i,cap)*step), so animating hundreds of rows looked
+       identical to animating a dozen while costing far more. And the old loop
+       read n.offsetWidth per node, forcing a synchronous layout each iteration:
+       with a 300-row archive that was ~300 full reflows per redraw and the main
+       source of the stall. Now class writes (which do not force layout) happen
+       first, then ONE reflow for the whole batch, then the small visible set is
+       animated. */
+    var pick = [];
+    for (var k = 0; k < nodes.length; k++){
+      var n = nodes[k];
+      if (!n || n.nodeType !== 1) continue;
+      if (n.tagName === "SCRIPT" || n.tagName === "STYLE") continue;
+      n.classList.remove(cls);
+      if (pick.length <= cap) pick.push(n);
+    }
+    if (!pick.length) return;
+    void (pick[0].parentNode || pick[0]).offsetWidth;
+    pick.forEach(function(n, idx){
+      n.style.animationDelay = (idx * step) + "ms";
+      n.classList.add(cls);
+      n.addEventListener("animationend", function(){
+        n.classList.remove(cls);
+        n.style.animationDelay = "";
+      }, {once: true});
+    });
+  }
+
+  /* 1. status line reacts to every action outcome */
+  if (typeof setStatus === "function"){
+    var origStatus = setStatus;
+    window.setStatus = function(m, k){
+      var out = origStatus.apply(this, arguments);
+      if (!RM){
+        var el = D.getElementById("status");
+        if (el){
+          el.classList.remove("bwa-st","bwa-err","bwa-ok","bwa-busy");
+          void el.offsetWidth;
+          el.classList.add("bwa-st");
+          if (k === "err") el.classList.add("bwa-err");
+          else if (k === "ok") el.classList.add("bwa-ok");
+          else if (k === "busy") el.classList.add("bwa-busy");
+        }
+      }
+      return out;
+    };
+  }
+
+  /* 2. any rendered result animates in, whatever triggered it */
+  function observe(id, cls, deep, step){
+    var host = D.getElementById(id);
+    if (!host) return;
+    new MutationObserver(function(muts){
+      if (RM) return;
+      var added = false;
+      for (var i = 0; i < muts.length; i++){
+        if (muts[i].addedNodes && muts[i].addedNodes.length){ added = true; break; }
+      }
+      if (!added) return;
+      stagger(host.children, cls, step, 12);
+      if (deep) stagger(host.querySelectorAll(".dsec,.hcard,.kv"), "bwa-anim", 35, 16);
+    }).observe(host, {childList: true});
+  }
+  observe("report",  "bwa-anim", true, 45);
+  observe("reports", "bwa-row",  false, 22);
+  observe("btbody",  "bwa-row",  false, 18);
+  observe("metrics", "bwa-pop",  false, 50);
+
+  /* 3. click ripple + press feedback on every control */
+  D.addEventListener("pointerdown", function(e){
+    if (RM || !e.target || !e.target.closest) return;
+    var t = e.target.closest(".btn,.fbtn,.seg .s,.hchip,.hcard");
+    if (!t) return;
+    var box = t.getBoundingClientRect();
+    var s = D.createElement("span");
+    s.className = "bwa-rip";
+    s.style.left = (e.clientX - box.left) + "px";
+    s.style.top  = (e.clientY - box.top) + "px";
+    t.appendChild(s);
+    setTimeout(function(){ if (s.parentNode) s.parentNode.removeChild(s); }, 620);
+  }, true);
+
+  /* 4. drag & drop feedback */
+  var drop = D.getElementById("drop");
+  if (drop && !RM){
+    ["dragenter","dragover"].forEach(function(ev){
+      drop.addEventListener(ev, function(){ drop.classList.add("bwa-drag"); });
+    });
+    ["dragleave","dragend","drop"].forEach(function(ev){
+      drop.addEventListener(ev, function(){ drop.classList.remove("bwa-drag"); });
+    });
+    drop.addEventListener("drop", function(){
+      drop.classList.remove("bwa-drop"); void drop.offsetWidth; drop.classList.add("bwa-drop");
+    });
+  }
+
+  /* 5. toast bounce */
+  var toast = D.getElementById("toast");
+  if (toast && !RM){
+    new MutationObserver(function(){
+      toast.classList.remove("bwa-t"); void toast.offsetWidth; toast.classList.add("bwa-t");
+    }).observe(toast, {childList: true, characterData: true, subtree: true});
+  }
+
+  /* 6. first paint */
+  if (!RM) stagger(D.querySelectorAll(".card"), "bwa-anim", 60, 8);
+})();
+</script>
+<script>
+/* Nav entry to the project intro page. Label uses \u escapes to keep this
+   appended block pure ASCII (the file is edited over a mixed-encoding link). */
+(function(){
+  if (document.getElementById("bwAboutLink")) return;
+  var a = document.createElement("a");
+  a.id = "bwAboutLink";
+  a.href = "/about";
+  a.textContent = "\u78d0\u5792\u4e3b\u52a8\u9632\u5fa1 \u4e0b\u8f7d\u9875\u9762";   /* download page */
+  a.title = "Bulwark \u78d0\u5792\u4e3b\u52a8\u9632\u5fa1 \u4e0b\u8f7d\u9875\u9762";
+  a.style.cssText = "position:fixed;right:18px;top:16px;z-index:50;"
+    + "padding:8px 15px;border-radius:10px;font-size:13px;font-weight:700;"
+    + "color:#fff;text-decoration:none;background:linear-gradient(135deg,#4f46e5,#7c3aed);"
+    + "box-shadow:0 4px 14px rgba(79,70,229,.32);transition:.15s";
+  a.addEventListener("mouseenter", function(){ a.style.transform = "translateY(-2px)"; });
+  a.addEventListener("mouseleave", function(){ a.style.transform = "none"; });
+  document.body.appendChild(a);
+})();
+</script>
+</body>
+</html>

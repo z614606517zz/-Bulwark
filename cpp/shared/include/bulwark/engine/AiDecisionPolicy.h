@@ -28,9 +28,16 @@ struct AiDecisionPolicy {
     static bool shouldConsultGrayZone(bulwark::VerdictAction currentAction);
 
     // 把一次 AI 研判结果折回灰区裁决(currentAction 通常为 Ask)。
+    //
+    // blockOnFailure 对应 RuntimeSettings::aiScanBlockOnFailure(设置页「AI 不可用时按拦截处理」)。
+    // 该开关此前在服务端【从未被读取】—— 设置页有开关但没有任何消费点,规则 1 恒为 fail-open。
+    // 现在:开启时,AI 不可用 / 超时 / 无结论会把灰区事件升格为 Block(fail-closed),
+    // 适合"宁可多拦"的高安全场景;默认关闭,保持原有的 fail-open 语义。
+    // 注意它【只影响灰区(Ask)】:确定性 Block 与强可信 Allow 都不经过本策略,不受影响。
     static Outcome apply(const bulwark::SecurityEvent& e, bulwark::VerdictAction currentAction,
                          bool aiAvailable, bulwark::VerdictAction aiRecommendation,
-                         const QString& aiSummary = QString());
+                         const QString& aiSummary = QString(),
+                         bool blockOnFailure = false);
 };
 
 } // namespace bulwark::engine

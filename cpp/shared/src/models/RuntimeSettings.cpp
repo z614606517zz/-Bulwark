@@ -20,6 +20,7 @@ QJsonObject RuntimeSettings::toJson() const {
     o["trustSignedActors"] = trustSignedActors;
     o["defaultBlock"] = defaultBlock;
     o["silentMode"] = silentMode;
+    o["attackChainToast"] = attackChainToast;
     o["promptTimeoutSeconds"] = promptTimeoutSeconds;
 
     o["virusTotalEnabled"] = virusTotalEnabled;
@@ -40,6 +41,7 @@ QJsonObject RuntimeSettings::toJson() const {
     o["aiScanDoubleClickEnabled"] = aiScanDoubleClickEnabled;
     o["aiScanSuspendDuringScan"] = aiScanSuspendDuringScan;
     o["aiScanBlockOnFailure"] = aiScanBlockOnFailure;
+    o["cloudBehaviorUploadEnabled"] = cloudBehaviorUploadEnabled;
 
     o["aiBaseUrl"] = aiBaseUrl;
     o["aiApiKey"] = aiApiKey;
@@ -81,6 +83,9 @@ RuntimeSettings RuntimeSettings::fromJson(const QJsonObject& o) {
     s.trustSignedActors = getBool(o, "trustSignedActors", s.trustSignedActors);
     s.defaultBlock = getBool(o, "defaultBlock", s.defaultBlock);
     s.silentMode = getBool(o, "silentMode", s.silentMode);
+    // 老配置文件没有这个键 -> 取默认值 true(开)。新增通知类开关按「默认开」处理:
+    // 它的价值恰在于覆盖静默模式造成的盲区,默认关掉就等于白做。
+    s.attackChainToast = getBool(o, "attackChainToast", s.attackChainToast);
     s.promptTimeoutSeconds = getInt(o, "promptTimeoutSeconds", s.promptTimeoutSeconds);
 
     s.virusTotalEnabled = getBool(o, "virusTotalEnabled", s.virusTotalEnabled);
@@ -101,6 +106,8 @@ RuntimeSettings RuntimeSettings::fromJson(const QJsonObject& o) {
     s.aiScanDoubleClickEnabled = getBool(o, "aiScanDoubleClickEnabled", s.aiScanDoubleClickEnabled);
     s.aiScanSuspendDuringScan = getBool(o, "aiScanSuspendDuringScan", s.aiScanSuspendDuringScan);
     s.aiScanBlockOnFailure = getBool(o, "aiScanBlockOnFailure", s.aiScanBlockOnFailure);
+    // 缺失该键 -> 保持默认 false(关)。老配置升级后不会被悄悄打开。
+    s.cloudBehaviorUploadEnabled = getBool(o, "cloudBehaviorUploadEnabled", s.cloudBehaviorUploadEnabled);
 
     if (o.contains(QLatin1String("aiBaseUrl"))) s.aiBaseUrl = getStr(o, "aiBaseUrl");
     if (o.contains(QLatin1String("aiApiKey"))) s.aiApiKey = getStr(o, "aiApiKey");

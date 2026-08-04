@@ -4,7 +4,10 @@
 #include "bulwark/json/JsonSupport.h"
 #include "bulwark/models/Enums.h"
 
+#include <QDateTime>
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -191,9 +194,87 @@ QString AiScanner::endpoint() const
     return url;
 }
 
+void AiScanner::setCreditGuard(bool enabled, qint64 monthlyBudget)
+{
+    m_creditGuard = enabled;
+    m_creditBudget = monthlyBudget;
+    loadCredit();
+}
+
+// 与 AiScanHistoryStore 同一套数据目录解析(UI 侧没有服务端的 programDataDir())。
+static QString aiCreditPath()
+{
+    const QString base = qEnvironmentVariable("ProgramData", QStringLiteral("C:/ProgramData"))
+                         + QStringLiteral("/Bulwark");
+    QDir().mkpath(base);
+    return base + QStringLiteral("/ai_credit.json");
+}
+
+void AiScanner::loadCredit()
+{
+    const QString p = aiCreditPath();
+    const QString month = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM"));
+    m_creditMonth = month;
+    m_creditUsed = 0;
+    QFile f(p);
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    f.close();
+    // 跨月自动清零:账本里记的月份与当前不同就从 0 开始,不需要额外的定时任务。
+    if (o.value(QStringLiteral("month")).toString() == month)
+        m_creditUsed = static_cast<qint64>(o.value(QStringLiteral("used")).toDouble());
+}
+
+void AiScanner::saveCredit() const
+{
+    QJsonObject o{ {QStringLiteral("month"), m_creditMonth},
+                   {QStringLiteral("used"), static_cast<double>(m_creditUsed)} };
+    QFile f(aiCreditPath());
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+        f.close();
+    }
+    // 写失败不影响任何功能:最坏情况是这次用量没记上,下次调用照常。
+}
+
+bool AiScanner::creditBlocked()
+{
+    if (!m_creditGuard || m_creditBudget <= 0)
+        return false;
+    // 月份可能在进程长时间运行期间翻过去,这里顺手对齐一次。
+    const QString month = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM"));
+    if (month != m_creditMonth) {
+        m_creditMonth = month;
+        m_creditUsed = 0;
+        saveCredit();
+    }
+    if (m_creditUsed < m_creditBudget)
+        return false;
+    emit creditExhausted(m_creditUsed, m_creditBudget);
+    return true;
+}
+
+void AiScanner::addCreditUsage(int tokens)
+{
+    if (tokens <= 0)
+        return;
+    m_creditUsed += tokens;
+    saveCredit();
+}
+
 void AiScanner::postChat(const QString& systemPrompt, const QString& userPrompt,
                          std::function<void(bool, const QString&, int)> onDone)
 {
+    // 额度守卫:超预算直接 fail-open 拒绝,连网络请求都不发。
+    // fail-open(而不是当成"恶意")是刻意的 —— 额度用尽属于「问不到 AI」,
+    // 按本项目原则绝不因此影响实时防护;调用方收到 ok=false 会走各自的降级分支。
+    if (creditBlocked()) {
+        onDone(false, QStringLiteral("本月 AI token 额度已用尽(%1 / %2),已跳过本次研判")
+                          .arg(m_creditUsed).arg(m_creditBudget), 0);
+        return;
+    }
+
     QJsonObject sys{ {QStringLiteral("role"), QStringLiteral("system")},
                      {QStringLiteral("content"), systemPrompt} };
     QJsonObject usr{ {QStringLiteral("role"), QStringLiteral("user")},
@@ -217,7 +298,7 @@ void AiScanner::postChat(const QString& systemPrompt, const QString& userPrompt,
     connect(timeout, &QTimer::timeout, reply, [reply] { if (reply->isRunning()) reply->abort(); });
     timeout->start();
 
-    connect(reply, &QNetworkReply::finished, this, [reply, onDone]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, onDone]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             onDone(false, reply->errorString(), 0);
@@ -231,6 +312,7 @@ void AiScanner::postChat(const QString& systemPrompt, const QString& userPrompt,
         if (!choices.isEmpty())
             content = choices.at(0).toObject().value(QStringLiteral("message"))
                           .toObject().value(QStringLiteral("content")).toString();
+        addCreditUsage(tokens);   // 记入本月用量(额度守卫关闭时也记,便于用户随时查看真实消耗)
         onDone(!content.trimmed().isEmpty(), content, tokens);
     });
 }
@@ -263,7 +345,7 @@ QString AiScanner::buildUserPrompt(const bulwark::SecurityEvent& e) const
     lines << u("== 静态内容特征(研判的主要依据) ==");
     // Real static evidence extracted from the file itself (PE header / section
     // entropy / dangerous API names / URLs·IPs / suspicious tokens · script src).
-    lines << extractStaticFeatures(e.actorPath).toPromptText();
+    lines << extractStaticFeatures(e.actorPath, m_limits).toPromptText();
 
     return lines.join(QLatin1Char('\n'));
 }

@@ -86,11 +86,38 @@ BlwEndsWithSys(_In_ PCWSTR Str, _In_ USHORT StrChars)
 // AppData / ProgramData / Downloads 等改由「用户态规则 + 启动后处置」
 // 处理,内核侧不再做这种宽口径上报。
 //
+// 【这份名单只用于用户态 DLL】。刻意不加 AppData / ProgramData —— 那正是上面说的事件风暴
+// 来源。侧载 DLL 的检测改由用户态承担:主体进程创建事件本来就会上报(ProgramData / AppData
+// 都不在内核的可信路径白名单里),服务在富化该事件时会顺带校验同目录模块是否「签名后被篡改」
+// (见 Worker::detectSideloadedTamperedModule)。那条路径能拿到验签能力、有缓存、且只在
+// 进程创建这条低频路径上跑一次,比在每个 DLL 加载上做宽口径上报正确得多。
+//
 static BOOLEAN
 BlwPathIsSuspicious(_In_ PCWSTR Path, _In_ USHORT Chars)
 {
     return BlwWideContains(Path, Chars, L"\\Temp\\")
         || BlwWideContains(Path, Chars, L"\\Users\\Public\\");
+}
+
+//
+// 「用户可写目录」判定 —— 只用于【内核模块(.sys)】加载,即 BYOVD。
+//
+// 与上面那份名单分开的理由:事件风暴的来源是用户态 DLL(一个 Electron 应用启动就加载上百个),
+// 而内核驱动加载是极低频事件(整机每天个位数),对它用宽口径判定没有任何量级风险。
+//
+// 原实现两者共用那份窄名单,于是「从 ProgramData / AppData 加载未签名驱动」这条 BYOVD 路径
+// 完全不上报 —— 而攻击者把易受攻击的签名驱动丢在 ProgramData 下再加载,是这类攻击最常见的落法
+//(丢在 \Temp\ 反而不典型,因为驱动要长期驻留)。这是一处纯粹的覆盖缺口,补上不付任何代价。
+//
+static BOOLEAN
+BlwPathIsUserWritable(_In_ PCWSTR Path, _In_ USHORT Chars)
+{
+    return BlwWideContains(Path, Chars, L"\\Temp\\")
+        || BlwWideContains(Path, Chars, L"\\Users\\Public\\")
+        || BlwWideContains(Path, Chars, L"\\ProgramData\\")
+        || BlwWideContains(Path, Chars, L"\\AppData\\")
+        || BlwWideContains(Path, Chars, L"\\Downloads\\")
+        || BlwWideContains(Path, Chars, L"\\Desktop\\");
 }
 
 //
@@ -130,9 +157,11 @@ BlwLoadImageNotify(
     // 系统目录(System32/WinSxS/Program Files)下的正常加载一律忽略。
     //
     if (isKernelModule) {
-        // 驱动加载:只关心从可疑(非系统)目录加载的 .sys。
+        // 驱动加载(BYOVD):只关心从【用户可写目录】加载的 .sys。这里用宽口径判定 ——
+        // 驱动加载是极低频事件,不存在事件风暴风险,而 ProgramData / AppData 恰恰是这类
+        // 攻击最常见的落点(见 BlwPathIsUserWritable 的说明)。
         if (BlwEndsWithSys(FullImageName->Buffer, chars) &&
-            BlwPathIsSuspicious(FullImageName->Buffer, chars)) {
+            BlwPathIsUserWritable(FullImageName->Buffer, chars)) {
             report = TRUE;
         }
     } else {

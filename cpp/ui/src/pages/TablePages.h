@@ -17,5 +17,6 @@ QWidget* rules(IpcClient* ipc);         // 防护规则 — allow / block policy
 QWidget* trust(IpcClient* ipc);         // 信任名单 — trusted programs & directories
 QWidget* quarantine(IpcClient* ipc);    // 隔离区 — quarantined threat files
 QWidget* persistence(IpcClient* ipc);   // 自启动项 — autostart persistence audit
+QWidget* attackChain(IpcClient* ipc);   // 攻击链 — 组合表状态 + 命中记录(跨事件,故独立于拦截记录页)
 
 } // namespace pages

@@ -1,0 +1,22 @@
+[Unit]
+# 攻击链组合引擎的特征库构建器。每天从 vt_reports 里已有的沙箱行为记录重挖一次组合。
+# 只读 vt_reports、只写 engine_* 三张表,与在线查询互不干扰(app.py 只读这些表)。
+Description=Bulwark attack-chain pattern engine daily build
+After=network-online.target bulwark-intel.service
+Wants=bulwark-intel.service
+
+[Service]
+Type=oneshot
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/engine_build.py --top 0
+# 构建是纯离线批处理,让它给在线请求让路。
+Nice=15
+IOSchedulingClass=idle
+# 组合挖掘随样本量增长会变慢(Apriori 剪枝已限住规模),给足余量但不无限等。
+TimeoutStartSec=3600
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulwark-intel
+PrivateTmp=true
+MemoryMax=768M

@@ -21,6 +21,14 @@ struct RuntimeSettings {
     bool trustSignedActors = true;
     bool defaultBlock = false;
     bool silentMode = false;
+
+    // 攻击链命中的右下角通知。【独立于 silentMode】,默认开。
+    //
+    // 为什么要独立:静默模式的语义是「不要为决策打扰我」,它把询问降级成放行 —— 于是造出一个
+    // 盲区:攻击链凑齐了 N 个动作、有真实样本作证,却被静默放行而用户毫不知情。这条通知不带
+    // 处置按钮、自动消失、不抢焦点,是告知而非提问,不该被静默模式吞掉。
+    // 但仍然留一个独立开关 —— 产品原则是尽量少打扰,一个完全关不掉的弹窗不可接受。
+    bool attackChainToast = true;
     int  promptTimeoutSeconds = 30;
 
     bool virusTotalEnabled = false;
@@ -42,6 +50,13 @@ struct RuntimeSettings {
     bool aiScanDoubleClickEnabled = true;
     bool aiScanSuspendDuringScan = true;
     bool aiScanBlockOnFailure = false;
+
+    // 威胁情报共享(默认关,须用户显式开启)。开启后:云查杀确认为恶意/可疑的样本,其
+    // 「病毒信息 + 行为数据」在本机暂存,每天凌晨自动上传中央服务器,上传成功即删除本地暂存。
+    // 只含哈希、判定、引擎计数、威胁名与沙箱行为 IOC(释放物名/哈希、注册表键、外联 IP/域名、
+    // 服务名、互斥体);绝不含文件内容、本机文件路径、计算机名、用户名等任何个人隐私信息。
+    // 关闭时立即清空本地暂存(用户撤回即刻生效,不留存已收集的数据)。
+    bool cloudBehaviorUploadEnabled = false;
 
     QString aiBaseUrl;
     QString aiApiKey;

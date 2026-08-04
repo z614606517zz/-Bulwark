@@ -264,13 +264,30 @@ void bindThreatFox(const QJsonObject& o, ThreatFoxFeedOptions& t) {
     bindInt(o, "QueryTimeoutSeconds", t.QueryTimeoutSeconds);
 }
 
+void bindAttackChain(const QJsonObject& o, AttackChainOptions& a) {
+    bindBool(o, "Enabled", a.Enabled);
+    bindBool(o, "DryRun", a.DryRun);
+    bindStr(o, "BaseUrl", a.BaseUrl);
+    bindInt(o, "InitialDelaySeconds", a.InitialDelaySeconds);
+    bindInt(o, "DailyUpdateHour", a.DailyUpdateHour);
+    bindInt(o, "RefreshIntervalHours", a.RefreshIntervalHours);
+    bindInt(o, "QueryTimeoutSeconds", a.QueryTimeoutSeconds);
+    bindInt(o, "LedgerRetentionMinutes", a.LedgerRetentionMinutes);
+    bindInt(o, "LedgerMaxProcesses", a.LedgerMaxProcesses);
+    bindStr(o, "MinGrade", a.MinGrade);
+}
+
 void bindReputationProxy(const QJsonObject& o, ReputationProxyOptions& p) {
     bindStr(o, "BaseUrl", p.BaseUrl);
     bindStr(o, "BaseUrlObfuscated", p.BaseUrlObfuscated);
     bindStr(o, "BearerToken", p.BearerToken);
     bindBool(o, "Enabled", p.Enabled);
     bindInt(o, "QueryTimeoutSeconds", p.QueryTimeoutSeconds);
+    bindInt(o, "RequestsPerMinute", p.RequestsPerMinute);
+    bindInt(o, "RequestsPerHour", p.RequestsPerHour);
     bindInt(o, "FreshQueriesPerDay", p.FreshQueriesPerDay);
+    bindBool(o, "SyncResultsToServer", p.SyncResultsToServer);
+    bindInt(o, "ContributionUploadHour", p.ContributionUploadHour);
 }
 
 } // namespace
@@ -301,6 +318,8 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindStrList(o, "UiClientAllowedThumbprints", UiClientAllowedThumbprints);
     bindStrList(o, "UiClientAllowedPublishers", UiClientAllowedPublishers);
     bindBool(o, "OnlineCertRevocationCheck", OnlineCertRevocationCheck);
+    bindInt(o, "EventDrainIntervalMs", EventDrainIntervalMs);
+    bindInt(o, "InlineReputationBudgetMs", InlineReputationBudgetMs);
     bindStrList(o, "ProtectedPaths", ProtectedPaths);
     bindStrList(o, "FileHardBlocks", FileHardBlocks);
     bindStrList(o, "ProtectedRegistryKeys", ProtectedRegistryKeys);
@@ -326,6 +345,7 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindHybridAnalysis(sub("HybridAnalysis"), HybridAnalysis);
     bindThreatFox(sub("ThreatFoxFeed"), ThreatFoxFeed);
     bindReputationProxy(sub("ReputationProxy"), ReputationProxy);
+    bindAttackChain(sub("AttackChainEngine"), AttackChainEngine);
     bindAi(sub("Ai"), Ai);
     bindEtw(sub("Etw"), Etw);
     return true;

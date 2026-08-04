@@ -98,6 +98,37 @@ bool anyContains(const QStringList& needles, const QString& hay) {
     return false;
 }
 
+//
+// 带【词边界】的 token 匹配:命中位置前后都必须不是字母/数字。
+//
+// 为什么必须有边界:imAutomationTokens 里是 wxpy / qqbot / ntchat / itchat 这类【纯小写字母
+// 数字】的包名,最短只有 4 个字符,而原来用裸 contains 去扫整条命令行。命令行里只要出现一段
+// 足够长的 base64(密钥、序列化参数、编码载荷都是),这些短 token 就会按概率被撞上 ——
+// .toLower() 之后 base64 的大小写坍缩成同一个字母,更抬高了命中率。
+//
+// 实测:C:\Windows\System32\OpenSSH\ssh.exe 的命令行含一段 5424 字符的 base64,于是被判
+// 「调用微信/QQ 自动化群控框架(疑似批量群发)」,与 84 分一起拦下 —— ssh 和群发毫无关系。
+//
+// 真实调用里这些名字总是被分隔符包着(空格、\ / . - _ = : 引号),而在 base64 内部两侧必然
+// 是字母数字,所以边界判定能干净地区分两者,不损失任何真实命中。
+//
+bool containsDelimitedToken(const QStringList& tokens, const QString& hay) {
+    for (const QString& t : tokens) {
+        if (t.isEmpty()) continue;
+        int from = 0;
+        for (;;) {
+            const int at = hay.indexOf(t, from);
+            if (at < 0) break;
+            const bool leftOk  = (at == 0) || !hay.at(at - 1).isLetterOrNumber();
+            const int end = at + t.size();
+            const bool rightOk = (end >= hay.size()) || !hay.at(end).isLetterOrNumber();
+            if (leftOk && rightOk) return true;
+            from = at + 1;
+        }
+    }
+    return false;
+}
+
 // ── 命令行:远控配置 / RDP / 反弹 shell / 群发 ──
 void analyzeCommandLine(const SecurityEvent& e, ScoreResult& r) {
     const QString cmd = e.commandLine.toLower();
@@ -146,7 +177,9 @@ void analyzeCommandLine(const SecurityEvent& e, ScoreResult& r) {
         r.reasons << u("远程控制工具被配置为无人值守/静默/设密码(疑似远控后门,T1219)");
     }
 
-    if (anyContains(imAutomationTokens(), cmd)) {
+    // 【必须用带词边界的匹配】。这些是 4~11 字符的纯字母数字包名,裸 contains 会被命令行里的
+    // base64 按概率撞中(实测 ssh.exe 因此被判群发,见 containsDelimitedToken 的说明)。
+    if (containsDelimitedToken(imAutomationTokens(), cmd)) {
         r.score += 30;
         r.reasons << u("调用微信/QQ 自动化群控框架(疑似批量群发,T1102)");
     }

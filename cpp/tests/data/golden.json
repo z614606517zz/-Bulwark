@@ -1,0 +1,1764 @@
+{
+    "corpusFixedNowUtc": "2026-01-15T12:00:00.000Z",
+    "results": [
+        {
+            "label": "step1-self-component",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "本软件自身组件,无条件放行",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "TrustedSigner",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step1-user-trusted-file",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "用户信任放行,已跳过全部检测:[信任] 语料:用户信任项",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:命中规则;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": true
+            }
+        },
+        {
+            "label": "step2-security-product-coexist",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "已安装的知名安全软件(hipsdaemon.exe),共存放行",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "TrustPolicy"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "TrustedSigner",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step2-security-name-outside-installdir",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命中规则:[内置] 写入开机启动项（HKLM/HKCU Run）",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "[内置] 写入开机启动项（HKLM/HKCU Run）",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行"
+                ],
+                "riskScore": 40,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step3-vendor-app-network",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "已知良性厂商应用(wechat.exe)·签名健康(Tencent),检测前放行(仅外联/DNS 维度)",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "TrustPolicy"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "TrustedSigner",
+                "techniques": [
+                ],
+                "userTrusted": true
+            }
+        },
+        {
+            "label": "step3-vendor-app-imageload-NOT-exempt",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "命中规则:[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-lolbin-certutil-urlcache",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "certutil 远程下载(-urlcache,T1105)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命令行内含明文 URL",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 20,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "certutil 远程下载文件(伪装证书工具,T1105/T1140)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 50,
+                        "source": "LolbinAnalyzer"
+                    },
+                    {
+                        "description": "格式化拼接(-f 运算符,混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 24,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "命令行信息熵偏高(4.5,疑似混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 0,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] certutil 远程下载并分割(-urlcache -split)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] certutil 远程下载并分割(-urlcache -split)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "certutil 远程下载(-urlcache,T1105)",
+                    "命令行内含明文 URL",
+                    "certutil 远程下载文件(伪装证书工具,T1105/T1140)",
+                    "格式化拼接(-f 运算符,混淆)",
+                    "命令行信息熵偏高(4.5,疑似混淆)"
+                ],
+                "riskScore": 100,
+                "source": "Rule",
+                "techniques": [
+                    "T1105 工具传输/下载执行"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-lolbin-regsvr32-squiblydoo",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "命令行内含明文 URL",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 20,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "regsvr32 远程加载 scriptlet(Squiblydoo 无文件执行,T1218.010)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 85,
+                        "source": "LolbinAnalyzer"
+                    },
+                    {
+                        "description": "regsvr32 静默注册远程组件(T1218.010)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "LolbinAnalyzer"
+                    },
+                    {
+                        "description": "命令行信息熵偏高(4.6,疑似混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 16,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] regsvr32 远程脚本执行(Squiblydoo)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] regsvr32 远程脚本执行(Squiblydoo)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "命令行内含明文 URL",
+                    "regsvr32 远程加载 scriptlet(Squiblydoo 无文件执行,T1218.010)",
+                    "regsvr32 静默注册远程组件(T1218.010)",
+                    "命令行信息熵偏高(4.6,疑似混淆)"
+                ],
+                "riskScore": 100,
+                "source": "Rule",
+                "techniques": [
+                    "T1218.010 Regsvr32 代理执行(Squiblydoo)"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-lolbin-mshta-remote",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "命令行内含明文 URL",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 20,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "mshta 执行远程 HTA/脚本(T1218.005)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 50,
+                        "source": "LolbinAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] mshta 执行远程脚本",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 70)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] mshta 执行远程脚本",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "命令行内含明文 URL",
+                    "mshta 执行远程 HTA/脚本(T1218.005)"
+                ],
+                "riskScore": 70,
+                "source": "Rule",
+                "techniques": [
+                    "T1218.005 Mshta 代理执行"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-lolbin-comsvcs-lsass-dump",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "进程内存转储(崩溃上报组件也用此参数,需互证)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 35,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "rundll32 经 comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 55,
+                        "source": "LolbinAnalyzer"
+                    },
+                    {
+                        "description": "LSASS 内存转储 / Mimikatz 凭据抓取(T1003.001)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 55,
+                        "source": "CredentialAccessAnalyzer"
+                    },
+                    {
+                        "description": "命令行信息熵偏高(4.7,疑似混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 16,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)",
+                    "进程内存转储(崩溃上报组件也用此参数,需互证)",
+                    "rundll32 经 comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)",
+                    "LSASS 内存转储 / Mimikatz 凭据抓取(T1003.001)",
+                    "命令行信息熵偏高(4.7,疑似混淆)"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                    "T1003.001 LSASS 内存转储"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-lolbin-vssadmin-delete-shadows",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "命中规则:[内置] 删除卷影副本(vssadmin,勒索特征)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "[内置] 删除卷影副本(vssadmin,勒索特征)",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-powershell-encoded-download",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "PowerShell 编码命令(-EncodedCommand,T1027)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 35,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "PowerShell 跳过配置文件(-NoProfile)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 8,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "隐藏窗口运行",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 30,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命令行信息熵偏高(4.6,疑似混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 30,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "含较长 Base64 块(120 字符)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 0,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] 隐藏窗口+编码命令组合(-w 简写,高可疑)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 隐藏窗口+编码命令组合(-w 简写,高可疑)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "PowerShell 编码命令(-EncodedCommand,T1027)",
+                    "PowerShell 跳过配置文件(-NoProfile)",
+                    "隐藏窗口运行",
+                    "命令行信息熵偏高(4.6,疑似混淆)",
+                    "含较长 Base64 块(120 字符)"
+                ],
+                "riskScore": 100,
+                "source": "Rule",
+                "techniques": [
+                    "T1027 混淆文件或信息"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-masquerade-svchost-outside-system32",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "疑似进程伪装:svchost.exe 不在合法目录(T1036.005)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命中规则:[内置] 从 Public 目录执行未签名程序",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 80)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 从 Public 目录执行未签名程序",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "疑似进程伪装:svchost.exe 不在合法目录(T1036.005)"
+                ],
+                "riskScore": 80,
+                "source": "Rule",
+                "techniques": [
+                    "T1036.005 伪装为合法名称/位置"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-typosquat-svch0st",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "疑似仿冒系统进程名:svch0st.exe 形近 svchost.exe(典型伪装手法,T1036.005)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:行为研判;风险分 60)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "疑似仿冒系统进程名:svch0st.exe 形近 svchost.exe(典型伪装手法,T1036.005)"
+                ],
+                "riskScore": 60,
+                "source": "Heuristic",
+                "techniques": [
+                    "T1036.005 伪装为合法名称/位置"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-double-extension",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "可疑双重扩展名(伪装文档,T1036.007)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 30,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命中规则:[内置] 双重扩展名伪装(.pdf.exe)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 70)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 双重扩展名伪装(.pdf.exe)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "可疑双重扩展名(伪装文档,T1036.007)"
+                ],
+                "riskScore": 70,
+                "source": "Rule",
+                "techniques": [
+                    "T1036.007 双重文件扩展名"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-office-spawns-lolbin",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "异常进程链:winword.exe 派生 powershell.exe(疑似宏病毒/钓鱼)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "隐藏窗口运行",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 30,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "绕过执行策略",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 30,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命令行信息熵偏高(4.5,疑似混淆)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 16,
+                        "source": "CommandObfuscationAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] 绕过 PowerShell 执行策略",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 绕过 PowerShell 执行策略",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "异常进程链:winword.exe 派生 powershell.exe(疑似宏病毒/钓鱼)",
+                    "隐藏窗口运行",
+                    "绕过执行策略",
+                    "命令行信息熵偏高(4.5,疑似混淆)"
+                ],
+                "riskScore": 100,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-remote-thread-into-lsass",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "向 LSASS 注入远程线程(凭据窃取,T1003.001)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 55,
+                        "source": "CredentialAccessAnalyzer"
+                    },
+                    {
+                        "description": "向凭据进程 lsass.exe 注入远程线程(疑似凭据窃取,T1003.001 / T1055)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 100,
+                        "source": "InjectionAnalyzer"
+                    },
+                    {
+                        "description": "注入发起方无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "InjectionAnalyzer"
+                    },
+                    {
+                        "description": "注入发起方位于高危可写目录",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "InjectionAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] 银狐:Temp 未签名进程注入远程线程(shellcode 注入,高危)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 银狐:Temp 未签名进程注入远程线程(shellcode 注入,高危)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "向 LSASS 注入远程线程(凭据窃取,T1003.001)",
+                    "向凭据进程 lsass.exe 注入远程线程(疑似凭据窃取,T1003.001 / T1055)",
+                    "注入发起方无可信签名",
+                    "注入发起方位于高危可写目录"
+                ],
+                "riskScore": 100,
+                "source": "Rule",
+                "techniques": [
+                    "T1003.001 LSASS 内存转储"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-sideload-unsigned-dll-from-temp",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "命中规则:[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-ransomware-canary-touch",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "触碰蜜罐诱饵文件(几乎可确认勒索/批量加密)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 100,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "触碰蜜罐诱饵文件(几乎可确认勒索/批量加密)"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-00",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-01",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-02",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-03",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-04",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-05",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 70,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "信标主体无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "目标 198.51.100.42,已累计 6 次外联",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                    "信标主体无可信签名",
+                    "目标 198.51.100.42,已累计 6 次外联"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-06",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 70,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "信标主体无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "目标 198.51.100.42,已累计 7 次外联",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                    "信标主体无可信签名",
+                    "目标 198.51.100.42,已累计 7 次外联"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-07",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 70,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "信标主体无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "目标 198.51.100.42,已累计 8 次外联",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                    "信标主体无可信签名",
+                    "目标 198.51.100.42,已累计 8 次外联"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-08",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 70,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "信标主体无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "目标 198.51.100.42,已累计 9 次外联",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                    "信标主体无可信签名",
+                    "目标 198.51.100.42,已累计 9 次外联"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-beacon-09",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 70,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "信标主体无可信签名",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "目标 198.51.100.42,已累计 10 次外联",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 0,
+                        "source": "BeaconDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "周期性外联信标:间隔≈60s 抖动极低(CV=0.00,疑似 C2 回连)",
+                    "信标主体无可信签名",
+                    "目标 198.51.100.42,已累计 10 次外联"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step5-dga-dns-query",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "域名标签熵极高(4.0,疑似 DGA 随机域名)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 78,
+                        "source": "DgaDomainAnalyzer"
+                    },
+                    {
+                        "description": "域名元音比例极低(0%,非可读单词)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 0,
+                        "source": "DgaDomainAnalyzer"
+                    },
+                    {
+                        "description": "含 16 个连续辅音(非自然拼写)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 0,
+                        "source": "DgaDomainAnalyzer"
+                    },
+                    {
+                        "description": "超长高熵标签(16 字符)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 0,
+                        "source": "DgaDomainAnalyzer"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "域名标签熵极高(4.0,疑似 DGA 随机域名)",
+                    "域名元音比例极低(0%,非可读单词)",
+                    "含 16 个连续辅音(非自然拼写)",
+                    "超长高熵标签(16 字符)",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 100,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step6-explicit-block-rule",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "命中规则:语料:用户 Block 规则",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "语料:用户 Block 规则",
+                "memoryInjection": false,
+                "riskReasons": [
+                ],
+                "riskScore": 0,
+                "source": "Rule",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step7-strongly-trusted-ms-system32",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "微软签名且位于系统目录",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "TrustPolicy"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "微软签名且位于系统目录"
+                ],
+                "riskScore": 0,
+                "source": "TrustedSigner",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step8-cert-revoked",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "签名证书已被吊销(疑似盗用证书)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 60,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 60)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "签名证书已被吊销(疑似盗用证书)"
+                ],
+                "riskScore": 60,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step8-signed-after-cert-expiry",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "使用过期证书签名(疑似盗用旧证书)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 45)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "使用过期证书签名(疑似盗用旧证书)"
+                ],
+                "riskScore": 45,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step9-healthy-signed-allow",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "有效数字签名:Google LLC(健康),直接放行",
+                        "kind": "Trust",
+                        "scoreDelta": 0,
+                        "source": "TrustPolicy"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "有效数字签名:Google LLC(健康),直接放行"
+                ],
+                "riskScore": 0,
+                "source": "TrustedSigner",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step9-firstseen-shortlived-cert",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "带签名但本机首次出现(低流行度)",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "签名证书较新(疑似空壳公司新证书)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "已签名程序从可疑目录运行",
+                        "kind": "Info",
+                        "scoreDelta": 5,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 35)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "带签名但本机首次出现(低流行度)",
+                    "签名证书较新(疑似空壳公司新证书)",
+                    "已签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 35,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step11-unsigned-benign-allow",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step11-unsigned-from-temp-softsignals-only",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        }
+    ],
+    "schema": 1
+}

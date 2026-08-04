@@ -42,7 +42,7 @@ void ProcessChainTracker::record(const bulwark::SecurityEvent& e) {
     auto it = byPid_.find(e.actorPid);
     if (it == byPid_.end()) {
         it = byPid_.insert(e.actorPid, QVector<bulwark::ChainEventInfo>());
-        firstSeen_[e.actorPid] = QDateTime::currentDateTimeUtc();
+        firstSeen_[e.actorPid] = nowUtc();
     }
     it.value().append(info);
     // 单进程事件上限:超出丢弃最旧的(保留最近行为)。
@@ -54,7 +54,7 @@ void ProcessChainTracker::record(const bulwark::SecurityEvent& e) {
     if (e.type == bulwark::EventType::FileWrite && !e.target.isEmpty()) {
         const QString ext = QStringLiteral(".") + QFileInfo(e.target).suffix().toLower();
         if (ext.size() > 1 && executableWriteExt_.contains(ext))
-            recentExeWrites_[normalizePath(e.target)] = QDateTime::currentDateTimeUtc();
+            recentExeWrites_[normalizePath(e.target)] = nowUtc();
     }
 
     evictIfNeeded();
@@ -68,7 +68,7 @@ bool ProcessChainTracker::wasRecentlyWritten(const QString& path, int withinSeco
     const auto it = recentExeWrites_.constFind(key);
     if (it == recentExeWrites_.constEnd())
         return false;
-    return it.value().secsTo(QDateTime::currentDateTimeUtc()) <= withinSeconds;
+    return it.value().secsTo(nowUtc()) <= withinSeconds;
 }
 
 QVector<bulwark::ChainEventInfo> ProcessChainTracker::buildContext(const bulwark::SecurityEvent& e,
@@ -210,7 +210,7 @@ void ProcessChainTracker::removePid(int pid) {
 }
 
 void ProcessChainTracker::evictIfNeeded() {
-    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime now = nowUtc();
 
     // 1) 过期清理。
     {

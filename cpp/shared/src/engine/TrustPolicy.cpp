@@ -221,7 +221,7 @@ TrustDecision TrustPolicy::isHealthySigned(const bulwark::SecurityEvent& e) {
     if (isAbnormalChain(e)) return {};
 
     if (e.isFirstSeen && e.certNotAfterUtc.has_value()) {
-        const qint64 secs = QDateTime::currentDateTimeUtc().secsTo(*e.certNotAfterUtc);
+        const qint64 secs = nowUtc().secsTo(*e.certNotAfterUtc);
         if (secs > 0 && secs <= static_cast<qint64>(186) * 24 * 3600) return {};
     }
 

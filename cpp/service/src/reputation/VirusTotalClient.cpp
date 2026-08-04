@@ -166,9 +166,10 @@ void VirusTotalClient::noteHttpResult(const std::shared_ptr<KeyState>& ks, int h
 }
 
 void VirusTotalClient::setApiKey(const QString& key) {
-    // 空 Key -> 回退内置;逗号分隔可配置多 Key,每个可标注 "KEY:RPD:RPM"。
     const QString k = key.trimmed();
     rebuildPool(k.isEmpty() ? builtInApiKey() : k);
+    log_.info(QStringLiteral("setApiKey: key.len=%1, pool=%2, enabled=%3")
+                  .arg(key.length()).arg(keyCount()).arg(enabled_.load()));
 }
 
 void VirusTotalClient::diag(const QString& line) {
@@ -348,8 +349,20 @@ bulwark::FileReputation VirusTotalClient::uploadAndScan(const QString& filePath,
         progress(bulwark::VtScanStage::Analyzing, 100);
     QString resolvedSha = sha256;
     const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + 4LL * 60 * 1000;
+    // 自适应轮询节奏:VT 分析常在数秒内就绪(尤其近期已被他人分析过的样本),故先用递增的
+    // 短间隔快速轮询,再退避到稳态间隔。旧实现固定「先睡 15s 再轮询」——哪怕分析 3s 就完成,
+    // 用户也要干等满 15s 才看到「双击云扫描」结论;首个短间隔把这段无谓等待直接砍掉。
+    // 关键:bucket.wait() 仍是配额闸门。启动时令牌桶已备有若干分钟令牌(acquireKey 只取走一枚),
+    // 早期几轮加速轮询消耗的正是这些余量;令牌耗尽后 wait() 自动把节奏压回每分钟预算内(约 15s/次),
+    // 故加速轮询绝不超配额,也不改变结论(仅缩短时延)。
+    static constexpr int kPollBackoffSecs[] = { 3, 5, 8, 12 };
+    static constexpr int kPollBackoffCount = static_cast<int>(sizeof(kPollBackoffSecs) / sizeof(kPollBackoffSecs[0]));
+    static constexpr int kPollSteadySecs = 15; // 稳态间隔(与 4/min 免费档令牌补充节奏对齐)
+    int pollRound = 0;
     while (QDateTime::currentMSecsSinceEpoch() < deadline) {
-        std::this_thread::sleep_for(std::chrono::seconds(15));
+        const int waitSecs = pollRound < kPollBackoffCount ? kPollBackoffSecs[pollRound] : kPollSteadySecs;
+        ++pollRound;
+        std::this_thread::sleep_for(std::chrono::seconds(waitSecs));
         ks->bucket.wait();
 
         const auto pr = ReputationCurl::get(vtAnalysesUrl(opt_) + analysisId, headers, opt_.QueryTimeoutSeconds);

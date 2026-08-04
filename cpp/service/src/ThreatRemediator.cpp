@@ -242,12 +242,29 @@ bool isInProtectedZone(const QString& path) {
     return false;
 }
 
+// 是否为「绝不能删」的系统可执行文件。
+//
+// 判据 = 文件名命中名单【且】文件真的位于系统目录。两个条件必须同时成立。
+//
+// 只按文件名判会让「改名成系统程序」直接变成免清理护身符 —— 实测机器上
+// C:\Users\<u>\AppData\Local\DBG\csrss.exe(SalatStealer,情报已确认恶意)每分钟都被
+// 足迹清理跳过一次,日志固定输出「隔离文件 0 个 … 未清理 1 项」,原因就是这里只比了文件名。
+// 而本函数要防的是「把真的 C:\Windows\System32\cmd.exe 删掉」,那个场景本来就带系统路径,
+// 加上路径条件一分保护都不会少。
 bool isSystemExecutable(const QString& path) {
     const QFileInfo fi(path);
     const QString fname = fi.fileName().toLower();
+    bool nameHit = false;
     for (const char* sysExe : kSystemExecutables)
-        if (fname == QLatin1String(sysExe)) return true;
-    return false;
+        if (fname == QLatin1String(sysExe)) { nameHit = true; break; }
+    if (!nameHit) return false;
+
+    // 系统目录判定与 ProcessInspector::isSystemImageDir 同义(WRP + 高 ACL,普通用户写不进去)。
+    // 刻意不含 \Program Files\:那里第三方安装程序能落文件,不足以证明「这是 Windows 自己那份」。
+    const QString lower = path.toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
+    return lower.contains(QLatin1String("\\windows\\system32\\"))
+        || lower.contains(QLatin1String("\\windows\\syswow64\\"))
+        || lower.contains(QLatin1String("\\windows\\winsxs\\"));
 }
 
 // Safe to clean iff in a user-writable drop zone, not a system/install dir, and

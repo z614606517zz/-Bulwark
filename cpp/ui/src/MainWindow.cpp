@@ -84,6 +84,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     addPage("lock", u("隔离区"), u("隔离区"), u("已隔离的威胁文件"), pages::quarantine(m_ipc));
     addPage("power", u("自启动项"), u("自启动项"), u("开机持久化审计"), pages::persistence(m_ipc));
     addPage("cloud", u("云信誉"), u("云信誉"), u("多引擎哈希信誉查询"), pages::reputation(m_ipc));
+    addPage("link", u("攻击链"), u("攻击链"), u("动作组合定性 · 命中记录"), pages::attackChain(m_ipc));
     addPage("sparkles", u("AI 研判"), u("AI 研判"), u("大模型行为研判"), pages::aiScan(m_ipc));
     addPage("settings", u("设置"), u("设置"), u("防护与情报配置"), pages::settings(m_ipc));
 
@@ -95,6 +96,9 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     m_toasts = new ToastNotifier(this);
     connect(m_toasts, &ToastNotifier::blockToastClicked, this,
             [this] { showFromTray(); navigateTo(QStringLiteral("shield-x")); });
+    // 点攻击链 toast -> 跳到「攻击链」页面看完整命中记录("link" 即该页的导航图标)。
+    connect(m_toasts, &ToastNotifier::attackChainToastClicked, this,
+            [this] { showFromTray(); navigateTo(QStringLiteral("link")); });
     setupTray();
 
     // Live named-pipe link to the service. Drives the connection pill, pops the
@@ -104,6 +108,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     connect(m_ipc, &IpcClient::connectionChanged, this, &MainWindow::setConnected);
     connect(m_ipc, &IpcClient::promptReceived, this, &MainWindow::onPromptReceived);
     connect(m_ipc, &IpcClient::blockNotification, this, &MainWindow::onBlockNotification);
+    connect(m_ipc, &IpcClient::attackChainHit, this, &MainWindow::onAttackChainHit);
     connect(m_ipc, &IpcClient::aiScanStarted, this, &MainWindow::onAiScanStarted);
     connect(m_ipc, &IpcClient::remediationReport, this, &MainWindow::onRemediationReport);
     // Keep the prompt-timeout + default verdict in sync with the service so the
@@ -150,12 +155,18 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                 m_repPingId = QUuid();
                 const bool online = resp.success;
                 const bool checking = !online && resp.message.contains(QString::fromUtf8("检测中"));
+                // 「限流中」是在线的一种:链路好着,只是服务端对本出口 IP 的配额暂时用满,
+                // 本地直连情报照常兜底。单独画成警示色,别再和「离线」混为一谈 —— 以前服务端
+                // 一回 429 就报离线,而不受限流管辖的 /health 仍是 200,状态灯于是来回跳。
+                const bool throttled = online && resp.message.contains(QString::fromUtf8("限流"));
                 ui::stylePill(m_repPill,
-                              online ? QString::fromUtf8("● 信誉服务在线")
-                                     : (checking ? QString::fromUtf8("○ 信誉服务检测中")
-                                                 : QString::fromUtf8("○ 信誉服务离线")),
-                              online ? theme::success()
-                                     : (checking ? theme::textMuted() : theme::danger()));
+                              throttled ? QString::fromUtf8("◐ 信誉服务限流中")
+                                        : (online ? QString::fromUtf8("● 信誉服务在线")
+                                                  : (checking ? QString::fromUtf8("○ 信誉服务检测中")
+                                                              : QString::fromUtf8("○ 信誉服务离线"))),
+                              throttled ? theme::warning()
+                                        : (online ? theme::success()
+                                                  : (checking ? theme::textMuted() : theme::danger())));
                 m_repPill->setToolTip(resp.message.isEmpty()
                                           ? (online ? QString::fromUtf8("中央信誉服务连接正常")
                                                     : QString::fromUtf8("中央信誉服务不可达,已回退本地直连"))
@@ -193,9 +204,9 @@ QWidget* MainWindow::buildSidebar()
     v->addLayout(brand);
     v->addSpacing(22);
 
-    // nav items host。导航项已有 11 项(仪表盘 / 拦截记录 / 活动日志 / 事件时间线 / 进程管理 /
-    // 防护规则 / 信任名单 / 隔离区 / 自启动项 / 云信誉 / AI 研判 / 设置),在最小窗口高度
-    // (620)下会挤不下,故放进一个无边框透明滚动区:窗口够高时看不出区别,不够高时可滚动,
+    // nav items host。导航项已有 13 项(仪表盘 / 拦截记录 / 活动日志 / 事件时间线 / 进程管理 /
+    // 防护规则 / 信任名单 / 隔离区 / 自启动项 / 云信誉 / 攻击链 / AI 研判 / 设置),在最小窗口
+    // 高度(620)下会挤不下,故放进一个无边框透明滚动区:窗口够高时看不出区别,不够高时可滚动,
     // 而不是把底部的连接状态条挤掉。
     auto* navHost = new QWidget;
     navHost->setStyleSheet(QStringLiteral("background:transparent;"));
@@ -344,6 +355,15 @@ void MainWindow::onBlockNotification(const bulwark::SecurityEvent& event)
 {
     if (m_toasts)
         m_toasts->showBlock(event);
+}
+
+void MainWindow::onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit)
+{
+    // 这条通知【不看静默模式】—— 服务端已按 attackChainToast 开关决定要不要发,
+    // UI 收到就显示。理由见 RuntimeSettings::attackChainToast 处的说明:
+    // 静默模式把询问降级成放行,恰好造出「命中了但用户毫不知情」的盲区。
+    if (m_toasts)
+        m_toasts->showAttackChain(hit);
 }
 
 void MainWindow::onAiScanStarted(const bulwark::SecurityEvent& event)

@@ -48,12 +48,18 @@ public:
     // 写/删才会上报,避免全量事件洪泛。须在 start() 之前调用(回调在消费线程读取,启动前设置无竞争)。
     void setWatchLists(const QStringList& registryKeys, const QStringList& filePaths);
 
+    // 出队间隔(毫秒)。与内核源的 Bulwark:EventDrainIntervalMs 同一个旋钮 —— 两个源都会
+    // 把事件先攒在队列里再按节拍搬到主线程,所以延迟地板必须一起调,只调一个等于没调。
+    void setDrainIntervalMs(int ms);
+
     void start() override;
     void stop() override;
     bool isAvailable() const override { return available_; }
 
 private:
     void drain(); // 主线程:出队 -> emit eventProduced
+
+    static constexpr int kDefaultDrainMs = 20; // 与 BulwarkOptions::EventDrainIntervalMs 的默认值一致
 
     struct Impl;                     // pImpl:把 windows.h / krabs 细节挡在头文件外
     std::unique_ptr<Impl> d_;

@@ -1,4 +1,5 @@
 #include "pages/TablePages.h"
+#include "dialogs/AttackChainDetailDialog.h"
 #include "dialogs/AttackGraphWindow.h"
 #include "dialogs/AttackTimelineWindow.h"
 #include "dialogs/ProcessDetailDialog.h"
@@ -779,7 +780,12 @@ QWidget* pages::persistence(IpcClient* ipc)
 {
     auto b = buildPage({u("名称"), u("类别"), u("路径 / 命令"), u("ATT&CK"), u("风险"), u("状态")});
     auto* scan = ui::toolButton("refresh", u("重新扫描"), "ghost", theme::textSecondary());
+    // 清理按钮:此前本页是纯只读的 —— 服务端 ThreatRemediator 把 8 类持久化点的清理动作全实现了、
+    // IPC 也留了消息号,但没有任何入口,那些代码一行都到不了。这里补上唯一的用户入口。
+    auto* clean = ui::toolButton("shield-x", u("清理选中项"), "ghost", theme::danger());
+    clean->setEnabled(false);   // 选中一行才可用
     b.toolbar->addWidget(scan);
+    b.toolbar->addWidget(clean);
     b.toolbar->addStretch();
     auto* count = ui::label(u("点「重新扫描」枚举自启动项"), "secondary");
     b.toolbar->addWidget(count);
@@ -788,9 +794,14 @@ QWidget* pages::persistence(IpcClient* ipc)
     t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
 
     auto* scanning = new bool(false);
+    // 保留本次扫描的完整条目:清理请求要把整条 PersistenceEntry 回传(服务端按 category 分派、
+    // 用 location/name/imagePath 定位目标,且扫描是无状态的按需枚举,服务端不留上次结果)。
+    auto* rows = new QList<bulwark::PersistenceEntry>();
+
     QObject::connect(ipc, &IpcClient::persistenceReceived, b.page,
-                     [t, count, scanning](const bulwark::ipc::PersistenceListResponsePayload& p) {
+                     [t, count, scanning, rows](const bulwark::ipc::PersistenceListResponsePayload& p) {
         *scanning = false;
+        *rows = p.entries;
         t->setRowCount(0);
         for (const bulwark::PersistenceEntry& e : p.entries) {
             const int i = addRow(t);
@@ -815,7 +826,57 @@ QWidget* pages::persistence(IpcClient* ipc)
         ipc->requestPersistence();
     };
     QObject::connect(scan, &QPushButton::clicked, b.page, doScan);
-    QObject::connect(b.page, &QObject::destroyed, [scanning] { delete scanning; });
+
+    // 选中行才允许清理(避免空点或误点到表头)。
+    QObject::connect(t, &QTableWidget::itemSelectionChanged, b.page, [t, clean] {
+        clean->setEnabled(t->currentRow() >= 0);
+    });
+
+    QObject::connect(clean, &QPushButton::clicked, b.page, [ipc, t, rows, count] {
+        const int row = t->currentRow();
+        if (row < 0 || row >= rows->size())
+            return;
+        if (!ipc->isConnected()) {
+            QMessageBox::warning(t, u("清理自启动项"), u("未连接服务,无法执行清理。"));
+            return;
+        }
+        const bulwark::PersistenceEntry e = rows->at(row);
+        // 清理是不可逆动作(改注册表 / 删计划任务 / 停服务),必须显式二次确认并说清后果。
+        // 文件类载荷会进隔离区(可还原),注册表/任务/服务的移除【不可撤销】—— 这点必须写明。
+        const QString detail =
+            u("将清理以下自启动项:\n\n名称:%1\n类别:%2\n位置:%3\n命令:%4\n\n")
+                .arg(e.name, persistenceCategoryLabel(e.category), e.location,
+                     e.command.isEmpty() ? e.imagePath : e.command)
+            + u("• 指向的可执行文件会被移入隔离区(可还原)\n")
+            + u("• 注册表项 / 计划任务 / 服务的移除【不可撤销】\n")
+            + u("• 清理后该项会被加入内核注册表硬拦,阻止被立刻重建\n\n")
+            + u("如果这是你自己安装的正常软件,请改用「信任名单」而不是清理。确定继续吗?");
+        if (QMessageBox::warning(t, u("清理自启动项(高危)"), detail,
+                                 QMessageBox::Yes | QMessageBox::Cancel,
+                                 QMessageBox::Cancel) != QMessageBox::Yes)
+            return;
+        count->setText(u("清理中…"));
+        ipc->requestPersistenceCleanup(e);
+    });
+
+    QObject::connect(ipc, &IpcClient::persistenceCleanupDone, b.page,
+                     [t, count, doScan](const bulwark::ipc::PersistenceCleanupResultPayload& r) {
+        count->setText(r.message);
+        if (r.success) {
+            QString extra;
+            if (!r.quarantinedFiles.isEmpty())
+                extra += u("\n\n已隔离(可在「隔离区」还原):\n") + r.quarantinedFiles.join(QLatin1Char('\n'));
+            if (!r.removedRegistryValues.isEmpty())
+                extra += u("\n\n已移除持久化:\n") + r.removedRegistryValues.join(QLatin1Char('\n'));
+            QMessageBox::information(t, u("清理自启动项"), r.message + extra);
+            doScan();   // 清完立刻重扫,让列表反映真实现状(而不是留一条已消失的行)
+        } else {
+            // 服务端的护栏拒绝(已加白 / 本产品自身 / 目标已不存在)也走这里,如实展示原因。
+            QMessageBox::warning(t, u("清理自启动项"), r.message);
+        }
+    });
+
+    QObject::connect(b.page, &QObject::destroyed, [scanning, rows] { delete scanning; delete rows; });
     return b.page;
 }
 
@@ -1256,5 +1317,243 @@ QWidget* pages::processes(IpcClient* ipc)
                          if (c) QTimer::singleShot(1500, page, [reload] { reload(); });
                      });
     if (ipc->isConnected()) QTimer::singleShot(1500, b.page, [reload] { reload(); });
+    return b.page;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 攻击链 —— 组合表状态 + 命中记录。
+//
+// 这页回答两个问题:
+//   1) 「我这台机器上装的是哪一版组合表、还灵不灵」——版本 / 组合条数 / 标记数 / 更新计划;
+//   2) 「它到底逮到过什么」——每次凑齐组合的记录:谁、凑齐了哪几个动作、多少样本作证、最终怎么处置的。
+//
+// 为什么不并进「拦截记录」页:一次攻击链命中横跨【多条】事件(凑齐组合的那几个动作分散在不同
+// 事件里),挂到任何单条事件上都看不到全貌,所以服务端单独存了一份记录,这页单独读它。
+//
+// dry-run 的显示要诚实:默认「只记录不拦截」,此时命中【不影响裁决】。若不明说,用户会误以为
+// 这些记录都已被拦下 —— 故顶部横幅与每行的「最终裁决」都如实标注真实处置。
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// 组合强度配色:hard 是「仅此一条就足以定性」,ask 只是「值得问一句」。
+QColor chainGradeColor(const QString& grade)
+{
+    if (grade == QLatin1String("hard"))   return theme::danger();
+    if (grade == QLatin1String("strong")) return theme::warning();
+    return theme::info();
+}
+
+QString chainGradeLabel(const QString& grade)
+{
+    if (grade == QLatin1String("hard"))   return u("确定恶意");
+    if (grade == QLatin1String("strong")) return u("高度可疑");
+    if (grade == QLatin1String("ask"))    return u("需询问");
+    return grade.isEmpty() ? u("—") : grade;
+}
+
+QColor chainLevelColor(const QString& level)
+{
+    if (level == QLatin1String("critical")) return theme::danger();
+    if (level == QLatin1String("high"))     return theme::warning();
+    return theme::info();
+}
+
+} // namespace
+
+QWidget* pages::attackChain(IpcClient* ipc)
+{
+    auto b = buildPage({u("时间"), u("主体"), u("PID"), u("凑齐的动作"),
+                        u("强度"), u("严重度"), u("样本数"), u("家族"), u("最终裁决")});
+
+    // ---- 工具栏:引擎状态 + 组合表汇总 ----
+    //
+    // 这里【刻意不放卡片】。全部列表页的结构都是「工具栏 -> 表格」,汇总数字一律是工具栏里的
+    // 一行 muted 文字(隔离区「共 11 项 · 100.2 MB」、进程管理「共 N 个进程」),状态一律是
+    // ui::pill(侧栏「● 已连接服务」、右上「● 防护开启」)。此前这页在表格上方加了一张带
+    // 大号数字的状态卡 —— 那是整个界面里唯一的一张,自成一套写法,所以看着格格不入。
+    // 现在改回既有词汇表:状态用 pill,数字用 muted 汇总,细节挂 tooltip。
+    auto* statePill = ui::pill(u("● 读取中…"), theme::textMuted());
+    b.toolbar->addWidget(statePill);
+    auto* summary = ui::label(QString(), "muted");
+    b.toolbar->addWidget(summary);
+    b.toolbar->addStretch();
+    auto* search = ui::searchBox(u("搜索主体 / 动作 / 家族"), 240);
+    b.toolbar->addWidget(search);
+    auto* count = ui::label(QString(), "secondary");
+    b.toolbar->addWidget(count);
+    auto* refresh = ui::toolButton("refresh", u("刷新"), "ghost", theme::textSecondary());
+    auto* clear = ui::toolButton("trash", u("清空记录"), "ghost", theme::danger());
+    b.toolbar->addWidget(refresh);
+    b.toolbar->addWidget(clear);
+
+    auto* t = b.table;
+    // ui::table() 默认把所有列设为 Stretch。9 列平分后每列只有 ~104px,连时间戳
+    // 「08-01 04:11:12」都会被截成「08-01 04:11:…」。故给内容宽度固定的列钉死宽度,
+    // 把省下来的空间全留给三个真正长的文本列(主体 / 凑齐的动作 / 家族)。
+    auto* hh = t->horizontalHeader();
+    const auto fixWidth = [hh](int col, int px) {
+        hh->setSectionResizeMode(col, QHeaderView::Fixed);
+        hh->resizeSection(col, px);
+    };
+    fixWidth(0, 118);                                        // 时间(MM-dd HH:mm:ss)
+    hh->setSectionResizeMode(1, QHeaderView::Stretch);       // 主体(长路径)
+    fixWidth(2, 74);                                         // PID
+    hh->setSectionResizeMode(3, QHeaderView::Stretch);       // 凑齐的动作(长规则名)
+    // 强度要装得下最长的 4 字标签(确定恶意 / 高度可疑),留够余量,否则胶囊里的字会被挤扁。
+    fixWidth(4, 108);                                        // 强度
+    fixWidth(5, 84);                                         // 严重度
+    fixWidth(6, 76);                                         // 样本数
+    hh->setSectionResizeMode(7, QHeaderView::Stretch);       // 家族
+    fixWidth(8, 92);                                         // 最终裁决
+
+    // 保留整份记录用于本地过滤 —— 搜索不该每次都往服务端跑一趟。
+    auto* rows = new QList<bulwark::ipc::AttackChainHitPayload>();
+
+    auto repaint = [t, rows, count, search] {
+        const QString q = search->text().trimmed();
+        t->setRowCount(0);
+        int shown = 0;
+        for (int src = 0; src < rows->size(); ++src) {
+            const bulwark::ipc::AttackChainHitPayload& h = rows->at(src);
+            if (!q.isEmpty()) {
+                const bool hit = h.actorPath.contains(q, Qt::CaseInsensitive)
+                              || h.families.contains(q, Qt::CaseInsensitive)
+                              || h.titles.join(QLatin1Char(' ')).contains(q, Qt::CaseInsensitive);
+                if (!hit)
+                    continue;
+            }
+            const int i = addRow(t);
+            put(t, i, 0, h.whenUtc.toLocalTime().toString(QStringLiteral("MM-dd HH:mm:ss")), true);
+            // 行 -> 记录下标。表格带过滤,显示行号不等于记录下标,双击要靠这个回查
+            //(与进程管理页同一约定:下标暗存在第 0 列的 UserRole)。
+            if (auto* c0 = t->item(i, 0))
+                c0->setData(Qt::UserRole, src);
+            put(t, i, 1, h.actorPath, false, true);
+            put(t, i, 2, h.actorPid > 0 ? QString::number(h.actorPid) : u("—"), true, true);
+            // 凑齐的动作是这页的重点:哪几个行为叠在一起才定性,一行摊开给人看。
+            put(t, i, 3, h.titles.join(u(" + ")));
+            // 9 列挤在一屏,主体路径与组合动作名(原 Sigma 规则名,很长)必然被截断。
+            // 悬停提示供扫读时快速确认,要看全量字段(可选中复制)则双击开详情。
+            if (auto* cell = t->item(i, 1))
+                cell->setToolTip(h.actorPath);
+            if (auto* cell = t->item(i, 3))
+                cell->setToolTip(h.titles.join(QStringLiteral("\n+ ")));
+            ui::pillCell(t, i, 4, chainGradeLabel(h.grade), chainGradeColor(h.grade));
+            ui::pillCell(t, i, 5, h.maxLevel.isEmpty() ? u("—") : h.maxLevel,
+                         chainLevelColor(h.maxLevel));
+            put(t, i, 6, h.support > 0 ? QString::number(h.support) : u("—"), true, true);
+            put(t, i, 7, h.families.isEmpty() ? u("—") : h.families, true);
+            if (auto* cell = t->item(i, 7); cell && !h.families.isEmpty())
+                cell->setToolTip(h.families);
+            // 最终裁决:dry-run 下这里显示的是【本次事件的真实处置】,与命中强度无关。
+            QString vt = h.action;
+            QColor vc = theme::textMuted();
+            if (h.action == QLatin1String("Block"))      { vt = u("已拦截"); vc = theme::danger(); }
+            else if (h.action == QLatin1String("Ask"))   { vt = u("已询问"); vc = theme::warning(); }
+            else if (h.action == QLatin1String("Allow")) { vt = u("已放行"); vc = theme::success(); }
+            else if (vt.isEmpty())                       { vt = u("—"); }
+            ui::pillCell(t, i, 8, vt, vc);
+            ++shown;
+        }
+        count->setText(q.isEmpty() ? u("共 %1 条").arg(rows->size())
+                                   : u("匹配 %1 / %2 条").arg(shown).arg(rows->size()));
+    };
+
+    QObject::connect(ipc, &IpcClient::attackChainReceived, b.page,
+                     [=](const bulwark::ipc::AttackChainResponsePayload& p) {
+        *rows = p.hits;
+
+        // 引擎状态 -> pill。三种状态各自把话说明白,别让用户对着一张空表猜。
+        // 「只记录不拦截」这条最要紧的前提由 pill 的橙色 + tooltip 承担:表里所有记录都
+        // 没影响过裁决,不说清楚会被误读成「这些都已经拦下了」。
+        QString stateText;
+        QColor stateColor;
+        QString tip;
+        if (!p.enabled) {
+            stateColor = theme::textMuted();
+            stateText = u("引擎未启用");
+            tip = u("在 appsettings.json 里把 AttackChainEngine.Enabled 设为 true 后生效。");
+        } else if (p.version <= 0) {
+            stateColor = theme::warning();
+            stateText = u("等待组合表");
+            tip = u("引擎已启用,但还没装载到组合表,正在等首次同步。");
+        } else if (p.dryRun) {
+            stateColor = theme::warning();
+            stateText = u("只记录不拦截");
+            tip = u("下表记录均未参与过拦截判定。要让攻击链真正生效,"
+                    "把 appsettings.json 里的 AttackChainEngine.DryRun 改为 false。");
+        } else {
+            stateColor = theme::success();
+            stateText = u("参与拦截判定");
+            tip = u("组合凑齐即作为硬指标进入裁决流水线,按强度判为拦截或弹窗询问。");
+        }
+        ui::stylePill(statePill, u("● ") + stateText, stateColor);
+
+        // 组合表汇总 -> 一行 muted 文字(与隔离区「共 11 项 · 100.2 MB」同一写法)。
+        QStringList parts;
+        if (p.version > 0) {
+            // 展示服务器给的可读版本号(0.1 起、每次内容变化 +0.1);老服务端不下发时
+            // 回退到内部整数版本号,别把版本位置留空。内部号挂 tooltip,排查时还用得上。
+            const QString ver = p.versionLabel.isEmpty()
+                                    ? QStringLiteral("v%1").arg(p.version)
+                                    : p.versionLabel;
+            parts << ver << u("%1 条组合").arg(p.patterns) << u("%1 标记").arg(p.markers);
+        }
+        parts << u("记账 %1 进程").arg(p.trackedProcesses);
+        summary->setText(parts.join(u(" · ")));
+
+        // 更新计划与来源是元数据,不占版面,挂 tooltip。
+        QStringList meta{tip};
+        if (p.version > 0 && !p.versionLabel.isEmpty())
+            meta << u("内部版本号 v%1(客户端据此判断是否需要重新下载)").arg(p.version);
+        if (!p.updateSchedule.isEmpty())
+            meta << p.updateSchedule;
+        if (!p.endpoint.isEmpty())
+            meta << u("组合表来源 %1").arg(p.endpoint);
+        const QString fullTip = meta.join(QStringLiteral("\n"));
+        statePill->setToolTip(fullTip);
+        summary->setToolTip(fullTip);
+        repaint();
+    });
+
+    auto reload = [ipc, count] {
+        if (!ipc->isConnected()) { count->setText(u("未连接服务")); return; }
+        ipc->requestAttackChain();
+    };
+    QObject::connect(refresh, &QPushButton::clicked, b.page, reload);
+    QObject::connect(search, &QLineEdit::textChanged, b.page, [repaint] { repaint(); });
+
+    // 双击一行 -> 命中详情(与拦截记录双击开攻击时间线、进程管理双击开进程详情同一约定)。
+    QObject::connect(t, &QTableWidget::cellDoubleClicked, b.page, [t, rows](int row, int) {
+        if (auto* c0 = t->item(row, 0)) {
+            const int src = c0->data(Qt::UserRole).toInt();
+            if (src >= 0 && src < rows->size()) {
+                AttackChainDetailDialog dlg(rows->at(src), t->window());
+                dlg.exec();
+            }
+        }
+    });
+
+    QObject::connect(clear, &QPushButton::clicked, b.page, [ipc, t] {
+        if (!ipc->isConnected()) {
+            QMessageBox::warning(t, u("清空命中记录"), u("未连接服务,无法清空。"));
+            return;
+        }
+        if (QMessageBox::question(t, u("清空命中记录"),
+                                  u("将清空全部攻击链命中记录(含落盘文件),此操作不可撤销。\n\n"
+                                    "这只影响这页的历史展示,不会改变组合表或防护策略。确定继续吗?"),
+                                  QMessageBox::Yes | QMessageBox::Cancel,
+                                  QMessageBox::Cancel) != QMessageBox::Yes)
+            return;
+        ipc->clearAttackChainHits();   // 服务端清完会主动回推空列表,无需再请求
+    });
+
+    QObject::connect(ipc, &IpcClient::connectionChanged, b.page, [reload](bool c) {
+        if (c) reload();
+    });
+    if (ipc->isConnected())
+        reload();
+
+    QObject::connect(b.page, &QObject::destroyed, [rows] { delete rows; });
     return b.page;
 }

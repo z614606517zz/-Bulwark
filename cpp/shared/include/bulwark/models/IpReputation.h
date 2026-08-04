@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QJsonObject>
 #include "bulwark/models/Enums.h"
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
@@ -14,7 +15,7 @@ struct IpReputation {
     QString threatLabel;                                // 可空:C2/Botnet/...
     int confidence = 0;                                 // 0-100
     bool querySucceeded = false;
-    QDateTime fetchedUtc = QDateTime::currentDateTimeUtc();
+    QDateTime fetchedUtc = nowUtc();
 
     QJsonObject toJson() const;
     static IpReputation fromJson(const QJsonObject& o);

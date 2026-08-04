@@ -11,9 +11,10 @@
 #include <vector>
 
 // 多源信誉聚合器:对上层(ReputationManager)实现统一的 IHashReputationService,内部
-// 顺序查询所有已启用的下游信誉源(MalwareBazaar / OTX / MetaDefender / HybridAnalysis…),
-// 再按「取最强可信结论」合并(Malicious > Suspicious > Clean > Unknown)。单源失败/超时
-// 不影响其他源,整体是「锦上添花」。对应 .NET Bulwark.Service/Reputation/AggregateReputationService.cs。
+// 并行查询所有已启用的下游信誉源(MalwareBazaar / OTX / MetaDefender / HybridAnalysis…),
+// 再按「取最强可信结论」合并(Malicious > Suspicious > Clean > Unknown)。并行使总延迟
+// 收敛到「最慢的单源」而非各源之和,缩短 VT 未收录时的回退等待;合并与完成顺序无关。
+// 单源失败/超时不影响其他源,整体是「锦上添花」。对应 .NET Bulwark.Service/Reputation/AggregateReputationService.cs。
 namespace bulwark::service::reputation {
 
 class AggregateReputationService : public IHashReputationService {
@@ -24,6 +25,12 @@ public:
     bool isEnabled() const override;
     bulwark::FileReputation query(const QString& sha256) override;
     bulwark::FileReputation query(const QString& sha256, bool priority) override;
+    // 排除指定源后查询其余活跃源(名称比较不区分大小写;空名等价于 query)。
+    // 用于双击云扫描的分级链路:VirusTotal 已在上一级单独查过且未给出结论时,这一级只查
+    // 「其他源」,既不重复消耗 VT 配额(聚合器里的 VT 与双击扫描用的是同一个客户端实例,
+    // 重复查会真的扣两次额度),也保持「VT 优先、其他兜底」的顺序语义。
+    bulwark::FileReputation queryExcluding(const QString& sha256, bool priority,
+                                           const QString& excludeSource);
     // 遍历活跃源拉取行为画像并合并(各源结果取并集,去重)。供确认恶意后清理 + 生成规则。
     bulwark::ThreatBehaviorProfile fetchBehaviorProfile(const QString& sha256) override;
     std::pair<bool, QString> testConnection() override;
@@ -43,6 +50,9 @@ public:
 private:
     // 某源当前是否真正参与查询:配置可用 且 运行时开关未关闭。
     bool isActive(IHashReputationService* s) const;
+    // query / queryExcluding 的共同实现:取活跃源快照(可排除一个)后并行查询并合并。
+    bulwark::FileReputation queryFiltered(const QString& sha256, bool priority,
+                                          const QString& excludeSource);
     static int rank(bulwark::ReputationVerdict v);
     static bulwark::FileReputation merge(const QString& sha256,
                                          const QVector<bulwark::FileReputation>& results);

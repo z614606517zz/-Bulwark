@@ -53,8 +53,25 @@ const QVector<Sig>& commandLineSignals() {
         { "-noprofile", 8, "PowerShell 跳过配置文件", false },
         { "-windowstyle hidden", 30, "隐藏窗口运行" },
         { "-w hidden", 30, "隐藏窗口运行" },
-        { "-executionpolicy bypass", 30, "绕过执行策略" },
-        { "-ep bypass", 30, "绕过执行策略" },
+        // 「绕过执行策略」按【软信号】计,与 TrustPolicy::softDangerTokens 的判断保持一致。
+        //
+        // TrustPolicy 那边早就得出过结论并写在注释里:正规安装器 / CI 脚本 / 本项目自己的
+        // build 脚本全都用 `-ExecutionPolicy Bypass`(那是在 Windows 上跑 .ps1 的标准姿势),
+        // 所以它把 "bypass" 放进 softDangerTokens、要求【至少两个软构造同时出现】才撤销信任,
+        // 并明确写道「单独出现时仍由 ThreatDetector(计 30 分)…继续计分/询问」—— 也就是说
+        // 本表这一条的设计意图从来是「计分 + 询问」,不是「单独定罪」。
+        //
+        // 但 Sig::hard 默认为 true,于是它实际一直在置 hasThreatIndicator,后果是:
+        //   · 健康签名放行(TrustPolicy::isHealthySigned)因 hasThreatIndicator 直接失效;
+        //   · 开了静默模式后,风险分过 50 就被静默升级成 Block —— 进程直接被结束。
+        // 实测:cmd.exe 因 `-NoProfile` + `-ExecutionPolicy Bypass` + 命令行熵 4.9 得 62 分被杀
+        //(这正是那条注释里担心的「本软件拦自己的构建脚本」)。
+        //
+        // 改为软信号后检出能力不丢:真实恶意几乎总是组合出现 —— `-w hidden`(30,硬)、
+        // `-enc`(35,硬)、`downloadstring`(40,硬)任一命中即照旧定罪;内置规则
+        // `*-executionpolicy bypass*` 仍会产生 Ask;ScriptAnalyzer 对脚本正文另计 35 分。
+        { "-executionpolicy bypass", 30, "绕过执行策略", false },
+        { "-ep bypass", 30, "绕过执行策略", false },
         { "downloadstring", 40, "内存下载执行(DownloadString,T1105)" },
         { "downloadfile", 35, "远程下载文件(T1105)" },
         { "invoke-expression", 35, "动态执行(IEX,T1059.001)" },
@@ -69,7 +86,16 @@ const QVector<Sig>& commandLineSignals() {
         { "bitsadmin /transfer", 35, "BITS 后台下载(T1197)" },
         { "-noninteractive", 5, "非交互运行", false },
         { "comsvcs.dll", 40, "comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)" },
-        { "minidump", 35, "进程内存转储(疑似凭据窃取,T1003.001)" },
+        // 「minidump」单独出现【只作软信号】。这个词是崩溃处理器的本职词汇:Crashpad /
+        // Breakpad / WerFault / 各类客户端的崩溃上报组件命令行里都带它,而转储自己进程的内存
+        // 恰恰是它们存在的意义。实测 Tencent 签名的
+        //   C:\Program Files\Tencent\QQNT\...\crashpad_handler.exe
+        // 就因为这一个词被判「疑似凭据窃取」,51 分被拦 4 次。
+        //
+        // 真正的凭据转储不会只留下这一个词,而且都另有硬判据兜着:comsvcs.dll(上一行,40 分硬)、
+        // sekurlsa / lsadump(下面两行,50 分硬)、CredentialAccessAnalyzer 的 LSASS 判定,
+        // 以及下面新增的「minidump + lsass 同时出现」合取。所以降为软信号不丢检出。
+        { "minidump", 35, "进程内存转储(崩溃上报组件也用此参数,需互证)", false },
         { "sekurlsa", 50, "Mimikatz 凭据抓取(sekurlsa,T1003.001)" },
         { "lsadump", 50, "Mimikatz 凭据转储(lsadump,T1003.001)" },
         { "mimikatz", 55, "Mimikatz 凭据攻击工具(T1003.001)" },
@@ -324,6 +350,15 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     int score = 0;
     e.hasThreatIndicator = false;
 
+    // 并入攻击链组合引擎的贡献。它在本函数【之前】就完成了匹配(Worker 在 evaluate 前调用),
+    // 而本函数开头复位 hasThreatIndicator、结尾用赋值覆盖 riskScore —— 若不在此显式并入,
+    // 它的结论就会被无声擦掉。这正是组合表上线后从未生效过一次的原因,勿删。
+    // 放在最前面而不是最后:后面「威胁情报判为干净则减 10 分」那一支要读 hasThreatIndicator,
+    // 组合命中属互证硬指标,不该被信誉良好抵扣。
+    score += e.chainScore;
+    if (e.chainHardIndicator)
+        e.hasThreatIndicator = true;
+
     // hard=true 视为硬恶意指标,置位 hasThreatIndicator。
     auto Add = [&](int delta, const QString& reason, bool hard = false,
                    EvidenceKind kind = EvidenceKind::SoftSignal) {
@@ -355,6 +390,16 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     if (e.signatureMismatch)
         Add(45, u("数字签名校验失败(疑似篡改或盗用证书)"), true);
 
+    // 1b-1) 侧载模块篡改(「白加黑」):主体签名健康,但它目录里有模块【签名后被改过】。
+    //
+    // 按硬指标计,而且分值与主体自身失配同级 —— 这不是软信号:一个模块内嵌了厂商签名却
+    // 校验不过,只有两种可能,要么文件损坏,要么被人改了代码;放在一个签名壳旁边、又被那个
+    // 壳加载,就是「白加黑」的完成态。这也是唯一能穿透「白壳签名健康 -> 第 9 步直接放行」
+    // 的判据(见 SecurityEvent::tamperedModulePath 的说明:漏检现场每次风险分只有 5)。
+    if (!e.tamperedModulePath.isEmpty())
+        Add(50, u("同目录模块签名后被篡改(签名壳侧载恶意模块,T1574.002):") +
+                e.tamperedModulePath, true);
+
     // 1b-2) 吊销 / 过期后签名
     if (e.certRevoked)
         Add(60, u("签名证书已被吊销(疑似盗用证书)"), true);
@@ -365,7 +410,7 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     if (e.actorSigned && e.isFirstSeen) {
         Add(15, u("带签名但本机首次出现(低流行度)"), false, EvidenceKind::Info);
         if (e.certNotAfterUtc.has_value()) {
-            const qint64 secs = QDateTime::currentDateTimeUtc().secsTo(*e.certNotAfterUtc);
+            const qint64 secs = nowUtc().secsTo(*e.certNotAfterUtc);
             if (secs > 0 && secs <= static_cast<qint64>(186) * 24 * 3600)
                 Add(15, u("签名证书较新(疑似空壳公司新证书)"));
         }
@@ -421,6 +466,27 @@ void ThreatDetector::analyze(SecurityEvent& e) {
         for (const Sig& sig : commandLineSignals())
             if (cmd.contains(QLatin1String(sig.token)))
                 Add(sig.score, u(sig.reason), sig.hard);
+
+        // 合取判据:「转储工具/动作」+「目标点名 lsass」同时出现 —— 这才是凭据转储,而不是崩溃上报。
+        // 上面的 Sig 表是扁平的单 token 匹配,表达不了这种组合,故在此单列一条。
+        //
+        // 只用 minidump / procdump / nanodump / dumpert 这几个【长且无歧义】的词。
+        // 刻意【不用 "-ma"】(procdump 的全内存转储开关):它只有三个字符,裸子串会撞上
+        // --max-time / --machine 之类的正常参数 —— 这正是本轮在 RemoteControlAnalyzer 修掉的
+        // 那类「短 token 裸匹配」错误,不该在这里重新引入一个。按名字转储 lsass 的形态由
+        // procdump 这个词本身覆盖。
+        //
+        // 注意本条【不是】comsvcs 手法的主要判据:`rundll32 comsvcs.dll, MiniDump <pid> out.dmp full`
+        // 传的是 PID 而非进程名,命令行里根本不会出现 "lsass"。那条路由上一行的 comsvcs.dll
+        //(40 分硬)以及 CredentialAccessAnalyzer 的 `comsvcs.dll && minidump`(55 分硬)负责。
+        // 本条补的是 `procdump -ma lsass.exe` 这种按名字点名的形态。
+        const bool namesLsass = cmd.contains(QLatin1String("lsass"));
+        const bool dumpVerb = cmd.contains(QLatin1String("minidump")) ||
+                              cmd.contains(QLatin1String("procdump")) ||
+                              cmd.contains(QLatin1String("nanodump")) ||
+                              cmd.contains(QLatin1String("dumpert"));
+        if (namesLsass && dumpVerb)
+            Add(45, u("对 LSASS 做内存转储(凭据窃取,T1003.001)"), true);
     }
 
     // 4b) LOLBin 滥用
@@ -531,15 +597,18 @@ void ThreatDetector::analyze(SecurityEvent& e) {
         const ScoreResult obf = CommandObfuscationAnalyzer::analyze(e.commandLine);
         if (obf.score > 0) {
             score += obf.score;
-            const bool obfHard = obf.score >= 30;
+            // 硬 / 软由分析器自己给(与 LolbinAnalyzer / CredentialAccessAnalyzer 等一致)。
+            // 【别改回「obf.score >= 30」】:那等于让香农熵 + Base64 长串这两个纯统计量单独
+            // 定罪,实测把 Amazon 签名的 Electron 应用永久钉进内核禁止执行名单 ——
+            // 原因与代价见 CommandObfuscationAnalyzer::analyze 末尾 hardSignal 处的说明。
             bool first = true;
             for (const QString& r : obf.reasons) {
                 e.addEvidence(QStringLiteral("CommandObfuscationAnalyzer"),
-                    obfHard ? EvidenceKind::HardIndicator : EvidenceKind::SoftSignal,
+                    obf.hardSignal ? EvidenceKind::HardIndicator : EvidenceKind::SoftSignal,
                     r, first ? obf.score : 0);
                 first = false;
             }
-            if (obfHard) e.hasThreatIndicator = true;
+            if (obf.hardSignal) e.hasThreatIndicator = true;
         }
     }
 
@@ -582,21 +651,52 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     // 9) 外部文件信誉(VT 缓存结果,不发起网络调用)
     if (e.reputation.has_value()) {
         const FileReputation& rep = *e.reputation;
+
+        //
+        // 情报结论是否【带实据】。只有带实据的结论才配当硬指标(可单独定罪)。
+        //
+        // 两类源的实据形式不同,都要认:
+        //   · 多引擎源(VT / MetaDefender):实据是 malicious/totalEngines 的引擎计数;
+        //   · 命中型源(MalwareBazaar / ThreatFox / 微步):没有引擎计数,实据是 threatLabel
+        //     那个family/威胁名(onReputationMalicious 里也是这么区分表述的)。
+        //
+        // 实测事故:微步(Proxy:ThreatBook)返回过
+        //     {"verdict":2(可疑),"malicious":0,"totalEngines":0,"threatLabel":""}
+        // 也就是【什么实据都没有】的一条「可疑」。原实现照样把它登记成 HardIndicator 并置
+        // hasThreatIndicator,理由串直接印成「威胁情报:0/0 个引擎判为可疑」—— 一句自我否定的话
+        // 却拥有定罪效力。后果:uniclash-setup 安装包风险分被顶到 70,静默模式据此升级为 Block,
+        // 用户看到的就是「安装包一运行就消失」。
+        //
+        // 零实据的结论现在只作软信号:分数照加(它确实是一点弱线索),但必须与真正的硬指标
+        // 互证才能升格 —— 与本项目「软信号绝不单独定罪」一致。理由串也不再谎称有引擎判过。
+        //
+        const bool hasEngineCounts = rep.totalEngines > 0 && rep.malicious > 0;
+        const bool hasLabel = !rep.threatLabel.trimmed().isEmpty();
+        const bool substantiated = hasEngineCounts || hasLabel;
+        // 有引擎计数就按 "n/m 个引擎" 表述;否则按威胁名表述;两者都无则如实说明「无明细」。
+        const QString detail = hasEngineCounts
+            ? (QString::number(rep.malicious) + QStringLiteral("/") +
+               QString::number(rep.totalEngines) + u(" 个引擎"))
+            : (hasLabel ? rep.threatLabel.trimmed() : u("该源未给出引擎计数或威胁名"));
+        const QString srcTag = rep.source.trimmed().isEmpty()
+            ? u("威胁情报") : (u("威胁情报[") + rep.source.trimmed() + u("]"));
+
         switch (rep.verdict) {
             case ReputationVerdict::Malicious:
                 score += 60;
-                e.addEvidence(QStringLiteral("Reputation"), EvidenceKind::HardIndicator,
-                    u("威胁情报:") + QString::number(rep.malicious) + QStringLiteral("/") +
-                    QString::number(rep.totalEngines) + u(" 个引擎判为恶意") +
-                    (rep.threatLabel.isEmpty() ? QString() : (u("(") + rep.threatLabel + u(")"))), 60);
-                e.hasThreatIndicator = true;
+                e.addEvidence(QStringLiteral("Reputation"),
+                    substantiated ? EvidenceKind::HardIndicator : EvidenceKind::SoftSignal,
+                    srcTag + u(":判为恶意(") + detail + QStringLiteral(")") +
+                    (substantiated ? QString() : u("〔无实据,按软信号计,需互证〕")), 60);
+                if (substantiated) e.hasThreatIndicator = true;
                 break;
             case ReputationVerdict::Suspicious:
                 score += 30;
-                e.addEvidence(QStringLiteral("Reputation"), EvidenceKind::HardIndicator,
-                    u("威胁情报:") + QString::number(rep.malicious) + QStringLiteral("/") +
-                    QString::number(rep.totalEngines) + u(" 个引擎判为可疑"), 30);
-                e.hasThreatIndicator = true;
+                e.addEvidence(QStringLiteral("Reputation"),
+                    substantiated ? EvidenceKind::HardIndicator : EvidenceKind::SoftSignal,
+                    srcTag + u(":判为可疑(") + detail + QStringLiteral(")") +
+                    (substantiated ? QString() : u("〔无实据,按软信号计,需互证〕")), 30);
+                if (substantiated) e.hasThreatIndicator = true;
                 break;
             case ReputationVerdict::Clean:
                 if (!e.hasThreatIndicator && score > 0) {

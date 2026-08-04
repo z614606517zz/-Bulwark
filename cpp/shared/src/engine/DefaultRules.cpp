@@ -223,6 +223,51 @@ QVector<DefenseRule> DefaultRules::build() {
     addCmdlineEvasionRules(list);
     addNetworkC2Rules(list);
     addSilverFoxWdacByovdRules(list);
+
+    //
+    // ============ 给内置规则赋【稳定 id】(必须保留)============
+    //
+    // DefenseRule::id 的默认值是 QUuid::createUuid() —— 每次进程启动都是全新随机值。
+    // 而 RuleEngine 步骤 6 的规则排序在「层级 > 具体度 > 动作强度 > createdUtc」全部打平时
+    // 以 id 收尾定序,内置规则的 createdUtc 又都取自同一次 nowUtc() 调用(彼此相同),
+    // 于是【两条完全同级的内置规则谁胜出由随机 UUID 决定,每次重启都可能翻转】。
+    //
+    // 实际后果(裁决快照测试就是这么发现的):同一条 `powershell -w hidden -enc ...` 命令行
+    // 同时命中「PowerShell 编码命令」与「隐藏窗口+编码命令组合」两条规则,两者动作相同但
+    // 备注不同 —— 用户在 UI / 审计日志里看到的拦截理由每次重启会随机切换。
+    //
+    // 这里按规则的【判别性内容】派生 UUIDv5:同一条内置规则在任何机器、任何一次启动上都得到
+    // 同一个 id。除消除上述抖动外,还让内置规则的身份跨重启稳定(规则存储 / 按 id 删除等
+    // 依赖 id 的路径因此才有意义)。
+    //
+    // 注意:参与派生的字段必须足以区分任意两条内置规则,否则会撞 id。此处把全部匹配条件
+    // 连同备注一起纳入 —— 备注本身在内置规则里就是唯一的,已足够,其余字段是冗余保险。
+    //
+    for (DefenseRule& r : list) {
+        QString key;
+        key.reserve(256);
+        key += r.note;
+        key += QLatin1Char('\x1f');
+        key += r.actorPath;
+        key += QLatin1Char('\x1f');
+        key += r.actorPattern;
+        key += QLatin1Char('\x1f');
+        key += r.targetPattern;
+        key += QLatin1Char('\x1f');
+        key += r.commandLinePattern;
+        key += QLatin1Char('\x1f');
+        key += r.parentPattern;
+        key += QLatin1Char('\x1f');
+        key += r.type.has_value() ? QString::number(static_cast<int>(*r.type))
+                                  : QStringLiteral("-");
+        key += QLatin1Char('\x1f');
+        key += QString::number(static_cast<int>(r.action));
+        key += QLatin1Char('\x1f');
+        key += r.requireUnsigned ? QLatin1Char('1') : QLatin1Char('0');
+        key += r.hardOverride ? QLatin1Char('1') : QLatin1Char('0');
+        key += r.exemptTrustedOsComponent ? QLatin1Char('1') : QLatin1Char('0');
+        r.id = QUuid::createUuidV5(QUuid{}, key.toUtf8());
+    }
     return list;
 }
 

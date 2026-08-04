@@ -612,11 +612,12 @@ QWidget* pages::settings(IpcClient* ipc)
     struct Widgets {
         bulwark::RuntimeSettings last;
         bool loading{false}; // true while pushing service settings -> controls (suppresses auto-apply)
-        ToggleSwitch *protection{}, *defaultBlock{}, *silent{};
+        ToggleSwitch *protection{}, *defaultBlock{}, *silent{}, *chainToast{};
         ToggleSwitch *proc{}, *file{}, *reg{}, *self{}, *net{}, *mem{};
         ToggleSwitch *trustSigned{}, *baseline{}, *canary{}, *userMon{}, *kernel{}, *grayAi{};
         ToggleSwitch *vt{}, *mb{}, *otx{}, *tb{}, *mdc{}, *ha{};
         ToggleSwitch *aiDouble{}, *aiSuspend{}, *aiBlockFail{};
+        ToggleSwitch* cloudUpload{}; // 威胁情报共享(默认关)
         QSpinBox* timeout{};
         QLineEdit *vtKey{}, *mbKey{}, *otxKey{}, *tbKey{}, *mdcKey{}, *haKey{}; // 各情报源 API Key
         QLineEdit *aiBase{}, *aiKey{}, *aiModel{};
@@ -668,6 +669,11 @@ QWidget* pages::settings(IpcClient* ipc)
     wg->protection = settingRow(s1, u("实时防护"), u("监控并拦截敏感系统行为"), true);
     wg->defaultBlock = settingRow(s1, u("默认拦截未知行为"), u("灰区行为无匹配规则时默认拦截(更严格)"), false);
     wg->silent = settingRow(s1, u("静默模式"), u("不弹窗打扰,询问类自动放行,仅拦确定性高危"), false);
+    // 紧跟静默模式之后,并在说明里点明「不受静默模式影响」—— 否则用户开了静默还看到弹窗
+    // 会以为静默没生效。这两项的关系必须在界面上说清,不能只写在代码注释里。
+    wg->chainToast = settingRow(s1, u("攻击链命中通知"),
+                               u("右下角提示并自动消失,不受静默模式影响 —— 静默会把询问降级为放行,"
+                                 "这条通知补的正是那种「命中了却无声」的情况"), true);
     {
         auto* w = new QWidget;
         auto* h = new QHBoxLayout(w);
@@ -734,6 +740,24 @@ QWidget* pages::settings(IpcClient* ipc)
     wg->aiKey = fieldRow(s5, u("API Key"), true);
     wg->aiModel = fieldRow(s5, u("模型"), false);
 
+    // 威胁情报共享(默认关)。开关下方用一段可换行的说明把「上传什么 / 不上传什么」讲清楚 ——
+    // 这是用户决定要不要开启的唯一依据,不能只写一行含糊的描述。
+    auto* s6 = section(v, u("威胁情报共享"));
+    wg->cloudUpload = settingRow(s6, u("共享病毒信息与行为数据"),
+                                 u("默认关闭。开启后每天凌晨自动上传,上传成功即删除本地暂存"), false);
+    {
+        auto* note = ui::label(
+            u("只上传病毒信息与沙箱行为数据:病毒文件的 SHA-256、判定结果、引擎检出数、"
+              "威胁名称,以及该病毒已知的释放物名称与哈希、注册表键、外联 IP 与域名、"
+              "服务名、互斥体。\n"
+              "不涉及任何个人隐私信息:不上传文件内容,不上传该文件在本机的路径与文件名,"
+              "不上传计算机名、用户名或任何账号信息,也不附带任何机器标识。\n"
+              "仅在云查杀判定为恶意或可疑时才收集;关闭开关会立即删除本地已暂存的全部数据。"),
+            "muted");
+        note->setWordWrap(true);
+        s6->addWidget(note);
+    }
+
     auto* bar = new QHBoxLayout;
     bar->addStretch();
     auto* status = ui::label(QString(), "muted");
@@ -754,6 +778,7 @@ QWidget* pages::settings(IpcClient* ipc)
         wg->protection->setChecked(s.protectionEnabled);
         wg->defaultBlock->setChecked(s.defaultBlock);
         wg->silent->setChecked(s.silentMode);
+    wg->chainToast->setChecked(s.attackChainToast);
         wg->timeout->setValue(s.promptTimeoutSeconds);
         wg->proc->setChecked(s.processProtection);
         wg->file->setChecked(s.fileProtection);
@@ -782,6 +807,7 @@ QWidget* pages::settings(IpcClient* ipc)
         wg->aiDouble->setChecked(s.aiScanDoubleClickEnabled);
         wg->aiSuspend->setChecked(s.aiScanSuspendDuringScan);
         wg->aiBlockFail->setChecked(s.aiScanBlockOnFailure);
+        wg->cloudUpload->setChecked(s.cloudBehaviorUploadEnabled);
         wg->aiBase->setText(s.aiBaseUrl);
         wg->aiKey->setText(s.aiApiKey);
         wg->aiModel->setText(s.aiModel);
@@ -797,6 +823,7 @@ QWidget* pages::settings(IpcClient* ipc)
         s.protectionEnabled = wg->protection->isChecked();
         s.defaultBlock = wg->defaultBlock->isChecked();
         s.silentMode = wg->silent->isChecked();
+    s.attackChainToast = wg->chainToast->isChecked();
         s.promptTimeoutSeconds = wg->timeout->value();
         s.processProtection = wg->proc->isChecked();
         s.fileProtection = wg->file->isChecked();
@@ -825,6 +852,7 @@ QWidget* pages::settings(IpcClient* ipc)
         s.aiScanDoubleClickEnabled = wg->aiDouble->isChecked();
         s.aiScanSuspendDuringScan = wg->aiSuspend->isChecked();
         s.aiScanBlockOnFailure = wg->aiBlockFail->isChecked();
+        s.cloudBehaviorUploadEnabled = wg->cloudUpload->isChecked();
         s.aiBaseUrl = wg->aiBase->text().trimmed();
         s.aiApiKey = wg->aiKey->text().trimmed();
         s.aiModel = wg->aiModel->text().trimmed();
@@ -843,11 +871,12 @@ QWidget* pages::settings(IpcClient* ipc)
     };
 
     // Toggles + timeout apply on change; text fields apply when editing commits.
-    for (ToggleSwitch* t : {wg->protection, wg->defaultBlock, wg->silent, wg->proc,
+    for (ToggleSwitch* t : {wg->protection, wg->defaultBlock, wg->silent, wg->chainToast, wg->proc,
                             wg->file, wg->reg, wg->self, wg->net, wg->mem,
                             wg->trustSigned, wg->baseline, wg->canary, wg->userMon,
                             wg->kernel, wg->grayAi, wg->vt, wg->mb, wg->otx, wg->tb,
-                            wg->mdc, wg->ha, wg->aiDouble, wg->aiSuspend, wg->aiBlockFail})
+                            wg->mdc, wg->ha, wg->aiDouble, wg->aiSuspend, wg->aiBlockFail,
+                            wg->cloudUpload})
         QObject::connect(t, &QAbstractButton::toggled, page, [apply](bool) { apply(); });
     QObject::connect(wg->timeout, qOverload<int>(&QSpinBox::valueChanged), page,
                      [apply](int) { apply(); });

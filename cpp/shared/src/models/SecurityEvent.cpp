@@ -9,7 +9,7 @@ void SecurityEvent::addEvidence(const QString& source, EvidenceKind kind,
                                 const QString& description, int scoreDelta,
                                 bool alsoReason) {
     Evidence e;
-    e.timestampUtc = QDateTime::currentDateTimeUtc();
+    e.timestampUtc = nowUtc();
     e.source = source;
     e.kind = kind;
     e.description = description;

@@ -58,6 +58,15 @@ public:
                                std::optional<QDateTime> expiresUtc = std::nullopt,
                                bool sessionOnly = false);
 
+    // 行为基线画像的导出 / 导入(转发到内部 BaselineAnalyzer,内部自带锁)。
+    //
+    // 之所以要暴露:BaselineAnalyzer 早就实现了 exportSnapshot/importSnapshot,服务侧也早就有
+    // BaselineStore(带 load/save、原子写),但 BaselineStore 从未被构造过 —— 基线因此纯内存、
+    // 每次服务重启清零,「行为偏离自身历史基线」这条检测在重启后要重新经历学习期。
+    // 分析器是 RuleEngine 的私有成员,没有这两个转发口,main 就没法把它接到存储上。
+    BaselineSnapshot exportBaseline() { return baseline_.exportSnapshot(); }
+    void importBaseline(const BaselineSnapshot& snapshot) { baseline_.importSnapshot(snapshot); }
+
     // 登记勒索诱饵文件(用户态行为源投放蜜罐时调用):任何进程改写/删除该路径即被
     // 时序监视器判为强勒索信号(canaryHit -> 直接 Block)。转发到内部勒索监视器。
     void addCanaryFile(const QString& path) { ransomware_.addCanaryFile(path); }

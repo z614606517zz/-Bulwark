@@ -5,6 +5,7 @@
 #include <QString>
 
 namespace bulwark { struct SecurityEvent; }
+namespace bulwark::ipc { struct AttackChainHitPayload; }
 
 class ToastWindow;
 class QTimer;
@@ -27,8 +28,17 @@ public:
     // Generic informational toast.
     void showInfo(const QString& heading, const QString& detail);
 
+    // 攻击链组合命中(攻击链通知)。与 showBlock 分开的三个理由:
+    //   1. 处置可能是拦截 / 询问 / 放行 —— 用拦截 toast 的红色与"已拦截"措辞会在放行时谎报;
+    //   2. 要展示的是【动作链】(凑齐的那几个动作)与作证样本数,拦截 toast 的字段结构装不下;
+    //   3. 去重键必须按「主体 + 组合」而不是拦截那套键 —— 同一程序反复命中同一组合应合并
+    //      (实测 kiro-account-manager 三分钟内命中两次)。
+    void showAttackChain(const bulwark::ipc::AttackChainHitPayload& hit);
+
 signals:
     void blockToastClicked();
+    // 点了攻击链 toast —— 外壳据此切到「攻击链」页面。
+    void attackChainToastClicked();
 
 private:
     void present(ToastWindow* toast, bool isBlock);
@@ -48,4 +58,10 @@ private:
     static constexpr int kMaxVisible = 4;
     static constexpr int kDedupWindowMs = 10000; // 同一威胁 10s 内只弹一次
     static constexpr int kMinBlockGapMs = 800;   // 单条拦截 toast 最小间隔(超出即合并)
+
+    // 攻击链去重窗口取得比拦截长得多:攻击链是低频事件(一天几次),而同一程序凑齐同一组合
+    // 往往在几分钟内反复触发(每次新事件都会再次凑齐)。10s 压不住,5 分钟才压得住。
+    static constexpr int kChainDedupWindowMs = 300000;
+    // 存活期比拦截 toast(6s)长:动作链有两三个动作名要读完。悬停暂停倒计时。
+    static constexpr int kChainLifetimeMs = 9000;
 };

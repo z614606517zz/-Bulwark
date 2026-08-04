@@ -12,10 +12,20 @@ bool AiDecisionPolicy::shouldConsultGrayZone(VerdictAction currentAction) {
 AiDecisionPolicy::Outcome AiDecisionPolicy::apply(const bulwark::SecurityEvent& e,
                                                   VerdictAction currentAction, bool aiAvailable,
                                                   VerdictAction aiRecommendation,
-                                                  const QString& aiSummary) {
-    // 1) AI 不可用:fail-open,维持原裁决(退回正常弹窗)。
-    if (!aiAvailable)
+                                                  const QString& aiSummary,
+                                                  bool blockOnFailure) {
+    // 1) AI 不可用 / 超时 / 无明确结论。
+    if (!aiAvailable) {
+        // blockOnFailure(设置页「AI 不可用时按拦截处理」)开启 -> fail-closed,灰区升格为拦截。
+        // 该开关此前在服务端从未被读取,这里是它唯一的生效点。刻意不标 rememberMalicious:
+        // 「因为问不到 AI 而拦」不是「已确认恶意」,绝不能据此记住哈希或下发内核禁运名单。
+        if (blockOnFailure) {
+            return { VerdictAction::Block, currentAction != VerdictAction::Block,
+                     QString::fromUtf8("AI 研判不可用,按设置(AI 不可用时按拦截处理)升格为拦截"),
+                     false };
+        }
         return { currentAction, false, QString::fromUtf8("AI 研判不可用,维持原裁决(fail-open)"), false };
+    }
 
     // 2) AI 判定恶意:灰区升格为 Block。
     if (aiRecommendation == VerdictAction::Block) {

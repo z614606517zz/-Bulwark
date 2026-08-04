@@ -149,6 +149,14 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::EventHistoryResponse:
         emit eventHistoryReceived(msg->payloadAs<EventHistoryResponsePayload>().events);
         break;
+    case IpcMessageType::AttackChainHitNotification:
+        // 攻击链命中即时通知。与 AttackChainResponse 分开:后者是「点开攻击链页面时的全量快照」,
+        // 这条是「刚刚命中了一次」的实时推送,用来弹右下角 toast。
+        emit attackChainHit(msg->payloadAs<AttackChainHitPayload>());
+        break;
+    case IpcMessageType::AttackChainResponse:
+        emit attackChainReceived(msg->payloadAs<AttackChainResponsePayload>());
+        break;
     case IpcMessageType::VtScanUpdate:
         emit vtScanUpdate(msg->payloadAs<bulwark::VtScanRecord>());
         break;
@@ -169,6 +177,14 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::SettingsResponse: {
         const auto s = msg->payloadAs<bulwark::RuntimeSettings>();
         m_ai->setConfig(s.aiBaseUrl, s.aiApiKey, s.aiModel); // keep the AI client in sync with settings
+        // 这三项与下面两项此前只在 RuntimeSettings 里被序列化、无人消费(静态特征提取用硬编码常量,
+        // 「额度守卫」功能根本不存在)。在这里一并同步,它们才真正生效。
+        StaticFeatureLimits lim;
+        lim.maxReadBytes   = static_cast<qint64>(s.aiScanBinarySampleLimitMb) * 1024 * 1024;
+        lim.scriptCapBytes = s.aiScanScriptTextLimitKb * 1024;
+        lim.maxStrings     = s.aiScanMaxStrings;
+        m_ai->setStaticLimits(lim);
+        m_ai->setCreditGuard(s.aiCreditGuardEnabled, s.aiMonthlyCreditBudget);
         emit settingsReceived(s);
         break;
     }
@@ -180,6 +196,9 @@ void IpcClient::dispatch(const QString& line)
         break;
     case IpcMessageType::PersistenceListResponse:
         emit persistenceReceived(msg->payloadAs<PersistenceListResponsePayload>());
+        break;
+    case IpcMessageType::PersistenceCleanupResponse:
+        emit persistenceCleanupDone(msg->payloadAs<PersistenceCleanupResultPayload>());
         break;
     case IpcMessageType::EventTimelineResponse:
         emit timelineReceived(msg->payloadAs<TimelineResponsePayload>());
@@ -291,6 +310,13 @@ void IpcClient::quarantineDelete(const QUuid& id)
     send(IpcMessage::from(IpcMessageType::QuarantineDelete, p));
 }
 
+void IpcClient::requestPersistenceCleanup(const bulwark::PersistenceEntry& entry)
+{
+    PersistenceCleanupRequestPayload p;
+    p.entry = entry;
+    send(IpcMessage::from(IpcMessageType::PersistenceCleanupRequest, p));
+}
+
 void IpcClient::requestPersistence()
 {
     send(IpcMessage::create(IpcMessageType::PersistenceListRequest, {}));
@@ -304,6 +330,16 @@ void IpcClient::requestEventHistory()
 void IpcClient::clearEventHistory()
 {
     send(IpcMessage::create(IpcMessageType::EventHistoryClearRequest, {}));
+}
+
+void IpcClient::requestAttackChain()
+{
+    send(IpcMessage::create(IpcMessageType::AttackChainRequest, {}));
+}
+
+void IpcClient::clearAttackChainHits()
+{
+    send(IpcMessage::create(IpcMessageType::AttackChainClearRequest, {}));
 }
 
 void IpcClient::manualQuarantine(const QString& path)

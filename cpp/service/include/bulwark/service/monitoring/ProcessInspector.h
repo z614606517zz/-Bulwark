@@ -55,6 +55,12 @@ public:
     static bool isCriticalProcess(int pid);
     // 强制结束进程(命中关键进程直接跳过);先确保 SeDebugPrivilege。
     static bool tryTerminateProcess(int pid);
+    // 等待 PID 真正退出,最多 msTimeout 毫秒。true = 已确认退出。
+    // 用于「结束进程之后如实确认是否真的死了」:结束是异步的,而且被别人持有句柄的僵尸进程
+    // 仍会留在进程快照里,所以不能用「PID 还在不在快照里」来判定。
+    // 打不开且错误为 ERROR_INVALID_PARAMETER(PID 不存在)视为已退出;其余打不开的情况
+    // 视为无法确认(返回 false),绝不把"看不见"说成"已清除"。
+    static bool waitForExit(int pid, int msTimeout = 0);
     // 结束进程及其所有后代(先叶后根;PID 复用防护;每个仍走关键进程安全门槛)。
     static int  terminateProcessTree(int rootPid);
     // 挂起 / 恢复进程的所有线程(VT 研判期间冻结可疑进程,防止研判窗口内造成破坏)。成功返回 true。

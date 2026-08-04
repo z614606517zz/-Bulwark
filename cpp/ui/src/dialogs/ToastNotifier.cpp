@@ -1,6 +1,7 @@
 #include "dialogs/ToastNotifier.h"
 #include "dialogs/ToastWindow.h"
 
+#include "bulwark/ipc/Payloads.h"
 #include "bulwark/models/Enums.h"
 #include "bulwark/models/SecurityEvent.h"
 
@@ -55,6 +56,60 @@ ToastNotifier::ToastNotifier(QObject* parent) : QObject(parent)
         if (m_suppressedBlocks > 0) // 期间又有积压:继续下一轮合并
             m_coalesceTimer->start();
     });
+}
+
+void ToastNotifier::showAttackChain(const bulwark::ipc::AttackChainHitPayload& hit)
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    // 去重键 = 主体路径 + 组合内容。同一程序反复命中【同一组合】在窗口期内只提示一次 ——
+    // 实测 kiro-account-manager\svchost.exe 三分钟内命中两次,逐条弹是纯噪音。
+    // 但换了组合(说明是新的行为链)仍会提示,不会被压掉。
+    // 与拦截那套键分开:拦截按「程序+行为+目标」,攻击链的目标每次可能不同、组合才是身份。
+    const QString key = QStringLiteral("chain|") + hit.actorPath + QLatin1Char('|')
+                      + hit.titles.join(QLatin1Char('+'));
+    auto it = m_recentBlockKeys.find(key);
+    if (it != m_recentBlockKeys.end() && now - it.value() < kChainDedupWindowMs) {
+        it.value() = now;
+        return;
+    }
+    m_recentBlockKeys.insert(key, now);
+    pruneRecentKeys(now);
+
+    QString program = QFileInfo(hit.actorPath).fileName();
+    if (program.isEmpty())
+        program = hit.actorPath.isEmpty() ? u("未知程序") : hit.actorPath;
+    if (hit.actorPid > 0)
+        program += QStringLiteral(" (PID %1)").arg(hit.actorPid);
+
+    // 处置如实写。dry-run 时明确标出「仅记录」,否则用户会以为已经处理了。
+    const QString act = hit.dryRun
+        ? u("仅记录")
+        : (hit.action == QLatin1String("Block") ? u("已拦截")
+         : hit.action == QLatin1String("Ask")   ? u("已询问")
+                                                : u("已放行"));
+
+    const QString gradeCn = hit.grade == QLatin1String("hard")   ? u("可直接拦断")
+                          : hit.grade == QLatin1String("strong") ? u("阻断或强提示")
+                                                                : u("弹窗询问");
+
+    QList<ToastField> fields;
+    fields << ToastField{u("程序"), program};
+    // 动作链是这条通知的主体信息 —— 它回答「凭什么定性」,而不只是「拦了谁」。
+    fields << ToastField{u("动作链"), hit.titles.join(u(" ＋ "))};
+    if (!hit.families.trimmed().isEmpty())
+        fields << ToastField{u("常见家族"), hit.families};
+
+    const QString subtitle = u("%1 个恶意样本作证 · 强度「%2」")
+                                 .arg(hit.support).arg(gradeCn);
+
+    // 存活期比拦截 toast 更长:动作链常有两三个动作名要读完。悬停会暂停倒计时(ToastWindow 已有)。
+    auto* t = new ToastWindow(ToastWindow::Kind::AttackChain, u("攻击链组合命中"), subtitle,
+                              QString(), fields, QStringList(), kChainLifetimeMs, nullptr, act);
+    connect(t, &ToastWindow::clicked, this, [this](ToastWindow*) {
+        emit attackChainToastClicked();
+    });
+    present(t, /*isBlock=*/false);
 }
 
 void ToastNotifier::showBlock(const SecurityEvent& e)

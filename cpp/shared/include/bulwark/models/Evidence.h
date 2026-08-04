@@ -3,13 +3,14 @@
 #include <QDateTime>
 #include <QJsonObject>
 #include "bulwark/models/Enums.h"
+#include "bulwark/Clock.h"
 
 namespace bulwark {
 
 // 证据链中的单条记录(对应 .NET Models/Evidence.cs)。把「哪个分析器、什么类别、
 // 加了多少分、说了什么」结构化下来,串成可解释的决策时间线。
 struct Evidence {
-    QDateTime timestampUtc = QDateTime::currentDateTimeUtc();
+    QDateTime timestampUtc = nowUtc();
     QString source;                       // 产生该证据的分析器/决策点
     EvidenceKind kind = EvidenceKind::Info;
     QString description;

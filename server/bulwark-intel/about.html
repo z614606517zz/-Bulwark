@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磐垒主动防御 Bulwark · 下载页面</title>
+<style>
+  :root{
+    --bg:#070a10; --bg2:#0b0f18; --panel:#0f1622; --panel2:#121b29;
+    --line:rgba(148,163,184,.14); --line2:rgba(148,163,184,.22);
+    --ink:#f1f5f9; --txt:#c3cede; --muted:#8b98ab; --dim:#5f6f83;
+    --brand:#34d399; --brand2:#22d3ee; --violet:#a78bfa;
+    --mal:#f87171; --susp:#fbbf24; --ok:#34d399;
+    --r0:#22d3ee; --r3:#a78bfa; --uiA:#34d399;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Cascadia Code",monospace;
+    --sh:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(0,0,0,.35);
+    --sh2:0 1px 0 rgba(255,255,255,.05) inset,0 18px 44px rgba(0,0,0,.5);
+    --nav-h:60px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;color:var(--txt);background:var(--bg);
+    font:15px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  body:before{content:"";position:fixed;inset:0;z-index:-2;background:
+    radial-gradient(1000px 520px at 8% -8%,rgba(52,211,153,.16),transparent 60%),
+    radial-gradient(920px 480px at 96% -4%,rgba(34,211,238,.14),transparent 62%),
+    radial-gradient(800px 700px at 50% 120%,rgba(167,139,250,.10),transparent 60%),
+    var(--bg)}
+  body:after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+    background-image:linear-gradient(rgba(148,163,184,.05) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(148,163,184,.05) 1px,transparent 1px);
+    background-size:46px 46px;mask-image:radial-gradient(circle at 50% 0,#000,transparent 78%)}
+  a{color:var(--brand2);text-decoration:none}
+  a:hover{color:#67e8f9;text-decoration:underline}
+  b{color:var(--ink)}
+  code{font:12.6px var(--mono);background:rgba(148,163,184,.12);border:1px solid var(--line);
+    padding:1.5px 6px;border-radius:6px;color:#7dd3fc}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 22px 84px}
+
+  /* ============ NAV ============ */
+  nav{position:sticky;top:0;z-index:50;height:var(--nav-h);
+    background:rgba(7,10,16,.72);backdrop-filter:saturate(160%) blur(14px);
+    -webkit-backdrop-filter:saturate(160%) blur(14px);
+    border-bottom:1px solid transparent;transition:border-color .25s,background .25s}
+  nav.stuck{border-bottom-color:var(--line);background:rgba(7,10,16,.86)}
+  .nav-in{max-width:1120px;margin:0 auto;height:100%;padding:0 20px;
+    display:flex;align-items:center;gap:16px}
+  .brand{display:inline-flex;align-items:center;gap:10px;font-weight:800;color:var(--ink);
+    letter-spacing:.2px;white-space:nowrap;flex:none}
+  .brand:hover{text-decoration:none}
+  .brand .mk{width:26px;height:26px;filter:drop-shadow(0 2px 6px rgba(52,211,153,.4))}
+  .brand small{font:600 11px/1 var(--mono);color:var(--brand);letter-spacing:1px;opacity:.85}
+  .nav-links{display:flex;align-items:center;gap:2px;overflow-x:auto;flex:1;
+    scrollbar-width:none;-ms-overflow-style:none;mask-image:linear-gradient(90deg,transparent,#000 14px,#000 calc(100% - 14px),transparent)}
+  .nav-links::-webkit-scrollbar{display:none}
+  .nav-links a{color:var(--muted);font-size:13px;font-weight:600;padding:7px 11px;border-radius:8px;
+    white-space:nowrap;transition:.15s}
+  .nav-links a:hover{color:var(--ink);background:rgba(148,163,184,.1);text-decoration:none}
+  .nav-links a.active{color:var(--brand);background:rgba(52,211,153,.12)}
+  .nav-cta{display:flex;align-items:center;gap:8px;flex:none}
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;
+    border-radius:9px;color:var(--txt);border:1px solid var(--line);background:rgba(148,163,184,.06);transition:.15s}
+  .icon-btn:hover{color:var(--ink);border-color:var(--line2);text-decoration:none;transform:translateY(-1px)}
+  .dl-btn{display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:10px;
+    font-size:13.5px;font-weight:700;color:#05221a;white-space:nowrap;
+    background:linear-gradient(135deg,var(--brand),var(--brand2));
+    box-shadow:0 6px 18px rgba(52,211,153,.28);transition:.15s}
+  .dl-btn:hover{color:#05221a;text-decoration:none;transform:translateY(-1px);
+    box-shadow:0 10px 26px rgba(52,211,153,.4)}
+  @media (max-width:720px){ .dl-btn span{display:none} .dl-btn{padding:8px 11px} }
+
+  /* ============ HERO ============ */
+  .hero{position:relative;overflow:hidden;padding:66px 22px 108px}
+  .hero .in{max-width:1120px;margin:0 auto;position:relative;z-index:2}
+  .hero .emblem{position:absolute;right:-40px;top:-10px;width:400px;height:400px;opacity:.14;
+    z-index:1;pointer-events:none;filter:drop-shadow(0 0 40px rgba(52,211,153,.5))}
+  @media (max-width:900px){ .hero .emblem{opacity:.07;right:-90px} }
+  .badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;
+    font:700 12px/1 var(--mono);letter-spacing:.6px;color:var(--brand);
+    background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.28)}
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--brand);
+    box-shadow:0 0 0 4px rgba(52,211,153,.18);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  h1{margin:20px 0 8px;font-size:44px;line-height:1.14;letter-spacing:-1px;color:var(--ink);font-weight:800}
+  h1 .g{background:linear-gradient(120deg,var(--brand),var(--brand2) 60%,var(--violet));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  h1 small{display:block;font-size:16.5px;font-weight:600;color:var(--muted);margin-top:12px;letter-spacing:0}
+  .lead{max-width:720px;font-size:16.5px;color:var(--txt);margin:18px 0 0}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px;align-items:center}
+  .flow span{background:rgba(148,163,184,.08);border:1px solid var(--line);color:var(--txt);
+    padding:8px 14px;border-radius:10px;font-size:13.5px;font-weight:600}
+  .flow i{color:var(--brand);font-style:normal;font-weight:800}
+  .btns{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}
+  .ab{display:inline-flex;align-items:center;gap:9px;padding:12px 20px;border-radius:12px;
+    font-size:14.5px;font-weight:700;transition:.16s;border:1px solid transparent}
+  .ab:hover{text-decoration:none;transform:translateY(-2px)}
+  .ab.pri{color:#05221a;background:linear-gradient(135deg,var(--brand),var(--brand2));
+    box-shadow:0 10px 26px rgba(52,211,153,.34)}
+  .ab.pri:hover{color:#05221a;box-shadow:0 14px 34px rgba(52,211,153,.46)}
+  .ab.sec{background:rgba(148,163,184,.07);color:var(--ink);border-color:var(--line2)}
+  .ab.sec:hover{background:rgba(148,163,184,.13);color:var(--ink)}
+  .ab svg{flex:none}
+
+  /* ============ STAT STRIP ============ */
+  .strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:14px;
+    margin:-70px 0 40px;position:relative;z-index:5}
+  .stat{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:16px;padding:18px 20px;box-shadow:var(--sh);position:relative;overflow:hidden}
+  .stat:before{content:"";position:absolute;left:0;top:0;height:3px;width:100%;
+    background:linear-gradient(90deg,var(--brand),var(--brand2))}
+  .stat b{display:block;font-size:26px;font-weight:800;letter-spacing:-.5px;
+    background:linear-gradient(120deg,var(--brand),var(--brand2));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .stat span{font-size:12.5px;color:var(--muted);display:block;margin-top:4px}
+
+  /* ============ SECTION ============ */
+  section{margin:56px 0 0;scroll-margin-top:calc(var(--nav-h) + 18px)}
+  .sec-head{margin-bottom:20px}
+  .kicker{font:700 11.5px/1 var(--mono);letter-spacing:2px;color:var(--brand);text-transform:uppercase}
+  .sec-title{display:flex;align-items:center;gap:12px;margin:11px 0 0}
+  .sec-title .ic{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;
+    border-radius:11px;font-size:19px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.24)}
+  h2{font-size:23px;margin:0;color:var(--ink);letter-spacing:-.3px;font-weight:800}
+  .sub{color:var(--muted);font-size:14.5px;margin:12px 0 0;max-width:860px}
+
+  /* ============ CARDS ============ */
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:16px;padding:22px;box-shadow:var(--sh)}
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(248px,1fr))}
+  .card h3{margin:0 0 12px;font-size:15.5px;color:var(--ink);font-weight:700}
+
+  .layer{position:relative;padding-left:22px}
+  .layer:before{content:"";position:absolute;left:0;top:2px;bottom:2px;width:4px;border-radius:4px;background:var(--line2)}
+  .layer.r0:before{background:linear-gradient(180deg,var(--r0),transparent)}
+  .layer.r3:before{background:linear-gradient(180deg,var(--r3),transparent)}
+  .layer.ui:before{background:linear-gradient(180deg,var(--uiA),transparent)}
+  .layer h3{display:flex;align-items:center;gap:9px}
+  .tag{font:700 11px/1 var(--mono);padding:4px 8px;border-radius:6px;background:rgba(148,163,184,.1);
+    border:1px solid var(--line);color:var(--muted);letter-spacing:.3px}
+  .layer.r0 .tag{color:var(--r0);border-color:rgba(34,211,238,.3);background:rgba(34,211,238,.08)}
+  .layer.r3 .tag{color:var(--r3);border-color:rgba(167,139,250,.3);background:rgba(167,139,250,.08)}
+  .layer.ui .tag{color:var(--uiA);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.08)}
+  .layer p{margin:0;font-size:13.8px;color:var(--muted)}
+
+  /* ============ PIPELINE ============ */
+  ol.pipe{list-style:none;counter-reset:p;margin:2px 0 0;padding:0;position:relative}
+  ol.pipe:before{content:"";position:absolute;left:13px;top:8px;bottom:24px;width:2px;
+    background:linear-gradient(180deg,var(--brand),var(--brand2),var(--violet))}
+  ol.pipe li{counter-increment:p;position:relative;padding:12px 0 12px 46px;
+    border-bottom:1px dashed var(--line);display:flex;flex-wrap:wrap;align-items:baseline;gap:2px}
+  ol.pipe li:last-child{border-bottom:none}
+  ol.pipe li:before{content:counter(p);position:absolute;left:0;top:11px;width:28px;height:28px;
+    border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#05221a;
+    font:800 12.5px/28px var(--mono);text-align:center;box-shadow:0 4px 12px rgba(52,211,153,.3)}
+  ol.pipe b{color:var(--ink)}
+  ol.pipe em{font-style:normal;color:var(--muted);font-size:13.6px}
+  .hit{display:inline-block;font:700 11px/1 var(--mono);padding:4px 8px;border-radius:6px;margin-left:7px}
+  .hit.b{background:rgba(248,113,113,.14);color:var(--mal);border:1px solid rgba(248,113,113,.3)}
+  .hit.a{background:rgba(251,191,36,.14);color:var(--susp);border:1px solid rgba(251,191,36,.3)}
+  .hit.p{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+
+  ul.list{margin:0;padding-left:20px}
+  ul.list li{margin:7px 0;font-size:14px}
+  ul.list li::marker{color:var(--brand)}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:14px}
+  .chip{font:600 12px/1 var(--mono);padding:7px 10px;border-radius:8px;background:rgba(148,163,184,.08);
+    border:1px solid var(--line);color:var(--txt)}
+
+  /* ============ TABLE ============ */
+  .table-wrap{overflow-x:auto;border-radius:14px;border:1px solid var(--line);background:var(--panel)}
+  table{width:100%;border-collapse:collapse;font-size:13.8px;min-width:600px}
+  th,td{text-align:left;padding:12px 15px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  thead th,table tr:first-child th{font:700 11.5px/1.3 var(--mono);color:var(--brand);
+    text-transform:uppercase;letter-spacing:.6px;background:rgba(52,211,153,.05)}
+  tbody tr:hover td,table tr:hover td{background:rgba(148,163,184,.05)}
+  td b{color:var(--ink)}
+
+  /* ============ NOTES ============ */
+  .note{border-radius:12px;padding:14px 16px;font-size:13.8px;line-height:1.68;margin-top:16px;
+    display:flex;gap:11px;align-items:flex-start}
+  .note .em{flex:none;font-size:15px;line-height:1.5}
+  .note.warn{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.28);color:#f7d488}
+  .note.warn b{color:#fde9b8}
+  .note.info{background:rgba(34,211,238,.07);border:1px solid rgba(34,211,238,.26);color:#a5e9f5}
+  .note.info b{color:#d4f6fc}
+  .note.good{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.26);color:#a7eccf}
+  .note.good b{color:#d6f7e8}
+
+  /* ============ TERMINAL / TREE ============ */
+  .term{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#0a0f18;box-shadow:var(--sh)}
+  .term-bar{display:flex;align-items:center;gap:8px;padding:11px 15px;border-bottom:1px solid var(--line);
+    background:rgba(148,163,184,.05)}
+  .term-bar .d{width:11px;height:11px;border-radius:50%;background:#3a4658}
+  .term-bar .d.r{background:#f87171}.term-bar .d.y{background:#fbbf24}.term-bar .d.g{background:#34d399}
+  .term-bar .fn{margin-left:8px;font:12px var(--mono);color:var(--dim)}
+  .term pre,pre.cmd{margin:0;font:12.8px/1.9 var(--mono);white-space:pre;overflow-x:auto;color:var(--txt);padding:16px 18px}
+  pre.cmd{background:#0a0f18;border:1px solid var(--line);border-radius:12px;margin-top:16px}
+  pre .c{color:var(--dim)}
+  .tree-c{color:var(--brand2)}
+
+  .repo{display:flex;flex-wrap:wrap;align-items:center;gap:14px;justify-content:space-between}
+  .repo .u{font:13.5px var(--mono);color:var(--brand2);word-break:break-all}
+
+  /* ============ FOOTER ============ */
+  footer{margin-top:60px;padding-top:24px;border-top:1px solid var(--line);
+    color:var(--dim);font-size:12.8px;display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between}
+
+  .totop{position:fixed;right:20px;bottom:20px;width:46px;height:46px;border-radius:13px;z-index:40;
+    display:inline-flex;align-items:center;justify-content:center;color:#05221a;
+    background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 10px 26px rgba(52,211,153,.4);
+    opacity:0;transform:translateY(14px) scale(.9);pointer-events:none;transition:.22s}
+  .totop.show{opacity:1;transform:none;pointer-events:auto}
+  .totop:hover{text-decoration:none;transform:translateY(-2px)}
+
+  /* ============ MOTION ============ */
+  @keyframes rvup{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+  .rv{opacity:0}
+  .rv.in{animation:rvup .55s cubic-bezier(.22,.7,.25,1) both}
+  .card,.stat{transition:box-shadow .2s,transform .2s,border-color .2s}
+  .card:hover,.stat:hover{box-shadow:var(--sh2);transform:translateY(-2px);border-color:var(--line2)}
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .rv{opacity:1;animation:none}
+    .card:hover,.stat:hover,.totop{transform:none}
+    .badge .dot{animation:none}
+  }
+  @media (max-width:640px){ h1{font-size:32px} .hero{padding:44px 18px 96px} .sec-title .ic{width:34px;height:34px} }
+</style>
+</head>
+<body id="top">
+
+<nav id="nav">
+  <div class="nav-in">
+    <a href="/" class="brand" title="返回主页">
+      <svg class="mk" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+        <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" fill="url(#bg1)" opacity=".22"/>
+        <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" stroke="url(#bg1)" stroke-width="1.6"/>
+        <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#34d399" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      磐垒 <small>BULWARK</small>
+    </a>
+    <div class="nav-links" id="navlinks">
+      <a href="#get">获取</a>
+      <a href="#keys">密钥</a>
+      <a href="#arch">架构</a>
+      <a href="#sources">事件源</a>
+      <a href="#pipeline">决策</a>
+      <a href="#detect">检测</a>
+      <a href="#cloud">云与AI</a>
+      <a href="#response">处置</a>
+      <a href="#principles">原则</a>
+      <a href="#structure">结构</a>
+      <a href="#security">安全</a>
+    </div>
+    <div class="nav-cta">
+      <a class="icon-btn" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer" title="GitHub 开源仓库" aria-label="GitHub">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.23.41-2.81-.54-2.99-1.04-.1-.26-.54-1.04-.92-1.25-.31-.17-.76-.58-.01-.59.7-.01 1.2.64 1.37.91.8 1.35 2.08.97 2.59.74.08-.58.31-.98.57-1.2-1.99-.23-3.26-.99-3.26-4.4 0-.97.35-1.77.92-2.39-.09-.23-.4-1.14.09-2.37 0 0 .75-.24 2.46.91a6.5 6.5 0 0 1 1.68-.23c.57 0 1.14.08 1.68.23 1.71-1.16 2.46-.91 2.46-.91.49 1.23.18 2.14.09 2.37.57.62.92 1.42.92 2.39 0 3.42-1.28 4.17-3.27 4.4.33.28.62.83.62 1.68 0 1.21-.01 2.19-.01 2.49 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      </a>
+      <a class="dl-btn" href="/download">⬇ <span>下载完整版</span></a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <svg class="emblem" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" stroke="#34d399" stroke-width=".7"/>
+    <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#22d3ee" stroke-width=".9" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <div class="in">
+    <span class="badge"><span class="dot"></span>HOST INTRUSION PREVENTION SYSTEM · WINDOWS</span>
+    <h1>磐垒主动防御 <span class="g">Bulwark</span>
+      <small>一个 Windows 主机入侵防御(HIPS)软件,与杀软 / EDR 同类</small></h1>
+    <p class="lead">核心思路很直接:监控系统敏感行为,交给规则引擎决策,灰区行为弹窗让用户裁决。
+      只对<b>真正危险的行为</b>动手,尽量不打扰。</p>
+    <div class="flow">
+      <span>监控敏感行为</span><i>→</i>
+      <span>规则引擎决策</span><i>→</i>
+      <span>灰区弹窗裁决</span><i>→</i>
+      <span>允许 / 阻止 / 记住</span>
+    </div>
+    <div class="btns">
+      <a class="ab pri" href="/download">⬇ 下载打包完整版</a>
+      <a class="ab sec" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">
+        <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.23.41-2.81-.54-2.99-1.04-.1-.26-.54-1.04-.92-1.25-.31-.17-.76-.58-.01-.59.7-.01 1.2.64 1.37.91.8 1.35 2.08.97 2.59.74.08-.58.31-.98.57-1.2-1.99-.23-3.26-.99-3.26-4.4 0-.97.35-1.77.92-2.39-.09-.23-.4-1.14.09-2.37 0 0 .75-.24 2.46.91a6.5 6.5 0 0 1 1.68-.23c.57 0 1.14.08 1.68.23 1.71-1.16 2.46-.91 2.46-.91.49 1.23.18 2.14.09 2.37.57.62.92 1.42.92 2.39 0 3.42-1.28 4.17-3.27 4.4.33.28.62.83.62 1.68 0 1.21-.01 2.19-.01 2.49 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub 开源仓库
+      </a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="strip">
+    <div class="stat rv"><b>3 层</b><span>内核驱动 / 用户态服务 / Qt 桌面 UI</span></div>
+    <div class="stat rv"><b>6 维</b><span>进程 · 文件 · 注册表 · 网络 · 映像 · 线程</span></div>
+    <div class="stat rv"><b>11 步</b><span>RuleEngine 决策流水线</span></div>
+    <div class="stat rv"><b>6 源</b><span>多引擎哈希信誉聚合</span></div>
+    <div class="stat rv"><b>C++20</b><span>Qt6 / CMake / WDK</span></div>
+  </div>
+
+  <section id="get">
+    <div class="sec-head rv">
+      <span class="kicker">Download &amp; Source</span>
+      <div class="sec-title"><span class="ic">📦</span><h2>开源仓库与获取</h2></div>
+      <p class="sub">本项目完全开源。源码、构建脚本与发布产物都在 GitHub 上。</p>
+    </div>
+    <div class="card rv">
+      <div class="repo">
+        <div>
+          <div style="font-weight:700;color:var(--ink);font-size:15px;margin-bottom:4px">z614606517zz / -Bulwark</div>
+          <a class="u" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">https://github.com/z614606517zz/-Bulwark</a>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <a class="ab sec" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">
+            <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.23.41-2.81-.54-2.99-1.04-.1-.26-.54-1.04-.92-1.25-.31-.17-.76-.58-.01-.59.7-.01 1.2.64 1.37.91.8 1.35 2.08.97 2.59.74.08-.58.31-.98.57-1.2-1.99-.23-3.26-.99-3.26-4.4 0-.97.35-1.77.92-2.39-.09-.23-.4-1.14.09-2.37 0 0 .75-.24 2.46.91a6.5 6.5 0 0 1 1.68-.23c.57 0 1.14.08 1.68.23 1.71-1.16 2.46-.91 2.46-.91.49 1.23.18 2.14.09 2.37.57.62.92 1.42.92 2.39 0 3.42-1.28 4.17-3.27 4.4.33.28.62.83.62 1.68 0 1.21-.01 2.19-.01 2.49 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+            浏览源码
+          </a>
+          <a class="ab pri" href="/download">⬇ 下载打包完整版</a>
+        </div>
+      </div>
+      <pre class="cmd"><span class="c"># 克隆仓库</span>
+git clone https://github.com/z614606517zz/-Bulwark.git
+
+<span class="c"># 构建用户态(R3 + UI),顶层 CMake 为 cpp/CMakeLists.txt</span>
+cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release</pre>
+      <div class="note good"><span class="em">🔑</span><div>点「<b>下载打包完整版</b>」即可获取打包好的构建产物(服务 + UI + 驱动 + Qt6 运行时)。
+        压缩包已加密,<b>解压密码:<code style="font-size:15px">123</code></b>。</div></div>
+    </div>
+  </section>
+
+  <section id="keys">
+    <div class="sec-head rv">
+      <span class="kicker">Optional · API Keys</span>
+      <div class="sec-title"><span class="ic">🔑</span><h2>情报源与 AI 密钥获取</h2></div>
+      <p class="sub">全部<b>可选</b>。默认关闭,不填任何 Key 也能正常跑本地启发式 + 行为检测 ——
+        云信誉、情报 feed、AI 研判都只是锦上添花。绝大多数源都有免费额度。</p>
+    </div>
+    <div class="table-wrap rv">
+      <table>
+        <thead><tr>
+          <th style="width:190px">情报 / AI 源</th>
+          <th>用途</th>
+          <th style="width:230px">申请地址</th>
+          <th style="width:210px">获取方式</th>
+        </tr></thead>
+        <tbody>
+        <tr><td><b>VirusTotal</b></td><td>哈希信誉旗舰(70+ 引擎)+ 整文件上传扫描</td>
+          <td><a href="https://www.virustotal.com/" target="_blank" rel="noopener noreferrer">virustotal.com</a></td>
+          <td>注册后在 头像 → API Key;免费公开额度</td></tr>
+        <tr><td><b>微步 ThreatBook</b></td><td>哈希信誉 + 网络 IP 信誉</td>
+          <td><a href="https://x.threatbook.com/" target="_blank" rel="noopener noreferrer">x.threatbook.com</a></td>
+          <td>社区版注册后在个人中心;IP 信誉月配额较低</td></tr>
+        <tr><td><b>MalwareBazaar / ThreatFox</b><br><span style="color:var(--dim);font-size:12.5px">abuse.ch</span></td>
+          <td>恶意样本哈希查询 + 情报 feed 自动生成规则</td>
+          <td><a href="https://auth.abuse.ch/" target="_blank" rel="noopener noreferrer">auth.abuse.ch</a></td>
+          <td>免费注册一个 Auth-Key,两者共用</td></tr>
+        <tr><td><b>AlienVault OTX</b></td><td>社区威胁情报(pulse)</td>
+          <td><a href="https://otx.alienvault.com/" target="_blank" rel="noopener noreferrer">otx.alienvault.com</a></td>
+          <td>注册后在 Settings → API;免费</td></tr>
+        <tr><td><b>MetaDefender Cloud</b><br><span style="color:var(--dim);font-size:12.5px">OPSWAT</span></td>
+          <td>多引擎哈希信誉</td>
+          <td><a href="https://metadefender.opswat.com/" target="_blank" rel="noopener noreferrer">metadefender.opswat.com</a></td>
+          <td>注册后在账户页;有免费额度</td></tr>
+        <tr><td><b>Hybrid Analysis</b></td><td>沙箱信誉 + 行为画像</td>
+          <td><a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener noreferrer">hybrid-analysis.com</a></td>
+          <td>注册后在 Profile → API key;免费</td></tr>
+        <tr><td><b>小米 MiMo 大模型</b></td><td>AI 行为研判 + 自然语言生成规则</td>
+          <td><a href="https://mimo.mi.com/" target="_blank" rel="noopener noreferrer">mimo.mi.com</a></td>
+          <td>小米账号登录,控制台 → API Keys</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card rv">
+        <h3>填 Key 的三种方式</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">优先级:环境变量 &gt; 配置文件。</p>
+        <ul class="list">
+          <li><b>UI 设置页</b>逐项填写 —— 最方便,即时生效</li>
+          <li><b>环境变量</b> —— 服务以 SYSTEM 身份运行时需设为<b>系统级</b>,否则读不到用户级变量</li>
+          <li>本机 <code>appsettings.json</code> 对应字段 —— 注意别把带真实 Key 的配置提交上库</li>
+        </ul>
+        <div class="chips">
+          <span class="chip">BULWARK_VT_APIKEY</span>
+          <span class="chip">BULWARK_THREATBOOK_APIKEY</span>
+          <span class="chip">BULWARK_MB_AUTHKEY</span>
+          <span class="chip">BULWARK_OTX_APIKEY</span>
+          <span class="chip">BULWARK_MDC_APIKEY</span>
+          <span class="chip">BULWARK_HA_APIKEY</span>
+          <span class="chip">BULWARK_AI_APIKEY</span>
+        </div>
+      </div>
+      <div class="card rv">
+        <h3>VirusTotal 多 Key 与提额</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">VT 支持一次配多个 Key,用英文逗号分隔。
+          每个 Key 独立计账、额度叠加;某个 Key 触发限流(429)或失效(401)会自动冷却并跳到下一个。
+          还可按 <code>KEY:每日上限:每分钟上限</code> 标注,便于混用免费与 Premium。</p>
+        <div class="note warn"><span class="em">⚠</span><div>VT 服务条款<b>禁止注册多个免费账号绕过限额</b>,公开 API 也不得用于商业产品。
+          多 Key 主要面向 Premium / 企业 Key 或你合法拥有的独立 Key;要长期高频使用请走 VT Premium API。</div></div>
+      </div>
+    </div>
+
+    <div class="note good rv"><span class="em">🔐</span><div><b>密钥只留在本机。</b>
+      你填的 Key 只保存在 <code>%ProgramData%\Bulwark\settings.json</code> 或环境变量,绝不写入源码、绝不上传、绝不进版本库。开源仓库里各 Key 字段一律为空。</div></div>
+  </section>
+
+  <section id="arch">
+    <div class="sec-head rv">
+      <span class="kicker">Architecture</span>
+      <div class="sec-title"><span class="ic">🏗</span><h2>三层协作架构</h2></div>
+      <p class="sub">驱动 ↔ 服务经 Filter Manager 通信端口对话,服务 ↔ UI 经命名管道对话。
+        无论事件来自哪个事件源,统一由一个 <code>RuleEngine</code> 作决策中心。</p>
+    </div>
+    <div class="grid g3">
+      <div class="card layer r0 rv">
+        <h3>内核态驱动 <span class="tag">R0</span></h3>
+        <p>Minifilter 驱动 <code>Bulwark.sys</code>,做「行为发生前」原地拦截:硬拦名单、受保护项、
+          网络黑名单、自我保护。六个监控维度分别由
+          <code>ProcessMonitor</code> <code>FileMonitor</code> <code>RegistryMonitor</code>
+          <code>NetMonitor</code> <code>ImageMonitor</code> <code>ThreadMonitor</code> 实现,
+          <code>SelfProtect</code> 负责自保,<code>Comms</code> 负责与服务通信。</p>
+      </div>
+      <div class="card layer r3 rv">
+        <h3>用户态服务 <span class="tag">R3</span></h3>
+        <p><code>bulwark_service.exe</code> 承载全部决策与处置逻辑:<code>Worker</code> 主防御循环
+          (事件 → 富化 → 引擎 → 裁决 → 处置),<code>EventSourceCoordinator</code> 合并
+          ETW、用户态持续行为源与热切换的内核源;隔离区、足迹清理、持久化存储、SCM 集成都在这一层。</p>
+      </div>
+      <div class="card layer ui rv">
+        <h3>桌面 UI <span class="tag">Qt Widgets</span></h3>
+        <p><code>bulwark_ui.exe</code>,10 个功能页:仪表盘、拦截记录、活动日志、防护规则、信任名单、
+          隔离区、自启动项、云信誉、AI 研判、设置。另有行为弹窗、角标通知、扫描进度、
+          清理报告与攻击时间线等对话框。</p>
+      </div>
+    </div>
+    <div class="note warn rv"><span class="em">⚠</span><div><b>项目状态如实说明:</b>
+      内核驱动尚未在真实内核里做过端到端验证。<code>Bulwark.sys</code> 必须在带快照的测试虚拟机里
+      开启测试签名并加载,才能真正启用「行为发生前」内核拦截;内核回调出错可能蓝屏。
+      默认发布产物跑的是 <b>ETW 用户态观测链路</b>,用户态(R3 + UI)可直接编译运行。</div></div>
+  </section>
+
+  <section id="sources">
+    <div class="sec-head rv">
+      <span class="kicker">Event Sources</span>
+      <div class="sec-title"><span class="ic">🔀</span><h2>两种可切换的事件源</h2></div>
+      <p class="sub">由 <code>appsettings.json</code> 的 <code>EventSource</code> 决定。无论选哪种,决策与 UI 完全一致。</p>
+    </div>
+    <div class="table-wrap rv">
+      <table>
+        <thead><tr><th style="width:120px">事件源</th><th>能力</th><th style="width:230px">拦截方式</th></tr></thead>
+        <tbody>
+        <tr><td><code>Driver</code></td>
+          <td>加载内核驱动 + ETW 观测。内核对硬拦名单、受保护项、网络黑名单、自我保护做「行为前」原地拦截。</td>
+          <td>真正的事前阻断;进程创建走「遥测 + 启动后结束」补偿模型</td></tr>
+        <tr><td><code>Wmi</code></td>
+          <td>仅 ETW 用户态观测(取值名沿用历史命名,实际是 ETW)。</td>
+          <td>无法事前拦截,由「事后结束作恶进程树」补偿</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note info rv"><span class="em">ℹ</span><div>无论哪种事件源,用户态都始终并行一个
+      <b>持续行为源</b>(自启动持久化监视 + 勒索诱饵),弥补程序运行「之后」的事后盲区。</div></div>
+  </section>
+
+  <section id="pipeline">
+    <div class="sec-head rv">
+      <span class="kicker">Decision Pipeline</span>
+      <div class="sec-title"><span class="ic">⚖️</span><h2>决策流水线 RuleEngine</h2></div>
+      <p class="sub">每个事件进入 <code>RuleEngine::evaluate</code> 后按固定优先级走一条流水线,命中即返回
+        —— 而不是简单的三选一。</p>
+    </div>
+    <div class="card rv">
+      <ol class="pipe">
+        <li><b>无条件放行</b><em> —— 本软件自身组件;用户明确信任的文件 / 文件夹(信任 = 完全跳过后续一切检测)</em><span class="hit p">Allow</span></li>
+        <li><b>已安装的知名安全软件</b><em> —— 共存放行,避免互相残杀</em><span class="hit p">Allow</span></li>
+        <li><b>威胁研判</b><em> —— <code>ThreatDetector</code> 计算风险分并置位「硬恶意指标」</em></li>
+        <li><b>有状态时序检测</b><em> —— 勒索行为、C2 信标、DGA 域名、外联速率;触碰蜜罐诱饵直接阻止</em><span class="hit b">Block</span></li>
+        <li><b>行为基线偏离</b><em>(可开关) —— 显著偏离程序自身历史画像时产出软信号,须与硬指标互证才升格</em></li>
+        <li><b>显式规则</b><em> —— 按「层级 &gt; 具体度 &gt; 动作强度 &gt; 最近创建」排序命中</em></li>
+        <li><b>强可信主体</b><em> —— 证书指纹白名单,或微软签名 + 系统目录,且签名健康、无危险行为</em><span class="hit p">Allow</span></li>
+        <li><b>签名异常</b><em> —— 证书被吊销 / 用过期证书签名</em><span class="hit b">Block</span></li>
+        <li><b>健康签名</b><em> —— 排除硬指标与「空壳新证书」画像后放行</em><span class="hit p">Allow</span></li>
+        <li><b>仅当存在硬恶意指标才处置</b><em> —— 风险分 ≥ 高危阈值则阻止,否则弹窗询问</em><span class="hit b">Block</span><span class="hit a">Ask</span></li>
+        <li><b>无硬指标 → 一律放行</b><em> —— 仅记录。软信号绝不单独定罪</em><span class="hit p">Allow</span></li>
+      </ol>
+      <div class="note good"><span class="em">✓</span><div>裁决完成后自动追加「最终裁决」证据,
+        并由 <code>AttackAnnotator</code> 统一标注 MITRE ATT&amp;CK 技战术。裁决动作为
+        <b>Allow / Block / Ask</b>,来源标记为:命中规则 / 行为研判 / 可信放行 / 用户裁决 / 超时默认 / 默认策略。</div></div>
+    </div>
+  </section>
+
+  <section id="detect">
+    <div class="sec-head rv">
+      <span class="kicker">Detection</span>
+      <div class="sec-title"><span class="ic">🔬</span><h2>检测能力</h2></div>
+      <p class="sub">威胁研判中心 <code>ThreatDetector</code> 汇总内置启发式并调度多个专项分析器,
+        每条命中都写入结构化证据(硬指标 / 软信号 / 互证 / 信任 / 规则 / 信息)。</p>
+    </div>
+    <div class="grid g2">
+      <div class="card rv">
+        <h3>内置启发式</h3>
+        <ul class="list">
+          <li>签名校验失配、证书被吊销、过期证书签名</li>
+          <li>首见 + 空壳新证书画像</li>
+          <li>超大未签名文件(文件膨胀规避扫描)</li>
+          <li>可疑目录运行:Temp / Public / ProgramData / Downloads / Roaming / Desktop</li>
+          <li>Windows 非标准子目录伪装</li>
+          <li><b>异常父子链</b>:Office / 浏览器派生 LOLBin(疑似宏病毒、钓鱼)</li>
+          <li><b>进程伪装</b>:系统进程名出现在合法目录之外(T1036.005)</li>
+          <li><b>形近仿冒</b>:<code>svch0st</code> / <code>1sass</code> / 西里尔字母(编辑距离 ≤ 1)</li>
+          <li>双重扩展名(T1036.007)、NTFS 备用数据流执行(T1564.004)</li>
+          <li>覆盖大量 ATT&amp;CK 技战术的命令行特征表</li>
+        </ul>
+        <div class="chips">
+          <span class="chip">-enc 编码命令</span><span class="chip">DownloadString</span>
+          <span class="chip">IEX 动态执行</span><span class="chip">mimikatz / sekurlsa</span>
+          <span class="chip">comsvcs.dll</span><span class="chip">vssadmin delete</span>
+        </div>
+      </div>
+      <div class="card rv">
+        <h3>专项分析器</h3>
+        <ul class="list">
+          <li><b>LOLBins 白利用</b> —— regsvr32 / rundll32 / mshta / certutil / bitsadmin / msbuild / wmic /
+            comsvcs 被「二进制 + 特征参数」滥用(Squiblydoo、远程 HTA、certutil 下载、
+            comsvcs 转储 LSASS)。高置信滥用作硬指标,并<b>让签名信任豁免失效</b> —— 签名可信 ≠ 行为可信。</li>
+          <li><b>凭据访问</b> —— LSASS 转储 / 注入、SAM / SECURITY 蜂巢导出、NTDS.dit 提取、
+            浏览器凭据库 / DPAPI 读取</li>
+          <li><b>防御规避</b> —— 篡改 Defender、AMSI / ETW 致盲、清空事件日志、关防火墙 / UAC</li>
+          <li><b>远控 / RMM 滥用</b> —— RDP 劫持、反弹 shell,及即时通讯群控注入 / 侧载</li>
+          <li><b>进程注入 / DLL 侧载</b> —— 跨进程远程线程、可写目录加载未签名模块</li>
+          <li><b>命令行混淆</b>(无特征码) —— 香农熵、符号占比、超长 Base64 块的统计研判</li>
+          <li><b>脚本内容静态分析</b> —— PowerShell / VBS / JS / Batch 脚本体</li>
+          <li><b>杀伤链阶段分析</b> —— 同一进程树覆盖 ≥3 个 ATT&amp;CK 阶段才计分</li>
+        </ul>
+      </div>
+      <div class="card rv">
+        <h3>有状态时序监视器</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">按 PID / 序列维护滑动窗口,线程安全。</p>
+        <ul class="list">
+          <li><b>勒索行为</b> —— 批量改写速率、扩展名同化、勒索信写入、蜜罐诱饵触碰(命中即阻止)</li>
+          <li><b>C2 信标</b> —— 按 (PID | 远端) 记录外联时序,用周期性与抖动(变异系数)识别回连</li>
+          <li><b>外联速率 / 扇出</b> —— 速率突发与目标扇出,软信号需互证</li>
+          <li><b>DGA 域名</b> —— 只看字符串统计特征(熵 / 元音比 / 连续辅音 / 数字交错),无黑名单</li>
+          <li><b>行为基线</b> —— 为每个程序建立子进程 / 外联 / 写目录画像,带学习期,可导入导出快照</li>
+          <li><b>进程链关联</b> —— 串起孤立事件,识别 dropper,支持整树足迹清理</li>
+        </ul>
+      </div>
+      <div class="card rv">
+        <h3>信任策略分级 TrustPolicy</h3>
+        <ul class="list">
+          <li>知名安全软件共存</li>
+          <li>强可信(可跳过行为检测)</li>
+          <li>健康签名</li>
+          <li>较可信签名(仅风险打折)</li>
+          <li>可豁免敏感规则的 OS 组件</li>
+        </ul>
+        <div class="note warn"><span class="em">⚠</span><div>任一档下出现危险命令行、
+          LOLBin 滥用、凭据攻击或签名异常,<b>一律不再放行</b>。</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="cloud">
+    <div class="sec-head rv">
+      <span class="kicker">Cloud · Intel · AI</span>
+      <div class="sec-title"><span class="ic">☁️</span><h2>云信誉 · 威胁情报 · AI 研判</h2></div>
+      <p class="sub">全部 opt-in,默认关闭。不填任何 Key 也能正常跑本地启发式 + 行为检测 —— 这些只是锦上添花。</p>
+    </div>
+
+    <div class="table-wrap rv" style="margin-bottom:16px">
+      <table>
+        <thead><tr><th style="width:170px">情报 / AI 源</th><th>用途</th><th style="width:280px">注册地址</th></tr></thead>
+        <tbody>
+        <tr><td><b>VirusTotal</b></td><td>哈希信誉旗舰(70+ 引擎)+ 整文件上传扫描</td>
+          <td><a href="https://www.virustotal.com/" target="_blank" rel="noopener noreferrer">virustotal.com</a></td></tr>
+        <tr><td><b>微步 ThreatBook</b></td><td>哈希信誉 + 网络 IP 信誉</td>
+          <td><a href="https://x.threatbook.com/" target="_blank" rel="noopener noreferrer">x.threatbook.com</a></td></tr>
+        <tr><td><b>MalwareBazaar<br>ThreatFox</b></td><td>恶意样本哈希查询 + 情报 feed 自动生成规则</td>
+          <td><a href="https://auth.abuse.ch/" target="_blank" rel="noopener noreferrer">auth.abuse.ch</a><br>
+            <span style="font-size:12px;color:var(--dim)">注册一个 Auth-Key,两者共用</span></td></tr>
+        <tr><td><b>AlienVault OTX</b></td><td>社区威胁情报(pulse)</td>
+          <td><a href="https://otx.alienvault.com/" target="_blank" rel="noopener noreferrer">otx.alienvault.com</a></td></tr>
+        <tr><td><b>MetaDefender</b></td><td>多引擎哈希信誉</td>
+          <td><a href="https://metadefender.opswat.com/" target="_blank" rel="noopener noreferrer">metadefender.opswat.com</a></td></tr>
+        <tr><td><b>Hybrid Analysis</b></td><td>沙箱信誉 + 行为画像</td>
+          <td><a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener noreferrer">hybrid-analysis.com</a></td></tr>
+        <tr><td><b>小米 MiMo 大模型</b></td><td>AI 行为研判 + 自然语言生成规则</td>
+          <td><a href="https://mimo.mi.com/" target="_blank" rel="noopener noreferrer">mimo.mi.com</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid g2">
+      <div class="card rv">
+        <h3>多引擎哈希信誉</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 8px">聚合 6 个源并取最强结论
+          (恶意 &gt; 可疑 &gt; 干净 &gt; 未知),分级缓存 + 限流,断网时用「最近已知」兜底。</p>
+        <div class="chips">
+          <span class="chip">VirusTotal</span><span class="chip">微步 ThreatBook</span>
+          <span class="chip">MalwareBazaar</span><span class="chip">OTX</span>
+          <span class="chip">MetaDefender</span><span class="chip">Hybrid Analysis</span>
+        </div>
+        <p style="color:var(--muted);font-size:13.4px;margin:12px 0 0">缓存策略:恶意永久 / 干净 7 天 / 可疑 24 时 / 未知短负缓存。
+          <b>信誉只加减分,绝不单独处置,断网不影响实时防护。</b></p>
+      </div>
+      <div class="card rv">
+        <h3>威胁情报 feed</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">定期拉取近期恶意 IOC(按可信度阈值),
+          <b>自动生成哈希 / IP / 域名拦截规则</b>,带来源标记与到期时间,也支持在 UI 里手动
+          刷新 / 预览 / 采纳。网络外联仅对可疑目标做 IP 情报互证(月配额极低 + 7 天强缓存 + 在途去重),
+          确认恶意再补偿处置。</p>
+      </div>
+      <div class="card rv">
+        <h3>AI 研判(大模型)</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 8px">OpenAI 兼容接口,异步,任何失败都
+          fail-open。三种能力:</p>
+        <ul class="list">
+          <li>基于<b>纯静态内容特征</b>研判恶意性 —— <b>绝不执行样本</b></li>
+          <li>把自然语言安全意图转成 1~5 条可复核的防御规则</li>
+          <li>对恶意 / 可疑文件一键生成清理脚本</li>
+        </ul>
+        <p style="color:var(--muted);font-size:13.4px;margin:10px 0 0">静态特征由
+          <code>StaticFeatureExtractor</code> 越界安全地提取:PE 头 + 各节香农熵(判壳,熵 &gt; 7.2)、
+          危险 Win32 API / URL / IP 字符串、能力标签(注入 / 反调试 / 键盘钩子 / 加密勒索 / 提权……)。</p>
+      </div>
+      <div class="card rv">
+        <h3>AI 灰区策略</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">仅对「询问(Ask)」类灰区事件咨询大模型:
+          AI 判恶意则升格阻止;AI 判干净且无硬指标则降级放行(减少打扰);其余维持原判。</p>
+        <div class="note good"><span class="em">✓</span><div><b>AI 绝不压制硬指标,也绝不改判确定性拦截或强可信放行。</b></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="response">
+    <div class="sec-head rv">
+      <span class="kicker">Response</span>
+      <div class="sec-title"><span class="ic">🧹</span><h2>处置、隔离与足迹清理</h2></div>
+    </div>
+    <div class="grid g3">
+      <div class="card rv">
+        <h3>拦截</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">内核源在动作前原地拒绝;
+          用户态观测源无法事前拦截,由 <code>Worker</code> 事后结束作恶进程树补偿,带关键进程防护。</p>
+      </div>
+      <div class="card rv">
+        <h3>隔离区</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">确认恶意的载荷经 XOR 中和后拷入金库,
+          删除原文件(被占用则计划重启删除),<b>完全可逆还原</b>。</p>
+      </div>
+      <div class="card rv">
+        <h3>足迹清理</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0"><code>ThreatRemediator</code> 按进程树
+          清理恶意足迹;<code>PersistenceScanner</code> 只读枚举 7 类自启动持久化点。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="principles">
+    <div class="sec-head rv">
+      <span class="kicker">Design Principles</span>
+      <div class="sec-title"><span class="ic">🎯</span><h2>设计原则</h2></div>
+    </div>
+    <div class="grid g3">
+      <div class="card rv">
+        <h3>只对真正危险的行为动手</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">软信号(未签名、可疑路径、首见、新证书)
+          <b>永远不单独触发拦截或弹窗</b>,只加分,并且必须与硬指标互证才升格。</p>
+      </div>
+      <div class="card rv">
+        <h3>尽量不打扰</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">健康签名的正规程序默认放行,
+          不弹窗。误报和骚扰本身就是安全软件最大的可用性问题。</p>
+      </div>
+      <div class="card rv">
+        <h3>自我保护可控</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0">这是一个正当的安全工具:
+          始终保留正常的、用户主导的卸载路径,<b>绝不做成「卸不掉」</b>。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="structure">
+    <div class="sec-head rv">
+      <span class="kicker">Solution Layout</span>
+      <div class="sec-title"><span class="ic">📁</span><h2>解决方案结构</h2></div>
+      <p class="sub">C++ / Qt 实现,顶层 CMake 为 <code>cpp/CMakeLists.txt</code>(C++20),由早期 .NET 原型移植而来。</p>
+    </div>
+    <div class="term rv">
+      <div class="term-bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn">-Bulwark / 目录结构</span></div>
+      <pre>cpp/
+├─ shared/          <span class="tree-c">共享契约层(静态库,服务与 UI 共用)</span>
+│   ├─ src/models/     SecurityEvent / Verdict / DefenseRule / Evidence(证据链)
+│   ├─ src/engine/     RuleEngine + 十余个分析器 / 监视器
+│   └─ src/ipc/        IpcMessage(命名管道消息协议)
+├─ service/         <span class="tree-c">用户态服务 R3 → bulwark_service.exe</span>
+│   ├─ Worker.cpp                  主防御循环 + 多个后台 worker
+│   ├─ EtwProcessEventSource.cpp   krabsetw 实时观测(5 个 ETW 提供程序)
+│   ├─ UserModeBehaviorSource.cpp  自启动 + 勒索诱饵
+│   ├─ DriverEventSource.cpp       内核源对接 + 按需加载 Bulwark.sys
+│   ├─ EventSourceCoordinator.cpp  合并 ETW + 行为源 + 内核源(热切换)
+│   ├─ monitoring/                 签名 / 证书画像 / 哈希 / 父进程取证
+│   ├─ reputation/                 6 源云信誉 + ThreatFox feed
+│   ├─ QuarantineManager.cpp       可逆隔离区
+│   ├─ ThreatRemediator.cpp        恶意足迹清理
+│   └─ *Store.cpp                  规则 / 设置 / 基线 / 历史 / 审计持久化
+└─ ui/              <span class="tree-c">桌面 UI → bulwark_ui.exe(Qt Widgets,命名管道连服务)</span>
+
+Bulwark.Driver/     <span class="tree-c">内核驱动 R0(MSBuild + WDK):Minifilter + 通信端口</span>
+├─ Driver.c  ProcessMonitor.c  FileMonitor.c  RegistryMonitor.c
+├─ NetMonitor.c  ImageMonitor.c  ThreadMonitor.c  SelfProtect.c
+├─ HashScan.c  Policy.c  Comms.c
+└─ Protocol.h       内核↔服务消息结构(用户态直接复用,单一事实来源)</pre>
+    </div>
+  </section>
+
+  <section id="security">
+    <div class="sec-head rv">
+      <span class="kicker">Key Security</span>
+      <div class="sec-title"><span class="ic">🔐</span><h2>关于密钥安全</h2></div>
+    </div>
+    <div class="card rv">
+      <p style="margin:0;font-size:14px">开源版<b>不内置任何厂商密钥</b> —— 源码与仓库里各 Key 字段一律为空。
+        你填的 Key 只保存在本机 <code>%ProgramData%\Bulwark\settings.json</code> 或环境变量,
+        <b>绝不写入源码、绝不上传、绝不进版本库</b>。</p>
+      <div class="note warn"><span class="em">⚠</span><div>VirusTotal 服务条款禁止「注册多个免费账号绕过限额」,公开 API 也不得用于商业产品。
+        要长期高频或全量使用,请走 VT Premium API。</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>磐垒主动防御 Bulwark · Windows HIPS · C++20 / Qt6 ·
+      <a href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">GitHub 开源仓库</a></span>
+    <span>本页仅介绍本地项目,不含任何密钥或服务器信息</span>
+  </footer>
+</div>
+
+<a class="totop" id="totop" href="#top" aria-label="回到顶部">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</a>
+
+<script>
+(function(){
+  "use strict";
+  var RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+  /* reveal-on-scroll */
+  var rv = document.querySelectorAll(".rv");
+  if (RM || !("IntersectionObserver" in window)) {
+    Array.prototype.forEach.call(rv, function(e){ e.classList.add("in"); e.style.opacity = 1; });
+  } else {
+    var io = new IntersectionObserver(function(rows){
+      rows.forEach(function(r){
+        if (!r.isIntersecting) return;
+        r.target.classList.add("in");
+        io.unobserve(r.target);
+      });
+    }, {rootMargin: "0px 0px -8% 0px", threshold: 0.06});
+    Array.prototype.forEach.call(rv, function(e){ io.observe(e); });
+  }
+
+  /* nav elevate + back-to-top visibility */
+  var nav = document.getElementById("nav");
+  var totop = document.getElementById("totop");
+  function onScroll(){
+    var y = window.pageYOffset || document.documentElement.scrollTop;
+    nav.classList.toggle("stuck", y > 8);
+    totop.classList.toggle("show", y > 560);
+  }
+  window.addEventListener("scroll", onScroll, {passive:true});
+  onScroll();
+
+  /* active section highlight in nav */
+  var links = Array.prototype.slice.call(document.querySelectorAll("#navlinks a"));
+  var map = {};
+  links.forEach(function(a){ map[a.getAttribute("href").slice(1)] = a; });
+  var secs = links.map(function(a){ return document.getElementById(a.getAttribute("href").slice(1)); }).filter(Boolean);
+  if ("IntersectionObserver" in window && secs.length){
+    var cur = null;
+    var so = new IntersectionObserver(function(rows){
+      rows.forEach(function(r){
+        if (r.isIntersecting){
+          if (cur) cur.classList.remove("active");
+          cur = map[r.target.id];
+          if (cur){
+            cur.classList.add("active");
+            /* keep active chip in view within the scrollable nav */
+            if (cur.scrollIntoView) cur.scrollIntoView({block:"nearest", inline:"center"});
+          }
+        }
+      });
+    }, {rootMargin: "-45% 0px -50% 0px", threshold: 0});
+    secs.forEach(function(s){ so.observe(s); });
+  }
+})();
+</script>
+</body>
+</html>

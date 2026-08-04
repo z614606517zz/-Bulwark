@@ -24,6 +24,8 @@ qt_add_executable(bulwark_service
     src/AuditLog.cpp
     src/AlertExporter.cpp
     src/VtScanHistoryStore.cpp
+    src/ThreatIntelContribStore.cpp
+    src/reputation/ThreatIntelUploader.cpp
     # storage (recovered .cpp, headers reconstructed this round)
     src/EventHistoryStore.cpp
     src/QuarantineManager.cpp
@@ -39,6 +41,8 @@ qt_add_executable(bulwark_service
     src/reputation/VirusTotalClient.cpp
     src/reputation/ThreatBookClient.cpp
     src/reputation/ThreatFoxFeed.cpp
+    # 攻击链组合引擎:下载服务器挖出的行为组合表 + 给每个进程记账 + 凑齐即喂证据
+    src/AttackChainEngine.cpp
     # monitoring (Authenticode/PE/hash forensics + process control)
     src/monitoring/ProcessInspector.cpp
     # monitoring: 进程启动来源溯源(PID -> 具体服务名 / 具体计划任务名)+ 在跑进程快照
@@ -59,6 +63,8 @@ qt_add_executable(bulwark_service
     include/bulwark/service/IpcServer.h
     include/bulwark/service/Worker.h
     src/IpcServer.cpp
+    # 控制管道客户端认证(GetNamedPipeClientProcessId -> 安装目录/映像名强制校验 + 可选签名加固)
+    src/IpcClientAuth.cpp
     src/EtwProcessEventSource.cpp
     # kernel driver (R0) integration: minifilter comms + auto register/load
     src/DriverEventSource.cpp
