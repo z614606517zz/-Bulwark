@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Bulwark sample sweep
+
+[Timer]
+OnCalendar=daily
+# Spread the wake-up: several nodes sharing one upstream should not all sweep at
+# the same second.
+RandomizedDelaySec=20m
+# Catch up after downtime instead of silently skipping a day.
+Persistent=true
+Unit=bulwark-janitor-samples.service
+
+[Install]
+WantedBy=timers.target

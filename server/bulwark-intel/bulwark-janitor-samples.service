@@ -1,0 +1,18 @@
+[Unit]
+Description=Bulwark janitor - daily sample sweep (lossless, crash debris only)
+After=bulwark-intel.service
+
+[Service]
+Type=oneshot
+# bulwarkintel, never root: root writing cache.db leaves a root-owned journal and
+# app.py's next write fails. This job does not touch the DB, but it shares a unit
+# template with the data job and the owner must match either way.
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-janitor.py --samples
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+TimeoutStartSec=300

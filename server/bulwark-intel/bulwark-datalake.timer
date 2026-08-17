@@ -1,0 +1,22 @@
+[Unit]
+Description=Run the Bulwark datalake collector every 30 minutes
+
+[Timer]
+# :05 and :35. The offset is deliberate: hourly archives are published at HH+1:00,
+# so starting at :05 picks up the freshest slot a few minutes after it lands
+# instead of racing it and getting a 404.
+# max_run_seconds is 1500s (25 min), so consecutive runs do not overlap; the flock
+# in the collector is the real guarantee, this is just spacing. The cadence exists
+# because the pacing is deliberately slow: datalake.queries_per_minute is 1 as of
+# 2026-08-12 (it was 2), so one run gets through ~25 samples and the day tops out
+# around 1200 VT calls instead of 2400. The reason for the cut is on the record:
+# VirusTotal started refusing this node's address outright -- every key, including
+# ones added minutes earlier, answered 429 QuotaExceededError while the same key
+# worked from the master's IP in the same minute. Driving a pool of keys hard from
+# one host is what got three of the accounts banned.
+OnCalendar=*:05/30
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

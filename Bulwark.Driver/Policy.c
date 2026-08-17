@@ -78,7 +78,7 @@ BlwOpenOrCreatePolicyKey(_In_ BOOLEAN Create, _Out_ PHANDLE OutKey)
     }
     totalLen = g_Blw.RegistryPath.Length + subKey.Length;
 
-    buf = (PWCH)ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)totalLen + sizeof(WCHAR), BLW_TAG);
+    buf = (PWCH)BlwAllocPool(PagedPool, (SIZE_T)totalLen + sizeof(WCHAR), BLW_TAG);
     if (buf == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -126,7 +126,7 @@ BlwQueryMultiSz(_In_ HANDLE KeyHandle, _In_ PCWSTR ValueName, _Out_ PULONG OutCh
         return NULL;
     }
 
-    info = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, needed, BLW_TAG);
+    info = (PKEY_VALUE_PARTIAL_INFORMATION)BlwAllocPool(PagedPool, needed, BLW_TAG);
     if (info == NULL) {
         return NULL;
     }
@@ -137,7 +137,7 @@ BlwQueryMultiSz(_In_ HANDLE KeyHandle, _In_ PCWSTR ValueName, _Out_ PULONG OutCh
         info->DataLength >= sizeof(WCHAR)) {
 
         ULONG chars = info->DataLength / sizeof(WCHAR);
-        out = (PWCH)ExAllocatePool2(POOL_FLAG_PAGED, (SIZE_T)(chars + 1) * sizeof(WCHAR), BLW_TAG);
+        out = (PWCH)BlwAllocPool(PagedPool, (SIZE_T)(chars + 1) * sizeof(WCHAR), BLW_TAG);
         if (out != NULL) {
             RtlCopyMemory(out, info->Data, (SIZE_T)chars * sizeof(WCHAR));
             out[chars] = L'\0';   // 尾部保护 NUL,确保枚举不越界
@@ -336,7 +336,7 @@ BlwPersistListToRegistry(_In_ PCWSTR ValueName, _In_ BLW_PROTECTED_PATH* List, _
 
     // 上界:每条最多 BLW_MAX_PATH 字符(含分隔 NUL),共 BLW_MAX_PROTECTED 条,加结尾 NUL。
     maxChars = (SIZE_T)BLW_MAX_PROTECTED * BLW_MAX_PATH + 1;
-    data = (PWCH)ExAllocatePool2(POOL_FLAG_PAGED, maxChars * sizeof(WCHAR), BLW_TAG);
+    data = (PWCH)BlwAllocPool(PagedPool, maxChars * sizeof(WCHAR), BLW_TAG);
     if (data == NULL) {
         return;
     }

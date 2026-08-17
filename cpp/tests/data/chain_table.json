@@ -1,0 +1,234 @@
+{
+  "_readme": [
+    "攻击链组合引擎的回归语料。与 corpus.json/golden.json 同一形制:固定输入 + 内嵌期望,",
+    "由 bulwark_service.exe --attackchain-selftest 重放并逐项比对。",
+    "",
+    "为什么期望值内嵌在同一个文件里而不另起 golden.json:这里的期望全部是【由本文件的输入",
+    "直接推出来的】小整数与档位,放在一起时一次 diff 就能看出「输入改了、期望没跟着改」;",
+    "拆成两个文件反而容易出现两边不同步而测试照样绿的情况。",
+    "",
+    "_coverage 也写在这里,故意不从 appsettings.json 取 —— 否则有人改了本机的受保护路径/",
+    "注册表名单,这个测试的结论就跟着变,那就不是回归测试了。",
+    "",
+    "改动本文件时必须同步 _expect。每一项的推导都写在下面对应的 _why 里。"
+  ],
+
+  "version": 999,
+  "label": "test-9.9",
+  "unchanged": false,
+
+  "_coverage": {
+    "_why": "刻意配成能同时产出 Reachable / Sparse / Dead 三种可观测性的最小覆盖面。",
+    "driverSource": true,
+    "registryWatch": ["\\CurrentVersion\\Run"],
+    "fileWatch": ["\\Start Menu\\Programs\\Startup\\"],
+    "etwFileEvents": true,
+    "etwDns": true,
+    "moduleSignature": false,
+    "cmdLineInBand": true
+  },
+
+  "markers": {
+    "m_run": {
+      "title": "Run key written",
+      "level": "high",
+      "observable": true,
+      "event": "RegistryWrite",
+      "match": { "target": "*\\CurrentVersion\\Run*" },
+      "_why_reach": "Reachable —— target 的字面片段与 registryWatch 有交集"
+    },
+    "m_cert": {
+      "title": "Root certificate installed",
+      "level": "high",
+      "observable": true,
+      "event": "RegistryWrite",
+      "match": { "target": "*\\SystemCertificates\\*" },
+      "_why_reach": "Dead —— 与 registryWatch 无交集,该键的写入根本不上报"
+    },
+    "m_drop": {
+      "title": "Executable dropped in Public",
+      "level": "high",
+      "observable": true,
+      "event": "FileWrite",
+      "match": { "target": "*\\Users\\Public\\*" },
+      "_why_reach": "Reachable —— target 落在用户可写目录,走 isDroppedExecutable 那条不采样的通道"
+    },
+    "m_delete": {
+      "title": "Startup item deleted",
+      "level": "medium",
+      "observable": true,
+      "event": "FileDelete",
+      "match": { "target": "*\\Start Menu\\Programs\\Startup\\*" },
+      "_why_reach": "Reachable —— 命中 fileWatch"
+    },
+    "m_cmd": {
+      "title": "Defender exclusion via PowerShell",
+      "level": "critical",
+      "observable": true,
+      "event": "ProcessCreate",
+      "match": { "cmdline": "*Add-MpPreference*Exclusion*" },
+      "_why_reach": "Reachable —— cmdLineInBand 为真,命令行随事件到达"
+    },
+    "m_dns": {
+      "title": "Suspicious DNS query",
+      "level": "high",
+      "observable": true,
+      "event": "DnsQuery",
+      "match": {},
+      "_why_reach": "Reachable —— etwDns 已启用"
+    },
+    "m_sideload": {
+      "title": "Vcruntime140 sideloading",
+      "level": "high",
+      "observable": true,
+      "event": "ImageLoad",
+      "match": { "target": "*\\vcruntime140.dll" },
+      "_why_reach": "Sparse —— 内核只上报 \\Temp\\ 与 \\Users\\Public\\ 下的用户态模块加载,此 target 不在其中"
+    },
+    "m_unsigned_a": {
+      "title": "System name in unexpected location",
+      "level": "high",
+      "observable": true,
+      "event": "ProcessCreate",
+      "match": { "unsigned": true },
+      "_why": "与 m_unsigned_b 条件完全相同 —— 用来验证「证据重复」那道护栏"
+    },
+    "m_unsigned_b": {
+      "title": "System file execution anomaly",
+      "level": "high",
+      "observable": true,
+      "event": "ProcessCreate",
+      "match": { "unsigned": true },
+      "_why": "同上。真实表里就出过这一对(条件都退化成「未签名的进程创建」)"
+    },
+    "m_actor_ps": {
+      "title": "PowerShell spawned",
+      "level": "high",
+      "observable": true,
+      "event": "ProcessCreate",
+      "match": { "actor": "*\\powershell.exe" },
+      "_why": "与 m_actor_st 主体不同 —— 用来验证「主体冲突」那道护栏"
+    },
+    "m_actor_st": {
+      "title": "Scheduled task created",
+      "level": "high",
+      "observable": true,
+      "event": "ProcessCreate",
+      "match": { "actor": "*\\schtasks.exe" },
+      "_why": "同上"
+    },
+    "m_unobs": {
+      "title": "Unsigned module in lsass",
+      "level": "critical",
+      "observable": false,
+      "event": "ImageLoad",
+      "match": {},
+      "_why": "observable=false —— 用来验证含不可观测标记的组合会被整条丢弃"
+    }
+  },
+
+  "patterns": [
+    {
+      "markers": ["m_cmd", "m_drop", "m_run"],
+      "support": 30, "grade": "hard", "max_level": "critical",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "全可达 + 正常语料零命中 -> 不降档,hard 恒 80"
+    },
+    {
+      "markers": ["m_cmd", "m_drop", "m_dns"],
+      "support": 30, "grade": "hard", "max_level": "critical",
+      "families": "TestFam", "benign_support": 3,
+      "_why": "benign_support>0 且为 hard -> 降到 strong。分数 55+(30-8)/3=62"
+    },
+    {
+      "markers": ["m_cmd", "m_run", "m_sideload"],
+      "support": 30, "grade": "hard", "max_level": "critical",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "含 Sparse 标记 -> 降到 strong。分数 55+(30-8)/3=62"
+    },
+    {
+      "markers": ["m_cmd", "m_dns", "m_sideload"],
+      "support": 30, "grade": "hard", "max_level": "critical",
+      "families": "TestFam", "benign_support": 2,
+      "_why": "两条降档【叠加】:benign(hard->strong)再 sparse(strong->ask)。分数 50+(30-5)/3=58"
+    },
+    {
+      "markers": ["m_drop", "m_dns", "m_sideload"],
+      "support": 20, "grade": "strong", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "含 Sparse -> strong 降到 ask。分数 50+(20-5)/3=55"
+    },
+    {
+      "markers": ["m_dns", "m_run"],
+      "support": 5, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "勉强达标的 ask -> 无加分,分数恰为 50。也是记账/命中用例的目标组合"
+    },
+    {
+      "markers": ["m_delete", "m_run"],
+      "support": 60, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "支持度高的 ask -> 50+min(20,(60-5)/3=18)=68。与上一条对比证明支持度确实参与打分"
+    },
+    {
+      "markers": ["m_cert", "m_run"],
+      "support": 12, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "含 Dead 标记 -> 仍装载(可达性诊断如实报死路),但不降档(ask 已是地板)。分数 50+(12-5)/3=52"
+    },
+    {
+      "markers": ["m_actor_ps", "m_actor_st"],
+      "support": 20, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "两个不同主体 -> 单进程记账永不命中 -> 装载期剔除(dropped_conflict)"
+    },
+    {
+      "markers": ["m_unsigned_a", "m_unsigned_b"],
+      "support": 20, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "两个标记条件指纹相同 -> 不构成互证 -> 装载期剔除(dropped_redundant)"
+    },
+    {
+      "markers": ["m_run", "m_unobs"],
+      "support": 20, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "含不可观测标记 -> 整条丢弃(静默 continue,不计入两个 dropped 计数)"
+    },
+    {
+      "markers": ["m_run"],
+      "support": 50, "grade": "ask", "max_level": "high",
+      "families": "TestFam", "benign_support": 0,
+      "_why": "单标记「组合」-> 等于凭一个动作定性,与互证前提相悖 -> 丢弃(同样不计入 dropped 计数)"
+    }
+  ],
+
+  "_expect": {
+    "server_patterns": 12,
+    "dropped_conflict": 1,
+    "dropped_redundant": 1,
+    "loaded": 8,
+    "_why_loaded": "12 - 1(主体冲突) - 1(证据重复) - 1(含不可观测标记) - 1(单标记) = 8",
+
+    "capped": 4,
+    "_why_capped": "第 2/3/4/5 条降档;第 8 条含 Dead 但 ask 已是地板,不计",
+
+    "reachable": 4,
+    "sparse": 3,
+    "dead": 1,
+    "_why_reach": "装载的 8 条里:含 m_sideload 的 3 条为稀疏,含 m_cert 的 1 条为死路,其余 4 条可靠可达",
+
+    "patterns": {
+      "m_cmd|m_drop|m_run":      { "grade": "hard",   "score": 80 },
+      "m_cmd|m_dns|m_drop":      { "grade": "strong", "score": 62 },
+      "m_cmd|m_run|m_sideload":  { "grade": "strong", "score": 62 },
+      "m_cmd|m_dns|m_sideload":  { "grade": "ask",    "score": 58 },
+      "m_dns|m_drop|m_sideload": { "grade": "ask",    "score": 55 },
+      "m_dns|m_run":             { "grade": "ask",    "score": 50 },
+      "m_delete|m_run":          { "grade": "ask",    "score": 68 },
+      "m_cert|m_run":            { "grade": "ask",    "score": 52 }
+    },
+
+    "hit_pattern_key": "m_dns|m_run",
+    "_why_hit": "记账用例:先喂 m_run 再喂 m_dns,此时只有这一条组合凑齐(其余含 m_dns 的都还缺别的动作)"
+  }
+}

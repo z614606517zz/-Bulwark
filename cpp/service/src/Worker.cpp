@@ -58,6 +58,25 @@ constexpr qint64 kVtUnknownDedupTtlSec = 24LL * 3600;            // 未收录/�
 // 丢弃会让内核阻塞类事件永远收不到回写,也会让该事件既不出现在拦截记录也不出现在活动日志里。
 constexpr int    kMaxPendingPrompts    = 512;
 
+// 情报来源的展示名:把 FileReputation::source 里的取数管路细节翻成用户看得懂的一句。
+//
+// 为什么必须翻:云查毒刻意「先问中央服务器有没有收录,没收录才动本机 VT 密钥」,于是
+//「这条结论是服务器给的还是本机直连查的」是用户唯一能验证该策略生效的地方。而线上取值形如
+// "Proxy:VirusTotal"(服务器转来的 VT 结论)/ "Proxy"(服务器未标注底层源)/ "VirusTotal" /
+// "MalwareBazaar" …… 其中 "Proxy:" 这个前缀对用户毫无意义,却正好盖住了那个区分。
+// 早先的做法是把前缀整段剥掉,结果服务器命中与本机直连 VT 命中在界面上一模一样。
+QString intelSourceDisplayName(const QString& raw) {
+    const QString s = raw.trimmed();
+    if (s.startsWith(QLatin1String("Proxy:"), Qt::CaseInsensitive)) {
+        const QString under = s.mid(6).trimmed();
+        return under.isEmpty() ? QStringLiteral("中央服务器")
+                               : QStringLiteral("中央服务器·") + under;
+    }
+    if (s.compare(QLatin1String("Proxy"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("中央服务器"); // 服务器没说底层是谁给的,那就只讲到服务器这一层
+    return s;
+}
+
 // 把内部清理报告转成发往 UI 的「足迹清理报告」负载(如实列出已清理项与未能清理项)。
 bulwark::ipc::RemediationReportPayload makeRemediationPayload(
     const bulwark::SecurityEvent& e, const QString& reason, const RemediationReport& r) {
@@ -273,6 +292,13 @@ void Worker::setCloudScanChain(reputation::ProxyReputationService* proxy,
                                reputation::AggregateReputationService* aggregate) {
     repProxy_ = proxy;
     repAggregate_ = aggregate;
+    // ServerOnly 下别再把「-> VirusTotal -> 其他情报源 -> 上传扫描」写进日志:那三级压根不走。
+    // 启动日志是排查「这台机器到底会不会外发」的第一现场,写错等于把排查引到反方向。
+    if (proxy && proxy->isServerOnly()) {
+        log_.info(QStringLiteral("云扫描链路(本机不动用第三方情报源):本地缓存 -> 中央服务器是否已收录;"
+                                 "不用本机密钥查各情报源、不上传文件,未收录即无云端结论。"));
+        return;
+    }
     log_.info(QStringLiteral("云扫描分级链路:本地缓存 -> %1 -> VirusTotal -> %2 -> 上传扫描%3。")
                   .arg(proxy ? QStringLiteral("中央服务器") : QStringLiteral("(无中央服务器)"),
                        aggregate ? QStringLiteral("其他情报源") : QStringLiteral("(无其他源)"),
@@ -280,9 +306,21 @@ void Worker::setCloudScanChain(reputation::ProxyReputationService* proxy,
 }
 
 QString Worker::describe(const SecurityEvent& e, VerdictAction action) const {
-    const QString act = action == VerdictAction::Block ? QString::fromUtf8("\xe6\x8b\xa6\xe6\x88\xaa")
-                      : action == VerdictAction::Ask   ? QString::fromUtf8("\xe8\xaf\xa2\xe9\x97\xae")
-                                                       : QString::fromUtf8("\xe6\x94\xbe\xe8\xa1\x8c");
+    QString act = action == VerdictAction::Block ? QString::fromUtf8("\xe6\x8b\xa6\xe6\x88\xaa")
+                : action == VerdictAction::Ask   ? QString::fromUtf8("\xe8\xaf\xa2\xe9\x97\xae")
+                                                 : QString::fromUtf8("\xe6\x94\xbe\xe8\xa1\x8c");
+    // 内核已在发生前阻断的操作,绝不能按用户态结论写成「放行」。
+    //
+    // 内核基线(自我保护 / 命令行硬拦 / 本地已知恶意集)与用户态 RuleEngine 是两条【独立】
+    // 的决策路径:内核同步决定并当场执行,用户态只是事后收到通知、再各自算一遍。两边结论
+    // 不一致是正常的,而生效的永远是内核那条。
+    //
+    // 不区分的后果是日志会骗人 —— 实测:安装更新时备份被内核自我保护拒绝(Copy-Item 报
+    // 「访问被拒绝」),而同一时刻审计日志里十几条都写着「放行 FileDelete ...」。排查时
+    // 照着日志走会得出「没被拦」的错误结论,实际白跑一轮。
+    if (e.kernelBlocked && action != VerdictAction::Block)
+        act = QString::fromUtf8("\xe5\x86\x85\xe6\xa0\xb8\xe5\xb7\xb2\xe6\x8b\xa6")   // 内核已拦
+            + QString::fromUtf8("\x28") + act + QString::fromUtf8("\x29");            // (用户态结论)
     QString line = QStringLiteral("[%1] %2 %3 %4 -> %5 (%6 %7)")
         .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")),
              act, bulwark::eventTypeToString(e.type), e.actorPath, e.target,
@@ -812,14 +850,31 @@ void Worker::enrich(SecurityEvent& e) {
         return;
     }
 
-    e.actorSigned    = ProcessInspector::isSigned(path);
-    e.actorPublisher = ProcessInspector::tryGetPublisher(path);
-    e.actorHash      = ProcessInspector::tryComputeSha256(path);
+    //
+    // 一次取齐:签名 / 发布者 / SHA-256 /(无可信签名时的)内嵌签名 / 证书画像 / 文件体积。
+    //
+    // 原先是逐项调 isSigned、tryGetPublisher、tryComputeSha256、hasEmbeddedSignature、
+    // getCertInfo,再单独构造一个 QFileInfo 取体积 —— 而每个逐项接口内部都要先算一次「文件
+    // 身份」(小写路径|大小|修改时刻)作为缓存键,算身份就是一次 stat。结果是【一条事件对同
+    // 一个文件 stat 五六遍】,即便这些事实全部命中缓存、验签与哈希一次都没真跑。事件风暴下
+    // 这笔开销按事件数线性放大,而且全压在主线程上。
+    //
+    // collectForensics 把 stat 收敛成一次,求值范围与原来的调用序列一一对应:
+    //   · 证书画像仅在【非自身组件】时求(includeCert),与原先「自身组件在此提前 return」等价;
+    //   · 内嵌签名仅在没有可信签名时求,与原先那个 if 等价 —— 已知未受信时只需知道有没有内嵌
+    //     签名,不必在进程创建的同步裁决路径上再验一次签。
+    // 故结论逐字段不变,省掉的纯粹是重复的 stat。
+    //
+    const ProcessInspector::ForensicFacts facts =
+        ProcessInspector::collectForensics(path, /*includeCert=*/!selfComponent);
 
-    // 签名失配:内嵌了签名但信任校验不过(篡改 / 盗用证书的典型特征)。已知未受信时,
-    // 只需检测是否内嵌签名即可,避免在进程创建同步裁决路径上重复一次验签。
+    e.actorSigned    = facts.trustedSignature;
+    e.actorPublisher = facts.publisher;
+    e.actorHash      = facts.sha256;
+    // 签名失配:内嵌了签名但信任校验不过(篡改 / 盗用证书的典型特征)。保留原来的条件写法,
+    // 使「有可信签名时不触碰该字段」这一点逐字节不变(facts.embeddedSignature 此时也恒为 false)。
     if (!e.actorSigned)
-        e.signatureMismatch = ProcessInspector::hasEmbeddedSignature(path);
+        e.signatureMismatch = facts.embeddedSignature;
 
     // 自身组件到此为止(理由见第 3.1 步):签名 / 发布者 / 哈希已经拿到,足够 UI 如实展示,
     // 而下面的证书链构建、侧载扫描、首见落盘、云查询对「无条件放行」的结论没有任何影响。
@@ -827,7 +882,7 @@ void Worker::enrich(SecurityEvent& e) {
         return;
 
     // 证书画像:指纹 / 有效期 / 吊销 / 过期后签名(证书被吊销即便验签不过仍是硬指标)。
-    const ProcessInspector::CertInfo ci = ProcessInspector::getCertInfo(path);
+    const ProcessInspector::CertInfo& ci = facts.cert;
     if (!ci.thumbprint.isEmpty())    e.actorCertThumbprint = ci.thumbprint;
     if (ci.notAfterUtc.isValid())    e.certNotAfterUtc     = ci.notAfterUtc;
     if (ci.signingTimeUtc.isValid()) e.signingTimeUtc      = ci.signingTimeUtc;
@@ -839,9 +894,9 @@ void Worker::enrich(SecurityEvent& e) {
     detectSideloadedTamperedModule(e);
 
     // 文件体积:银狐 / 游蛇 惯用「文件膨胀」把样本撑到数十 MB 以规避扫描。
-    const QFileInfo fi(path);
-    if (fi.exists() && fi.isFile())
-        e.actorFileSize = fi.size();
+    // 复用上面那一次 stat 的结果(原先在这里又构造了一个 QFileInfo)。
+    if (facts.isRealFile)
+        e.actorFileSize = facts.fileSize;
 
     // 本机首见(低流行度信号):按 SHA-256 判定并落盘;单独不触发拦截,仅参与提分。
     if (firstSeen_ && !e.actorHash.isEmpty())
@@ -2232,7 +2287,15 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     record.fileName = QFileInfo(e.actorPath).fileName();
     record.source = QStringLiteral("\xe5\x8f\x8c\xe5\x87\xbb"); // 双击
     record.stage = bulwark::VtScanStage::Querying;
-    record.message = QStringLiteral("正在查询中央服务器是否已收录…");
+    // 中央服务器这一跳到底存在吗(已启用 + 有端点 + 有哈希可查)。进度文案必须据此写:
+    // 代理没开却写「正在查询中央服务器…」,就是在卡片上骗人 —— 而「云查是否真的服务器优先」
+    // 恰恰只能从这几句文案上看出来,一旦写错,现场排查就再也分不清走的是服务器还是本机密钥。
+    const bool serverHop = repProxy_ && repProxy_->isServerEnabled() && !hash.isEmpty();
+    // 【本机不动用任何第三方情报源】(ReputationProxy.ServerOnly):第 2/3/4 级(本机密钥查 VT、
+    // 其他情报源、上传整文件)全部跳过,云端只保留「问服务器收录了吗」这一跳。判据从代理那里读,
+    // 不在 Worker 里再存一份开关 —— 两处各写一份必然跑偏。
+    const bool localSources = !(repProxy_ && repProxy_->isServerOnly());
+    record.message = QStringLiteral("正在查询本机信誉缓存…");
     publishVtRecord(record);
 
     // 云扫描分级链路(顺序刻意如此,先便宜/覆盖广的,再贵的):
@@ -2262,6 +2325,12 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
             rep = *cached;
             foundByHash = true;
             alreadyShared = true;
+            // 标注「这次一次网络都没走」。不覆盖底层出处:缓存只是副本,结论仍是当初那个源
+            // 给的,故写成「本机缓存·中央服务器·VirusTotal」这样的两段式(见 finalizeVtRecord)。
+            record.intelSource = QStringLiteral("本机缓存");
+            const QString producer = intelSourceDisplayName(rep.source);
+            if (!producer.isEmpty())
+                record.intelSource += QStringLiteral("·") + producer;
         }
     }
 
@@ -2277,7 +2346,9 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     //                     混成一句之后,「这次到底有没有走服务器」在日志和卡片上就再也查不清了,
     //                     而「云扫描是否真的服务器优先」恰恰只能从这里看出来。
     bool serverAnswered = false; // 服务器给出了可采信的权威回复(未必有实据)
-    if (!foundByHash && !hash.isEmpty() && repProxy_) {
+    if (!foundByHash && serverHop) {
+        record.message = QStringLiteral("正在查询中央服务器是否已收录…");
+        publishVtRecord(record);
         bool hasRecord = false;
         const bulwark::FileReputation srv =
             repProxy_->queryServerOnly(hash, /*priority=*/false, &hasRecord, &serverAnswered);
@@ -2294,17 +2365,39 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
                                      .arg(srv.malicious).arg(srv.totalEngines)
                                      .arg(srv.source.isEmpty() ? QStringLiteral("-") : srv.source)
                                : serverAnswered
-                                     ? QStringLiteral("未收录,转本地密钥查询")
-                                     : QStringLiteral("未应答(未启用/熔断/请求预算用尽/查询失败),转本地密钥查询")));
+                                     ? (localSources ? QStringLiteral("未收录,转本地密钥查询")
+                                                     : QStringLiteral("未收录;本机不动用第三方情报源,无云端结论"))
+                                     : (localSources
+                                            ? QStringLiteral("未应答(未启用/熔断/请求预算用尽/查询失败),转本地密钥查询")
+                                            : QStringLiteral("未应答(未启用/熔断/查询失败);本机不动用第三方情报源,无云端结论"))));
+    }
+
+    // 1.5) ServerOnly:链路到这里就结束了(第 2/3/4 级都不走)。服务器【权威地答过「没有收录」】
+    //      时,那是一个有效结论(未收录),不是查询失败 —— 必须如实记成 querySucceeded 的
+    //      Unknown:否则卡片会写成「查询失败」(把服务器答过这件事说没了),而且这条结论进不了
+    //      本地负缓存,同一个哈希每次双击都要再问服务器一遍。
+    //      刻意【不原样采用】服务器那条回复:老服务端会把「谁都没数据」讲成 verdict=clean/0 引擎,
+    //      照抄就会被本地缓存按 CleanCacheTtlDays(7 天)当成「此文件干净」—— 那正是
+    //      serverHasRecord / downgradeToUnknown 一直在堵的漏,这里不能再开一次。
+    if (!foundByHash && !localSources && serverAnswered) {
+        rep.verdict = bulwark::ReputationVerdict::Unknown;
+        rep.malicious = 0;
+        rep.totalEngines = 0;
+        rep.threatLabel.clear();
+        rep.source.clear(); // 「没有收录」不是谁给的结论,不标来源
+        rep.querySucceeded = true;
+        rep.fetchedUtc = QDateTime::currentDateTimeUtc();
     }
 
     // 2) 服务器没有收录(或这次没问到)-> 用本机密钥查 VirusTotal(按哈希,秒级;省去对已收录
     //    文件的重复上传)。卡片文案按上一步的真实结局区分,别把「没问到」写成「未收录」。
     bool vtAnswered = false; // VT 权威作答(区别于配额/网络/鉴权失败),供下一级文案用
-    if (!foundByHash && !hash.isEmpty()) {
-        record.message = serverAnswered
-            ? QStringLiteral("服务器未收录,正在查询 VirusTotal…")
-            : QStringLiteral("服务器暂未应答,正在查询 VirusTotal…");
+    if (!foundByHash && !hash.isEmpty() && localSources) {
+        record.message = !serverHop
+            ? QStringLiteral("中央服务器未启用,正在查询 VirusTotal…")
+            : serverAnswered
+                ? QStringLiteral("服务器未收录,正在查询 VirusTotal…")
+                : QStringLiteral("服务器暂未应答,正在查询 VirusTotal…");
         publishVtRecord(record);
         const bulwark::FileReputation vtRep = vt_->query(hash, false);
         vtAnswered = vtRep.querySucceeded;
@@ -2320,7 +2413,7 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     //    合并取最强结论。刻意【排除 VirusTotal】:聚合器里的 VT 与上一级用的是同一个客户端
     //    实例,再查一遍会真的扣两次额度、还多等一次往返。这些源只能按哈希查(无法扫描未知
     //    文件),故放在昂贵的 VT 上传【之前】:一旦命中就无需上传;即便 VT 挂了也仍有结论。
-    if (!foundByHash && !hash.isEmpty() && repAggregate_) {
+    if (!foundByHash && !hash.isEmpty() && repAggregate_ && localSources) {
         record.message = vtAnswered
             ? QStringLiteral("VirusTotal 未收录,正在查询其他情报源…")
             : QStringLiteral("VirusTotal 查询未成功,正在查询其他情报源…");
@@ -2334,7 +2427,9 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     }
 
     // 4) 全都未收录 -> 上传整文件云端多引擎扫描,进度经回调推 UI。
-    if (!foundByHash && !e.actorPath.isEmpty() && QFileInfo::exists(e.actorPath)) {
+    //    ServerOnly 下【绝不走这一步】:上传整文件是本机对第三方发出的最重的一次外发,
+    //    也是最大的隐私暴露面,正是那个模式首先要禁掉的事。
+    if (!foundByHash && localSources && !e.actorPath.isEmpty() && QFileInfo::exists(e.actorPath)) {
         const auto progress = [this, &record](bulwark::VtScanStage stage, int pct) {
             record.stage = stage;
             record.percent = pct;
@@ -2397,28 +2492,38 @@ void Worker::finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::File
     if (!rep.sha256.isEmpty())
         record.sha256 = rep.sha256;
 
+    // 【本机不动用任何第三方情报源】模式:文案必须跟着变,否则会把「本机按策略压根没查」写成
+    // 「各情报源都失败了」—— 那是两件完全不同的事,一个是配置,一个是故障。
+    const bool serverOnly = repProxy_ && repProxy_->isServerOnly();
+
     if (!rep.querySucceeded) {
         record.stage = bulwark::VtScanStage::Error;
         record.outcome = bulwark::VtScanOutcome::Error;
-        record.message = QStringLiteral("VT 查询失败 / 超时(已按放行处理)");
+        // 不写成「VT 查询失败」:走到这里意味着中央服务器、VirusTotal、其余情报源【全都】没能
+        // 权威作答(链路见 runVtScan),单独点名 VT 会让人以为换个源就好了,而实际上是整条云查
+        // 都没结论。谁也没答上来时不标来源。
+        record.message = serverOnly
+            ? QStringLiteral("云查毒未得出结论(中央服务器未应答;本机不动用第三方情报源,已按放行处理)")
+            : QStringLiteral("云查毒未得出结论(服务器与各情报源均未成功,已按放行处理)");
+        record.intelSource.clear();
     } else {
         record.stage = bulwark::VtScanStage::Completed;
         record.outcome = rep.verdict == bulwark::ReputationVerdict::Malicious  ? bulwark::VtScanOutcome::Malicious
                        : rep.verdict == bulwark::ReputationVerdict::Suspicious ? bulwark::VtScanOutcome::Suspicious
                        : rep.verdict == bulwark::ReputationVerdict::Clean      ? bulwark::VtScanOutcome::Clean
                                                                                : bulwark::VtScanOutcome::Unknown;
-        // 命中来源标注:非 VirusTotal 的回退源附「· 来源 X」;命中型源(无引擎计数)省略 N/M。
-        // 经中央服务器命中时 rep.source 形如 "Proxy:VirusTotal" —— 「Proxy:」只是取数管路的细节,
-        // 对用户没有意义。展示前剥掉:服务器转来的 VT 结论就和本地直连 VT 一样不带来源后缀,
-        // 其他源只显示源名本身。不剥的话这条消息会长出一行,把居中查毒卡片的结论挤到卡片外面。
-        QString srcName = rep.source.trimmed();
-        if (srcName.startsWith(QLatin1String("Proxy:"), Qt::CaseInsensitive))
-            srcName = srcName.mid(6).trimmed();
-        else if (srcName.compare(QLatin1String("Proxy"), Qt::CaseInsensitive) == 0)
-            srcName.clear(); // 服务器未标注底层源:说不清是谁给的结论,那就不标
-        const bool fromVt = srcName.isEmpty() || srcName == QStringLiteral("VirusTotal");
-        const QString srcSuffix = fromVt ? QString()
-                                         : QStringLiteral(" · 来源 ") + srcName;
+        // 命中来源标注:一律附「· 来源 X」;命中型源(无引擎计数)省略 N/M。
+        //
+        // 「一律」是刻意的。这条链路的核心策略是「先问中央服务器有没有收录,没收录才动本机
+        // VT 密钥」,而用户能验证它的唯一位置就是这句结论。早先只给非 VT 的回退源标来源,并把
+        // "Proxy:" 前缀整段剥掉,于是「服务器命中」与「本机直连 VT 命中」在界面上完全一样 ——
+        // 策略到底有没有生效,从界面上根本看不出来。intelSource 若已由上游标注(命中本机缓存)
+        // 则沿用那个更精确的说法,否则据 rep.source 翻译。
+        if (record.intelSource.isEmpty())
+            record.intelSource = intelSourceDisplayName(rep.source);
+        const QString srcSuffix = record.intelSource.isEmpty()
+                                      ? QString()
+                                      : QStringLiteral(" · 来源 ") + record.intelSource;
         const QString engines = rep.totalEngines > 0
                                     ? QStringLiteral(" · %1/%2").arg(rep.malicious).arg(rep.totalEngines)
                                     : QString();
@@ -2433,7 +2538,9 @@ void Worker::finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::File
                            + (rep.totalEngines > 0 ? QStringLiteral(" · 0/%1").arg(rep.totalEngines) : QString())
                            + srcSuffix;
         else
-            record.message = QStringLiteral("未收录 / 无明确结论");
+            record.message = serverOnly
+                ? QStringLiteral("中央服务器未收录(本机不动用第三方情报源,已按放行处理)")
+                : QStringLiteral("未收录 / 无明确结论");
     }
     publishVtRecord(record);
 }

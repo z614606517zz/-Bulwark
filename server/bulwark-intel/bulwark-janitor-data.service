@@ -1,0 +1,17 @@
+[Unit]
+Description=Bulwark janitor - trim local vt_reports the master already has
+After=bulwark-intel.service bulwark-sync.service
+
+[Service]
+Type=oneshot
+# MUST be bulwarkintel: this writes cache.db, and root doing so leaves a root-owned
+# journal file that makes app.py's next write fail.
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-janitor.py --data
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+TimeoutStartSec=900

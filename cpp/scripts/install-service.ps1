@@ -1,4 +1,4 @@
-# 安装 Bulwark 用户态服务(需管理员)。把 cpp\dist\ 拷到 Program Files 并注册为自启动
+﻿# 安装 Bulwark 用户态服务(需管理员)。把 cpp\dist\ 拷到 Program Files 并注册为自启动
 # Windows 服务(SvcName=BulwarkService,与内核驱动服务 Bulwark 区分),随后启动。
 #
 # 前置:先跑 cpp\scripts\package.ps1 生成 cpp\dist\。

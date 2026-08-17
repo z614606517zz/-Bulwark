@@ -156,6 +156,17 @@ QString ReputationProxyOptions::maskUrl(const QString& url) {
     return scheme.isEmpty() ? masked : (scheme + QStringLiteral("://") + masked);
 }
 
+// 更新端点。留空则复用信誉代理解析出的地址 —— 本来就是同一台服务器,把混淆后的
+// URL 在配置里写第二遍只会多一处会跑偏的地方(与 AttackChainEngine.BaseUrl 同一取舍)。
+QString UpdateOptions::resolveBaseUrl(const QString& reputationProxyBaseUrl) const {
+    QString u = BaseUrl.trimmed();
+    if (u.isEmpty())
+        u = reputationProxyBaseUrl.trimmed();
+    while (u.endsWith(QLatin1Char('/')))
+        u.chop(1);
+    return u;
+}
+
 } // namespace bulwark::service
 
 namespace bulwark::service {
@@ -277,6 +288,28 @@ void bindAttackChain(const QJsonObject& o, AttackChainOptions& a) {
     bindStr(o, "MinGrade", a.MinGrade);
 }
 
+void bindUpdate(const QJsonObject& o, UpdateOptions& u) {
+    bindBool(o, "Enabled", u.Enabled);
+    bindStr(o, "BaseUrl", u.BaseUrl);
+    bindStr(o, "Channel", u.Channel);
+    bindInt(o, "QueryTimeoutSeconds", u.QueryTimeoutSeconds);
+    bindInt(o, "DownloadTimeoutSeconds", u.DownloadTimeoutSeconds);
+    bindInt(o, "AutoCheckDelayMinutes", u.AutoCheckDelayMinutes);
+    // 只是【追加】可接受的签名者指纹(证书轮换期同时收新旧两张),内置那条永远有效。
+    // 详见 bulwark/UpdateTrust.h:做成「可替换」等于改一行配置就能换掉整条信任链。
+    bindStrList(o, "AllowedThumbprints", u.AllowedThumbprints);
+}
+
+void bindDiskCleanup(const QJsonObject& o, DiskCleanupOptions& d) {
+    bindBool(o, "Enabled", d.Enabled);
+    bindInt(o, "MinFileAgeHours", d.MinFileAgeHours);
+    bindInt(o, "MaxFilesPerCategory", d.MaxFilesPerCategory);
+    bindInt(o, "MaxSeconds", d.MaxSeconds);
+    // 注意这里【只】绑定排除表,没有「包含表」——清理范围写死在 JunkCleaner 的类别表里,
+    // 配置只能让范围变小。见 DiskCleanupOptions 的说明。
+    bindStrList(o, "ExcludePaths", d.ExcludePaths);
+}
+
 void bindReputationProxy(const QJsonObject& o, ReputationProxyOptions& p) {
     bindStr(o, "BaseUrl", p.BaseUrl);
     bindStr(o, "BaseUrlObfuscated", p.BaseUrlObfuscated);
@@ -286,6 +319,8 @@ void bindReputationProxy(const QJsonObject& o, ReputationProxyOptions& p) {
     bindInt(o, "RequestsPerMinute", p.RequestsPerMinute);
     bindInt(o, "RequestsPerHour", p.RequestsPerHour);
     bindInt(o, "FreshQueriesPerDay", p.FreshQueriesPerDay);
+    bindBool(o, "LookupOnly", p.LookupOnly);
+    bindBool(o, "ServerOnly", p.ServerOnly);
     bindBool(o, "SyncResultsToServer", p.SyncResultsToServer);
     bindInt(o, "ContributionUploadHour", p.ContributionUploadHour);
 }
@@ -346,6 +381,8 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindThreatFox(sub("ThreatFoxFeed"), ThreatFoxFeed);
     bindReputationProxy(sub("ReputationProxy"), ReputationProxy);
     bindAttackChain(sub("AttackChainEngine"), AttackChainEngine);
+    bindUpdate(sub("Update"), Update);
+    bindDiskCleanup(sub("DiskCleanup"), DiskCleanup);
     bindAi(sub("Ai"), Ai);
     bindEtw(sub("Etw"), Etw);
     return true;

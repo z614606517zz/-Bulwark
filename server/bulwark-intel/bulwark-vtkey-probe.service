@@ -1,0 +1,21 @@
+[Unit]
+Description=Ask VirusTotal what it thinks of each configured API key
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root for the same reason the rest of this helper is root: it reads config.json
+# (640 root:bulwarkintel) and writes the status file the dashboard renders. The
+# dashboard itself must not gain either capability.
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-vtkey.py --probe
+Nice=15
+TimeoutStartSec=300
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+MemoryMax=128M

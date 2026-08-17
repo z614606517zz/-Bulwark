@@ -1,0 +1,19 @@
+[Unit]
+Description=Re-check queued manual submissions every 3 minutes
+
+[Timer]
+# Every 3 minutes, as requested. This is the RE-CHECK cadence: a freshly uploaded
+# file does not wait for it, because bulwark-submit.path fires the moment the record
+# lands in the inbox. The interval matters most for files sitting in vt_wait -- a VT
+# analysis takes minutes, so polling faster would only burn quota on "still running".
+OnUnitActiveSec=3min
+OnBootSec=2min
+# No RandomizedDelaySec: someone is watching this queue and a predictable 3 minutes
+# is the point. The work is tiny and local, so there is no upstream to be polite to
+# (the paced VT calls are budgeted inside the worker instead).
+AccuracySec=15s
+Persistent=false
+Unit=bulwark-submit.service
+
+[Install]
+WantedBy=timers.target

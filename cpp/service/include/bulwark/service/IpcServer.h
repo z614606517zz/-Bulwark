@@ -73,6 +73,22 @@ public:
     // ---- 攻击链组合引擎。读的是内存里的表状态与有上限的命中记录,微秒级,故同步返回。----
     std::function<bulwark::ipc::AttackChainResponsePayload()> attackChainRequested;
     std::function<void()>                                    attackChainClearRequested;
+    // ---- 在线更新。两者都是【异步】的:检查要一次网络往返(可达 15s),下载是几 MB。
+    //      宿主在后台线程做完后经 sendUpdateCheck / sendUpdateProgress /
+    //      sendUpdateDownloadResult 回推,绝不在 IPC 线程上等网络 —— 那会把弹窗和
+    //      拦截通知一起堵住。----
+    std::function<void()>                                    updateCheckRequested;
+    std::function<void()>                                    updateDownloadRequested;
+    // 就地应用已下载的更新。同样是异步的:要重新校验三个 PE 的签名并做文件替换。
+    std::function<void()>                                    updateApplyRequested;
+    // ---- 磁盘垃圾清理。两者都是【异步】的:要遍历 %TEMP% / 浏览器缓存这类动辄数万文件的
+    //      目录,秒级到十几秒。宿主在后台线程做完后经 sendJunkScan / sendJunkClean 回推,
+    //      中途用 sendJunkProgress 报进度 —— 与取证查询、进程列表、在线更新同一约定。----
+    std::function<void(const bulwark::ipc::JunkScanRequestPayload&)>  junkScanRequested;
+    std::function<void(const bulwark::ipc::JunkCleanRequestPayload&)> junkCleanRequested;
+    // 大文件查找。同样异步(要遍历整块磁盘)。注意【没有对应的删除回调】—— 本功能纯只读,
+    // 界面只提供「打开所在位置」,详见 JunkCleaner.h 里 LargeFileScanner 的说明。
+    std::function<void(const bulwark::ipc::LargeFileScanRequestPayload&)> largeFileScanRequested;
     std::function<void(int)>                                 uiProcessConnected;
 
     // ---- 服务 -> UI 广播 ----
@@ -93,6 +109,16 @@ public:
     void sendTimeline(const bulwark::ipc::TimelineResponsePayload& payload);          // EventTimelineResponse
     void sendAttackGraph(const bulwark::ipc::AttackGraphResponsePayload& payload);    // AttackGraphResponse
     void sendProcessList(const bulwark::ipc::ProcessListResponsePayload& payload);    // ProcessListResponse
+    // 在线更新的异步回推(须在主线程调用;后台线程用 QMetaObject::invokeMethod 编组)。
+    void sendUpdateCheck(const bulwark::ipc::UpdateCheckResponsePayload& payload);          // UpdateCheckResponse
+    void sendUpdateProgress(const bulwark::ipc::UpdateProgressPayload& payload);            // UpdateProgressNotification
+    void sendUpdateDownloadResult(const bulwark::ipc::UpdateDownloadResponsePayload& p);    // UpdateDownloadResponse
+    void sendUpdateApplyResult(const bulwark::ipc::UpdateApplyResponsePayload& p);          // UpdateApplyResponse
+    // 磁盘垃圾清理的异步回推(同上,须在主线程调用)。
+    void sendJunkScan(const bulwark::ipc::JunkScanResponsePayload& payload);                // JunkScanResponse
+    void sendJunkClean(const bulwark::ipc::JunkCleanResponsePayload& payload);              // JunkCleanResponse
+    void sendJunkProgress(const bulwark::ipc::JunkProgressPayload& payload);                // JunkProgressNotification
+    void sendLargeFileScan(const bulwark::ipc::LargeFileScanResponsePayload& payload);      // LargeFileScanResponse
 
     // 主动推送最新快照(改动后回推,UI 无需再请求)。
     void sendRules();

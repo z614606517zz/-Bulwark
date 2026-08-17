@@ -1,0 +1,39 @@
+[Unit]
+Description=Work the manual-submission queue (ask master, then VT, then push results)
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+# No start rate limit. bulwark-submit.path fires once per file landing in the inbox, so
+# dropping a folder of 44 files triggers this unit dozens of times within seconds and
+# systemd's default (5 starts / 10s) refuses the rest with 'start-limit-hit' -- leaving
+# the unit failed, the path trigger dead, and the queue waiting on the 3-minute timer.
+# Measured on the first real folder upload: 6 starts went through, then start-limit-hit.
+#
+# Rapid restarts are harmless here by construction: the worker takes an exclusive flock
+# and a second instance exits immediately, and a pass with nothing to do costs one
+# process spawn. So the rate limit only ever hurt.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# root, like bulwark-sync.service and for the same two reasons: it has to rewrite
+# records in a spool the dashboard owns, and it has to be able to start
+# bulwark-sync.service the moment a submission produced new rows. The dashboard
+# deliberately has neither capability -- it only streams bytes into the inbox.
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-submit.py
+Nice=10
+# A single sample can be up to VirusTotal's 650 MB limit, and a pass may stream several
+# of them. This is deliberately well ABOVE the worker's own max_pass_seconds (900s) so
+# the worker always stops itself at a clean boundary rather than being SIGTERM'd in the
+# middle of an upload. Overlapping passes are prevented by the worker's flock, not here.
+TimeoutStartSec=1800
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,8 @@ add_library(bulwark_shared STATIC
     src/models/PersistenceEntry.cpp
     src/models/AttackGraph.cpp
     src/models/ProcessEntry.cpp
+    # 磁盘垃圾清理的契约模型(类别 / 风险档 / 位置聚合 / 清理结果)
+    src/models/JunkEntry.cpp
     src/ipc/IpcMessage.cpp
     src/ipc/Payloads.cpp
 

@@ -39,6 +39,15 @@ public:
     bool matchesSelf(const QString& path) const;
     bool isSelfComponent(const SecurityEvent& e) const;
 
+    // 「受认可的维护执行体」:系统自带解释器正在执行【本产品安装目录内】的本产品脚本。
+    //
+    // 为什么必须单独认这一类:本产品的安装/卸载/日志收集都是 .bat + .ps1,真正的发起者
+    // 是 cmd.exe / powershell.exe —— 微软签名的系统程序,不是本产品的 exe。于是
+    // isSelfComponent() 认不出它们,而这些脚本干的事(bcdedit 改引导 + powershell
+    // -ExecutionPolicy Bypass)恰好构成攻击链检测里最强的组合,结果是本产品把自己的
+    // 安装脚本判成勒索软件:实测 收集日志.bat 被打到 riskScore 100 并被内核全维封禁。
+    bool isSanctionedMaintenanceActor(const SecurityEvent& e) const;
+
     // 规则排序辅助:层级(用户精确加白>硬覆盖>普通)、动作强度(Block>Ask>Allow)。
     static int ruleTier(const DefenseRule& r);
     static int rulePriority(VerdictAction a);
@@ -93,7 +102,42 @@ private:
     // 信任项在威胁检测之前提前放行——"信任以后所有检测都不做"。
     std::optional<QString> matchedUserTrust(const SecurityEvent& e) const;
 
+    //
+    // ===================== 规则索引(纯性能,不改变命中集合)=====================
+    //
+    // rules_ 仍是唯一权威集合(以 id 为键,增删改都落在它身上)。索引只是它的两份派生视图,
+    // 用来把「每条事件都要把整个规则集扫一遍」降成「只扫可能命中的那一小撮」。
+    //
+    // 为什么这是【行为等价】的,而不是一种近似:
+    //
+    //   1) 按事件类型分桶 —— DefenseRule::matches() 的第三道判据就是
+    //      `if (type.has_value() && *type != e.type) return false;`
+    //      也就是说一条【带类型】的规则【只可能】被同类型事件命中,对其它类型的事件而言
+    //      它出现在候选集里纯属做功。所以把带类型的规则按类型分桶、type==nullopt 的放进
+    //      typeAgnostic_,再对一条事件只扫「本类型桶 + typeAgnostic_」,得到的命中集合与
+    //      全表扫描逐条相同。
+    //
+    //   2) 命中集合相同还不够,还要保证【胜出的那一条】相同。这一点由步骤 6 的比较器负责:
+    //      它以 id 收尾定序,是一个【全序】(见 RuleEngine.cpp 里那段说明),因此 std::sort
+    //      的结果与候选集的枚举顺序无关。索引改变的只是枚举顺序,不改变排序结果。
+    //
+    // 内置规则里带类型的占绝大多数(reg/file_/del/cmd/proc/netActor/... 这些构造器全都设了
+    // type),所以分桶后单条事件的候选量是数量级下降,而不是常数改善。
+    //
+    // 代价:索引里存的是 DefenseRule 的【副本】而不是指向 rules_ 的指针 —— QHash 一旦重哈希,
+    // 指针即失效,那类悬垂在这条路径上代价太高。副本的实际开销很小:DefenseRule 里的字符串
+    // 都是写时复制,拷贝只增引用计数,多出来的是结构体本身(数百字节 x 规则数)。
+    //
+    void rebuildIndexLocked();                        // 全量重建(loadRules / pruneExpired)
+    void indexInsertLocked(const DefenseRule& r);     // 增量插入(addRule)
+    const QVector<DefenseRule>& bucketForLocked(EventType t) const;
+
     QHash<QUuid, DefenseRule> rules_;
+    QHash<int, QVector<DefenseRule>> byType_;   // 键 = EventType 的整数值
+    QVector<DefenseRule> typeAgnostic_;         // type == nullopt 的规则
+    // 「文件信任中心」生成的信任项(note 以 [信任] 开头的 Allow 规则)。步骤 1 与
+    // trustNoteForPath() 只需要扫这一小撮,而不是为了找几条信任项把 588 条内置规则全过一遍。
+    QVector<DefenseRule> trustEntries_;
     mutable QReadWriteLock rulesLock_;
     QSet<QString> selfDirectories_;
     mutable QMutex selfDirLock_;

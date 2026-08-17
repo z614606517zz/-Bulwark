@@ -1,0 +1,27 @@
+[Unit]
+Description=Bulwark abuse.ch datalake -> VirusTotal collector (node 245)
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+# Same reasoning as bulwark-harvest.service: only a clean exit is worth syncing
+# on. A run systemd had to kill on timeout is marked failed, and OnSuccess= then
+# correctly does not fire, so a half-processed batch is never pushed to the
+# master archive. TimeoutStartSec must stay ABOVE datalake.max_run_seconds in
+# config.json (currently 1500s) so systemd stays a backstop rather than the usual
+# reason a run ends -- the collector is supposed to stop itself on its own budget.
+OnSuccess=bulwark-sync.service
+
+[Service]
+Type=oneshot
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/bulwark-datalake.py
+Nice=10
+TimeoutStartSec=1800
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulwark-intel
+PrivateTmp=true
+# Sample binaries are streamed to disk in 1 MiB blocks and the range cache holds
+# at most 6 chunks, so peak RSS is bounded well below this. It is a guard against
+# a pathological archive, not a working limit.
+MemoryMax=512M

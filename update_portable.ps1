@@ -58,6 +58,20 @@ Say ("dist : " + $dist)
 Say ("pkg  : " + $pkg)
 Say ""
 
+# The one thumbprint every shipped PE must be signed by. Read from the header the
+# client compiles in, so packaging and the running updater can never disagree about
+# who is allowed to sign an update.
+$pinnedThumb = ''
+$trustHeader = Join-Path $root 'cpp\shared\include\bulwark\UpdateTrust.h'
+if (Test-Path $trustHeader) {
+  $tm = [regex]::Match([IO.File]::ReadAllText($trustHeader),
+                       'BULWARK_UPDATE_SIGNER_THUMBPRINT\s+"([0-9A-Fa-f]{40})"')
+  if ($tm.Success) { $pinnedThumb = $tm.Groups[1].Value.ToUpper() }
+}
+if ($pinnedThumb) { Say ("pinned signer : " + $pinnedThumb) }
+else { Say "pinned signer : (UpdateTrust.h not readable -- signer check degraded to presence-only)" }
+Say ""
+
 # ---- 0) staleness guard ------------------------------------------------------
 # The package silently regressed twice before (missing service exe, unsigned driver, dev config).
 # A binary older than its own sources is the same class of failure: it looks fine and quietly
@@ -113,16 +127,39 @@ foreach ($n in $copyList) {
   # exists to prevent. What actually matters is that a signature is present and intact;
   # whether this particular machine trusts the issuer is the target machine's business
   # (the package's bulwark.ps1 imports the cert on the target machine).
-  if ($n -eq 'Bulwark.sys') {
+  # Every PE that ships must be signed by the cert pinned in UpdateTrust.h.
+  #
+  # This used to cover only the driver (the kernel refuses to load an unsigned one, so
+  # the rule enforced itself). The two exes shipped NotSigned for a long time and nothing
+  # complained. That became a real defect the moment online updates landed: the client
+  # only installs an update whose PEs are signed by the pinned thumbprint, so an unsigned
+  # build produces a package that can never be updated -- and the failure would surface
+  # much later, on a user's machine, as "update refused" with no visible cause.
+  if ($n -match '\.(exe|sys)$') {
     $s = Get-AuthenticodeSignature $src
+    $what = if ($n -eq 'Bulwark.sys') { 'driver' } else { $n }
     if ($s.Status -eq 'NotSigned' -or $null -eq $s.SignerCertificate) {
-      Say "REFUSED: dist driver is unsigned -> not copied"; continue
+      Say ("REFUSED: dist " + $what + " is unsigned -> not copied")
+      Say "  run (elevated):  powershell -ExecutionPolicy Bypass -File scripts\sign-binaries.ps1 -FromBuild"
+      continue
     }
     if ($s.Status -eq 'HashMismatch') {
-      Say "REFUSED: dist driver signature does not match its bytes -> not copied"; continue
+      Say ("REFUSED: dist " + $what + " signature does not match its bytes -> not copied"); continue
     }
+    if ($pinnedThumb -and $s.SignerCertificate.Thumbprint.ToUpper() -ne $pinnedThumb) {
+      # Wrong signer is worse than no signer: the package looks properly signed while
+      # the updater will reject every update it is offered.
+      Say ("REFUSED: dist " + $what + " is signed by an unpinned cert -> not copied")
+      Say ("  signer = " + $s.SignerCertificate.Thumbprint.ToUpper())
+      Say ("  pinned = " + $pinnedThumb + "  (cpp\shared\include\bulwark\UpdateTrust.h)")
+      continue
+    }
+    # Deliberately NOT requiring Status='Valid': the cert is self-signed, so Valid only
+    # happens on a box that already trusts it. Whether THIS machine trusts the issuer is
+    # the target machine's business; what matters is that a signature is present, intact,
+    # and made by the pinned key.
     if ($s.Status -ne 'Valid') {
-      Say ("note: driver signature=" + $s.Status + " (self-signed test cert not trusted on this box) signer=" + $s.SignerCertificate.Subject)
+      Say ("note: " + $what + " signature=" + $s.Status + " (self-signed test cert not trusted on this box) signer=" + $s.SignerCertificate.Subject)
     }
   }
   Copy-Item $src (Join-Path $pkg $n) -Force

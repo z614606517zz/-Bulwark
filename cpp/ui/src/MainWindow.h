@@ -72,6 +72,7 @@ private:
     bool m_forceQuit = false;
     bool m_trayHintShown = false;    // close-to-tray hint (shown once on first close)
     bool m_trayBalloonShown = false; // startup "here's the tray icon" balloon (once)
+    bool m_updateBalloonShown = false; // "new version available" balloon (once per session)
     int m_trayRetries = 0;           // setupTray() retry budget while the tray warms up
 
     // Live copies of the service's prompt policy, used to arm the behavior

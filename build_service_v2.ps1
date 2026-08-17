@@ -1,4 +1,4 @@
-# Compile bulwark_service v2.0.2
+﻿# Compile bulwark_service v2.0.2
 Set-Location "d:\新建文件夹 (3)\cpp\build"
 cmake --build . --config Release --target bulwark_service
 

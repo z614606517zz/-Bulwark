@@ -1,3 +1,41 @@
 // Embeds the Bulwark brand badge as the service exe icon (shares the same .ico
 // generated for the UI). Path is relative to this .rc file's directory.
+//
+// VERSIONINFO mirrors the UI's -- see cpp/ui/app.rc for why it has to be here
+// at all. Both blocks read bulwark/Version.h, so the service and the console
+// can never disagree about what version they are; that mattered enough to be
+// worth a shared header, because the updater trusts this number.
+//
+// ASCII-only: rc.exe decodes a BOM-less .rc with the system ANSI codepage.
+#include <winresrc.h>
+#include <bulwark/VersionNumbers.h>
+
 IDI_ICON1 ICON "../ui/app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    BULWARK_VERSION_MAJOR,BULWARK_VERSION_MINOR,BULWARK_VERSION_PATCH,0
+ PRODUCTVERSION BULWARK_VERSION_MAJOR,BULWARK_VERSION_MINOR,BULWARK_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"    // zh-CN (0x0804), Unicode (1200)
+        BEGIN
+            VALUE "CompanyName",      BULWARK_COMPANY_NAME_A
+            VALUE "FileDescription",  "Bulwark HIPS Service"
+            VALUE "FileVersion",      BULWARK_VERSION_STRING
+            VALUE "InternalName",     "bulwark_service"
+            VALUE "OriginalFilename", "bulwark_service.exe"
+            VALUE "ProductName",      BULWARK_PRODUCT_NAME_A
+            VALUE "ProductVersion",   BULWARK_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

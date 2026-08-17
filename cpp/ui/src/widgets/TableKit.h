@@ -1,6 +1,7 @@
 #pragma once
 #include "Theme.h"
 #include "widgets/AppIcon.h"
+#include "widgets/TableColumns.h"
 #include "widgets/Ui.h"
 
 #include <QHBoxLayout>
@@ -24,7 +25,12 @@ inline QTableWidget* table(const QStringList& headers)
     t->setHorizontalHeaderLabels(headers);
     t->verticalHeader()->setVisible(false);
     t->horizontalHeader()->setHighlightSections(false);
-    t->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    // 列宽:Interactive = 用户可以拖列边界(Stretch 是拖不动的,而且强行平分列宽,
+    // 路径列必被截断)。每页紧接着用 ui::columns() 给出各列的默认宽度与伸缩权重;
+    // 没给规格的表格退化成「最后一列占满剩余」,至少不至于挤成一团。
+    t->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    t->horizontalHeader()->setStretchLastSection(true);
+    t->horizontalHeader()->setDefaultSectionSize(140);
     t->horizontalHeader()->setMinimumSectionSize(70);
     t->verticalHeader()->setDefaultSectionSize(48);
     t->setSelectionBehavior(QAbstractItemView::SelectRows);

@@ -34,8 +34,39 @@ public:
     static bool    hasEmbeddedSignature(const QString& path);
     // 签名失配:内嵌了签名但信任校验不过(篡改/盗证书的典型特征)。
     static bool    isSignatureMismatch(const QString& path);
+
+    // 内嵌签名的【原始】WinVerifyTrust 状态码,不做任何塌缩。
+    //
+    // 存在的理由:isSigned() / isSignatureMismatch() 把所有非成功状态都合并成
+    // 「不可信」,于是「文件被改过」和「这台机器没导入我们的自签根证书」变成同一个
+    // 答案。用于威胁打分时这没问题(两者都值得怀疑),但用于【在线更新的准入】就
+    // 是错的:自签测试证书在目标机器上「根不受信任」恰恰是常态,而那会让每一次
+    // 更新都被判成「疑似篡改」而拒装 —— 这个 bug 真实发生过。
+    // 调用方需要区分「摘要不匹配(必须拒)」和「链不受信(可接受,信任锚点是钉死
+    // 的指纹)」时,用这个函数自己判状态码。
+    static long    embeddedSignatureStatus(const QString& path);
     // 提取证书画像(指纹/有效期/吊销;签名时间保守留空,详见 .cpp 注释)。
     static CertInfo getCertInfo(const QString& path);
+
+    // 一次性取齐富化阶段要用的文件取证事实(与逐项接口共用同一批缓存表)。
+    //
+    // 存在的理由是【省掉重复的 stat】:上面每个逐项接口内部都要先算一遍「文件身份」
+    // (小写路径|大小|修改时刻)作为缓存键,而算身份就是一次 QFileInfo stat。Worker::enrich
+    // 对同一个 path 连着调 4~5 个,再加一次为取文件体积的 QFileInfo,合计对同一文件 stat 5~6
+    // 遍 —— 即便这些事实全部命中缓存。本接口把它收敛成一次。
+    // 求值范围与 enrich 的调用序列一一对应,结论完全一致。详见 .cpp 里的说明。
+    struct ForensicFacts {
+        bool     trustedSignature = false;  // 等同 isSigned()
+        bool     embeddedSignature = false; // 等同 hasEmbeddedSignature();仅在无可信签名时求值
+        QString  publisher;                 // 等同 tryGetPublisher()
+        QString  sha256;                    // 等同 tryComputeSha256()
+        CertInfo cert;                      // 等同 getCertInfo();仅在 includeCert 时求值
+        // 路径是否指向一个真实存在的普通文件,以及它的体积。分成两个字段而不是拿
+        // 「fileSize > 0」当存在判据:0 字节的文件是存在的,调用方需要能区分这两种情况。
+        bool     isRealFile = false;
+        qint64   fileSize = 0;
+    };
+    static ForensicFacts collectForensics(const QString& path, bool includeCert);
 
     // ---- 进程自省 ----------------------------------------------------------
     // 解析 PID 的可执行文件完整路径(QueryFullProcessImageName,比 MainModule 可靠)。

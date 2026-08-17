@@ -1,0 +1,17 @@
+[Unit]
+Description=Re-query degraded vt_reports placeholders (hourly, budget-capped)
+
+[Timer]
+# 每小时跑一次,而不是每天一次:每轮受 VT 余量硬限(单轮最多 60 行、且要给在线查询
+# 留 150 次),一天一轮补不完 3000 多行占位。摊到每小时能持续利用当天的空闲额度,
+# 而占位行本身没有时效压力。
+#
+# 分钟位刻意错开整点:整点已经有采集与同步在跑,挤在一起只会互相拖慢。
+OnCalendar=*-*-* *:37:00
+RandomizedDelaySec=300
+# 关机错过的那次不补:这个任务本来就是每小时机会性地跑,补跑没有意义,反而可能在
+# 开机瞬间和别的任务撞在一起。
+Persistent=false
+
+[Install]
+WantedBy=timers.target

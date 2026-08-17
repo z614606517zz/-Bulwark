@@ -1,0 +1,39 @@
+[Unit]
+Description=Bulwark collector-node dashboard (per-concern pages: queue/downloads/uploads/transfers)
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bulwarkintel
+Group=bulwarkintel
+Environment=BULWARK_DASH_HOST=0.0.0.0
+Environment=BULWARK_DASH_PORT=8788
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/dashboard.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Opens cache.db read-only and only reads the harvester's append-only ledgers, so
+# a reporting bug here cannot corrupt state the harvester depends on.
+ReadOnlyPaths=/var/lib/bulwark-intel /etc/bulwark-intel
+# Two narrow exceptions. ReadWritePaths is applied after ReadOnlyPaths, so these
+# re-open exactly these subdirectories and nothing else -- the dashboard still cannot
+# touch cache.db, the ledgers, or config.json.
+#   vtkey-spool:  the VT-key page drops a request file for the root-side
+#                 bulwark-vtkey helper to validate and apply.
+#   submit-spool: the upload page streams submitted samples into inbox/ and
+#                 bulwark-submit.py (root) takes them from there. Bytes have to
+#                 outlive the request because the queue re-checks every 3 minutes and
+#                 a VT analysis takes minutes -- an in-memory batch cannot do that,
+#                 and cannot do "unlimited file count" either.
+ReadWritePaths=/var/lib/bulwark-intel/vtkey-spool /var/lib/bulwark-intel/submit-spool
+# Streaming to disk in fixed blocks means a 400 MB sample no longer costs 400 MB of
+# RAM, which is what the old in-memory submit path forced. Kept at 192M deliberately:
+# if a future change starts buffering bodies again, this is the tripwire.
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

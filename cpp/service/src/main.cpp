@@ -18,9 +18,12 @@
 #include "bulwark/service/UserModeBehaviorSource.h"
 #include "bulwark/service/EventSourceCoordinator.h"
 #include "bulwark/service/PersistenceScanner.h"
+#include "bulwark/service/JunkCleaner.h"
 #include "bulwark/service/ForensicsService.h"
 #include "bulwark/service/Worker.h"
 #include "bulwark/service/AttackChainEngine.h"
+#include "bulwark/service/UpdateService.h"
+#include "bulwark/Version.h"
 
 #include "bulwark/service/monitoring/ProcessInspector.h"
 #include "bulwark/service/monitoring/ProcessEnumerator.h"
@@ -49,6 +52,11 @@
 #include <QProcess>
 #include <QStringList>
 #include <QTextStream>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QTemporaryDir>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -65,7 +73,9 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace bulwark::service;
@@ -116,6 +126,338 @@ int runInspect(const QString& path) {
     }
     QTextStream(stdout) << buf << "result written to: " << resultPath << "\n";
     return 0;
+}
+
+// ============================ 垃圾清理:只读干跑 =============================
+//
+// --junk-scan
+//
+// 跑一次真实的垃圾扫描并把结果打出来,然后立即退出。【纯只读】:调的是 JunkCleaner::scan,
+// 它一个字节都不删;也不启动事件循环 / ETW / 驱动 / IPC。
+//
+// 为什么值得有这个入口:垃圾清理是本产品里唯一会主动删用户文件的功能,它的正确性首先体现在
+// 「它认为自己该动哪些位置」。有了这个模式,验证「范围对不对」就不必先起服务、开界面、点按钮
+// —— 而且在真机上排查「为什么某类清不动」时,能直接看到是哪条根目录被护栏拒了(拒绝原因由
+// JunkCleaner 写进服务日志)。
+int runJunkScanDryRun(const BulwarkOptions& options) {
+    QTextStream out(stdout);
+    out << "=== JunkCleaner dry-run (read-only) ===\n";
+
+    JunkCleanerPolicy pol;
+    pol.enabled = options.DiskCleanup.Enabled;
+    pol.minAgeHours = options.DiskCleanup.MinFileAgeHours;
+    pol.maxFilesPerCategory = options.DiskCleanup.MaxFilesPerCategory;
+    pol.maxSeconds = options.DiskCleanup.MaxSeconds;
+    pol.excludes = options.DiskCleanup.ExcludePaths;
+    pol.selfDir = QCoreApplication::applicationDirPath();
+    // 诊断入口不接引擎,故不查用户信任名单(isUserTrusted 留空 = 不查)。这只影响
+    // 「本来会被跳过的位置这里也算进来」,不会让它多删什么 —— 它根本不删。
+
+    bulwark::ipc::JunkScanRequestPayload req;
+    const bulwark::ipc::JunkScanResponsePayload res = JunkCleaner::scan(req, pol);
+
+    out << "enabled: " << (res.enabled ? "true" : "false") << "\n";
+    out << "minAgeHours: " << res.minAgeHours << "\n";
+    out << "truncated: " << (res.truncated ? "true" : "false") << "\n";
+    out << "elapsedMs: " << res.elapsedMs << "   unreadableDirs: " << res.unreadable << "\n";
+    out << "message: " << res.message << "\n";
+    out << "total: " << res.totalBytes << " bytes / " << res.totalFiles << " files\n\n";
+    for (const bulwark::JunkCategoryResult& c : res.categories) {
+        out << QStringLiteral("[%1] %2\n")
+                   .arg(bulwark::junk::categoryKey(c.category), c.title);
+        out << QStringLiteral("    risk=%1 available=%2 cleanable=%3 recommended=%4 elapsed=%5ms\n")
+                   .arg(c.risk == bulwark::junk::Risk::Safe ? QStringLiteral("safe")
+                                                            : QStringLiteral("caution"))
+                   .arg(c.available).arg(c.cleanable).arg(c.recommended).arg(c.elapsedMs);
+        out << QStringLiteral("    %1 bytes / %2 files / %3 skipped / %4 unreadable\n")
+                   .arg(c.bytes).arg(c.fileCount).arg(c.skipped).arg(c.unreadable);
+        if (!c.message.isEmpty())
+            out << "    note: " << c.message << "\n";
+        for (const bulwark::JunkLocation& loc : c.locations)
+            out << QStringLiteral("      - %1  (%2 bytes / %3 files / %4 skipped / %5 unreadable)"
+                                  "%6\n")
+                       .arg(loc.path).arg(loc.bytes).arg(loc.fileCount).arg(loc.skipped)
+                       .arg(loc.unreadable)
+                       .arg(loc.note.isEmpty() ? QString()
+                                               : QStringLiteral("  [%1]").arg(loc.note));
+    }
+    out.flush();
+    return 0;
+}
+
+// ============================ 大文件查找:只读干跑 ============================
+//
+// --large-files [阈值MB]
+//
+// 与 --junk-scan 同样是纯只读的诊断入口。大文件查找本身就没有删除路径(见 LargeFileScanner
+// 的说明),所以这个模式和生产路径做的是完全同一件事,只是把结果打到 stdout。
+int runLargeFileScan(const BulwarkOptions& options, qint64 minBytes) {
+    QTextStream out(stdout);
+    out << "=== LargeFileScanner dry-run (read-only) ===\n";
+
+    LargeFileScannerPolicy pol;
+    pol.excludes = options.DiskCleanup.ExcludePaths;
+    pol.selfDir = QCoreApplication::applicationDirPath();
+
+    bulwark::ipc::LargeFileScanRequestPayload req;
+    req.minBytes = minBytes;
+    req.limit = 30;
+    const bulwark::ipc::LargeFileScanResponsePayload res = LargeFileScanner::scan(req, pol);
+
+    out << "minBytes: " << res.minBytes << "\n";
+    out << "scannedFiles: " << res.scannedFiles << "   unreadableDirs: " << res.unreadable << "\n";
+    out << "truncated: " << (res.truncated ? "true" : "false")
+        << "   elapsedMs: " << res.elapsedMs << "\n";
+    out << "message: " << res.message << "\n";
+    out << "listed: " << res.files.size() << " files / " << res.totalBytes << " bytes\n\n";
+    for (const bulwark::LargeFileEntry& f : res.files) {
+        out << QStringLiteral("%1 MB  %2  [%3]\n")
+                   .arg(f.bytes / (1024 * 1024), 6)
+                   .arg(f.path)
+                   .arg(f.suffix.isEmpty() ? QStringLiteral("-") : f.suffix);
+    }
+    out.flush();
+    return 0;
+}
+
+// ============================ 攻击链回归测试 =================================
+//
+// --attackchain-selftest <table.json>
+//
+// 为什么需要它(而 --attackchain-check 顶不上):后者的表是从服务器现拉的。于是
+//   * 服务器明天重挖出一张不同的表,数字就变了 —— 分不清「代码改坏了」还是「表变了」;
+//   * 表里恰好没有 hard/strong 档时,降档逻辑一次都不会被触发,测了等于没测
+//     (实测 v16 表 21 条全是 ask,降档机制装上后 capped 恒为 0);
+//   * 离线 / CI 里根本跑不起来。
+// 本模式改成从【固定的本地语料】装表,把上面三点全部消掉:同一份输入永远得到同一份结论。
+//
+// 状态隔离:引擎用临时目录(dataDirOverride),绝不碰 %ProgramData% 下真实的组合表缓存与
+// 命中记录 —— 否则跑一次测试就把机器上的真表冲掉了。
+// 配置也全部就地构造,不读 appsettings.json —— 否则有人改了本机配置,测试结论跟着变。
+int runAttackChainSelfTest(const QString& tablePath) {
+    QTextStream out(stdout);
+    out << "=== AttackChain regression selftest ===\n";
+    out << "fixture: " << tablePath << "\n";
+
+    QFile f(tablePath);
+    if (!f.open(QIODevice::ReadOnly)) {
+        out << "FAIL: cannot open fixture\n";
+        return 1;
+    }
+    const QByteArray raw = f.readAll();
+    f.close();
+    QJsonParseError perr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(raw, &perr);
+    if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+        out << "FAIL: fixture is not valid JSON: " << perr.errorString() << "\n";
+        return 1;
+    }
+    const QJsonObject payload = doc.object();
+    const QJsonObject expect = payload.value(QLatin1String("_expect")).toObject();
+    const QJsonObject covObj = payload.value(QLatin1String("_coverage")).toObject();
+
+    int pass = 0, total = 0;
+    const auto check = [&](bool ok, const QString& what) {
+        ++total;
+        if (ok) ++pass;
+        out << (ok ? "  PASS " : "  FAIL ") << what << "\n";
+    };
+    const auto checkInt = [&](int got, const QJsonValue& want, const QString& what) {
+        const int w = want.toInt(-987654);
+        ++total;
+        const bool ok = (got == w);
+        if (ok) ++pass;
+        out << (ok ? "  PASS " : "  FAIL ") << what << " = " << got;
+        if (!ok) out << " (expected " << w << ")";
+        out << "\n";
+    };
+
+    // ---- 就地构造配置:全确定,不受 appsettings 影响 ----
+    AttackChainOptions opt;
+    opt.Enabled = true;
+    opt.DryRun = false;          // 必须强制模式,否则 applyHitToEvent 不产生分数,无从断言
+    opt.MinGrade = QStringLiteral("ask");   // 全档收下,不在装载期就把语料过滤掉
+    opt.LedgerRetentionMinutes = 30;
+    opt.LedgerMaxProcesses = 4096;
+
+    QTemporaryDir tmp;
+    if (!tmp.isValid()) {
+        out << "FAIL: cannot create temp dir for state isolation\n";
+        return 1;
+    }
+    AttackChainEngine engine(opt, tmp.path());
+
+    if (!engine.applyTable(payload)) {
+        out << "FAIL: applyTable rejected the fixture\n";
+        return 1;
+    }
+
+    // ---- 覆盖面同样来自语料 ----
+    CoverageProfile cov;
+    cov.driverSource   = covObj.value(QLatin1String("driverSource")).toBool();
+    cov.etwFileEvents  = covObj.value(QLatin1String("etwFileEvents")).toBool();
+    cov.etwDns         = covObj.value(QLatin1String("etwDns")).toBool();
+    cov.moduleSignature= covObj.value(QLatin1String("moduleSignature")).toBool();
+    cov.cmdLineInBand  = covObj.value(QLatin1String("cmdLineInBand")).toBool();
+    for (const QJsonValue& v : covObj.value(QLatin1String("registryWatch")).toArray())
+        cov.registryWatch << v.toString();
+    for (const QJsonValue& v : covObj.value(QLatin1String("fileWatch")).toArray())
+        cov.fileWatch << v.toString();
+    const int capped = engine.setCoverage(cov);
+
+    // ---- 1) 装载期的剔除 ----
+    out << "\n-- load-time filtering --\n";
+    const ReachabilityReport rep = engine.analyzeReachability(cov);
+    checkInt(rep.serverPatterns, expect.value(QLatin1String("server_patterns")), QStringLiteral("server_patterns"));
+    checkInt(rep.droppedConflict, expect.value(QLatin1String("dropped_conflict")), QStringLiteral("dropped_conflict"));
+    checkInt(rep.droppedRedundant, expect.value(QLatin1String("dropped_redundant")), QStringLiteral("dropped_redundant"));
+    checkInt(engine.patternCount(), expect.value(QLatin1String("loaded")), QStringLiteral("loaded"));
+
+    // ---- 2) 可观测性分类 ----
+    out << "\n-- reachability --\n";
+    checkInt(rep.reachable, expect.value(QLatin1String("reachable")), QStringLiteral("reachable"));
+    checkInt(rep.sparse, expect.value(QLatin1String("sparse")), QStringLiteral("sparse"));
+    checkInt(rep.dead, expect.value(QLatin1String("dead")), QStringLiteral("dead"));
+
+    // ---- 3) 降档与打分 ----
+    //
+    // 分数不直接调 gradeScore,而是走【真实路径】applyHitToEvent -> 读 chainScore:
+    // 那才是生产里决定处置的那条线。直接测内部函数会漏掉「打分用了 serverGrade 而不是
+    // 生效 grade」这类接线错误 —— 而那正是让整套降档变成装饰的方式。
+    out << "\n-- grade capping & scoring --\n";
+    checkInt(capped, expect.value(QLatin1String("capped")), QStringLiteral("capped"));
+    const QJsonObject wantPats = expect.value(QLatin1String("patterns")).toObject();
+    const QVector<ChainPattern> pats = engine.patternSnapshot();
+    check(pats.size() == wantPats.size(),
+          QStringLiteral("每条装载的组合都有期望值(%1 条 vs 期望表 %2 项)")
+              .arg(pats.size()).arg(wantPats.size()));
+    for (const ChainPattern& p : pats) {
+        if (!wantPats.contains(p.key)) {
+            check(false, QStringLiteral("组合 %1 在期望表里没有条目").arg(p.key));
+            continue;
+        }
+        const QJsonObject w = wantPats.value(p.key).toObject();
+        check(p.grade == w.value(QLatin1String("grade")).toString(),
+              QStringLiteral("%1 生效强度 %2(期望 %3)")
+                  .arg(p.key, p.grade, w.value(QLatin1String("grade")).toString()));
+
+        ChainHit hit;
+        hit.pattern = p;
+        hit.titles = p.markers;
+        bulwark::SecurityEvent se;
+        se.type = bulwark::EventType::ProcessCreate;
+        se.actorPid = 990000;
+        se.actorPath = QStringLiteral("C:\\x\\fixture.exe");
+        se.actorSigned = true;   // 签名健康 -> 分数只可能来自组合命中
+        engine.applyHitToEvent(se, hit);
+        const int wantScore = w.value(QLatin1String("score")).toInt(-1);
+        check(se.chainScore == wantScore,
+              QStringLiteral("%1 分数 %2(期望 %3)").arg(p.key).arg(se.chainScore).arg(wantScore));
+        check(se.chainHardIndicator, QStringLiteral("%1 置了硬指标").arg(p.key));
+    }
+
+    // ---- 4) 记账不再为「什么都没命中」的事件建账 ----
+    //
+    // 这一条钉住的是一个真实的泄漏:原实现一进 observe 就 ledger_[pid](QHash::operator[]
+    // 会默认插入),于是每个产生过任意事件的 PID 都留下一条空账;而淘汰当时挂在函数末尾、
+    // 两处 early-return 之后,只有【组合命中】时才跑 —— 命中是罕见事件,于是保留窗口与
+    // 容量上限从未生效,记账表实际只增不减。
+    out << "\n-- ledger hygiene --\n";
+    {
+        // 签名健康 + 主体不是 powershell/schtasks + 命令行不匹配 -> 一个 ProcessCreate 标记都不命中。
+        for (int i = 0; i < 3000; ++i) {
+            bulwark::SecurityEvent e;
+            e.type = bulwark::EventType::ProcessCreate;
+            e.actorPid = 100000 + i;                       // 每条一个新 PID
+            e.actorPath = QStringLiteral("C:\\Windows\\System32\\notepad.exe");
+            e.actorSigned = true;
+            e.commandLine = QStringLiteral("notepad.exe readme.txt");
+            engine.observe(e);
+        }
+        checkInt(engine.trackedProcessCount(), QJsonValue(0),
+                 QStringLiteral("3000 条零命中事件后的记账进程数"));
+    }
+
+    // ---- 5) 命中只在凑齐时发生,且同一进程同一组合只报一次 ----
+    out << "\n-- combo completion --\n";
+    {
+        const int pid = 200001;
+        bulwark::SecurityEvent r;
+        r.type = bulwark::EventType::RegistryWrite;
+        r.actorPid = pid;
+        r.actorPath = QStringLiteral("C:\\x\\dropper.exe");
+        r.target = QStringLiteral("\\REGISTRY\\MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\evil");
+        r.actorSigned = true;
+        check(!engine.observe(r).has_value(), QStringLiteral("只置位 m_run 时不应命中(组合还缺一个动作)"));
+        checkInt(engine.trackedProcessCount(), QJsonValue(1), QStringLiteral("命中了标记 -> 建账 1 条"));
+
+        bulwark::SecurityEvent d;
+        d.type = bulwark::EventType::DnsQuery;
+        d.actorPid = pid;
+        d.actorPath = r.actorPath;
+        d.target = QStringLiteral("evil.example.com");
+        d.actorSigned = true;
+        const auto hit = engine.observe(d);
+        check(hit.has_value(), QStringLiteral("补齐 m_dns 后应当命中"));
+        if (hit)
+            check(hit->pattern.key == expect.value(QLatin1String("hit_pattern_key")).toString(),
+                  QStringLiteral("命中的是期望的那条组合:%1").arg(hit->pattern.key));
+
+        // 再来一条同类事件:同一进程同一组合只报一次(firedPatterns 去重)。
+        bulwark::SecurityEvent d2 = d;
+        d2.target = QStringLiteral("evil2.example.com");
+        check(!engine.observe(d2).has_value(), QStringLiteral("同一进程同一组合不重复上报"));
+    }
+
+    // ---- 6) PID 复用必须清账 ----
+    //
+    // Windows 会回收 PID。若不清账,前一个进程的动作会被算到新进程头上 —— 那是最典型的
+    // 误报来源。这里先用 PID X 置位 m_run,再让同一个 PID 换成另一个映像去置位 m_dns:
+    // 旧账若没清掉,组合就会「凑齐」并误报。
+    out << "\n-- PID reuse --\n";
+    {
+        const int pid = 200002;
+        bulwark::SecurityEvent r;
+        r.type = bulwark::EventType::RegistryWrite;
+        r.actorPid = pid;
+        r.actorPath = QStringLiteral("C:\\x\\first.exe");
+        r.target = QStringLiteral("\\REGISTRY\\MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\a");
+        r.actorSigned = true;
+        engine.observe(r);
+
+        bulwark::SecurityEvent d;
+        d.type = bulwark::EventType::DnsQuery;
+        d.actorPid = pid;
+        d.actorPath = QStringLiteral("C:\\x\\second.exe");   // 同 PID、换了映像 = PID 被复用
+        d.target = QStringLiteral("other.example.com");
+        d.actorSigned = true;
+        check(!engine.observe(d).has_value(),
+              QStringLiteral("PID 复用后旧账已清,不应凭上一个进程的动作凑齐组合"));
+    }
+
+    // ---- 7) 确定性:同一份语料重放两次必须得到同一结论 ----
+    //
+    // Qt6 的 QHash 每进程随机化种子,而装载期的分桶/索引都走 QHash。这一条防的是
+    // 「结论依赖容器迭代顺序」——那种缺陷平时全绿,换台机器或换次运行才炸。
+    out << "\n-- determinism --\n";
+    {
+        QTemporaryDir tmp2;
+        AttackChainEngine e2(opt, tmp2.path());
+        e2.applyTable(payload);
+        const int capped2 = e2.setCoverage(cov);
+        QStringList a, b;
+        for (const ChainPattern& p : pats)
+            a << (p.key + QLatin1Char('=') + p.grade);
+        for (const ChainPattern& p : e2.patternSnapshot())
+            b << (p.key + QLatin1Char('=') + p.grade);
+        a.sort();
+        b.sort();
+        check(capped2 == capped && a == b, QStringLiteral("二次装载得到完全相同的组合与档位"));
+    }
+
+    out << "\n=== " << pass << "/" << total << " passed ===\n";
+    out.flush();
+    return (pass == total) ? 0 : 2;
 }
 
 // 攻击链组合表自检(--attackchain-check)。只读:拉一次组合表、解析、打印统计与前几条组合,然后退出。
@@ -175,6 +517,18 @@ int runAttackChainCheck() {
     out << "  patterns: " << engine.patternCount() << "\n";
     out << "  markers : " << engine.markerCount() << "\n";
 
+    // 覆盖面与定档。必须【在自检之前】做,顺序也必须与 serviceRun 里一致:
+    //   补齐前的覆盖面 -> 派生受关注键 -> 加进覆盖面 -> setCoverage 定档
+    // 否则自检打印的档位和服务实际生效的档位是两回事,而这份报告的全部价值就在于「所见即所行」。
+    const CoverageProfile cov = CoverageProfile::fromOptions(options);
+    // derivedRegistryWatch 必须用【补齐前】的覆盖面算 —— 它找的正是「因为键不在名单里而
+    // 结构性死掉」的标记,拿补齐后的去算会一个都找不到。
+    const QStringList derived = engine.derivedRegistryWatch(cov);
+    CoverageProfile covLive = cov;
+    covLive.registryWatch += derived;
+    const int capped = engine.setCoverage(covLive);
+    out << "  capped  : " << capped << " 条组合按本机情况降档(正常语料命中 / 依赖稀疏事件)\n";
+
     // 合成事件走一遍「标记置位 -> 累积 -> 组合命中」。实机触发靠不住(驱动对文件写入
     // 1/32 采样),这一步才是对组合逻辑的确定性验证。
     QStringList detail;
@@ -194,21 +548,34 @@ int runAttackChainCheck() {
     // 第三段:实机可达性。上面两段全绿也只说明「逻辑对」,说明不了「真机上点得亮」——
     // 标记依赖的事件维度本身是有条件才上报的(受关注注册表键名单 / 文件写入采样 /
     // 模块加载位置过滤 / 命令行靠读 PEB)。这一段把差距量化出来。
-    const CoverageProfile cov = CoverageProfile::fromOptions(options);
     out << "\n=== live reachability ===\n";
     out << "  event source   : " << (cov.driverSource ? "Driver (kernel + ETW)" : "user-mode (ETW only)") << "\n";
     out << "  registry watch : " << cov.registryWatch.size() << " entries\n";
     out << "  new-file watch : " << cov.fileWatch.size() << " entries\n";
-    const ReachabilityReport rr = engine.analyzeReachability(cov);
-    for (const QString& d : rr.lines)
-        out << d << "\n";
 
-    // 服务启动时会把这些键补进受关注名单(仅上报、不拦截),使原本不可观测的注册表标记活过来。
-    // 在自检里一并打出来,让「机器上会多监视哪几个键」是看得见的,而不是藏在启动日志里。
-    const QStringList derived = engine.derivedRegistryWatch(cov);
-    out << "  derived registry watch additions: "
-        << (derived.isEmpty() ? QStringLiteral("(none needed)") : derived.join(QStringLiteral(", ")))
-        << "\n";
+    // 【为什么要报两遍】原实现只用 cov(补齐【前】的覆盖面)算一次可达性,然后把 derived
+    // 另起一行打出来。于是自检报的可达率并不是服务真正达到的可达率 —— 实测 24 条下发里
+    // 有 4 条被判「结构性死路」,全都因为同一个标记要 *\SystemCertificates\* 而该键不在名单里;
+    // 可 derivedRegistryWatch 恰好就会为它派生出 \SystemCertificates\,服务一启动那 4 条就活了。
+    // 结果是:自检说 62.5%,服务实际是 79.2%。这个诊断本来就是「判断本引擎是否真实有用的
+    // 唯一客观标尺」,标尺自己偏一截,读的人会照着一个不存在的问题去查。
+    // 故:补齐前的数字仍然报(它说明「不派生的话会损失多少」),但【以补齐后为准】。
+    const ReachabilityReport rr = engine.analyzeReachability(cov);
+    if (derived.isEmpty()) {
+        for (const QString& d : rr.lines)
+            out << d << "\n";
+        out << "  derived registry watch additions: (none needed)\n";
+    } else {
+        out << "  -- 按当前 appsettings 的名单(尚未派生补齐)--\n";
+        for (const QString& d : rr.lines)
+            out << d << "\n";
+        out << "  derived registry watch additions: " << derived.join(QStringLiteral(", ")) << "\n";
+
+        const ReachabilityReport rrAfter = engine.analyzeReachability(covLive);
+        out << "  -- 服务启动补齐这 " << derived.size() << " 个键之后(这才是实际运行时的口径)--\n";
+        for (const QString& d : rrAfter.lines)
+            out << d << "\n";
+    }
 
     const bool comboOk = (st.first == st.second && st.second > 0);
     const bool verdictOk = (vt.first == vt.second && vt.second > 0);
@@ -237,6 +604,16 @@ static int serviceRun(int argc, char** argv) {
     QCoreApplication::setApplicationName(QStringLiteral("Bulwark Defense"));
     std::set_terminate(onTerminate);
 
+    // 控制台代码页对齐到 UTF-8。诊断入口(--inspect / --attackchain-check / --junk-scan /
+    // --large-files)的结论文案是中文,而 QTextStream(stdout) 在 Qt6 里固定按 UTF-8 编码;
+    // 中文版 Windows 的控制台默认是 936(GBK),于是每一行中文都渲染成乱码 —— 一个「给人看的
+    // 诊断输出」看不懂,就等于没有。
+    //
+    // 只影响控制台【渲染】:输出被重定向到文件或管道时,拿到的本来就是原始 UTF-8 字节,这行
+    // 改不到它。以服务身份运行时没有控制台,调用直接失败返回,无副作用 —— 所以不需要先判断
+    // 是否附着控制台。
+    ::SetConsoleOutputCP(CP_UTF8);
+
     // 诊断自检(在任何服务初始化之前处理):只读取证并退出,绝不启动监控/处置。
     {
         const QStringList args = QCoreApplication::arguments();
@@ -245,6 +622,15 @@ static int serviceRun(int argc, char** argv) {
             return runInspect(idx + 1 < args.size() ? args.at(idx + 1) : QString());
         if (args.contains(QStringLiteral("--attackchain-check")))
             return runAttackChainCheck();
+        // 回归测试:从固定语料装表并逐项比对。离线、确定、状态隔离(见 runAttackChainSelfTest)。
+        const int sidx = args.indexOf(QStringLiteral("--attackchain-selftest"));
+        if (sidx >= 0) {
+            if (sidx + 1 >= args.size()) {
+                QTextStream(stdout) << "usage: --attackchain-selftest <table.json>\n";
+                return 1;
+            }
+            return runAttackChainSelfTest(args.at(sidx + 1));
+        }
     }
 
     startFileLog();
@@ -260,6 +646,37 @@ static int serviceRun(int argc, char** argv) {
 
     // 按配置决定证书吊销校验是否联网(默认 false:仅用本机缓存 CRL,绝不联网/阻塞富化)。
     monitoring::ProcessInspector::onlineRevocationCheck = options.OnlineCertRevocationCheck;
+
+    // 垃圾清理的只读干跑。放在这里(而不是上面那个诊断块)是因为它要用真实的 appsettings 配置;
+    // 放在存储层与事件源初始化【之前】,所以它不会碰规则库、不会起 ETW / 驱动 / IPC。
+    //
+    // ⚠ 必须显式 stopFileLog():此处已经在 startFileLog() 之后,而文件日志是一条后台写入线程。
+    // 直接 return 会让它在全局析构期间还活着,进程退出时以 0xC0000409(STATUS_STACK_BUFFER_OVERRUN)
+    // 收场 —— 结果全都打印对了、退出码却是崩溃。上面那两个诊断入口(--inspect /
+    // --attackchain-selftest)在 startFileLog() 【之前】就返回了,所以它们没有这个问题;
+    // 任何以后加在这个位置的诊断入口都得记得停日志线程。
+    if (QCoreApplication::arguments().contains(QStringLiteral("--junk-scan"))) {
+        const int rc = runJunkScanDryRun(options);
+        stopFileLog();
+        return rc;
+    }
+    // 同上,也必须显式 stopFileLog()(见上面那段关于 0xC0000409 的说明)。
+    {
+        const QStringList args = QCoreApplication::arguments();
+        const int li = args.indexOf(QStringLiteral("--large-files"));
+        if (li >= 0) {
+            qint64 minBytes = 0;   // 0 = 用 LargeFileScanner 的默认阈值(100 MB)
+            if (li + 1 < args.size()) {
+                bool ok = false;
+                const qint64 mb = args.at(li + 1).toLongLong(&ok);
+                if (ok && mb > 0)
+                    minBytes = mb * 1024 * 1024;
+            }
+            const int rc = runLargeFileScan(options, minBytes);
+            stopFileLog();
+            return rc;
+        }
+    }
 
     // 存储层。
     SettingsStore settingsStore;
@@ -375,14 +792,37 @@ static int serviceRun(int argc, char** argv) {
     (void)repProxyFirst.healthCheckNonBlocking();
     // 把查毒的取数路径写进日志 —— 这是最容易被误解的一环(到底走服务器还是本地),明确记一行。
     // 端点一律以掩码形式记录(https://***:port),绝不在日志里泄露服务器地址(便携包隐藏端点意图)。
-    if (options.ReputationProxy.Enabled && !options.ReputationProxy.resolveBaseUrl().trimmed().isEmpty()) {
+    if (options.ReputationProxy.ServerOnly) {
+        // 这一条要压在最前面:它决定了「这台机器会不会拿本机密钥外发到第三方」,是排查取数路径
+        // 时最先要看的一句。它与下面几条互斥,不能让「未收录即改用本机密钥直连」那句同时出现。
+        const QString ep = options.ReputationProxy.resolveBaseUrl().trimmed();
+        const bool usable = options.ReputationProxy.Enabled && !ep.isEmpty();
+        log.info(QStringLiteral("[Aggregate] 哈希信誉取数:【本机不动用任何第三方情报源】—— 云端只向中央服务器 %1 "
+                                "查询「是否已收录」;不用本机密钥查 VirusTotal/MalwareBazaar/OTX/微步/"
+                                "MetaDefender/HybridAnalysis,不拉行为画像,不上传文件。"
+                                "未收录 => 无云端结论(只剩本地启发式/规则/内核基线兜底)。%2")
+                     .arg(usable ? ReputationProxyOptions::maskUrl(ep) : QStringLiteral("(未配置)"))
+                     .arg(usable ? QString()
+                                 : QStringLiteral("⚠ 中央服务器未启用/未配置 —— 当前【完全没有】云端信誉。")));
+    } else if (options.ReputationProxy.Enabled && !options.ReputationProxy.resolveBaseUrl().trimmed().isEmpty()) {
         const int freshCap = options.ReputationProxy.FreshQueriesPerDay;
-        log.info(QStringLiteral("[Aggregate] 哈希信誉取数:优先中央服务器 %1(超时 %2s,每日新鲜查询上限 %3),"
-                                "服务器缓存命中不限次;超额或不可用自动回退本地直连聚合器;"
-                                "离线期间熔断跳过,每 60s 半开重试一次。")
-                     .arg(ReputationProxyOptions::maskUrl(options.ReputationProxy.resolveBaseUrl()))
-                     .arg(options.ReputationProxy.QueryTimeoutSeconds)
-                     .arg(freshCap > 0 ? QString::number(freshCap) : QStringLiteral("不限")));
+        if (options.ReputationProxy.LookupOnly) {
+            // 「只查收录」模式:别再讲「每日新鲜查询上限」——那条预算在这个模式下压根不生效,
+            // 日志里出现一个用不掉的数字只会让人以为还有别的路径在花服务器配额。
+            log.info(QStringLiteral("[Aggregate] 哈希信誉取数:仅向中央服务器 %1 查询「是否已收录」"
+                                    "(超时 %2s,永不请求服务器查询它的上游情报源);未收录即改用"
+                                    "本机密钥直连各情报源;服务器不可用时同样走本地,"
+                                    "离线期间熔断跳过,每 60s 半开重试一次。")
+                         .arg(ReputationProxyOptions::maskUrl(options.ReputationProxy.resolveBaseUrl()))
+                         .arg(options.ReputationProxy.QueryTimeoutSeconds));
+        } else {
+            log.info(QStringLiteral("[Aggregate] 哈希信誉取数:优先中央服务器 %1(超时 %2s,每日新鲜查询上限 %3),"
+                                    "服务器缓存命中不限次;超额或不可用自动回退本地直连聚合器;"
+                                    "离线期间熔断跳过,每 60s 半开重试一次。")
+                         .arg(ReputationProxyOptions::maskUrl(options.ReputationProxy.resolveBaseUrl()))
+                         .arg(options.ReputationProxy.QueryTimeoutSeconds)
+                         .arg(freshCap > 0 ? QString::number(freshCap) : QStringLiteral("不限")));
+        }
     } else {
         log.info(QStringLiteral("[Aggregate] 哈希信誉取数:仅本地直连各情报源(中央服务器未配置/未启用)。"));
     }
@@ -392,9 +832,24 @@ static int serviceRun(int argc, char** argv) {
     reputation::ReputationManager repManager(&repProxyFirst, &repCache);
     // 按运行时设置启用各信誉源(默认全关,由 UI 开启;VT 虽有内置 Key 也须用户显式启用)。
     // 与 .NET 一致:信誉查询是 opt-in,未启用任何源则后台 worker 不查询。
-    repAggregate.setRuntimeEnabled(settings.virusTotalEnabled, settings.malwareBazaarEnabled,
-                                   settings.otxEnabled, settings.threatBookEnabled,
-                                   settings.metaDefenderEnabled, settings.hybridAnalysisEnabled);
+    //
+    // 【本机不动用任何第三方情报源】(ReputationProxy.ServerOnly)时一律置为全关,并且 UI 的
+    // 逐源开关也不能把它们再打开 —— 否则这条策略就成了「一点就破」:用户在设置页拨一下开关,
+    // 本机密钥就又开始直连第三方了,而他并不知道那和 appsettings 里的策略是矛盾的。
+    // 开关本身照旧保存(设置页不撒谎地显示用户的选择),只是在这个模式下不生效。
+    // 初始化与「设置变更」两处共用这一份实现,免得两边各写一份而慢慢跑偏。
+    const bool serverOnlyMode = options.ReputationProxy.ServerOnly;
+    std::function<void(const bulwark::RuntimeSettings&)> applyIntelSourceToggles =
+        [&repAggregate, serverOnlyMode](const bulwark::RuntimeSettings& s) {
+            if (serverOnlyMode) {
+                repAggregate.setRuntimeEnabled(false, false, false, false, false, false);
+                return;
+            }
+            repAggregate.setRuntimeEnabled(s.virusTotalEnabled, s.malwareBazaarEnabled,
+                                           s.otxEnabled, s.threatBookEnabled,
+                                           s.metaDefenderEnabled, s.hybridAnalysisEnabled);
+        };
+    applyIntelSourceToggles(settings);
 
     // 情报规则应用(共享:后台自动刷新回调 + IPC 手动刷新/采纳都复用)。按来源标记清理上一轮
     // 同源规则后灌入新规则并落盘,返回清理的旧规则数。均在主线程调用(feed 回调已编组回主线程)。
@@ -471,6 +926,17 @@ static int serviceRun(int argc, char** argv) {
                          .arg(derivedReg.size())
                          .arg(derivedReg.join(QStringLiteral(", "))));
         }
+
+        // ---- 按本机实际观测能力给组合定档(只降不升)----
+        //
+        // 【必须在派生键补进 options 之后】。覆盖面是定档的输入,而它要等上面那一步做完才是
+        // 最终值 —— 早一行调用,那些刚被救活的注册表标记还会被算成不可观测。
+        //
+        // 定档做两件事:正常软件语料里出现过的组合不许「不问就拦」;依赖本机稀疏事件
+        //(驱动偏移 0 写的全局 1/32 采样、模块加载只在 \Temp\ 与 \Users\Public\ 才上报)
+        // 的组合降一档 —— 服务器给的强度隐含假设动作会被可靠观测到,而本机能不能可靠看到
+        // 是本地事实。降档一律从服务器原始强度算起,故与运行期的表更新重复调用无副作用。
+        attackChain.setCoverage(CoverageProfile::fromOptions(options));
     }
 
     // 威胁情报共享:夜间把本机暂存的「病毒信息 + 行为数据」批量上传中央服务器,成功即删本地。
@@ -560,9 +1026,12 @@ static int serviceRun(int argc, char** argv) {
     };
 
     // 运行时设置:查询(附只读内核/事件源状态)/ 更新(同步引擎 + 落盘)。
-    ipc.settingsRequested = [&settings, &engine, &coordinatorPtr] {
+    ipc.settingsRequested = [&settings, &engine, &coordinatorPtr, serverOnlyMode] {
         bulwark::RuntimeSettings snap = settings.clone();
         snap.trustSignedActors = engine.trustSignedActors;
+        // 只读策略位:让设置页知道「本机不动用第三方情报源」已生效,好把那六个源的开关禁掉并
+        // 说明原因(它们在服务端一律按关处理,见 applyIntelSourceToggles)。
+        snap.cloudServerOnly = serverOnlyMode;
         if (coordinatorPtr && coordinatorPtr->kernelConnected()) {
             snap.kernelConnected = true;
             // 不能一律显示「行为前拦截」:协议版本自 v9 起刻意锁死(见 Protocol.h),所以一个比
@@ -594,11 +1063,13 @@ static int serviceRun(int argc, char** argv) {
     // options 拖进 settingsUpdated 的捕获列表。
     const int contribUploadHour = options.ReputationProxy.ContributionUploadHour;
     ipc.settingsUpdated = [&settings, &engine, &settingsStore, &repAggregate, &repManager,
-                           &coordinatorPtr, &intelUploader, &intelContrib, contribUploadHour, &log](
+                           &applyIntelSourceToggles, &coordinatorPtr, &intelUploader,
+                           &intelContrib, contribUploadHour, serverOnlyMode, &log](
                               const bulwark::RuntimeSettings& s) {
         const bool wasContribOn = settings.cloudBehaviorUploadEnabled;
         bulwark::RuntimeSettings updated = s;
         updated.eventSource = settings.eventSource; // 只读字段保持不变
+        updated.cloudServerOnly = serverOnlyMode;   // 同上:策略来自 appsettings,UI 改不了
         settings = updated;
         engine.trustSignedActors = settings.trustSignedActors;
         engine.enableBaseline = settings.behaviorBaselineEnabled;
@@ -613,9 +1084,8 @@ static int serviceRun(int argc, char** argv) {
             coordinatorPtr->setMemoryProtectionEnabled(settings.memoryProtectionEnabled);
         }
         // 信誉源开关即时生效;若用户新启用了某源,(重)启动后台查询 worker(已运行则为空操作)。
-        repAggregate.setRuntimeEnabled(settings.virusTotalEnabled, settings.malwareBazaarEnabled,
-                                       settings.otxEnabled, settings.threatBookEnabled,
-                                       settings.metaDefenderEnabled, settings.hybridAnalysisEnabled);
+        // ServerOnly 时这一步会把各源一律按关处理(见 applyIntelSourceToggles 的说明)。
+        applyIntelSourceToggles(settings);
         // 情报源 API Key 热应用(UI 逐源填写,立即生效)。空 -> 禁用该源;VT 空则回退内置 Key。
         repAggregate.setApiKey(QStringLiteral("VirusTotal"),     settings.virusTotalApiKey);
         repAggregate.setApiKey(QStringLiteral("MalwareBazaar"),  settings.malwareBazaarApiKey);
@@ -776,6 +1246,253 @@ static int serviceRun(int argc, char** argv) {
     };
     ipc.attackChainClearRequested = [&attackChain] { attackChain.clearHits(); };
 
+    // ================= 在线更新:检查 / 下载 =================
+    //
+    // 两者都走网络(检查一次往返可达 15s,下载是几 MB),所以与取证查询同一处置:丢后台线程,
+    // 算完用 QMetaObject::invokeMethod 编组回主线程再经管道回推。
+    //
+    // UpdateService 用 shared_ptr 持有,而不是本函数栈上的局部量:后台线程可能比这段栈活得久
+    // (停机时正好在途),按引用捕获栈对象就是 use-after-file —— 这份代码里的信誉回传和健康
+    // 探测都因为这个坑吃过教训。
+    //
+    // 计数器【刻意复用】forensicsInflight:那是停机路径(app.exec() 之后)真正会去等的那一个。
+    // 另起一个语义更贴切但没人等的计数器,只会让停机时在途的更新线程写到已析构的 ipc 上。
+    // 名字不够准确是小事,漏等一个持有引用的线程不是。
+    //
+    // 声明提到这里(原本在下面的取证回溯段里):在线更新的绑定在它之前,不提前声明就编译不过。
+    // 取证那两个绑定继续用同一个对象,停机等待因此同时覆盖三类后台查询。
+    auto forensicsInflight = std::make_shared<std::atomic<int>>(0);
+
+    auto updateSvc = std::make_shared<UpdateService>(options);
+    auto lastUpdate = std::make_shared<UpdateInfo>();
+    auto lastStagingDir = std::make_shared<QString>();
+    auto updateMx = std::make_shared<std::mutex>();
+    auto updateBusy = std::make_shared<std::atomic<bool>>(false);
+    log.info(QStringLiteral("在线更新:%1(端点 %2,通道 %3)")
+                 .arg(updateSvc->isConfigured() ? QStringLiteral("已启用") : QStringLiteral("未配置"),
+                      updateSvc->maskedEndpoint(), options.Update.Channel));
+
+    // 「检查一次更新」这个动作抽成一份共享的可调用对象,而不是在「用户点检查」和
+    // 「启动后自动检查」两处各写一遍。两条路径必须产出【完全一样】的载荷:如果自动
+    // 检查说有新版本、手动检查说没有(或反过来),用户没有办法判断该信哪一个,而这种
+    // 分歧恰恰会在两段代码各自演化之后出现。
+    auto runUpdateCheck = std::make_shared<std::function<void()>>();
+    *runUpdateCheck = [&ipc, updateSvc, lastUpdate, updateMx, forensicsInflight] {
+        forensicsInflight->fetch_add(1);
+        std::thread([&ipc, updateSvc, lastUpdate, updateMx, forensicsInflight] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                ~Guard() { c->fetch_sub(1); }
+            } guard{ forensicsInflight };
+
+            UpdateInfo info;
+            try {
+                info = updateSvc->check();
+            } catch (...) {
+                info.ok = false;
+                info.error = QStringLiteral("检查更新时发生未预期的错误。");
+            }
+            {   // 记下这次结论,下载请求据此知道要取哪个版本
+                std::lock_guard<std::mutex> lk(*updateMx);
+                *lastUpdate = info;
+            }
+            bulwark::ipc::UpdateCheckResponsePayload res;
+            res.ok = info.ok;
+            res.available = info.available;
+            res.error = info.error;
+            res.currentVersion = bulwark::version::current();
+            res.version = info.version;
+            res.label = info.label;
+            res.notes = info.notes;
+            res.publishedUtc = info.publishedUtc;
+            res.endpointMasked = updateSvc->maskedEndpoint(); // 掩码,绝不回真实地址
+            res.totalBytes = info.totalBytes;
+            for (const UpdateFileInfo& f : info.files) {
+                bulwark::ipc::UpdateFileBrief b;
+                b.name = f.name;
+                b.size = f.size;
+                res.files.append(b);
+            }
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendUpdateCheck(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+    ipc.updateCheckRequested = [runUpdateCheck] { (*runUpdateCheck)(); };
+
+    ipc.updateDownloadRequested = [&ipc, updateSvc, lastUpdate, lastStagingDir, updateMx, updateBusy,
+                                   forensicsInflight] {
+        // 并发下载守卫。UI 上用户连点两下「下载」是常态,而两个线程同时往同一个暂存目录写
+        // 同名文件,得到的是一个哈希对不上的混合物 —— 而失败原因看起来会像「服务器发错了」。
+        bool expected = false;
+        if (!updateBusy->compare_exchange_strong(expected, true)) {
+            bulwark::ipc::UpdateDownloadResponsePayload res;
+            res.ok = false;
+            res.error = QStringLiteral("已有一个下载正在进行中。");
+            ipc.sendUpdateDownloadResult(res);
+            return;
+        }
+        UpdateInfo info;
+        {
+            std::lock_guard<std::mutex> lk(*updateMx);
+            info = *lastUpdate;
+        }
+        forensicsInflight->fetch_add(1);
+        std::thread([&ipc, updateSvc, info, updateBusy, forensicsInflight, updateMx, lastStagingDir] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                std::shared_ptr<std::atomic<bool>> busy;
+                ~Guard() { busy->store(false); c->fetch_sub(1); }
+            } guard{ forensicsInflight, updateBusy };
+
+            UpdateDownloadResult r;
+            try {
+                r = updateSvc->download(info, [&ipc](int done, int total, QString name, QString stage) {
+                    bulwark::ipc::UpdateProgressPayload p;
+                    p.done = done;
+                    p.total = total;
+                    p.fileName = name;
+                    p.stage = stage;
+                    QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendUpdateProgress(p); },
+                                              Qt::QueuedConnection);
+                });
+            } catch (...) {
+                r.ok = false;
+                r.error = QStringLiteral("下载更新时发生未预期的错误。");
+            }
+            // 记下暂存目录:应用请求是另一条 IPC 消息,那时得知道文件下到哪了。
+            // 不让 UI 把路径传回来 —— 那等于让「要替换安装目录里哪些文件」由管道对面
+            // 决定,而这条链路的终点是以 SYSTEM 写安装目录并加载内核驱动。
+            {
+                std::lock_guard<std::mutex> lk(*updateMx);
+                *lastStagingDir = r.stagingDir;
+            }
+            bulwark::ipc::UpdateDownloadResponsePayload res;
+            res.ok = r.ok;
+            res.error = r.error;
+            res.version = info.version;
+            res.stagingDir = r.stagingDir;
+            res.verified = r.verified;
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendUpdateDownloadResult(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+
+    // ---- 就地应用已下载的更新 ------------------------------------------------
+    // 由服务自己替换文件,不再由 UI 拉起提权脚本。为什么换掉脚本方案,见
+    // UpdateService::apply() 的说明:脚本是外部进程,会被本产品的自我保护逐项挡下,
+    // 而且 Stop-Process 那种失败是静默的,脚本会以为自己成功了。
+    //
+    // 同样丢后台线程:要重算三个 PE 的 SHA-256 并验签名,是秒级操作,不能占住 IPC 线程。
+    // 复用 updateBusy:下载与应用互斥 —— 一边替换一边往同一个暂存目录写,得到的是混合物。
+    ipc.updateApplyRequested = [&ipc, updateSvc, lastUpdate, lastStagingDir, updateMx, updateBusy,
+                                forensicsInflight] {
+        bool expected = false;
+        if (!updateBusy->compare_exchange_strong(expected, true)) {
+            bulwark::ipc::UpdateApplyResponsePayload res;
+            res.ok = false;
+            res.needsRestart = false;
+            res.error = QStringLiteral("上一次下载或安装还在进行中,请稍候。");
+            ipc.sendUpdateApplyResult(res);
+            return;
+        }
+
+        UpdateInfo info;
+        QString staging;
+        {
+            std::lock_guard<std::mutex> lk(*updateMx);
+            info = *lastUpdate;
+            staging = *lastStagingDir;
+        }
+        // lastStagingDir 只活在本次服务生命周期里,而「下载完 -> 点安装」中间完全可能
+        // 隔着一次服务重启(用户关掉界面过一会儿再开、机器重启过)。此时载荷其实还躺在
+        // 暂存目录里,却因为这个内存变量空了而被拒成「还没有下载好的更新」—— 用户看到的
+        // 就是「明明下载过,却怎么点都装不上」,只能重下一遍。
+        //
+        // 下载目录名是确定的(stagingRoot()/<版本>,见 download()),所以直接重建它。
+        // 这不是放宽信任:apply() 在取用的那一刻会把每个文件的哈希与钉死签名重验一遍,
+        // 并强制版本只许前进 —— 保证来自校验,而不是来自「这个路径是我们自己记下来的」。
+        if (info.available && staging.isEmpty()) {
+            const QString guess = QDir(UpdateService::stagingRoot()).filePath(info.version);
+            if (QDir(guess).exists())
+                staging = guess;
+        }
+        if (!info.available || staging.isEmpty()) {
+            updateBusy->store(false);
+            bulwark::ipc::UpdateApplyResponsePayload res;
+            res.ok = false;
+            res.needsRestart = false;
+            res.error = QStringLiteral("还没有下载好的更新,请先检查更新并下载。");
+            ipc.sendUpdateApplyResult(res);
+            return;
+        }
+
+        forensicsInflight->fetch_add(1);
+        std::thread([&ipc, updateSvc, info, staging, updateBusy, forensicsInflight] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                std::shared_ptr<std::atomic<bool>> b;
+                ~Guard() { c->fetch_sub(1); b->store(false); }
+            } guard{ forensicsInflight, updateBusy };
+
+            UpdateApplyResult a;
+            try {
+                a = updateSvc->apply(info, staging);
+            } catch (...) {
+                a.ok = false;
+                a.needsRestart = false;
+                a.error = QStringLiteral("应用更新时发生未预期的错误。");
+            }
+            bulwark::ipc::UpdateApplyResponsePayload res;
+            res.ok = a.ok;
+            res.error = a.error;
+            res.version = info.version;
+            res.replaced = a.replaced;
+            res.rolledBack = a.rolledBack;
+            res.needsRestart = a.needsRestart;
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendUpdateApplyResult(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+
+    // ---- 启动后静默检查一次(Update.AutoCheckDelayMinutes,0 = 关闭)-------------
+    //
+    // 只【检查】,绝不自动下载、更不自动安装:安装要停防护、换内核驱动、可能要求重启,
+    // 那必须是用户按下按钮才发生的事。这里做的全部事情是把「有新版本」这个事实告诉界面。
+    //
+    // 为什么要延迟:开机那几分钟是最忙的,而且此时网络往往还没真正通。立刻查一次的
+    // 典型结果是查失败,然后这一个服务生命周期里再也不查了 —— 比不查更糟。
+    //
+    // 为什么还要等界面接上:结论是靠管道推给界面的,界面没连上时这次检查就白做了。
+    // 而常驻模式下服务开机就起、界面可能过很久才打开,「到点就查」在那种模式下几乎
+    // 必然落空。所以到点先看有没有界面在听:没有就先不查,等界面接上再查。
+    if (updateSvc->isConfigured() && options.Update.AutoCheckDelayMinutes > 0) {
+        const int delayMs = options.Update.AutoCheckDelayMinutes * 60 * 1000;
+        auto delayElapsed = std::make_shared<std::atomic<bool>>(false);
+        auto haveClient   = std::make_shared<std::atomic<bool>>(ipc.clientCount() > 0);
+        auto autoDone     = std::make_shared<std::atomic<bool>>(false);
+
+        // 每个服务生命周期只自动查一次。界面反复开关会反复触发 clientCountChanged,
+        // 少了这个闸门就变成「每次打开界面都查一次」—— 那已经不是「启动后检查一次」,
+        // 而是把我们自己的服务器当成了心跳目标。
+        auto fireOnce = [runUpdateCheck, autoDone] {
+            bool expected = false;
+            if (!autoDone->compare_exchange_strong(expected, true)) return;
+            (*runUpdateCheck)();
+        };
+
+        QObject::connect(&ipc, &IpcServer::clientCountChanged, &ipc,
+                         [haveClient, delayElapsed, fireOnce](int n) {
+                             haveClient->store(n > 0);
+                             if (n > 0 && delayElapsed->load()) fireOnce();
+                         });
+        QTimer::singleShot(delayMs, &ipc, [delayElapsed, haveClient, fireOnce] {
+            delayElapsed->store(true);
+            if (haveClient->load()) fireOnce();
+        });
+        log.info(QStringLiteral("在线更新:启动 %1 分钟后自动检查一次(界面接入后才发起)")
+                     .arg(options.Update.AutoCheckDelayMinutes));
+    }
+
     // ================= 取证回溯:事件时间线 + 攻击图 =================
     //
     // 两者都要扫落盘的 events.jsonl(可达数万条)并解析 JSON,耗时可到秒级 —— 绝不能在 IPC
@@ -784,7 +1501,9 @@ static int serviceRun(int argc, char** argv) {
     //
     // 后台线程按引用捕获了本函数栈上的 ipc / eventHistory,所以必须纳入停机等待,否则停机时
     // 在途的查询会写到已析构的对象上(见 app.exec() 之后的等待)。
-    auto forensicsInflight = std::make_shared<std::atomic<int>>(0);
+    //
+    // forensicsInflight 已在上面的「在线更新」段声明(那一段的绑定在此之前,必须先有它)。
+    // 三类后台查询(时间线 / 攻击图 / 在线更新)共用同一个计数器,停机等待一并覆盖。
 
     ipc.timelineRequested = [&ipc, &eventHistory, forensicsInflight](
                                 const bulwark::ipc::TimelineRequestPayload& req) {
@@ -824,6 +1543,120 @@ static int serviceRun(int argc, char** argv) {
             }
             res.requestId = req.requestId;
             QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendAttackGraph(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+
+    // ================= 磁盘垃圾清理 =================
+    //
+    // 与取证查询同一套路(后台线程 + forensicsInflight 计数 + invokeMethod 编组回主线程),
+    // 理由也相同:遍历 %TEMP% / 浏览器缓存动辄数万文件,秒级到十几秒,绝不能占着 IPC 线程。
+    //
+    // 清理范围【不】来自请求:JunkCleaner 内部有一份编译期写死的类别/根目录表,请求里只有
+    // 类别序号。这里唯一从配置读的是「要不要开、留多久、上限多少、额外排除哪些」这类旋钮,
+    // 它们只能让清理范围变小。详见 JunkCleaner.h 顶部的七道护栏。
+    //
+    // 用户信任名单在这里接进去:用户显式信任过的路径连「它是不是垃圾」都不由我们判断。查询
+    // 走 engine.trustNoteForPath —— 它内部自带读锁,后台线程调用是安全的(与兜底扫描同样用法)。
+    auto junkPolicy = [&options, &engine]() {
+        JunkCleanerPolicy pol;
+        pol.enabled = options.DiskCleanup.Enabled;
+        pol.minAgeHours = options.DiskCleanup.MinFileAgeHours;
+        pol.maxFilesPerCategory = options.DiskCleanup.MaxFilesPerCategory;
+        pol.maxSeconds = options.DiskCleanup.MaxSeconds;
+        pol.excludes = options.DiskCleanup.ExcludePaths;
+        pol.selfDir = QCoreApplication::applicationDirPath();
+        pol.isUserTrusted = [&engine](const QString& path) {
+            return engine.trustNoteForPath(path).has_value();
+        };
+        return pol;
+    };
+
+    ipc.junkScanRequested = [&ipc, junkPolicy, forensicsInflight](
+                                const bulwark::ipc::JunkScanRequestPayload& req) {
+        forensicsInflight->fetch_add(1);
+        const JunkCleanerPolicy pol = junkPolicy();
+        std::thread([&ipc, req, pol, forensicsInflight] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                ~Guard() { c->fetch_sub(1); }
+            } guard{ forensicsInflight };
+            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
+                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
+                                          Qt::QueuedConnection);
+            };
+            bulwark::ipc::JunkScanResponsePayload res;
+            try {
+                res = JunkCleaner::scan(req, pol, progress);
+            } catch (...) {
+                res.message = QStringLiteral("垃圾扫描失败(目录访问异常)");
+            }
+            res.requestId = req.requestId;
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendJunkScan(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+
+    ipc.junkCleanRequested = [&ipc, junkPolicy, &log, forensicsInflight](
+                                 const bulwark::ipc::JunkCleanRequestPayload& req) {
+        forensicsInflight->fetch_add(1);
+        const JunkCleanerPolicy pol = junkPolicy();
+        // 删除动作必须留痕:谁请求的、清了哪几类。逐类别的明细由 JunkCleaner 自己写日志。
+        QStringList keys;
+        for (int c : req.categories)
+            keys << bulwark::junk::categoryKey(static_cast<bulwark::junk::Category>(c));
+        log.info(QStringLiteral("垃圾清理请求:%1 类(%2),保留时长 %3 小时")
+                     .arg(req.categories.size())
+                     .arg(keys.join(QStringLiteral(", ")))
+                     .arg(req.minAgeHours > 0 ? req.minAgeHours : pol.minAgeHours));
+        std::thread([&ipc, req, pol, forensicsInflight] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                ~Guard() { c->fetch_sub(1); }
+            } guard{ forensicsInflight };
+            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
+                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
+                                          Qt::QueuedConnection);
+            };
+            bulwark::ipc::JunkCleanResponsePayload res;
+            try {
+                res = JunkCleaner::clean(req, pol, progress);
+            } catch (...) {
+                res.success = false;
+                res.message = QStringLiteral("垃圾清理失败(目录访问异常)");
+            }
+            res.requestId = req.requestId;
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendJunkClean(res); },
+                                      Qt::QueuedConnection);
+        }).detach();
+    };
+
+    // 大文件查找。纯只读,所以【没有】对应的删除回调 —— 界面只提供「打开所在位置」。
+    // 遍历整块磁盘比垃圾扫描更久,同样丢后台线程并纳入停机等待。
+    ipc.largeFileScanRequested = [&ipc, &options, forensicsInflight](
+                                     const bulwark::ipc::LargeFileScanRequestPayload& req) {
+        forensicsInflight->fetch_add(1);
+        LargeFileScannerPolicy pol;
+        // 排除表沿用垃圾清理的那一份:部署方列进去的位置,在两个功能里都该被绕开。
+        pol.excludes = options.DiskCleanup.ExcludePaths;
+        pol.selfDir = QCoreApplication::applicationDirPath();
+        std::thread([&ipc, req, pol, forensicsInflight] {
+            struct Guard {
+                std::shared_ptr<std::atomic<int>> c;
+                ~Guard() { c->fetch_sub(1); }
+            } guard{ forensicsInflight };
+            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
+                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
+                                          Qt::QueuedConnection);
+            };
+            bulwark::ipc::LargeFileScanResponsePayload res;
+            try {
+                res = LargeFileScanner::scan(req, pol, progress);
+            } catch (...) {
+                res.message = QStringLiteral("大文件查找失败(目录访问异常)");
+            }
+            res.requestId = req.requestId;
+            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendLargeFileScan(res); },
                                       Qt::QueuedConnection);
         }).detach();
     };
@@ -1005,7 +1838,8 @@ static int serviceRun(int argc, char** argv) {
     };
 
     // 威胁情报 / VirusTotal:测试连接 / 按文件查询 / 用量统计(用户主动触发,阻塞可接受)。
-    ipc.vtRequested = [&repAggregate, &repManager, &repProxyFirst](const bulwark::ipc::VtRequestPayload& req)
+    ipc.vtRequested = [&repAggregate, &repManager, &repProxyFirst,
+                       serverOnlyMode](const bulwark::ipc::VtRequestPayload& req)
         -> bulwark::ipc::VtResponsePayload {
         bulwark::ipc::VtResponsePayload res;
         res.requestId = req.requestId;
@@ -1015,6 +1849,10 @@ static int serviceRun(int argc, char** argv) {
                 std::pair<bool, QString> r;
                 if (src == QStringLiteral("ReputationProxy"))
                     r = repProxyFirst.healthCheckNonBlocking(); // 中央代理健康(非阻塞,供 UI 状态灯)
+                else if (serverOnlyMode)
+                    // 逐源「测试连接」会真的拿本机密钥向第三方发一次请求 —— ServerOnly 下不发。
+                    // 如实说明,而不是回一个「连接失败」让人以为是网络问题。
+                    r = { false, QStringLiteral("本机不动用第三方情报源(仅向中央服务器查收录),该源未启用") };
                 else if (src.isEmpty())
                     r = repAggregate.testConnection();
                 else
@@ -1051,17 +1889,22 @@ static int serviceRun(int argc, char** argv) {
     // 拉 VT 完整报告可能耗时数十秒,一旦停机时它还在途,就会写到已销毁的对象上 —— 偶发的
     // 停机崩溃。用一个共享的在途计数把它纳入停机等待(见 app.exec() 之后)。
     auto vtDetailInflight = std::make_shared<std::atomic<int>>(0);
-    ipc.vtDetailRequested = [virusTotalPtr, &repManager, &ipc, vtDetailInflight](const QUuid& reqId,
-                                                                                const QString& sha256) {
+    ipc.vtDetailRequested = [virusTotalPtr, &repManager, &ipc, vtDetailInflight,
+                             serverOnlyMode](const QUuid& reqId, const QString& sha256) {
         vtDetailInflight->fetch_add(1);
-        std::thread([virusTotalPtr, &repManager, &ipc, reqId, sha256, vtDetailInflight] {
+        std::thread([virusTotalPtr, &repManager, &ipc, reqId, sha256, vtDetailInflight,
+                     serverOnlyMode] {
             // 无论中途出什么岔子,计数都必须回落,否则停机时会白等满超时。
             struct Guard {
                 std::shared_ptr<std::atomic<int>> c;
                 ~Guard() { c->fetch_sub(1); }
             } guard{ vtDetailInflight };
             bulwark::ipc::VtDetailResponsePayload p;
-            if (virusTotalPtr)
+            // ServerOnly:完整报告要拿本机密钥去问 VirusTotal —— 正是这个模式禁止的事。
+            // 如实回一句「按策略没查」,绝不为了补一张详情图而破掉策略。
+            if (serverOnlyMode)
+                p.message = QStringLiteral("本机不动用第三方情报源(仅向中央服务器查收录),无法获取完整报告");
+            else if (virusTotalPtr)
                 p = virusTotalPtr->fetchDetailReport(sha256);
             else
                 p.message = QStringLiteral("VirusTotal 客户端不可用");

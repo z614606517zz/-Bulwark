@@ -47,15 +47,55 @@ struct ChainMarker {
     QString title;                  // 可读标题(原 Sigma 规则名),写进证据链给人看
     QString level;                  // medium / high / critical
     bulwark::DefenseRule matcher;   // 只含条件的规则,直接用 matches() 判定
+
+    // ---- 「不含」条件 -------------------------------------------------------
+    //
+    // 为什么必须有它:一整类 Sigma 规则的信号是【缺少某个东西】,而 DefenseRule 只能
+    // 表达「含有」。最典型的是 "Uncommon Svchost Command Line Parameter" —— 真正的
+    // svchost 永远由 services.exe 带 `-k <组名>` 启动,该规则命中的正是【没有 -k】的
+    // 那种。服务器此前只能下发肯定的那一半(actor=*\svchost.exe),而那一半在 Windows 上
+    // 恒真:实测 v19 的 26 条装载组合里有 12 条依赖它,等于「一个动作 + 一个恒真项」
+    // 冒充互证,而组合命中在强制模式下是按【硬指标】登记的。
+    //
+    // 刻意【不】改 DefenseRule 加字段:那个结构体被主规则引擎共用、还要落盘序列化,
+    // 为攻击链一个用途去动它,风险远大于在这里多两个判断。通配匹配仍复用
+    // DefenseRule::wildcardMatch(它已是 public static),因此语义与主引擎不会跑偏。
+    QString cmdlineAbsent;          // 命令行【不得】命中此通配式,空=不限
+    QString targetAbsent;           // 目标【不得】命中此通配式,空=不限
+    QString parentAbsent;           // 父进程【不得】命中此通配式,空=不限
+
+    // 完整判定 = matcher.matches() 且全部「不含」条件都不命中。
+    //
+    // 单独提供这个方法而不是让调用方各自补两行:标记匹配有两个调用点(observe 的热路径
+    // 与 selfTest 的合成事件),漏掉任何一处都会让「不含」条件静默失效 —— 而那种失效
+    // 的表现恰好是「规则变宽」,也就是误报,最不容易被发现的方向。
+    bool matchesEvent(const bulwark::SecurityEvent& e) const;
 };
 
 // 一条攻击链组合:这些标记同时出现即定性。
 struct ChainPattern {
     QStringList markers;   // 标记 ID(已排序)
-    int support = 0;        // 有多少真实样本作证
-    QString grade;          // hard / strong / ask
+    int support = 0;        // 有多少真实样本作证(恶意侧)
+    QString grade;          // 【生效】强度:hard / strong / ask,可能已被本机降档
+    // 服务器下发的原始强度。降档【必须】从它算,不能就地改 grade ——
+    // 否则 setCoverage / applyTable 重复调用会把同一条组合一路降到底(hard->strong->ask)。
+    QString serverGrade;
+    // 这条组合在【正常软件语料】里出现过几次。服务器一直在下发(engine_patterns 的
+    // benign_support),此前客户端解析时直接丢掉了。现在用作独立于服务端封顶的第二道保险:
+    // 服务端语料不足 BENIGN_MIN_CORPUS(50)时它那边整个区分度环节是空转的,
+    // 而这个数字本身照样有值,客户端据此仍能把「正常软件里见过」的组合压住。
+    int benignSupport = 0;
+    // 降档原因(可读)。空 = 未降档。写进证据链 —— 否则服务器页面上显示 hard、
+    // 端点上却只是询问,看的人无从解释这个差异。
+    QString capReason;
     QString maxLevel;       // 组合内最高严重度
     QString families;       // 常见家族(展示用)
+    // 「本进程已报过这条组合」的去重键,装载时算一次(= markers 以 '|' 连接)。
+    //
+    // 刻意用【内容】而不是 patterns_ 里的下标:记账(ledger_)要跨越组合表更新继续存活,
+    // 而表一换下标就全部错位 —— 那会让「已报过」指向另一条组合,同一条链既可能重复刷屏、
+    // 也可能被永久静音。放在这里预先算好,是为了不在每次「组合凑齐」判定里现拼字符串。
+    QString key;
 };
 
 // 组合命中结果。
@@ -73,10 +113,21 @@ struct ChainHitRecord {
     QDateTime whenUtc;
     QString actorPath;
     int actorPid = 0;
+    // 命中的是【哪一条】组合 —— 稳定标识(= ChainPattern::key,由标记 ID 连接而成)。
+    //
+    // 为什么必须记它:排查「哪条组合在刷误报」时,titles 顶不上用 —— 那些标题来自 Sigma
+    // 规则名,服务器侧改个规则名,整段历史记录就与新表对不上号了;而且多条组合可以共用
+    // 同一批标记标题的子集,肉眼分不开。有了 patternKey,才能把 attackchain_hits.jsonl
+    // 按组合聚合,回答「这条组合命中 20 次、19 次被用户放行」这类问题。
+    // 在此之前这个能力是零 —— 也就无从按结果决定要不要停用某条组合或某一档。
+    QString patternKey;
     QStringList titles;      // 凑齐的那几个动作(可读)
-    QString grade;           // hard / strong / ask
+    QString grade;           // 【生效】强度(已计入本机降档)
+    QString serverGrade;     // 服务器原始强度 —— 与 grade 不同即说明本机压过档
+    QString capReason;       // 降档原因(空 = 未降档)
     QString maxLevel;
     int support = 0;
+    int benignSupport = 0;   // 正常软件语料里出现过几次
     QString families;
     bool dryRun = true;      // 命中当时是否处于「只记录不拦截」
     QString action;          // 最终裁决(Allow/Block/Ask);dry-run 下为本次事件的实际裁决
@@ -150,7 +201,13 @@ struct ReachabilityReport {
 
 class AttackChainEngine {
 public:
-    explicit AttackChainEngine(const AttackChainOptions& opt);
+    // dataDirOverride:把磁盘缓存(attackchain.json)与命中记录(attackchain_hits.jsonl)
+    // 改放到指定目录。仅回归测试用 —— 测试必须完全隔离于真实状态:
+    //   * applyTable 成功后会把回包写进缓存,拿测试表跑一次就会把机器上真正的表冲掉;
+    //   * recordHit 会往 jsonl 追加,测试数据会混进真实命中历史里。
+    // 留空 = 用 %ProgramData%\Bulwark(生产行为,与本参数加入前逐字节相同)。
+    explicit AttackChainEngine(const AttackChainOptions& opt,
+                               const QString& dataDirOverride = QString());
 
     bool isEnabled() const { return opt_.Enabled; }
     bool isDryRun() const { return opt_.DryRun; }
@@ -160,6 +217,18 @@ public:
     bool applyTable(const QJsonObject& payload);
     // 从磁盘缓存载入(启动时调用):使断网 / 服务器不可达时仍有上一次的表可用。
     bool loadFromDisk();
+
+    // 告知本机覆盖面,并据此重算各组合的【生效强度】(只会降档,绝不升档)。
+    //
+    // 为什么要单独一个入口、而不是在 applyTable 里一并做:正确的覆盖面要等
+    // derivedRegistryWatch 把派生键补进名单之后才知道,而那一步又需要表已经装好 ——
+    // 顺序是「装表 -> 派生键 -> 补进 options -> 才有最终覆盖面」。故装表与定档分开,
+    // 由调用方在补齐名单之后调用本函数收尾(见 main.cpp 的接线)。
+    //
+    // 幂等:降档一律从 ChainPattern::serverGrade 算起,重复调用结果相同。
+    // 未调用时按「不掌握覆盖面」处理 —— 不做任何稀疏降档(安全默认:不凭空猜测)。
+    // 返回被降档的组合数(供自检直接打印,免得再为此开一个枚举组合的公开接口)。
+    int setCoverage(const CoverageProfile& cov);
 
     // 内部整数版本号。仍是「要不要向服务器重新拉表」的唯一判据(单调递增)。
     int version() const;
@@ -227,6 +296,11 @@ public:
     // 当前表内全部标记的快照(供上层派生监视集)。
     QVector<ChainMarker> markerSnapshot() const;
 
+    // 当前已装载组合的快照。供回归测试断言【生效强度】与降档原因 ——
+    // 那两样是本引擎处置强度的直接决定因素,却没有任何对外可观测的出口,
+    // 以致「降档到底有没有真的发生」只能靠读日志猜。
+    QVector<ChainPattern> patternSnapshot() const;
+
     // 为「因注册表覆盖不到而结构性死掉」的标记,派生出恰好够用的受关注键片段。
     //
     // 【自限设计】只为当前判定为 Dead 的标记派生 —— 覆盖已经够的标记一个字都不加。
@@ -244,6 +318,18 @@ private:
     struct ProcLedger {
         QString actorKey;            // 小写主体路径:用于识别 PID 复用
         QDateTime firstSeen;
+        // 最近一次【置位标记】的时刻 —— 即「这个进程上次做可疑动作」是什么时候。
+        //
+        // 保留窗口据此计算,而不是据 firstSeen。原先按 firstSeen 算,含义是「这条账建立
+        // 超过 30 分钟就清掉」,于是一个长驻进程的证据每 30 分钟被无条件抹平一次:
+        // 后门先落文件、过一小时再写 Run 键、再过一小时加 Defender 排除项 —— 这是真实的
+        // 慢速攻击链形态,而按 firstSeen 计时永远凑不齐,因为账早被清了。
+        //
+        // 改成按 lastSeen(不活动才淘汰)之后,窗口的含义变为「距上次可疑动作 30 分钟」,
+        // 动作间隔在窗口内的链条无论总时长多久都能累积。
+        // 【关键约束】lastSeen 只在真的置位了标记时才前移,不随普通事件前移 —— 所以一个
+        // 忙碌但正常的进程照旧会到期淘汰,不会因为「一直在干活」就把账无限续下去。
+        QDateTime lastSeen;
         QSet<QString> markers;       // 已置位的标记
         QSet<QString> firedPatterns; // 已报过的组合(按 markers 连接的键),避免重复上报
     };
@@ -252,11 +338,29 @@ private:
     QVector<int> patternsFor(const QString& markerId) const;
     void loadHits();                 // 启动时回读命中记录(JSONL)
 
+    // 按「正常语料出现率」与「本机可观测性」重算 patterns_ 的生效强度。
+    // 调用方必须已持 tableLock_。返回被降档的组合数。
+    int regradeLocked();
+
     AttackChainOptions opt_;
-    mutable QMutex tableLock_;                     // 保护 markers_/patterns_/index_/version_
+    mutable QMutex tableLock_;                     // 保护 markers_/markersByType_/patterns_/index_/version_
     QHash<QString, ChainMarker> markers_;
+    // 事件类型 -> 该类型下的标记。热路径(observe)只遍历与本条事件同类型的那几个。
+    //
+    // 为什么值得单独存一份:DefenseRule::matches() 的第三步就是事件类型判定,类型不符的
+    // 标记必然返回假。原先每条事件都对【全表】标记逐个调用 matches(),于是一条 DnsQuery
+    // 也要挨个试过所有 RegistryWrite / FileWrite / ProcessCreate 标记 —— 纯白做功,而且是
+    // 在持锁的裁决前置路径上做。这份索引把它收窄到同类型的那一桶。
+    // 与 markers_ 是同一批数据的两种组织方式,由 applyTable 一并重建,不会走偏。
+    QHash<int, QVector<ChainMarker>> markersByType_;
     QVector<ChainPattern> patterns_;
     QHash<QString, QVector<int>> index_;           // 标记 ID -> 含该标记的组合下标
+
+    // 本机覆盖面。haveCoverage_ 为假时不做任何稀疏降档 —— CoverageProfile 的默认值
+    // (driverSource=true、监视集全空)会让 FileWrite 类标记被误判成稀疏,凭默认值降档
+    // 等于凭空削弱检出,故必须由调用方显式告知才生效。
+    CoverageProfile coverage_;
+    bool haveCoverage_ = false;
     int version_ = 0;
     QString label_;                                // 展示用版本号(如 "0.3");服务器未提供则为空
     // 装载期的剔除计数。原先只写进一条日志就丢掉了,于是「服务器给了 32 条、真正装上 27 条」
@@ -269,6 +373,17 @@ private:
     // 后来 UI 攻击链页面经 IPC 线程读 trackedProcessCount(),该前提就不成立了:主线程
     // 正在 rehash / erase 时另一线程在读,QHash 无并发保证,表现为堆被写坏后崩在别处。
     QHash<int, ProcLedger> ledger_;
+
+    // 淘汰触发节流计数。
+    //
+    // 淘汰要遍历整张记账表,所以不能每条事件都做;但更不能像原先那样【只在组合命中时】做——
+    // 命中是罕见事件(那正是本引擎的设计目标),于是 LedgerRetentionMinutes 与
+    // LedgerMaxProcesses 这两个配置项实际上从未生效过:机器跑一天,记账表里会攒下当天
+    // 出现过的每一个 PID。现在改为每 kEvictEveryEvents 条事件跑一次,另外一旦超过容量
+    // 上限就立即跑(见 evictIfNeeded 开头的节流判定)。
+    int sinceEvict_ = 0;
+    static constexpr int kEvictEveryEvents = 512;
+
     QString cachePath_;
 
     // 命中记录:内存最近 N 条 + JSONL 落盘。UI 请求可能来自 IPC 回调线程,故单独加锁。

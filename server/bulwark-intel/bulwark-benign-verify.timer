@@ -1,0 +1,17 @@
+[Unit]
+Description=Hourly benign quarantine recheck (24h hold, then export what is still clean)
+
+[Timer]
+OnCalendar=hourly
+# Spread away from the datalake collector, which runs on its own half-hourly timer
+# and shares the same VirusTotal budget. The recheck also yields on its own via
+# BULWARK_BENIGN_QUOTA_CEILING, but not colliding in the first place is cheaper.
+RandomizedDelaySec=420
+AccuracySec=1min
+# Catch up one missed run after a reboot: the quarantine clock is wall-clock based,
+# so a skipped hour only delays exports, it never shortens the 24h hold.
+Persistent=true
+Unit=bulwark-benign-verify.service
+
+[Install]
+WantedBy=timers.target

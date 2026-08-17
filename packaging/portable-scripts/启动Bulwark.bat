@@ -24,26 +24,86 @@ rem ---------------------------------------------------------------------------
 chcp 65001 >nul
 title Bulwark
 
-rem The service loads the kernel driver, opens an ETW session and writes
-rem %ProgramData%\Bulwark; staging the driver and registering the minifilter
-rem need System32 + SCM write access. All of that requires administrator.
-rem Two elevation branches on purpose. Start-Process rejects an EMPTY
-rem -ArgumentList ("cannot bind argument ... empty string"), and the no-argument
-rem double-click is the normal case -- collapsing these into one line makes the
-rem plain double-click fail silently while every switched invocation works.
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Requesting administrator privileges...
-    if "%~1"=="" (
-        powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    ) else (
-        powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
-    )
-    exit /b
+rem ===========================================================================
+rem  Administrator gate.
+rem
+rem  The service loads the kernel driver, opens an ETW session and writes
+rem  %ProgramData%\Bulwark; staging the driver and registering the minifilter
+rem  need System32 + SCM write access. All of that requires administrator.
+rem
+rem  Do NOT probe with "net session". It needs the Server (LanmanServer)
+rem  service, so on a machine where that service is stopped or disabled -- or
+rem  where another security product blocks net.exe -- it returns a non-zero
+rem  errorlevel even in an ALREADY-ELEVATED console. The earlier version then
+rem  relaunched itself unconditionally (the "%~1"=="" test only chose whether to
+rem  forward arguments, it was never a loop guard), so those machines got an
+rem  endless chain of elevated windows. Reported on Win10 x64: the title bar
+rem  already read "Administrator: Bulwark" while the body still printed
+rem  "Requesting administrator privileges...".
+rem
+rem  HKU\S-1-5-19 is the LocalService profile hive: readable by administrators
+rem  only, and dependent on no service at all. Measured elevated vs. a
+rem  "runas /trustlevel:0x20000" filtered token on Win11:
+rem      reg query "HKU\S-1-5-19"   ->  0 / 1   discriminates -- use this
+rem      fltmc                      ->  0 / 1   discriminates
+rem      net session                ->  0 / 2   service-dependent, unusable
+rem      whoami /groups high-IL SID ->  0 / 0   does NOT discriminate at all
+rem
+rem  --elevated is our own one-shot sentinel: consumed here, never forwarded to
+rem  bulwark.ps1. Its presence means "we already elevated once", so that path
+rem  asks PowerShell for the authoritative answer and then stops with a
+rem  readable message. It can never open another window.
+rem
+rem  Because the sentinel makes -ArgumentList always non-empty, the two
+rem  Start-Process branches the old code needed (Start-Process rejects an empty
+rem  -ArgumentList) collapse into a single line.
+rem ===========================================================================
+set "BLW_ARGS=%*"
+set "BLW_RETRY="
+if /i "%~1"=="--elevated" (
+    set "BLW_RETRY=1"
+    call set "BLW_ARGS=%%BLW_ARGS:*--elevated=%%"
 )
 
+reg query "HKU\S-1-5-19" >nul 2>&1
+if not errorlevel 1 goto :blw_elevated
+if defined BLW_RETRY goto :blw_retry
+
+rem Apostrophes are doubled so a path like C:\Users\O'Neil\Bulwark still
+rem survives the PowerShell single-quoted string below.
+set "BLW_SELF=%~f0"
+set "BLW_SELF=%BLW_SELF:'=''%"
+echo Requesting administrator privileges...
+powershell -NoProfile -Command "Start-Process -FilePath '%BLW_SELF%' -ArgumentList '--elevated %BLW_ARGS%' -Verb RunAs"
+if errorlevel 1 (
+    echo.
+    echo Elevation was cancelled or blocked, so Bulwark did not start.
+    echo Right-click this file and choose "Run as administrator".
+    echo.
+    pause
+)
+exit /b
+
+:blw_retry
+rem Reached only on the second pass. Both cmd-level probes can be blocked by
+rem another security product, so get the authoritative answer from PowerShell
+rem before refusing to start -- but never relaunch again.
+set "BLW_ISADMIN="
+for /f "usebackq delims=" %%A in (`powershell -NoProfile -Command "[int]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"`) do set "BLW_ISADMIN=%%A"
+if "%BLW_ISADMIN%"=="1" goto :blw_elevated
+echo.
+echo Already elevated once but administrator rights still cannot be confirmed,
+echo so Bulwark is stopping here instead of opening more windows.
+echo Right-click this file and choose "Run as administrator". If that still
+echo fails, another security product is most likely blocking reg.exe and
+echo powershell.exe.
+echo.
+pause
+exit /b 1
+
+:blw_elevated
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0bulwark.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0bulwark.ps1" %BLW_ARGS%
 
 rem Always hold the window. The elevated console is a NEW window, so without
 rem this any early failure (Secure Boot on, driver missing, service refused to

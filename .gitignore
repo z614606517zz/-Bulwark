@@ -175,6 +175,37 @@ scripts/_kiro_fix_policy_fp.ps1
 scripts/_kiro_prune_bad_ip_rules.ps1
 scripts/_kiro_remove_beacon_persistence.ps1
 scripts/_check_compile_proxyrep.ps1
+
+# ---- 自家基础设施特征串:明文清单,绝不入库 ----
+# 里面是端点、令牌和兜底 IP 的【明文】。它是 verify_portable.ps1 与
+# tools\test-redaction.ps1 的唯一真源,也正因为是明文,它既不进任何发布包、
+# 也不进版本库。仓库里保留的是按哈希匹配的消费方(bulwark.ps1),不是清单本身。
+# 自建者要用这套脱敏检查,请按该文件头部的格式自己写一份同名文件。
+packaging/redaction-needles.txt
+
+# ---- 远端节点运维脚本(含节点 IP 与 SSH 私钥路径)----
+# 这些是「在我这台机器上、对我那几台服务器」执行的东西,对别人没有意义,
+# 而且会把节点地址和密钥文件名带出去。服务端的【代码】照常入库,
+# 连到哪台机器由环境变量在部署时给。
+scripts/_*.sh
+
+# ---- 一次性排查输出(其中 bw_dashurl / bw_url2 带着可用的会话 token)----
+/bw_*.txt
+/zz_arc*.txt
+/bfe_imports.txt
+# .inf 编码实验产物(UTF-16 / 无 BOM 两份对照)
+/D_utf16.inf
+/D_utf8nobom.inf
+# 更新包的构建产物
+build_update/
+
+# ---- 服务端网页的草稿与备份 ----
+# 实际服务的是 webui.html,样式源是 design-system.css(会被生成进 html)。
+# 下面这些是改版过程中的中间产物和换版前的备份,没有保留价值。
+*.bak-lastswap
+*.predesign
+server/bulwark-intel/webui.new.html
+server/bulwark-intel/webui.redesign.html
 # backup-keys.ps1 的运行日志:会记录密钥文件的路径与长度
 scripts/backup-keys.txt
 # 私有测试包的内部说明(讲的是「本包不脱敏」的流程,对外无意义)

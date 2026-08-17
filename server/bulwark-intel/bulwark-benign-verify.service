@@ -1,0 +1,28 @@
+[Unit]
+Description=Bulwark benign quarantine - recheck white samples after 24h, drop the ones that flipped
+# Needs the local intel service: the recheck goes through its /vt/lookup so the
+# API keys, quota accounting and rate limiter stay in one place.
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+# Export runs only after a successful recheck pass. Chaining on OnSuccess (rather
+# than giving the push its own timer) means a run that died halfway never ships a
+# batch whose verdicts were only partly refreshed.
+OnSuccess=bulwark-benign-push.service
+
+[Service]
+Type=oneshot
+# MUST be bulwarkintel: this writes cache.db (marks verdicts, deletes rows that
+# flipped to malicious). root writing it leaves a root-owned journal beside a
+# journal_mode=delete database and app.py's next write fails.
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-benign-verify.py
+Nice=10
+# 40 rechecks paced 20s apart, plus the upstream call each one waits on.
+TimeoutStartSec=2400
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+MemoryMax=256M

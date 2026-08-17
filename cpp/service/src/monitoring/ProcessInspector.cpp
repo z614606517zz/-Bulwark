@@ -22,6 +22,7 @@
 #include <QVector>
 
 #include <cstring>
+#include <utility>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -53,7 +54,17 @@ QDateTime fileTimeToQDateTime(const FILETIME& ft)
     return QDateTime::fromMSecsSinceEpoch(ms, QTimeZone::UTC);
 }
 
-// ---- 文件身份(用于缓存键);文件不存在则返回空(不缓存瞬态缺失) ----------------
+// ---- 文件身份(用于缓存键) --------------------------------------------------
+// 身份 = 小写路径 | 大小 | 修改时刻。文件被替换(大小或时间变了)即自动失效,所以缓存
+// 不会把旧文件的验签结论安到新文件头上。
+QString identityFrom(const QString& path, const QFileInfo& fi)
+{
+    return path.toLower() + QLatin1Char('|')
+         + QString::number(fi.size()) + QLatin1Char('|')
+         + QString::number(fi.lastModified().toUTC().toMSecsSinceEpoch());
+}
+
+// 文件不存在则返回空(不缓存瞬态缺失)。
 QString fileIdentity(const QString& path)
 {
     if (path.isEmpty())
@@ -61,35 +72,74 @@ QString fileIdentity(const QString& path)
     QFileInfo fi(path);
     if (!fi.exists() || !fi.isFile())
         return QString();
-    return path.toLower() + QLatin1Char('|')
-         + QString::number(fi.size()) + QLatin1Char('|')
-         + QString::number(fi.lastModified().toUTC().toMSecsSinceEpoch());
+    return identityFrom(path, fi);
 }
 
 // ---- 轻量事实缓存(每类事实一张表,统一互斥) --------------------------------
 constexpr int kCacheCapacity = 8192;
 QMutex g_cacheMx;
 
-template <typename T, typename F>
-T cachedFact(QHash<QString, T>& store, const QString& path, F compute)
+//
+// 两代(hot / cold)缓存,取代原先「装满即整表 clear()」。
+//
+// 原实现在 size() >= kCacheCapacity 时把整张表清空。后果是一次溢出丢掉【全部】已验结论,
+// 连最热的那几十个主体(svchost / explorer / 服务自身的 exe)一起丢 —— 而重算一条的代价是
+// 一次 WinVerifyTrust 加一次整文件 SHA-256,毫秒量级。也就是说「装满」的那一瞬之后,每条
+// 事件都要重付一次全额取证;而装满恰恰发生在文件事件风暴里(短时间见到上万个不同文件),
+// 正是最不该再加负担的时刻。这是一个周期性的取证雪崩。
+//
+// 两代之后,溢出只是把 hot 整体降级成 cold:查找先看 hot 再看 cold,命中 cold 就提回 hot。
+// 于是热集合能跨越溢出继续命中,只有连续两代都没被碰过的冷条目才真正淘汰。内存上限从
+// kCacheCapacity 变成 2 x kCacheCapacity(存的都是 bool / QString / CertInfo 这类小对象)。
+//
+template <typename T>
+struct FactCache {
+    QHash<QString, T> hot;
+    QHash<QString, T> cold;
+};
+
+template <typename T>
+void insertHotLocked(FactCache<T>& store, const QString& id, const T& value)
 {
-    const QString id = fileIdentity(path);
+    if (store.hot.size() >= kCacheCapacity) {
+        store.cold = std::move(store.hot); // 老一代降级(而不是丢弃),热条目仍可被提回
+        store.hot.clear();                 // move 后状态未定义,显式清空
+    }
+    store.hot.insert(id, value);
+}
+
+// 已知文件身份时的取值入口。id 为空表示「文件身份不可知」——照算但不缓存。
+template <typename T, typename F>
+T cachedFactById(FactCache<T>& store, const QString& id, F compute)
+{
     if (id.isEmpty())
         return compute();
     {
         QMutexLocker lk(&g_cacheMx);
-        auto it = store.constFind(id);
-        if (it != store.constEnd())
-            return it.value();
+        const auto h = store.hot.constFind(id);
+        if (h != store.hot.constEnd())
+            return h.value();
+        const auto c = store.cold.find(id);
+        if (c != store.cold.end()) {
+            const T v = c.value();
+            store.cold.erase(c);
+            insertHotLocked(store, id, v); // 提回新生代
+            return v;
+        }
     }
     T value = compute(); // 在锁外计算,避免长 I/O 持锁;竞态下重复计算无害
     {
         QMutexLocker lk(&g_cacheMx);
-        if (store.size() >= kCacheCapacity)
-            store.clear();
-        store.insert(id, value);
+        insertHotLocked(store, id, value);
     }
     return value;
+}
+
+// 只有路径时的取值入口:自己算一次文件身份(一次 stat)。
+template <typename T, typename F>
+T cachedFact(FactCache<T>& store, const QString& path, F compute)
+{
+    return cachedFactById(store, fileIdentity(path), compute);
 }
 
 const wchar_t* wcstr(const QString& s)
@@ -101,6 +151,35 @@ const wchar_t* wcstr(const QString& s)
 
 // ============================ 签名 / 证书 内部实现 ============================
 namespace {
+
+// 嵌入式 Authenticode 验证的原始状态码(不塌缩)。ERROR_SUCCESS 表示完全可信;
+// 其余值区分得出「摘要不匹配」「根不受信」「过期」等具体原因 —— 更新准入需要这个区分。
+long embeddedSignatureStatusRaw(const QString& path)
+{
+    WINTRUST_FILE_INFO fileInfo;
+    ZeroMemory(&fileInfo, sizeof(fileInfo));
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = wcstr(path);
+
+    GUID actionGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    WINTRUST_DATA data;
+    ZeroMemory(&data, sizeof(data));
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &fileInfo;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionGuid, &data);
+
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionGuid, &data);
+
+    return static_cast<long>(status);
+}
 
 // 嵌入式 Authenticode 验证(WinVerifyTrust)。仅做本机校验,不联网撤销。
 bool verifyEmbeddedSignature(const QString& path)
@@ -300,114 +379,189 @@ bool computeCertRevoked(PCCERT_CONTEXT cert)
 } // namespace
 
 // ============================ 公有 API:签名 / 哈希 ==========================
+//
+// 每类事实的「计算」与「缓存表」都提到这里的文件作用域,而不是各自藏在函数里的 static。
+// 理由:除了逐项入口(isSigned / tryGetPublisher / …),还有一个一次性取齐全部事实的入口
+// (collectForensics),两者必须共用同一张表 —— 否则同一个文件会被验两遍签、哈希两遍。
+namespace {
+
+FactCache<bool>    g_signedCache;
+FactCache<QString> g_publisherCache;
+FactCache<QString> g_sha256Cache;
+FactCache<bool>    g_embeddedCache;
+FactCache<ProcessInspector::CertInfo> g_certCache;
+
+bool computeIsSigned(const QString& path)
+{
+    if (path.isEmpty() || path.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
+        return false;
+    if (verifyEmbeddedSignature(path))
+        return true;
+    return verifyCatalogSignature(path);
+}
+
+QString computePublisher(const QString& path)
+{
+    PCCERT_CONTEXT cert = acquireSignerCert(path);
+    if (!cert)
+        return QString();
+    QString publisher;
+    const DWORD cch = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+    if (cch > 1) {
+        QVector<wchar_t> buf(static_cast<int>(cch));
+        if (CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, buf.data(), cch) > 1)
+            publisher = QString::fromWCharArray(buf.data());
+    }
+    CertFreeCertificateContext(cert);
+    return publisher;
+}
+
+QString computeSha256(const QString& path)
+{
+    if (path.isEmpty())
+        return QString();
+    QFileInfo fi(path);
+    if (!fi.exists() || !fi.isFile())
+        return QString();
+    constexpr qint64 kMaxBytes = 256LL * 1024 * 1024; // 超大文件不哈希(膨胀样本另有体积规则)
+    if (fi.size() > kMaxBytes)
+        return QString();
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return QString();
+    QCryptographicHash h(QCryptographicHash::Sha256);
+    if (!h.addData(&f))
+        return QString();
+    // 大写十六进制:与 .NET Convert.ToHexString 及 FirstSeenStore 归一化一致。
+    return QString::fromLatin1(h.result().toHex().toUpper());
+}
+
+bool computeHasEmbeddedSignature(const QString& path)
+{
+    if (path.isEmpty())
+        return false;
+    HCERTSTORE hStore = nullptr;
+    HCRYPTMSG  hMsg = nullptr;
+    const bool ok = CryptQueryObject(CERT_QUERY_OBJECT_FILE, wcstr(path),
+                                     CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                                     CERT_QUERY_FORMAT_FLAG_BINARY, 0,
+                                     nullptr, nullptr, nullptr, &hStore, &hMsg, nullptr);
+    if (hMsg) CryptMsgClose(hMsg);
+    if (hStore) CertCloseStore(hStore, 0);
+    return ok;
+}
+
+ProcessInspector::CertInfo computeCertInfo(const QString& path)
+{
+    ProcessInspector::CertInfo info;
+    PCCERT_CONTEXT cert = acquireSignerCert(path);
+    if (!cert)
+        return info;
+
+    BYTE thumb[20];
+    DWORD cb = sizeof(thumb);
+    if (CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, thumb, &cb)) {
+        info.thumbprint = QString::fromLatin1(
+            QByteArray(reinterpret_cast<char*>(thumb), static_cast<int>(cb)).toHex().toUpper());
+    }
+
+    info.notBeforeUtc = fileTimeToQDateTime(cert->pCertInfo->NotBefore);
+    info.notAfterUtc  = fileTimeToQDateTime(cert->pCertInfo->NotAfter);
+    info.signingTimeUtc = computeSigningTime(path); // 可能无效
+
+    if (info.signingTimeUtc.isValid() && info.notAfterUtc.isValid() && info.notBeforeUtc.isValid()) {
+        if (info.signingTimeUtc > info.notAfterUtc || info.signingTimeUtc < info.notBeforeUtc)
+            info.signedAfterCertExpiry = true;
+    }
+
+    info.revoked = computeCertRevoked(cert);
+    CertFreeCertificateContext(cert);
+    return info;
+}
+
+} // namespace
 
 bool ProcessInspector::isSigned(const QString& path)
 {
-    static QHash<QString, bool> cache;
-    return cachedFact(cache, path, [&]() -> bool {
-        if (path.isEmpty() || path.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
-            return false;
-        if (verifyEmbeddedSignature(path))
-            return true;
-        return verifyCatalogSignature(path);
-    });
+    return cachedFact(g_signedCache, path, [&] { return computeIsSigned(path); });
 }
 
 QString ProcessInspector::tryGetPublisher(const QString& path)
 {
-    static QHash<QString, QString> cache;
-    return cachedFact(cache, path, [&]() -> QString {
-        PCCERT_CONTEXT cert = acquireSignerCert(path);
-        if (!cert)
-            return QString();
-        QString publisher;
-        const DWORD cch = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
-        if (cch > 1) {
-            QVector<wchar_t> buf(static_cast<int>(cch));
-            if (CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, buf.data(), cch) > 1)
-                publisher = QString::fromWCharArray(buf.data());
-        }
-        CertFreeCertificateContext(cert);
-        return publisher;
-    });
+    return cachedFact(g_publisherCache, path, [&] { return computePublisher(path); });
 }
 
 QString ProcessInspector::tryComputeSha256(const QString& path)
 {
-    static QHash<QString, QString> cache;
-    return cachedFact(cache, path, [&]() -> QString {
-        if (path.isEmpty())
-            return QString();
-        QFileInfo fi(path);
-        if (!fi.exists() || !fi.isFile())
-            return QString();
-        constexpr qint64 kMaxBytes = 256LL * 1024 * 1024; // 超大文件不哈希(膨胀样本另有体积规则)
-        if (fi.size() > kMaxBytes)
-            return QString();
-        QFile f(path);
-        if (!f.open(QIODevice::ReadOnly))
-            return QString();
-        QCryptographicHash h(QCryptographicHash::Sha256);
-        if (!h.addData(&f))
-            return QString();
-        // 大写十六进制:与 .NET Convert.ToHexString 及 FirstSeenStore 归一化一致。
-        return QString::fromLatin1(h.result().toHex().toUpper());
-    });
+    return cachedFact(g_sha256Cache, path, [&] { return computeSha256(path); });
 }
 
 bool ProcessInspector::hasEmbeddedSignature(const QString& path)
 {
-    static QHash<QString, bool> cache;
-    return cachedFact(cache, path, [&]() -> bool {
-        if (path.isEmpty())
-            return false;
-        HCERTSTORE hStore = nullptr;
-        HCRYPTMSG  hMsg = nullptr;
-        const bool ok = CryptQueryObject(CERT_QUERY_OBJECT_FILE, wcstr(path),
-                                         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-                                         CERT_QUERY_FORMAT_FLAG_BINARY, 0,
-                                         nullptr, nullptr, nullptr, &hStore, &hMsg, nullptr);
-        if (hMsg) CryptMsgClose(hMsg);
-        if (hStore) CertCloseStore(hStore, 0);
-        return ok;
-    });
+    return cachedFact(g_embeddedCache, path, [&] { return computeHasEmbeddedSignature(path); });
+}
+
+//
+// 一次性取齐富化阶段要用的全部文件取证事实。
+//
+// 【它解决什么】isSigned / tryGetPublisher / tryComputeSha256 / hasEmbeddedSignature /
+// getCertInfo 各自都要先算一遍「文件身份」(小写路径|大小|修改时刻)当缓存键,而算身份就是
+// 一次 QFileInfo stat。Worker::enrich 对同一个 path 连着调其中 4~5 个,紧接着又为了取文件
+// 体积再构造一个 QFileInfo —— 于是一条事件要对同一个文件 stat 5~6 遍,即便这些事实全都命中
+// 缓存、真正的验签与哈希一次都没跑。事件风暴下这笔开销按事件数线性放大,且全在主线程上。
+//
+// 本函数把 stat 收敛成一次:身份与文件体积都从这一次结果里来,再拿身份去查各张事实表。
+// 求值范围与 enrich 原先的调用序列逐条对应(含「仅当没有可信签名时才判是否内嵌签名」这个
+// 条件),所以结论完全一致 —— 省掉的只是重复的 stat。
+//
+ProcessInspector::ForensicFacts
+ProcessInspector::collectForensics(const QString& path, bool includeCert)
+{
+    ForensicFacts f;
+    if (path.isEmpty() || path.startsWith(QLatin1String("PID "), Qt::CaseInsensitive))
+        return f;
+
+    // 全流程唯一一次 stat。
+    const QFileInfo fi(path);
+    f.isRealFile = fi.exists() && fi.isFile();
+    const QString id = f.isRealFile ? identityFrom(path, fi) : QString();
+    if (f.isRealFile)
+        f.fileSize = fi.size();
+
+    f.trustedSignature =
+        cachedFactById(g_signedCache, id, [&] { return computeIsSigned(path); });
+    f.publisher =
+        cachedFactById(g_publisherCache, id, [&] { return computePublisher(path); });
+    f.sha256 =
+        cachedFactById(g_sha256Cache, id, [&] { return computeSha256(path); });
+    // 与 enrich 原有逻辑一致:已经有可信签名时不必再问「是否内嵌了签名」。
+    if (!f.trustedSignature)
+        f.embeddedSignature =
+            cachedFactById(g_embeddedCache, id, [&] { return computeHasEmbeddedSignature(path); });
+    if (includeCert)
+        f.cert = cachedFactById(g_certCache, id, [&] { return computeCertInfo(path); });
+    return f;
 }
 
 bool ProcessInspector::isSignatureMismatch(const QString& path)
 {
-    // 内嵌了签名但不受信 = 失配(篡改 / 盗用证书的典型特征)。
+    // 内嵌了签名但不受信 = 可疑(篡改 / 盗用证书 / 根不受信任都会落到这里)。
+    //
+    // ⚠ 这是一个【威胁打分用】的粗判据,不要拿它当准入闸门:它分不清「文件被改过」
+    // 和「这台机器没导入签发者的根证书」。在线更新曾经用它做校验,结果每次更新都被
+    // 判成「疑似被篡改」而拒装 —— 因为驱动用的是自签测试证书,根不受信任是常态。
+    // 需要区分的场合用 embeddedSignatureStatus()。
     return hasEmbeddedSignature(path) && !isSigned(path);
+}
+
+long ProcessInspector::embeddedSignatureStatus(const QString& path)
+{
+    return embeddedSignatureStatusRaw(path);
 }
 
 ProcessInspector::CertInfo ProcessInspector::getCertInfo(const QString& path)
 {
-    static QHash<QString, CertInfo> cache;
-    return cachedFact(cache, path, [&]() -> CertInfo {
-        CertInfo info;
-        PCCERT_CONTEXT cert = acquireSignerCert(path);
-        if (!cert)
-            return info;
-
-        BYTE thumb[20];
-        DWORD cb = sizeof(thumb);
-        if (CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, thumb, &cb)) {
-            info.thumbprint = QString::fromLatin1(
-                QByteArray(reinterpret_cast<char*>(thumb), static_cast<int>(cb)).toHex().toUpper());
-        }
-
-        info.notBeforeUtc = fileTimeToQDateTime(cert->pCertInfo->NotBefore);
-        info.notAfterUtc  = fileTimeToQDateTime(cert->pCertInfo->NotAfter);
-        info.signingTimeUtc = computeSigningTime(path); // 可能无效
-
-        if (info.signingTimeUtc.isValid() && info.notAfterUtc.isValid() && info.notBeforeUtc.isValid()) {
-            if (info.signingTimeUtc > info.notAfterUtc || info.signingTimeUtc < info.notBeforeUtc)
-                info.signedAfterCertExpiry = true;
-        }
-
-        info.revoked = computeCertRevoked(cert);
-        CertFreeCertificateContext(cert);
-        return info;
-    });
+    return cachedFact(g_certCache, path, [&] { return computeCertInfo(path); });
 }
 
 // ============================ 进程自省 =======================================

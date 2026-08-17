@@ -76,6 +76,18 @@ public:
     bulwark::ReputationUsage getUsage() override;
     QString name() const override { return QStringLiteral("ReputationProxy"); }
 
+    // 中央服务器这一跳是否真的可用(已启用 + 有端点)。刻意与 isEnabled() 分开:后者在代理
+    // 关闭、但本地直连聚合器可用时也返回 true(它回答的是「信誉查询整体可用吗」)。
+    // 云查毒的进度文案要据此决定第一句到底能不能写「正在查询中央服务器…」—— 代理没开却这么
+    // 写,就是在卡片上撒谎,而「云查是否真的服务器优先」恰恰只能从这句话看出来。
+    bool isServerEnabled() const { return enabled_.load(); }
+
+    // 【本机不动用任何第三方情报源】模式(ReputationProxy.ServerOnly)。为真时本装饰器绝不
+    // 回退到本地直连聚合器,行为画像也不去拉 —— 云端只用来问中央服务器「这个哈希你收录了吗」。
+    // 对外暴露是因为链路的另外几段(Worker 的分级云查毒、VT 完整报告、逐源「测试连接」)
+    // 各自持有自己的客户端句柄,必须能读到同一个判据;两处各写一份开关必然跑偏。
+    bool isServerOnly() const { return serverOnly_; }
+
     // The proxy holds keys server-side; nothing to hot-swap here. The direct
     // sources' keys keep flowing to the fallback (main.cpp calls setApiKey on
     // the aggregate directly), so this is intentionally a no-op.
@@ -106,8 +118,15 @@ private:
     //   · 传输层不可达 -> 冷却 kBreakerCooldownMs 后半开,只放一个请求去试探。
     bool proxyLikelyUp();
 
-    // 客户端侧请求预算:两个桶(每分钟 / 每小时)都过才放行。见 ReputationProxyOptions 里
-    // RequestsPerMinute/RequestsPerHour 的说明 —— 这是不再被服务端 429 封一小时的根本手段。
+    // 客户端侧请求预算:两个桶(每分钟 / 每小时)都过才放行。
+    //
+    // 【只查收录】模式下默认【不限次数】—— 这类请求只让服务端读自己的库(绝不触达它的付费
+    // 上游),既不花机队配额、也就没有理由按次数省着用;而每砍掉一次服务器查询,换来的都是
+    // 一次本机 VT 密钥消耗(那才是真稀缺的:免费档 4/min、500/天)。所以预算桶建了但先【不武装】。
+    //
+    // 唯一会武装它们的情形:服务端真的回了 429(见 noteOutcome)。那说明对面版本较旧、仍对
+    // 只读查询按 per-IP 滑窗限流,超限要封一小时 —— 此后自动收敛到 RequestsPerMinute/PerHour
+    // 之内,避免「不限次数」反而把服务器这一跳整小时地打没了。武装后本进程内不再解除。
     bool tryConsumeRequestBudget(bool priority);
 
     struct HealthCache; // 前置声明,noteOutcome 要用
@@ -123,6 +142,13 @@ private:
     QString token_;                      // bearer token (env var > appsettings)
     int timeoutSecs_;
     bool syncResults_ = true;            // 回传本地结论给服务器(ReputationProxy.SyncResultsToServer)
+    // 【只查收录】常态模式:每次请求都带 lookupOnly,永不让服务端去问它的上游付费情报源;
+    // 未收录即转本机密钥直连。与 freshBudget_ 互斥 —— 这个模式下不存在「新鲜的上游查询」,
+    // 故不占用每日新鲜配额。见 ReputationProxyOptions::LookupOnly。
+    bool lookupOnly_ = false;
+    // 【本机不动用任何第三方情报源】:见 ReputationProxyOptions::ServerOnly。为真时 fallback_
+    // 这条腿整条不走(查询、行为画像、连通性自检都不走),云端只剩「问服务器收录了吗」这一跳。
+    bool serverOnly_ = false;
 
     // Daily budget of *fresh* server-intel lookups (replies the server had to fetch from its
     // paid upstream, i.e. NOT served from its shared cache). null => unlimited. When the budget
@@ -151,11 +177,19 @@ private:
         // 服务器不认回传接口(404/405/501:未实现或已关闭)。一旦确认就不再为每次扫描白发
         // 一次请求。放在共享状态里,才能被 detach 出去的回传线程安全写入(同 state/atMs 之理)。
         std::atomic<bool>   submitUnsupported{false};
+        // 已就「服务端不认 lookupOnly」告警过(只警一次,别每条哈希刷一行)。
+        // 这条很重要:开关开着而服务端是旧版时,配额照烧却看不出来 —— 正是此前 cacheOnly
+        // 白发了很久都没人察觉的原因。
+        std::atomic<bool>   lookupOnlyUnsupportedWarned{false};
         // 传输层连续失败次数。达到阈值才判离线 —— 单次抖动(一次 DNS/TLS 抽风、curl 进程没起来)
         // 不该让状态灯翻牌,那是用户看到的「断链」里相当一部分的来源。
         std::atomic<int>    transportFailStreak{0};
         // 服务端限流冷却截止时刻(ms epoch),取自 429 回包的 retry_after_seconds。
         std::atomic<qint64> throttledUntilMs{0};
+        // 服务端确实对我们限过流(收到过 429)-> 武装客户端请求预算桶。
+        // 「只查收录」模式默认不限次数(那类请求不花服务端任何上游配额),这个标记就是那份
+        // 「不限」的唯一收敛条件:只对真的会限流的服务端收敛,而不是先验地假设每台都限。
+        std::atomic<bool>   budgetsArmed{false};
         // 熔断半开时刻。刻意与 atMs 分开:atMs 是【/health 探测缓存】的时间戳,而
         // healthCheckNonBlocking 靠「atMs 是否过期」决定要不要再探一次。以前熔断半开和
         // 每次失败的查询都去刷 atMs,于是查询一失败就把探测窗口顶新,UI 再也发不出 /health

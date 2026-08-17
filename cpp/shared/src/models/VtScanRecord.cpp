@@ -19,6 +19,7 @@ QJsonObject VtScanRecord::toJson() const {
     o["message"] = message;
     o["uploaded"] = uploaded;
     o["source"] = source;
+    o["intelSource"] = intelSource;
     o["timestampUtc"] = dateTimeToIso(timestampUtc);
     return o;
 }
@@ -39,6 +40,7 @@ VtScanRecord VtScanRecord::fromJson(const QJsonObject& o) {
     r.message = getStr(o, "message");
     r.uploaded = getBool(o, "uploaded");
     r.source = getStr(o, "source");
+    r.intelSource = getStr(o, "intelSource"); // 旧历史文件里没有这个键 -> 空,UI 自行兜底
     const QDateTime ts = dateTimeFromIso(getStr(o, "timestampUtc"));
     if (ts.isValid()) r.timestampUtc = ts;
     return r;

@@ -97,7 +97,21 @@ Emit ("package kind           : " + $(if ($private) { 'PRIVATE (test build - sec
 
 Emit ""
 Emit "=== sensitive-string scan (all text files in package) ==="
-$pats = @('8u2wluBknxZs','149.88.73.23','103.236.72.227','bulwark.icu')
+# Patterns come from the single source of truth, not a second copy kept in step by
+# hand. They used to be duplicated here AND (in plaintext) inside the shipped
+# bulwark.ps1, which is how the release package ended up carrying our endpoint,
+# token and IPs in a file any user can open in Notepad.
+$needleFile = Join-Path $root 'packaging\redaction-needles.txt'
+if (-not (Test-Path $needleFile)) {
+  # Do not degrade to "no patterns -> clean". A scan that silently checks nothing
+  # is worse than no scan: it prints a green line and gets trusted.
+  throw ("needle list missing: " + $needleFile)
+}
+$pats = @(Get-Content -LiteralPath $needleFile |
+          ForEach-Object { $_.Trim() } |
+          Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
+if ($pats.Count -eq 0) { throw ("needle list is empty: " + $needleFile) }
+Emit ("patterns: " + $pats.Count + " (from packaging\redaction-needles.txt)")
 $hit = $false
 foreach ($f in (Get-ChildItem $pkg -Recurse -File -Include *.txt,*.json,*.bat,*.ps1,*.html,*.sh -ErrorAction SilentlyContinue)) {
   $t = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
@@ -107,6 +121,104 @@ foreach ($f in (Get-ChildItem $pkg -Recurse -File -Include *.txt,*.json,*.bat,*.
 if (-not $hit) { Emit "  clean" }
 elseif ($private) { Emit "  ^ expected for a PRIVATE build; run update_portable.ps1 -Sanitize before sharing" }
 else { Emit "  ^ LEAK: package claims to be sanitized but still carries these" }
+
+Emit ""
+Emit "=== update trust: every shipped PE signed by the pinned cert ==="
+# The online updater installs a file only when its Authenticode signer thumbprint is
+# in the list compiled into the client. So "is this package updatable at all?" reduces
+# to "are its own binaries signed by that same cert?" -- checking it here means the
+# answer is known before shipping, not after a user reports a refused update.
+$trustH = Join-Path $root 'cpp\shared\include\bulwark\UpdateTrust.h'
+if (-not (Test-Path $trustH)) { Emit "  UpdateTrust.h missing -- cannot verify the pin" }
+else {
+  $tm = [regex]::Match((Get-Content -LiteralPath $trustH -Raw),
+                       'BULWARK_UPDATE_SIGNER_THUMBPRINT\s+"([0-9A-Fa-f]{40})"')
+  if (-not $tm.Success) { Emit "  UpdateTrust.h has no BULWARK_UPDATE_SIGNER_THUMBPRINT" }
+  else {
+    $pin = $tm.Groups[1].Value.ToUpper()
+    Emit ("  pinned: " + $pin)
+    $unsigned = 0; $wrong = 0; $good = 0
+    foreach ($n in @('bulwark_service.exe','bulwark_ui.exe','Bulwark.sys')) {
+      $p = Join-Path $pkg $n
+      if (-not (Test-Path $p)) { Emit ("  MISSING " + $n); continue }
+      $s = Get-AuthenticodeSignature $p
+      $tp = if ($s.SignerCertificate) { $s.SignerCertificate.Thumbprint.ToUpper() } else { '' }
+      if (-not $tp) { Emit ("  {0,-22} UNSIGNED -> updates can never install this" -f $n); $unsigned++ }
+      elseif ($tp -ne $pin) { Emit ("  {0,-22} signer={1} != pinned" -f $n, $tp); $wrong++ }
+      else {
+        $ts = if ($s.TimeStamperCertificate) { 'timestamped' } else { 'no timestamp' }
+        Emit ("  {0,-22} ok  status={1}  {2}" -f $n, $s.Status, $ts); $good++
+      }
+    }
+    if ($unsigned -eq 0 -and $wrong -eq 0) { Emit "  all shipped PEs match the pin -- package is updatable" }
+    else { Emit ("  ^ DEFECT: " + $unsigned + " unsigned, " + $wrong + " signed by an unpinned cert") }
+
+    # The pin exists in TWO places and both are load-bearing:
+    #   UpdateTrust.h            -> the service checks it when downloading
+    #   bulwark.ps1              -> the elevated installer re-checks it when applying
+    # The second check is not redundant: the staging directory is user-writable, so the
+    # files can be swapped between "downloaded and verified" and "installed as admin".
+    #
+    # Rotating the cert and updating only the header is a silent, very confusing break:
+    # downloads keep succeeding and every install gets refused, with nothing in the UI
+    # pointing at a mismatched pin. Nothing enforced this until it was checked for -- the
+    # header's own comment claimed this script verified it, and it did not.
+    $shipped = Join-Path $pkg 'bulwark.ps1'
+    if (-not (Test-Path $shipped)) { Emit "  bulwark.ps1 missing -- cannot verify the installer-side pin" }
+    else {
+      $sm = [regex]::Match([IO.File]::ReadAllText($shipped, [Text.Encoding]::UTF8),
+                           '\$UpdateSignerThumbprints\s*=\s*@\(([^)]*)\)')
+      if (-not $sm.Success) {
+        Emit "  ^ DEFECT: bulwark.ps1 defines no `$UpdateSignerThumbprints -- applying an update would fail"
+      } else {
+        $inScript = @([regex]::Matches($sm.Groups[1].Value, '[0-9A-Fa-f]{40}') |
+                      ForEach-Object { $_.Value.ToUpper() })
+        Emit ("  installer-side pin: " + ($inScript -join ', '))
+        if ($inScript -contains $pin) { Emit "  installer pin matches UpdateTrust.h" }
+        else { Emit ("  ^ DEFECT: bulwark.ps1 pin does not include " + $pin + " -- updates would download then be refused at install") }
+      }
+    }
+  }
+}
+
+Emit ""
+Emit "=== redaction needle set (shipped bulwark.ps1) ==="
+# The scan above only proves the package carries no plaintext needle. It cannot tell
+# "the needles were moved to hashes" apart from "the needle list was deleted and the
+# log collector now redacts nothing" -- both look clean. This section closes that
+# gap by checking the shipped hash list still covers every needle.
+$bps = Join-Path $pkg 'bulwark.ps1'
+if (-not (Test-Path $bps)) { Emit "  MISSING bulwark.ps1 -- package has no log collector" }
+else {
+  $bt = Get-Content -LiteralPath $bps -Raw
+  $m = [regex]::Match($bt, '(?s)\$script:RedactNeedleHashes\s*=\s*@\((.*?)\)')
+  if (-not $m.Success) {
+    Emit "  DEFECT: no `$script:RedactNeedleHashes block found -- collector cannot redact our infrastructure"
+  } else {
+    $shipped = @([regex]::Matches($m.Groups[1].Value, '[0-9a-fA-F]{64}') |
+                 ForEach-Object { $_.Value.ToLowerInvariant() })
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $expect = @($pats | ForEach-Object {
+      ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($_.ToLowerInvariant())))).Replace('-','').ToLowerInvariant()
+    })
+    $missing = @($expect | Where-Object { $shipped -notcontains $_ })
+    $extra   = @($shipped | Where-Object { $expect -notcontains $_ })
+    Emit ("  needles: " + $pats.Count + "   shipped hashes: " + $shipped.Count)
+    if ($missing.Count -eq 0 -and $extra.Count -eq 0) {
+      Emit "  in sync (hashes only, no plaintext) -- collector will redact all known needles"
+    } else {
+      if ($missing.Count -gt 0) { Emit ("  DESYNC: " + $missing.Count + " needle(s) have no shipped hash -> they will NOT be redacted") }
+      if ($extra.Count -gt 0)   { Emit ("  DESYNC: " + $extra.Count + " shipped hash(es) match no current needle (stale entry)") }
+      Emit "  paste this whole block into packaging\portable-scripts\bulwark.ps1:"
+      Emit "  `$script:RedactNeedleHashes = @("
+      for ($i = 0; $i -lt $expect.Count; $i++) {
+        $sep = ','; if ($i -eq $expect.Count - 1) { $sep = '' }
+        Emit ("      '" + $expect[$i] + "'" + $sep)
+      }
+      Emit "  )"
+    }
+  }
+}
 
 Emit ""
 Emit "=== package contents ==="

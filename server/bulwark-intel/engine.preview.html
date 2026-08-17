@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>攻击链组合引擎 · 磐垒</title>
+<style>
+:root{
+  --bg:#eef1f6; --pnl:#fff; --inset:#f5f7fa; --line:#e3e7ee; --line2:#eef1f6;
+  --ink:#0f1729; --ink2:#33405a; --mut:#5b6678; --dim:#8a93a3;
+  --acc:#4f46e5; --accbg:rgba(79,70,229,.07); --accln:rgba(79,70,229,.22);
+  --risk:#c2281c; --riskbg:rgba(194,40,28,.08);
+  --warn:#8a5209; --warnbg:rgba(138,82,9,.09);
+  --ok:#046239;
+  --mono:"Cascadia Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink2);font:13px/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased}
+a{color:var(--acc);text-decoration:none}
+
+/* ---- 顶栏 ---- */
+.top{background:rgba(255,255,255,.92);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
+.tin{max-width:1180px;margin:0 auto;padding:0 24px;height:50px;display:flex;
+  align-items:center;gap:16px}
+.bd{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:750;
+  color:var(--ink)}
+.top nav{display:flex;gap:2px}
+.top nav a{font-size:12.5px;font-weight:600;color:var(--mut);padding:6px 10px;
+  border-radius:7px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.top nav a:hover{background:var(--accbg);color:var(--acc)}
+.top nav a.on{background:var(--accbg);color:var(--acc)}
+.sp{flex:1}
+.ver{font:700 11.5px var(--mono);color:var(--acc);background:var(--accbg);
+  border:1px solid var(--accln);border-radius:20px;padding:3px 11px;white-space:nowrap}
+
+.wrap{max-width:1180px;margin:0 auto;padding:22px 24px 72px}
+
+/* ---- 摘要卡 ----------------------------------------------------------------
+   刻意做成【一张卡两栏】,而不是四块独立瓦片:处置能力与流水线是同一件事的两个
+   侧面(能拦到什么强度 / 这些规则怎么筛出来的),分成两张卡会让人以为它们无关。 */
+.card{background:var(--pnl);border:1px solid var(--line);border-radius:14px;
+  padding:20px 22px;box-shadow:0 1px 2px rgba(15,23,41,.04)}
+.card h1{margin:0 0 4px;font-size:18px;font-weight:750;color:var(--ink);
+  letter-spacing:-.2px}
+.card .lead{margin:0 0 18px;font-size:12.5px;color:var(--mut);max-width:76ch}
+.split{display:grid;grid-template-columns:minmax(240px,1fr) 2fr;gap:28px}
+@media(max-width:820px){.split{grid-template-columns:1fr;gap:20px}}
+.blk{min-width:0}
+.blk h2{margin:0 0 10px;font-size:10.5px;font-weight:750;letter-spacing:1.1px;
+  color:var(--dim);text-transform:uppercase}
+
+/* 处置能力:三行,数字右对齐等宽,一眼看出「最强能到哪一档」。 */
+.caps{display:flex;flex-direction:column;gap:1px}
+.cap{display:flex;align-items:baseline;gap:10px;padding:6px 0;
+  border-bottom:1px solid var(--line2)}
+.cap:last-child{border-bottom:none}
+.cap b{font:800 20px/1 var(--mono);font-variant-numeric:tabular-nums;
+  min-width:2.4em;text-align:right;color:var(--ink)}
+.cap span{font-size:12.5px;color:var(--ink2)}
+.cap em{font-style:normal;font-size:11px;color:var(--dim);margin-left:auto;
+  text-align:right}
+.cap.z b{color:var(--dim)}
+.cap.hard b{color:var(--risk)}
+.cap.strong b{color:var(--warn)}
+
+/* 流水线:横向阶梯 + 每段的损耗就地标注,不另起横带。 */
+.pipe{display:flex;align-items:stretch;flex-wrap:wrap;gap:0}
+.pst{padding:0 16px 0 0;margin-right:16px;border-right:1px solid var(--line);
+  min-width:104px}
+.pst:last-child{border-right:none;margin-right:0;padding-right:0}
+.pst b{display:block;font:800 19px/1.1 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.pst u{display:block;text-decoration:none;font-size:11px;color:var(--dim);
+  margin-top:3px;white-space:nowrap}
+.pst i{display:block;font-style:normal;font-size:10.5px;color:var(--warn);
+  margin-top:3px}
+.pst.fin b{color:var(--acc)}
+
+/* 诚实提示。整页只有这一处横带,而且只在真有话要说时出现。 */
+.note{margin-top:16px;padding:10px 13px;border-radius:9px;font-size:12px;
+  border:1px solid var(--line);border-left:3px solid var(--acc);
+  background:var(--accbg);color:var(--ink2)}
+.note.warn{border-left-color:var(--warn);background:var(--warnbg)}
+.note b{color:var(--ink)}
+
+/* ---- 区块 ---- */
+.sec{margin-top:18px;background:var(--pnl);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden}
+.sh{display:flex;align-items:center;gap:10px;padding:13px 20px;
+  border-bottom:1px solid var(--line)}
+.sh h2{margin:0;font-size:13px;font-weight:750;color:var(--ink)}
+.sh .n{font:700 11px var(--mono);color:var(--acc);background:var(--accbg);
+  border-radius:20px;padding:1px 9px}
+.sh .hint{margin-left:auto;font-size:11.5px;color:var(--dim);text-align:right}
+.sh input{margin-left:auto;width:200px;padding:5px 9px;border:1px solid var(--line);
+  border-radius:7px;font:12px var(--sans);color:var(--ink);background:var(--inset);
+  outline:none}
+.sh input:focus{border-color:var(--accln);background:#fff}
+
+/* ---- 规则表 ---------------------------------------------------------------
+   列宽写死并与吸顶表头共用同一组值,是这一版的核心修复:原来每个意图分组下都重印
+   一遍列头,26 条规则出了 8 次表头 —— 那是「乱」的主要来源。现在整节只有一行表头,
+   吸顶跟随滚动,分组降级成一条细分隔线。 */
+.colh{position:sticky;top:50px;z-index:20;display:flex;align-items:center;
+  gap:12px;padding:8px 20px;background:var(--inset);
+  border-bottom:1px solid var(--line);font-size:10.5px;font-weight:750;
+  letter-spacing:.5px;color:var(--dim)}
+.cg{flex:none;width:52px}
+.cc{flex:1;min-width:0}
+.ce{flex:none;width:64px;text-align:right}
+.cs{flex:none;width:56px;text-align:right}
+
+.grp{display:flex;align-items:baseline;gap:9px;padding:11px 20px 5px;
+  border-top:1px solid var(--line2)}
+.grp:first-of-type{border-top:none}
+.grp b{font-size:12px;font-weight:750;color:var(--ink)}
+.grp i{font-style:normal;font:700 10.5px var(--mono);color:var(--dim)}
+.grp s{text-decoration:none;font-size:11px;color:var(--dim);margin-left:auto}
+
+.rule{border-top:1px solid var(--line2)}
+.rule>summary{list-style:none;cursor:pointer;display:flex;align-items:center;
+  gap:12px;padding:9px 20px}
+.rule>summary::-webkit-details-marker{display:none}
+.rule>summary:hover{background:var(--accbg)}
+.rule[open]>summary{background:var(--accbg)}
+.rg{flex:none;width:52px;font:700 11px var(--sans);color:var(--mut)}
+.rg.hard{color:var(--risk)}
+.rg.strong{color:var(--warn)}
+/* ask 走的就是 .rg 的默认灰,但这条规则【必须写出来】:强度是 JS 拼上去的 class,
+   而本项目唯一能发现「某块掉了样式」的手段是「渲染后不存在无规则类」。留一个
+   只靠继承生效的类名,就等于在那个检查里永久留一条噪音,下次真掉样式时看不出来。 */
+.rg.ask{color:var(--mut)}
+.rchain{flex:1;min-width:0;font-size:13px;line-height:1.55;color:var(--ink2)}
+.rchain b{font-weight:750;color:var(--ink)}
+.rchain i{font-style:normal}
+.plus{color:var(--dim);margin:0 5px}
+/* 事件类型小标:让链条的「形状」(注册表→文件→进程)可以一眼扫出来,
+   而不必展开每一条。 */
+.ev{display:inline-block;font:600 9.5px var(--sans);color:var(--dim);
+  background:var(--inset);border:1px solid var(--line);border-radius:4px;
+  padding:0 4px;margin-right:4px;vertical-align:1px}
+/* 正常命中 > 0 是误报风险的直接证据,也是整页唯一该用红的地方。为 0 时【什么都不画】
+   —— 原来那一列 22 行全是 0。 */
+.ben{display:inline-block;margin-left:7px;font:700 10.5px var(--mono);
+  color:var(--risk);background:var(--riskbg);border-radius:4px;padding:0 5px}
+.re{flex:none;width:64px;text-align:right;font:12px var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.re.part{color:var(--warn);font-weight:700}
+.rs{flex:none;width:56px;text-align:right;font:12px var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+
+.more{padding:2px 20px 14px 84px;font-size:12px}
+.mr{display:flex;gap:10px;padding:4px 0;border-top:1px solid var(--line2)}
+.mr:first-child{border-top:none}
+.mk{flex:none;width:74px;color:var(--dim);font-size:11px}
+.mv{flex:1;min-width:0;color:var(--ink2);word-break:break-word}
+code{font-family:var(--mono);font-size:11px;background:var(--inset);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+  margin:0 4px 3px 0;display:inline-block;color:var(--ink2)}
+
+/* ---- 标记表 ---- */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:8px 12px;border-top:1px solid var(--line2);
+  vertical-align:top}
+thead th{position:sticky;top:50px;z-index:15;background:var(--inset);
+  color:var(--dim);font-size:10.5px;font-weight:750;letter-spacing:.5px;
+  border-top:none;border-bottom:1px solid var(--line);white-space:nowrap}
+tbody tr:hover td{background:var(--accbg)}
+td.cn{font-weight:650;color:var(--ink)}
+td.cn s{display:block;text-decoration:none;font:10.5px var(--mono);
+  color:var(--dim);margin-top:2px;word-break:break-all}
+td.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;
+  white-space:nowrap;color:var(--ink)}
+td.n.z{color:var(--dim)}
+td.n.bad{color:var(--risk);font-weight:700}
+.sp2,.sp1,.sp0{display:inline-block;font:700 10px var(--sans);border-radius:5px;
+  padding:1px 6px;white-space:nowrap;border:1px solid var(--line)}
+.sp2{color:var(--ok);background:rgba(4,98,57,.07)}
+.sp1{color:var(--mut);background:var(--inset)}
+.sp0{color:var(--warn);background:var(--warnbg)}
+.lv{display:inline-block;font:700 10px var(--sans);border-radius:5px;
+  padding:1px 6px;border:1px solid var(--line);color:var(--mut);
+  background:var(--inset);white-space:nowrap}
+.lv.hi{color:var(--warn);background:var(--warnbg)}
+.dim{color:var(--dim)}
+.empty{padding:34px;text-align:center;color:var(--dim);font-size:12.5px}
+
+/* ---- 未生效 / 折叠 ---- */
+.cut{display:flex;align-items:center;gap:12px;padding:8px 20px;
+  border-top:1px solid var(--line2);font-size:12.5px}
+.cutw{flex:none;width:120px;font-size:11px;color:var(--warn)}
+details.fold{margin-top:18px;background:var(--pnl);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden}
+details.fold>summary{cursor:pointer;padding:13px 20px;font-size:13px;
+  font-weight:750;color:var(--ink);list-style:none}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:"\25b8  ";color:var(--dim)}
+details.fold[open]>summary::before{content:"\25be  "}
+details.fold>summary em{font-style:normal;font-weight:500;font-size:12px;
+  color:var(--dim);margin-left:8px}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+  border-top:1px solid var(--line)}
+.kv div{display:flex;justify-content:space-between;gap:12px;padding:7px 20px;
+  border-bottom:1px solid var(--line2);font-size:12px}
+.kv u{text-decoration:none;color:var(--mut)}
+.kv b{font-family:var(--mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.ft{max-width:1180px;margin:0 auto;padding:0 24px 40px;font-size:11.5px;
+  color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header class="top"><div class="tin">
+  <div class="bd">&#128737; Bulwark 威胁分析</div>
+  <nav>
+    <a href="/">&#128737; 控制台</a>
+    <a href="/engine" class="on">&#129516; 攻击链引擎</a>
+    <a href="/online">&#128225; 在线客户端</a>
+    <a href="/support">&#127911; 在线客服</a>
+    <a href="/feedback">&#128172; 反馈</a>
+    <a href="/api/docs">&#128268; API 文档</a>
+    <a href="/about">&#128229; 下载</a>
+  </nav>
+  <div class="sp"></div>
+  <div class="ver" id="ver"></div>
+</div></header>
+
+<main class="wrap">
+
+  <section class="card">
+    <h1>攻击链组合引擎</h1>
+    <p class="lead" id="lead"></p>
+    <div class="split">
+      <div class="blk">
+        <h2>处置能力</h2>
+        <div class="caps" id="caps"></div>
+      </div>
+      <div class="blk">
+        <h2>规则是怎么筛出来的</h2>
+        <div class="pipe" id="pipe"></div>
+      </div>
+    </div>
+    <div id="notes"></div>
+  </section>
+
+  <section class="sec">
+    <div class="sh"><h2>生效规则</h2><span class="n" id="liveN"></span>
+      <span class="hint">按攻击意图分组 · 点开看匹配条件</span></div>
+    <div class="colh">
+      <span class="cg">强度</span>
+      <span class="cc">动作链（同一进程凑齐即命中）</span>
+      <span class="ce">真证据</span>
+      <span class="cs">作证</span>
+    </div>
+    <div id="rules"></div>
+  </section>
+
+  <section class="sec">
+    <div class="sh"><h2>行为标记</h2><span class="n" id="mkN"></span>
+      <input id="mfilt" type="search" placeholder="过滤标记 / 事件 / 条件"></div>
+    <table>
+      <thead><tr>
+        <th>标记</th><th>事件</th><th>严重度</th><th>区分力</th><th>匹配条件</th>
+        <th style="text-align:right">恶意样本</th>
+        <th style="text-align:right">正常命中</th>
+        <th style="text-align:right">被引用</th>
+      </tr></thead>
+      <tbody id="mkbody"></tbody>
+    </table>
+  </section>
+
+  <section class="sec" id="cutSec">
+    <div class="sh"><h2>未生效</h2><span class="n" id="cutN"></span>
+      <span class="hint">服务器挖出来了,但客户端装载时会剔除</span></div>
+    <div id="cut"></div>
+  </section>
+
+  <details class="fold">
+    <summary>构建统计<em>展开备查</em></summary>
+    <div class="kv" id="stats"></div>
+  </details>
+
+  <details class="fold">
+    <summary>阈值与原理<em>写死在 engine_build.py,不是学出来的参数</em></summary>
+    <div class="note" id="how"></div>
+  </details>
+
+</main>
+<footer class="ft" id="foot"></footer>
+
+<script>
+const D = {"version": 20, "label": "0.9", "built_at": "2026-08-09T00:36:48Z", "samples": 1004, "markers_total": 307, "mined": 703, "dedup": 397, "served": 22, "live": 22, "issues": {}, "benign": {"total": 63, "with_markers": 11, "signed": 4, "oldest": "2026-08-01T15:42:51Z", "newest": "2026-08-07T16:43:14Z", "cap": 20000}, "benign_min": 50, "benign_active": false, "benign_capped": 0, "benign_dropped": 0, "benign_generic": 0, "stats": {"total_reports": 4768, "skipped_other_platform": 3019, "skipped_not_threat": 0, "skipped_no_behaviour": 745, "usable_samples": 1004, "benign_reports": 63, "benign_other_platform": 50, "benign_usable": 13, "hand_rules_mismapped": 5, "markers_with_context": 301, "markers_derived": 84, "markers_derived_new": 56, "markers_spec_none": 229, "markers_spec_weak": 9, "markers_spec_ok": 69, "markers_observable": 78, "generic_dropped": 1, "benign_generic_dropped": 0, "benign_grading_active": 0, "implications": 170, "markers_effective": 287, "patterns_mined": 703, "patterns_after_dedup": 397, "patterns_after_cover": 22, "markers_mapped": 78, "patterns_kept": 22, "benign_capped": 0, "benign_dropped": 0, "patterns_dropped_no_evidence": 0, "stale_patterns_removed": 25, "stale_markers_removed": 0}, "tactics": [{"k": "evade", "t": "防御规避", "d": "关掉或绕开杀软与执行限制"}, {"k": "persist", "t": "开机留驻", "d": "让自己在重启后继续运行"}, {"k": "exec", "t": "落地执行", "d": "把载荷放到磁盘再跑起来"}, {"k": "masq", "t": "伪装", "d": "冒充系统程序名或系统所在位置"}, {"k": "cred", "t": "注入与凭据窃取", "d": "把模块塞进别人的进程，或读取凭据"}, {"k": "tamper", "t": "信任面篡改", "d": "改证书、服务、注册表等系统信任配置"}, {"k": "net", "t": "外联下载", "d": "联网取回载荷或回传"}, {"k": "other", "t": "其他", "d": "尚未归类的行为"}], "patterns": [{"g": "ask", "n": 2, "sup": 27, "ben": 0, "fam": "trojan.msil/agenttesla, trojan.msil/agensla, trojan.msil/noon", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "spec": 2}, {"id": "suspicious_powershell_in_registry_run_keys", "cn": "Suspicious PowerShell In Registry Run Keys", "en": "Suspicious PowerShell In Registry Run Keys", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows\\currentversion*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 18, "ben": 0, "fam": "trojan., trojan.awpf/phonzy, trojan.bazloader/banload", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "new_root_or_ca_or_authroot_certificate_to_store", "cn": "往证书存储装新根证书", "en": "New Root or CA or AuthRoot Certificate to Store", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\SystemCertificates\\*"], "spec": 2}, {"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 16, "ben": 0, "fam": "trojan.acsogenixx/ehz2, trojan.agenttesla/formbook, trojan.autoit/heur2", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "spec": 2}, {"id": "startup_folder_file_write", "cn": "往「启动」文件夹写文件", "en": "Startup Folder File Write", "lv": "medium", "lvcn": "中", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Start Menu\\Programs\\Startup\\*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 13, "ben": 0, "fam": "trojan.aeub/avarg, trojan.aenf/avarg, trojan.aevh/dgd9", "lv": "high", "tac": "other", "live": true, "iss": [], "mk": [{"id": "base64_encoded_powershell_command_detected", "cn": "Base64 Encoded PowerShell Command Detected", "en": "Base64 Encoded PowerShell Command Detected", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*truncated*"], "spec": 2}, {"id": "change_powershell_policies_to_an_insecure_level", "cn": "把 PowerShell 执行策略改松", "en": "Change PowerShell Policies to an Insecure Level", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*bypass*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 11, "ben": 0, "fam": "trojan.yogi/python, trojan., trojan.dumper/gencirc", "lv": "high", "tac": "cred", "live": true, "iss": [], "mk": [{"id": "potential_vcruntime140_dll_sideloading", "cn": "疑似 vcruntime140.dll 侧载", "en": "Potential Vcruntime140 DLL Sideloading", "lv": "high", "lvcn": "高", "ev": "ImageLoad", "evcn": "模块加载", "obs": true, "cond": ["目标=*\\vcruntime140.dll"], "spec": 2}, {"id": "powershell_defender_exclusion", "cn": "用 PowerShell 给 Defender 加排除项", "en": "Windows Defender Exclusions Added - PowerShell", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*Add-MpPreference*Exclusion*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 10, "ben": 0, "fam": "trojan.cloudeye/powershell, trojan.cloudeye/gen11, trojan.cloudeye/gen12", "lv": "high", "tac": "evade", "live": true, "iss": [], "mk": [{"id": "potential_powershell_command_line_obfuscation", "cn": "PowerShell 命令行疑似混淆", "en": "Potential PowerShell Command Line Obfuscation", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*truncated*"], "spec": 2}, {"id": "suspicious_powershell_invocation_from_script_engines", "cn": "脚本宿主调起 PowerShell", "en": "Suspicious PowerShell Invocation From Script Engines", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "父进程=*\\w*script.exe"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 10, "ben": 0, "fam": "trojan.aaga/camelot, trojan.adkp/dwnldr, trojan.adtg/gen198", "lv": "high", "tac": "exec", "live": true, "iss": [], "mk": [{"id": "suspicious_binaries_and_scripts_in_public_folder", "cn": "Public 目录出现可疑程序/脚本", "en": "Suspicious Binaries and Scripts in Public Folder", "lv": "high", "lvcn": "高", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Users\\Public\\*"], "spec": 2}, {"id": "windows_shell_scripting_application_file_write_to_suspicious_folder", "cn": "脚本宿主往可疑目录写文件", "en": "Windows Shell/Scripting Application File Write to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\c:\\users\\public*"], "spec": 2}]}, {"g": "strong", "n": 4, "sup": 9, "ben": 0, "fam": "trojan.tedy/bank, trojan.tedy/r785482", "lv": "high", "tac": "exec", "live": true, "iss": [], "mk": [{"id": "disable_internal_tools_or_feature_in_registry", "cn": "Disable Internal Tools or Feature in Registry", "en": "Disable Internal Tools or Feature in Registry", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\currentversion\\policies\\system\\consentpromptbehavioradmin*"], "spec": 2}, {"id": "path_to_screensaver_binary_modified", "cn": "Path To Screensaver Binary Modified", "en": "Path To Screensaver Binary Modified", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\hkcu\\control panel\\desktop\\scrnsave.exe*"], "spec": 2}, {"id": "service_startuptype_change_via_sc_exe", "cn": "Service StartupType Change Via Sc.EXE", "en": "Service StartupType Change Via Sc.EXE", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*disabled*"], "spec": 2}, {"id": "suspicious_binaries_and_scripts_in_public_folder", "cn": "Public 目录出现可疑程序/脚本", "en": "Suspicious Binaries and Scripts in Public Folder", "lv": "high", "lvcn": "高", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Users\\Public\\*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 9, "ben": 0, "fam": "trojan.gen60/iacgm, hacktool.connectwise/connectwisecontrol, hacktool.connectwise/applicunwnt", "lv": "high", "tac": "other", "live": true, "iss": [], "mk": [{"id": "registry_persistence_via_service_in_safe_mode", "cn": "Registry Persistence via Service in Safe Mode", "en": "Registry Persistence via Service in Safe Mode", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\currentcontrolset\\control\\safeboot\\network*"], "spec": 2}, {"id": "remote_access_tool_screenconnect_execution", "cn": "Remote Access Tool - ScreenConnect Execution", "en": "Remote Access Tool - ScreenConnect Execution", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*screenconnect*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 9, "ben": 0, "fam": "trojan.nanocore/msil, trojan.remcos/rescoms, trojan.bladabindi/msil", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "spec": 2}, {"id": "wow6432node_currentversion_autorun_keys_modification", "cn": "改 32 位视图的开机自启动项", "en": "Wow6432Node CurrentVersion Autorun Keys Modification", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\wow6432node\\microsoft\\windows\\currentversion*"], "spec": 2}]}, {"g": "strong", "n": 3, "sup": 8, "ben": 0, "fam": "trojan.iacgm/muldrop, trojan.biwdu6nhtqg/topis, trojan.cryxos/etecer", "lv": "medium", "tac": "evade", "live": true, "iss": [], "mk": [{"id": "change_powershell_policies_to_an_insecure_level", "cn": "把 PowerShell 执行策略改松", "en": "Change PowerShell Policies to an Insecure Level", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*bypass*"], "spec": 2}, {"id": "potentially_suspicious_powershell_script_execution_from_temp_folder", "cn": "从 Temp 目录跑 PowerShell 脚本", "en": "Potentially Suspicious Powershell Script Execution From Temp Folder", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "命令行=*\\Temp\\*"], "spec": 2}, {"id": "suspicious_powershell_invocation_from_script_engines", "cn": "脚本宿主调起 PowerShell", "en": "Suspicious PowerShell Invocation From Script Engines", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "父进程=*\\w*script.exe"], "spec": 2}]}, {"g": "strong", "n": 3, "sup": 8, "ben": 0, "fam": "trojan.msil/agenttesla, trojan.agenttesla/msil, trojan.msil/aqsh", "lv": "medium", "tac": "evade", "live": true, "iss": [], "mk": [{"id": "potentially_suspicious_powershell_script_execution_from_temp_folder", "cn": "从 Temp 目录跑 PowerShell 脚本", "en": "Potentially Suspicious Powershell Script Execution From Temp Folder", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "命令行=*\\Temp\\*"], "spec": 2}, {"id": "powershell_defender_exclusion", "cn": "用 PowerShell 给 Defender 加排除项", "en": "Windows Defender Exclusions Added - PowerShell", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*Add-MpPreference*Exclusion*"], "spec": 2}, {"id": "suspicious_powershell_in_registry_run_keys", "cn": "Suspicious PowerShell In Registry Run Keys", "en": "Suspicious PowerShell In Registry Run Keys", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows\\currentversion*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 8, "ben": 0, "fam": "trojan., dropper., trojan.almi/disco", "lv": "high", "tac": "cred", "live": true, "iss": [], "mk": [{"id": "new_root_or_ca_or_authroot_certificate_to_store", "cn": "往证书存储装新根证书", "en": "New Root or CA or AuthRoot Certificate to Store", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\SystemCertificates\\*"], "spec": 2}, {"id": "potential_vcruntime140_dll_sideloading", "cn": "疑似 vcruntime140.dll 侧载", "en": "Potential Vcruntime140 DLL Sideloading", "lv": "high", "lvcn": "高", "ev": "ImageLoad", "evcn": "模块加载", "obs": true, "cond": ["目标=*\\vcruntime140.dll"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 7, "ben": 0, "fam": "trojan.convagent/purelogs, trojan.lazy/msil, trojan.msil", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "service_binary_in_suspicious_folder", "cn": "服务程序位于可疑目录", "en": "Service Binary in Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\Services\\*"], "spec": 2}, {"id": "unsigned_dll_loaded_by_windows_utility", "cn": "系统工具加载未签名 DLL", "en": "Unsigned DLL Loaded by Windows Utility", "lv": "medium", "lvcn": "中", "ev": "ImageLoad", "evcn": "模块加载", "obs": true, "cond": ["目标=*\\c:\\windows\\assembly*"], "spec": 2}]}, {"g": "ask", "n": 3, "sup": 6, "ben": 0, "fam": "downloader.obfdldr/iacgm, trojan.cryxos/etecer, trojan.disco", "lv": "high", "tac": "exec", "live": true, "iss": [], "mk": [{"id": "change_powershell_policies_to_an_insecure_level", "cn": "把 PowerShell 执行策略改松", "en": "Change PowerShell Policies to an Insecure Level", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*bypass*"], "spec": 2}, {"id": "dot_net_compiler_compiles_file_from_suspicious_location", "cn": ".NET 编译器编译可疑目录下的文件", "en": "Dot net compiler compiles file from suspicious location", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\csc.exe", "命令行=*\\Temp\\*"], "spec": 2}, {"id": "dynamic_net_compilation_via_csc_exe", "cn": "用 csc.exe 动态编译代码", "en": "Dynamic .NET Compilation Via Csc.EXE", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\csc.exe"], "spec": 1}]}, {"g": "ask", "n": 3, "sup": 6, "ben": 0, "fam": "trojan.agentagen/ctrwuttjibi, trojan.msil/agenttesla, trojan.msil/aqsh", "lv": "high", "tac": "masq", "live": true, "iss": [], "mk": [{"id": "change_powershell_policies_to_an_insecure_level", "cn": "把 PowerShell 执行策略改松", "en": "Change PowerShell Policies to an Insecure Level", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*bypass*"], "spec": 2}, {"id": "powershell_defender_exclusion", "cn": "用 PowerShell 给 Defender 加排除项", "en": "Windows Defender Exclusions Added - PowerShell", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*Add-MpPreference*Exclusion*"], "spec": 2}, {"id": "uncommon_svchost_command_line_parameter", "cn": "svchost 命令行参数异常", "en": "Uncommon Svchost Command Line Parameter", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\svchost.exe"], "spec": 1}]}, {"g": "ask", "n": 3, "sup": 6, "ben": 0, "fam": "trojan.msil/agenttesla, trojan., trojan.donutloader/drop", "lv": "high", "tac": "persist", "live": true, "iss": [], "mk": [{"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "spec": 2}, {"id": "potentially_suspicious_powershell_script_execution_from_temp_folder", "cn": "从 Temp 目录跑 PowerShell 脚本", "en": "Potentially Suspicious Powershell Script Execution From Temp Folder", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "命令行=*\\Temp\\*"], "spec": 2}, {"id": "suspicious_dns_query_for_ip_lookup_service_apis", "cn": "Suspicious DNS Query for IP Lookup Service APIs", "en": "Suspicious DNS Query for IP Lookup Service APIs", "lv": "medium", "lvcn": "中", "ev": "DnsQuery", "evcn": "DNS 解析", "obs": true, "cond": ["目标=*ip-api.com*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 6, "ben": 0, "fam": "trojan.aenf/avarg, trojan.basic/msil, trojan.draftor/filerepmalware", "lv": "high", "tac": "other", "live": true, "iss": [], "mk": [{"id": "silenttrinity_stager_msbuild_activity", "cn": "Silenttrinity Stager Msbuild Activity", "en": "Silenttrinity Stager Msbuild Activity", "lv": "high", "lvcn": "高", "ev": "NetworkConnect", "evcn": "网络外联", "obs": true, "cond": ["主体=*\\msbuild.exe"], "spec": 2}, {"id": "suspicious_msbuild_execution_by_uncommon_parent_process", "cn": "Suspicious Msbuild Execution By Uncommon Parent Process", "en": "Suspicious Msbuild Execution By Uncommon Parent Process", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*microsoft.net*"], "spec": 2}]}, {"g": "ask", "n": 2, "sup": 6, "ben": 0, "fam": "trojan.aenf/avarg, trojan.aeub/avarg, trojan.cryxos/sonbokli", "lv": "high", "tac": "other", "live": true, "iss": [], "mk": [{"id": "base64_encoded_powershell_command_detected", "cn": "Base64 Encoded PowerShell Command Detected", "en": "Base64 Encoded PowerShell Command Detected", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*truncated*"], "spec": 2}, {"id": "suspicious_dns_query_for_ip_lookup_service_apis", "cn": "Suspicious DNS Query for IP Lookup Service APIs", "en": "Suspicious DNS Query for IP Lookup Service APIs", "lv": "medium", "lvcn": "中", "ev": "DnsQuery", "evcn": "DNS 解析", "obs": true, "cond": ["目标=*ip-api.com*"], "spec": 2}]}, {"g": "ask", "n": 3, "sup": 5, "ben": 0, "fam": "trojan.downlnk/lnkexec, trojan.falsesign/qzfl, trojan.ulise/abapplication", "lv": "high", "tac": "masq", "live": true, "iss": [], "mk": [{"id": "new_root_or_ca_or_authroot_certificate_to_store", "cn": "往证书存储装新根证书", "en": "New Root or CA or AuthRoot Certificate to Store", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\SystemCertificates\\*"], "spec": 2}, {"id": "startup_folder_file_write", "cn": "往「启动」文件夹写文件", "en": "Startup Folder File Write", "lv": "medium", "lvcn": "中", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Start Menu\\Programs\\Startup\\*"], "spec": 2}, {"id": "uncommon_svchost_command_line_parameter", "cn": "svchost 命令行参数异常", "en": "Uncommon Svchost Command Line Parameter", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\svchost.exe"], "spec": 1}]}, {"g": "ask", "n": 3, "sup": 5, "ben": 0, "fam": "trojan.falsesign/qzfl, trojan.ulise/abapplication, trojan.ulise/r786395", "lv": "high", "tac": "masq", "live": true, "iss": [], "mk": [{"id": "currentversion_nt_autorun_keys_modification", "cn": "CurrentVersion NT Autorun Keys Modification", "en": "CurrentVersion NT Autorun Keys Modification", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows nt\\currentversion*"], "spec": 2}, {"id": "startup_folder_file_write", "cn": "往「启动」文件夹写文件", "en": "Startup Folder File Write", "lv": "medium", "lvcn": "中", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Start Menu\\Programs\\Startup\\*"], "spec": 2}, {"id": "uncommon_svchost_command_line_parameter", "cn": "svchost 命令行参数异常", "en": "Uncommon Svchost Command Line Parameter", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\svchost.exe"], "spec": 1}]}, {"g": "ask", "n": 3, "sup": 5, "ben": 0, "fam": "trojan.dllhijack/genericml, trojan.falsesign/qzfl, trojan.ulise/abapplication", "lv": "high", "tac": "masq", "live": true, "iss": [], "mk": [{"id": "currentversion_nt_autorun_keys_modification", "cn": "CurrentVersion NT Autorun Keys Modification", "en": "CurrentVersion NT Autorun Keys Modification", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows nt\\currentversion*"], "spec": 2}, {"id": "new_root_or_ca_or_authroot_certificate_to_store", "cn": "往证书存储装新根证书", "en": "New Root or CA or AuthRoot Certificate to Store", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\SystemCertificates\\*"], "spec": 2}, {"id": "uncommon_svchost_command_line_parameter", "cn": "svchost 命令行参数异常", "en": "Uncommon Svchost Command Line Parameter", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\svchost.exe"], "spec": 1}]}], "mk": [{"id": "new_run_key_pointing_to_suspicious_folder", "cn": "新增自启动项指向可疑目录", "en": "New RUN Key Pointing to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\CurrentVersion\\Run*"], "sam": 86, "ben": 0, "tac": "persist", "use": 5, "uselive": 5, "spec": 2}, {"id": "change_powershell_policies_to_an_insecure_level", "cn": "把 PowerShell 执行策略改松", "en": "Change PowerShell Policies to an Insecure Level", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*bypass*"], "sam": 73, "ben": 0, "tac": "evade", "use": 4, "uselive": 4, "spec": 2}, {"id": "new_root_or_ca_or_authroot_certificate_to_store", "cn": "往证书存储装新根证书", "en": "New Root or CA or AuthRoot Certificate to Store", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\SystemCertificates\\*"], "sam": 117, "ben": 1, "tac": "tamper", "use": 4, "uselive": 4, "spec": 2}, {"id": "uncommon_svchost_command_line_parameter", "cn": "svchost 命令行参数异常", "en": "Uncommon Svchost Command Line Parameter", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\svchost.exe"], "sam": 191, "ben": 1, "tac": "masq", "use": 4, "uselive": 4, "spec": 1}, {"id": "potentially_suspicious_powershell_script_execution_from_temp_folder", "cn": "从 Temp 目录跑 PowerShell 脚本", "en": "Potentially Suspicious Powershell Script Execution From Temp Folder", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "命令行=*\\Temp\\*"], "sam": 67, "ben": 0, "tac": "exec", "use": 3, "uselive": 3, "spec": 2}, {"id": "powershell_defender_exclusion", "cn": "用 PowerShell 给 Defender 加排除项", "en": "Windows Defender Exclusions Added - PowerShell", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*Add-MpPreference*Exclusion*"], "sam": 94, "ben": 0, "tac": "evade", "use": 3, "uselive": 3, "spec": 2}, {"id": "startup_folder_file_write", "cn": "往「启动」文件夹写文件", "en": "Startup Folder File Write", "lv": "medium", "lvcn": "中", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Start Menu\\Programs\\Startup\\*"], "sam": 50, "ben": 0, "tac": "persist", "use": 3, "uselive": 3, "spec": 2}, {"id": "base64_encoded_powershell_command_detected", "cn": "Base64 Encoded PowerShell Command Detected", "en": "Base64 Encoded PowerShell Command Detected", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*truncated*"], "sam": 21, "ben": 0, "tac": "other", "use": 2, "uselive": 2, "spec": 2}, {"id": "currentversion_nt_autorun_keys_modification", "cn": "CurrentVersion NT Autorun Keys Modification", "en": "CurrentVersion NT Autorun Keys Modification", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows nt\\currentversion*"], "sam": 10, "ben": 0, "tac": "other", "use": 2, "uselive": 2, "spec": 2}, {"id": "potential_vcruntime140_dll_sideloading", "cn": "疑似 vcruntime140.dll 侧载", "en": "Potential Vcruntime140 DLL Sideloading", "lv": "high", "lvcn": "高", "ev": "ImageLoad", "evcn": "模块加载", "obs": true, "cond": ["目标=*\\vcruntime140.dll"], "sam": 27, "ben": 0, "tac": "cred", "use": 2, "uselive": 2, "spec": 2}, {"id": "suspicious_binaries_and_scripts_in_public_folder", "cn": "Public 目录出现可疑程序/脚本", "en": "Suspicious Binaries and Scripts in Public Folder", "lv": "high", "lvcn": "高", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\Users\\Public\\*"], "sam": 27, "ben": 0, "tac": "exec", "use": 2, "uselive": 2, "spec": 2}, {"id": "suspicious_dns_query_for_ip_lookup_service_apis", "cn": "Suspicious DNS Query for IP Lookup Service APIs", "en": "Suspicious DNS Query for IP Lookup Service APIs", "lv": "medium", "lvcn": "中", "ev": "DnsQuery", "evcn": "DNS 解析", "obs": true, "cond": ["目标=*ip-api.com*"], "sam": 133, "ben": 0, "tac": "other", "use": 2, "uselive": 2, "spec": 2}, {"id": "suspicious_powershell_in_registry_run_keys", "cn": "Suspicious PowerShell In Registry Run Keys", "en": "Suspicious PowerShell In Registry Run Keys", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\software\\microsoft\\windows\\currentversion*"], "sam": 32, "ben": 0, "tac": "other", "use": 2, "uselive": 2, "spec": 2}, {"id": "suspicious_powershell_invocation_from_script_engines", "cn": "脚本宿主调起 PowerShell", "en": "Suspicious PowerShell Invocation From Script Engines", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\powershell*.exe", "父进程=*\\w*script.exe"], "sam": 31, "ben": 0, "tac": "exec", "use": 2, "uselive": 2, "spec": 2}, {"id": "disable_internal_tools_or_feature_in_registry", "cn": "Disable Internal Tools or Feature in Registry", "en": "Disable Internal Tools or Feature in Registry", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\currentversion\\policies\\system\\consentpromptbehavioradmin*"], "sam": 12, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "dot_net_compiler_compiles_file_from_suspicious_location", "cn": ".NET 编译器编译可疑目录下的文件", "en": "Dot net compiler compiles file from suspicious location", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\csc.exe", "命令行=*\\Temp\\*"], "sam": 9, "ben": 0, "tac": "exec", "use": 1, "uselive": 1, "spec": 2}, {"id": "dynamic_net_compilation_via_csc_exe", "cn": "用 csc.exe 动态编译代码", "en": "Dynamic .NET Compilation Via Csc.EXE", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["主体=*\\csc.exe"], "sam": 10, "ben": 0, "tac": "exec", "use": 1, "uselive": 1, "spec": 1}, {"id": "path_to_screensaver_binary_modified", "cn": "Path To Screensaver Binary Modified", "en": "Path To Screensaver Binary Modified", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\hkcu\\control panel\\desktop\\scrnsave.exe*"], "sam": 10, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "potential_powershell_command_line_obfuscation", "cn": "PowerShell 命令行疑似混淆", "en": "Potential PowerShell Command Line Obfuscation", "lv": "high", "lvcn": "高", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*truncated*"], "sam": 18, "ben": 0, "tac": "evade", "use": 1, "uselive": 1, "spec": 2}, {"id": "registry_persistence_via_service_in_safe_mode", "cn": "Registry Persistence via Service in Safe Mode", "en": "Registry Persistence via Service in Safe Mode", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\currentcontrolset\\control\\safeboot\\network*"], "sam": 10, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "remote_access_tool_screenconnect_execution", "cn": "Remote Access Tool - ScreenConnect Execution", "en": "Remote Access Tool - ScreenConnect Execution", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*screenconnect*"], "sam": 13, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "service_binary_in_suspicious_folder", "cn": "服务程序位于可疑目录", "en": "Service Binary in Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\Services\\*"], "sam": 15, "ben": 0, "tac": "persist", "use": 1, "uselive": 1, "spec": 2}, {"id": "service_startuptype_change_via_sc_exe", "cn": "Service StartupType Change Via Sc.EXE", "en": "Service StartupType Change Via Sc.EXE", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*disabled*"], "sam": 10, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "silenttrinity_stager_msbuild_activity", "cn": "Silenttrinity Stager Msbuild Activity", "en": "Silenttrinity Stager Msbuild Activity", "lv": "high", "lvcn": "高", "ev": "NetworkConnect", "evcn": "网络外联", "obs": true, "cond": ["主体=*\\msbuild.exe"], "sam": 6, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "suspicious_msbuild_execution_by_uncommon_parent_process", "cn": "Suspicious Msbuild Execution By Uncommon Parent Process", "en": "Suspicious Msbuild Execution By Uncommon Parent Process", "lv": "medium", "lvcn": "中", "ev": "ProcessCreate", "evcn": "进程创建", "obs": true, "cond": ["命令行=*microsoft.net*"], "sam": 18, "ben": 0, "tac": "other", "use": 1, "uselive": 1, "spec": 2}, {"id": "unsigned_dll_loaded_by_windows_utility", "cn": "系统工具加载未签名 DLL", "en": "Unsigned DLL Loaded by Windows Utility", "lv": "medium", "lvcn": "中", "ev": "ImageLoad", "evcn": "模块加载", "obs": true, "cond": ["目标=*\\c:\\windows\\assembly*"], "sam": 39, "ben": 0, "tac": "cred", "use": 1, "uselive": 1, "spec": 2}, {"id": "windows_shell_scripting_application_file_write_to_suspicious_folder", "cn": "脚本宿主往可疑目录写文件", "en": "Windows Shell/Scripting Application File Write to Suspicious Folder", "lv": "high", "lvcn": "高", "ev": "FileWrite", "evcn": "文件写入", "obs": true, "cond": ["目标=*\\c:\\users\\public*"], "sam": 12, "ben": 0, "tac": "exec", "use": 1, "uselive": 1, "spec": 2}, {"id": "wow6432node_currentversion_autorun_keys_modification", "cn": "改 32 位视图的开机自启动项", "en": "Wow6432Node CurrentVersion Autorun Keys Modification", "lv": "medium", "lvcn": "中", "ev": "RegistryWrite", "evcn": "注册表写入", "obs": true, "cond": ["目标=*\\wow6432node\\microsoft\\windows\\currentversion*"], "sam": 23, "ben": 0, "tac": "persist", "use": 1, "uselive": 1, "spec": 2}]};
+const $ = i => document.getElementById(i);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* 北京时间。固定 +08:00,不读访问者时区 —— 这是中国服务器的运营台。 */
+function cst(iso){
+  if(!iso) return "—";
+  const ms = Date.parse(iso);
+  if(!ms) return String(iso);
+  const t = new Date(ms + 8*3600*1000), p = n => (n<10?"0":"")+n;
+  return t.getUTCFullYear()+"-"+p(t.getUTCMonth()+1)+"-"+p(t.getUTCDate())
+    +" "+p(t.getUTCHours())+":"+p(t.getUTCMinutes());
+}
+
+const G = {hard:{s:"拦断", t:"单独命中即可定性,客户端直接拦"},
+           strong:{s:"强提示", t:"阻断或给出强提示"},
+           ask:{s:"询问", t:"弹窗交给用户确认"}};
+/* 一个标记算不算「一份真证据」:区分力 >= 2。判据正本在服务端,这里只做展示。 */
+const isEvidence = m => (m.spec == null ? 1 : m.spec) >= 2;
+const SPEC = {2:["sp2","可作证据"], 1:["sp1","信息量低"], 0:["sp0","不构成证据"]};
+
+$("ver").textContent = "特征库 " + (D.label || ("v" + D.version));
+
+const live = D.patterns.filter(p => p.live);
+const cut  = D.patterns.filter(p => !p.live);
+
+$("lead").textContent =
+  "从 " + D.samples + " 个有沙箱行为的恶意样本里数出「哪几个动作凑在一起就足以定性」,"
+  + "压缩去重后下发给端点。客户端按单个进程记账,凑齐即把它作为证据喂给裁决流水线 —— "
+  + "本引擎不自己下结论。";
+
+/* ---- 处置能力:整页第一件事 --------------------------------------------------
+   这是打开这一页最想知道的事,而旧版完全没有:这些规则最强能到哪一档?
+   非 hard 档在客户端会被硬钳在「高危阈值 - 1」,单凭自己到不了拦截。 */
+(function(){
+  const by = {hard:0, strong:0, ask:0};
+  live.forEach(p => { if(by[p.g] != null) by[p.g]++; });
+  const rows = [
+    ["hard",   by.hard,   "可直接阻断", "单独命中即拦"],
+    ["strong", by.strong, "阻断或强提示", "落在可疑档"],
+    ["ask",    by.ask,    "弹窗询问", "交用户确认"],
+  ];
+  $("caps").innerHTML = rows.map(r =>
+    '<div class="cap ' + (r[1] ? r[0] : "z") + '">'
+    + '<b>' + r[1] + '</b><span>' + r[2] + '</span><em>' + r[3] + '</em></div>').join("");
+})();
+
+/* ---- 流水线:每段的损耗就地标注,不另起横带 ---- */
+(function(){
+  const st = D.stats || {};
+  const dropObs = (D.issues && (D.issues.unobservable || 0)) || 0;
+  const steps = [
+    [D.mined, "挖出原始组合", ""],
+    [D.dedup, "去重后", D.mined > D.dedup ? ("-" + (D.mined - D.dedup) + " 冗余") : ""],
+    [D.served, "下发端点", D.dedup > D.served
+      ? ("-" + (D.dedup - D.served) + " 覆盖筛选/证据不足") : ""],
+    [D.live, "端点生效", D.served > D.live
+      ? ("-" + (D.served - D.live) + " 装载剔除") : "全部装载"],
+  ];
+  $("pipe").innerHTML = steps.map((s, i) =>
+    '<div class="pst' + (i === steps.length-1 ? " fin" : "") + '">'
+    + '<b>' + s[0] + '</b><u>' + s[1] + '</u>'
+    + (s[2] ? '<i>' + esc(s[2]) + '</i>' : '') + '</div>').join("");
+})();
+
+/* ---- 诚实提示。只在真有话要说时出现,最多两条。 ---- */
+(function(){
+  const out = [];
+  const hard = live.filter(p => p.g === "hard").length;
+  if(!hard)
+    out.push(['warn', "当前没有任何「可直接阻断」档的组合。非 hard 档在端点上被钳在高危阈值"
+      + "之下,单凭攻击链命中只会弹窗询问,要到拦截必须有其它独立指标互证 —— "
+      + "这是现有语料能支撑的强度,不是配置问题。"]);
+  if(!D.benign_active)
+    out.push(['warn', "正常软件语料 <b>" + D.benign.total + "</b> 个,其中可用的不足 <b>"
+      + D.benign_min + "</b> 个门槛,区分度<b>未参与</b>定级。所以下面「正常命中」列的 0 "
+      + "是空分母,不是「不会误伤」的证据。"]);
+  $("notes").innerHTML = out.map(o =>
+    '<div class="note ' + o[0] + '">' + o[1] + '</div>').join("");
+})();
+
+/* ---- 生效规则 ---- */
+(function(){
+  const byTac = {};
+  live.forEach(p => { (byTac[p.tac] = byTac[p.tac] || []).push(p); });
+  $("liveN").textContent = live.length + " 条";
+
+  function chain(p){
+    return p.mk.map(m => {
+      const t = esc(m.cn);
+      const ev = m.evcn ? '<span class="ev">' + esc(m.evcn) + '</span>' : '';
+      return ev + (m.lv === "high" || m.lv === "critical" ? "<b>"+t+"</b>" : "<i>"+t+"</i>");
+    }).join('<span class="plus">+</span>');
+  }
+
+  function row(p){
+    const g = G[p.g] || {s:p.g, t:""};
+    const ev = p.mk.filter(isEvidence).length;
+    /* 真证据不足总数时标黄:说明这条组合里有标记只是「搭车」,不构成互证的一份。 */
+    const evCls = (ev < p.mk.length) ? "re part" : "re";
+    const ben = p.ben ? '<span class="ben">正常命中 ' + p.ben + '</span>' : '';
+    const conds = [].concat.apply([], p.mk.map(m => (m.cond||[]).map(c => [m.cn, c])));
+    let more = '<div class="mr"><span class="mk">事件</span><span class="mv">'
+      + esc(p.mk.map(m => m.evcn).filter((v,i,a) => a.indexOf(v)===i).join(" · "))
+      + '</span></div>';
+    more += '<div class="mr"><span class="mk">逐个动作</span><span class="mv">'
+      + p.mk.map(m => esc(m.cn) + ' <span class="' + SPEC[m.spec==null?1:m.spec][0]
+          + '">' + SPEC[m.spec==null?1:m.spec][1] + '</span>').join('<br>')
+      + '</span></div>';
+    if(conds.length)
+      more += '<div class="mr"><span class="mk">匹配条件</span><span class="mv">'
+        + conds.map(c => '<code>' + esc(c[1]) + '</code>').join("") + '</span></div>';
+    if(p.fam)
+      more += '<div class="mr"><span class="mk">作证家族</span><span class="mv dim">'
+        + esc(p.fam) + '</span></div>';
+    return '<details class="rule"><summary>'
+      + '<span class="rg ' + p.g + '" title="' + esc(g.t) + '">' + esc(g.s) + '</span>'
+      + '<span class="rchain">' + chain(p) + ben + '</span>'
+      + '<span class="' + evCls + '">' + ev + '/' + p.mk.length + '</span>'
+      + '<span class="rs">' + p.sup + '</span>'
+      + '</summary><div class="more">' + more + '</div></details>';
+  }
+
+  const html = D.tactics.filter(t => byTac[t.k]).map(t => {
+    const rows = byTac[t.k].slice().sort((a,b) => b.sup - a.sup);
+    return '<div class="grp"><b>' + esc(t.t) + '</b><i>' + rows.length + '</i>'
+      + '<s>' + esc(t.d) + '</s></div>' + rows.map(row).join("");
+  }).join("");
+  $("rules").innerHTML = html || '<div class="empty">暂无生效规则</div>';
+})();
+
+/* ---- 行为标记 ---- */
+(function(){
+  const mk = D.mk.slice().sort((a,b) => (b.spec||0)-(a.spec||0) || b.sam-a.sam);
+  $("mkN").textContent = mk.length + " 个";
+  function tr(m){
+    const sp = SPEC[m.spec == null ? 1 : m.spec];
+    const cond = (m.cond||[]).length
+      ? (m.cond||[]).map(c => '<code>' + esc(c) + '</code>').join("")
+      : '<span class="dim">无条件 —— 匹配该类型每一条事件</span>';
+    return '<tr><td class="cn">' + esc(m.cn) + '<s>' + esc(m.en) + '</s></td>'
+      + '<td>' + esc(m.evcn || "—") + '</td>'
+      + '<td><span class="lv' + (m.lv === "high" || m.lv === "critical" ? " hi" : "")
+        + '">' + esc(m.lvcn) + '</span></td>'
+      + '<td><span class="' + sp[0] + '">' + sp[1] + '</span></td>'
+      + '<td>' + cond + '</td>'
+      + '<td class="n">' + m.sam + '</td>'
+      + '<td class="n ' + (m.ben ? "bad" : "z") + '">' + m.ben + '</td>'
+      + '<td class="n ' + (m.uselive ? "" : "z") + '">' + m.uselive + " / " + m.use
+        + '</td></tr>';
+  }
+  const body = $("mkbody");
+  body.innerHTML = mk.map(tr).join("");
+  $("mfilt").addEventListener("input", e => {
+    const q = e.target.value.trim().toLowerCase();
+    const rows = mk.filter(m => !q
+      || (m.cn + " " + m.en + " " + (m.evcn||"") + " " + (m.cond||[]).join(" "))
+           .toLowerCase().indexOf(q) >= 0);
+    body.innerHTML = rows.length ? rows.map(tr).join("")
+      : '<tr><td colspan="8" class="empty">没有匹配的标记</td></tr>';
+  });
+})();
+
+/* ---- 未生效 ---- */
+(function(){
+  const RSN = {redundant:"证据重复", actor:"主体冲突", unobservable:"无法观测",
+               single:"单动作"};
+  $("cutN").textContent = cut.length + " 条";
+  if(!cut.length){ $("cutSec").hidden = true; return; }
+  $("cut").innerHTML = cut.map(p => {
+    const why = (p.iss||[]).map(i => RSN[i.k] || i.k).join(" · ") || "未标注";
+    const ch = p.mk.map(m => m.lv === "high" || m.lv === "critical"
+      ? "<b>"+esc(m.cn)+"</b>" : esc(m.cn)).join('<span class="plus">+</span>');
+    return '<div class="cut"><span class="cutw">' + esc(why) + '</span>'
+      + '<span class="rchain">' + ch + '</span>'
+      + '<span class="rs">' + p.sup + '</span></div>';
+  }).join("");
+})();
+
+/* ---- 构建统计 ---- */
+(function(){
+  const LB = {
+    total_reports:"报告总数", skipped_other_platform:"跳过·非本平台",
+    skipped_not_threat:"跳过·非威胁", skipped_no_behaviour:"跳过·无沙箱行为",
+    usable_samples:"可用恶意样本", benign_reports:"正常软件报告",
+    benign_other_platform:"正常·非本平台", benign_usable:"正常·可用",
+    markers_observable:"可观测标记", generic_dropped:"丢弃·泛化",
+    benign_generic_dropped:"丢弃·正常泛化", benign_grading_active:"正常分级生效",
+    implications:"蕴含关系", markers_effective:"有效标记",
+    patterns_mined:"挖出组合", patterns_after_dedup:"去重后",
+    patterns_after_cover:"覆盖筛选后", markers_mapped:"已映射标记",
+    patterns_kept:"保留组合", benign_capped:"正常语料截断",
+    benign_dropped:"正常语料丢弃", stale_patterns_removed:"清理·过期组合",
+    stale_markers_removed:"清理·过期标记",
+    markers_with_context:"带命中上下文的标记", markers_derived:"推导出条件的标记",
+    markers_derived_new:"推导·手写表未覆盖", hand_rules_mismapped:"手写表·填错字段",
+    markers_spec_ok:"区分力·可作证据", markers_spec_weak:"区分力·信息量低",
+    markers_spec_none:"区分力·不构成证据",
+    patterns_dropped_no_evidence:"丢弃·真证据不足两份",
+    patterns_dropped_actor_conflict:"丢弃·主体冲突", patterns_dropped_redundant:"丢弃·证据重复",
+    patterns_dropped_unobservable:"丢弃·标记不可观测"
+  };
+  const s = D.stats || {};
+  $("stats").innerHTML = Object.keys(s).map(k =>
+    '<div><u>' + esc(LB[k] || k) + '</u><b>' + s[k] + '</b></div>').join("");
+})();
+
+$("how").innerHTML =
+  "组合的定性强度由三件事决定,三者都要够:<b>动作数</b>(链条多长) × <b>最高严重度</b>"
+  + " × <b>支持度</b>(多少真实样本作证)。"
+  + "另有一道<b>互证闸门</b>:一条组合至少要有两个「区分力可作证据」的标记才下发 —— "
+  + "只有一个真判据加一个恒真项(如「任意 svchost 启动」「未签名进程」)不算互证,"
+  + "而客户端会把命中登记为硬指标,那等于把软信号提拔成处置依据。"
+  + "正常软件语料至少需要 <b>" + D.benign_min + "</b> 个才启用反向校验,当前 <b>"
+  + D.benign.total + "</b> 个(带标记 " + D.benign.with_markers + " 个、有签名 "
+  + D.benign.signed + " 个)," + (D.benign_active ? "已启用。" : "尚未达到阈值。");
+
+$("foot").innerHTML =
+  "特征库 " + esc(D.label || D.version) + " · 构建于 " + cst(D.built_at) + " 北京时间"
+  + " · 下发接口 /v1/engine/manifest 与 /v1/engine/patterns"
+  + " · 本页只读,不触发任何构建";
+</script>
+</body>
+</html>

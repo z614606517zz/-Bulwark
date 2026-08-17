@@ -1,4 +1,4 @@
-# 卸载 Bulwark 用户态服务(需管理员)。停止并注销 BulwarkService,可选删除安装目录。
+﻿# 卸载 Bulwark 用户态服务(需管理员)。停止并注销 BulwarkService,可选删除安装目录。
 # 遵循产品原则:始终保留用户主动卸载路径,绝不做成"无法卸载"。
 #
 # 用法(管理员 PowerShell):

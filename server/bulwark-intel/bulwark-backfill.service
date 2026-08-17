@@ -1,0 +1,29 @@
+[Unit]
+# 把 vt_reports 里的降级占位行(VT 429 时靠备用源拼出来的空壳)重查成完整报告。
+# 只读 vt_reports 选行,写库全部经由 app.py 的 /vt/lookup(upsert 原地覆盖),
+# 所以它自己不需要对数据库有写权限。
+Description=Bulwark backfill - re-query degraded vt_reports placeholders
+After=network-online.target bulwark-intel.service
+Wants=bulwark-intel.service
+
+[Service]
+Type=oneshot
+# bulwarkintel 而非 root:与其余任务同一口径 —— root 写 cache.db 会留下 root 所有的
+# journal 文件,之后 app.py 的写入就会失败。这个任务本身不写库,但台账文件要和别的
+# 任务同属主,否则下次别人写不动。
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/bulwark-backfill.py
+# 纯补库批处理,给在线请求让路。
+Nice=15
+IOSchedulingClass=idle
+# 单轮上限 60 行 × 每行 16 秒间隔 ≈ 16 分钟,再加上每次查询本身的往返。给足余量,
+# 但不允许无限期挂着 —— 挂死会让下一次定时被 systemd 跳过。
+TimeoutStartSec=2400
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 只为写台账 backfill_log.jsonl。数据库的写入不经这里。
+ReadWritePaths=/var/lib/bulwark-intel
+MemoryMax=256M

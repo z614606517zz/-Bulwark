@@ -1,4 +1,4 @@
-# Robust configure + build for the Bulwark C++/Qt tree.
+﻿# Robust configure + build for the Bulwark C++/Qt tree.
 # Paths are derived from $PSScriptRoot (this file lives in <cpp>/.tools) so we
 # never hardcode the Chinese workspace path — that avoids PS5.1 reading this
 # UTF-8 script as GBK and corrupting the path literal.

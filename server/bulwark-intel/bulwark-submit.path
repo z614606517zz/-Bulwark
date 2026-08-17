@@ -1,0 +1,27 @@
+[Unit]
+Description=Watch for files the dashboard's upload page dropped into the submit inbox
+
+[Path]
+# Fires as soon as the dashboard finishes writing a record, so the first query starts
+# in seconds instead of waiting up to 3 minutes for the timer. Same trigger the VT-key
+# spool uses: DirectoryNotEmpty re-fires while anything is left, so a record that
+# arrives during a running pass is still picked up on the next one instead of being
+# missed. The worker empties the inbox (records move to items/) which is what makes
+# this behave like an edge rather than a permanent alarm.
+DirectoryNotEmpty=/var/lib/bulwark-intel/submit-spool/inbox
+Unit=bulwark-submit.service
+# Backstop against the failure this unit is structurally prone to: DirectoryNotEmpty is
+# a LEVEL, not an edge, so anything the worker cannot remove from the inbox makes this
+# re-trigger forever. That is not hypothetical -- an interrupted upload left a .part
+# orphan and the worker was restarted continuously (three empty passes in one second).
+#
+# The real fix is upstream: uploads now stream into staging/ and only complete pairs are
+# moved into the inbox, and the worker actively clears anything unpaired. This limit is
+# only here so that if some future file does get stuck, the damage is a stopped trigger
+# rather than an endless process-spawn loop -- correctness still holds either way,
+# because the 3-minute timer drives the queue independently of this unit.
+TriggerLimitIntervalSec=10
+TriggerLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

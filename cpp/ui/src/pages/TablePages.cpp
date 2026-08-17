@@ -331,8 +331,16 @@ QWidget* pages::interceptions(IpcClient* ipc)
     });
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    // 列宽按内容量身定,剩余宽度全给「目标」(注册表键 / 文件路径 / URL,最长的那一列)。
+    // 表头可拖、可双击自适应、可右键还原,拖过的宽度会记住(见 ui::columns)。
+    ui::columns(t, QStringLiteral("interceptions"), {
+        {112, 0},              // 时间(MM-dd HH:mm:ss)
+        { 96, 0},              // 类型
+        {170, 1, true},        // 程序(文件名;完整路径见悬停提示)
+        {366, 3, true},        // 目标(长路径 / 注册表键 / URL)
+        { 88, 0},              // 风险
+        { 98, 0},              // 处置
+    });
     wireAttackTimeline(t, b.page, ipc); // 双击回溯攻击时间线(内含攻击关系图入口)
     wireTrustContextMenu(t, b.page, ipc, u("从拦截记录信任")); // 右键:攻击关系图 / 加入信任名单
 
@@ -343,6 +351,10 @@ QWidget* pages::interceptions(IpcClient* ipc)
         put(t, 0, 0, e.timestampUtc.toLocalTime().toString(QStringLiteral("MM-dd HH:mm:ss")), true, true);
         put(t, 0, 1, eventTypeLabel(e.type));
         put(t, 0, 2, QFileInfo(e.actorPath).fileName());
+        // 「程序」列只放文件名(svchost.exe 这类同名程序太多),完整路径挂成悬停提示:
+        // 不必拖宽列、也不用双击开详情就能确认到底是哪一个可执行文件。
+        if (auto* cell = t->item(0, 2); cell && !e.actorPath.isEmpty())
+            cell->setToolTip(QDir::toNativeSeparators(e.actorPath));
         put(t, 0, 3, e.target, true, true);
         ui::pillCell(t, 0, 4, riskLabel(e.riskScore), riskColor(e.riskScore));
         QString dt; QColor dc; dispositionPill(bulwark::VerdictAction::Block, enf, dt, dc);
@@ -392,7 +404,14 @@ QWidget* pages::activity(IpcClient* ipc)
     });
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("activity"), {
+        {112, 0},              // 时间
+        {124, 0},              // 事件
+        {300, 3, true},        // 程序(文件名;完整路径见悬停提示)
+        { 78, 0},              // PID
+        { 88, 0},              // 风险分
+        { 98, 0},              // 裁决
+    });
     wireAttackTimeline(t, b.page, ipc); // 双击回溯攻击时间线(内含攻击关系图入口)
     wireTrustContextMenu(t, b.page, ipc, u("从活动日志信任")); // 右键:攻击关系图 / 加入信任名单
 
@@ -402,6 +421,8 @@ QWidget* pages::activity(IpcClient* ipc)
         put(t, 0, 0, e.timestampUtc.toLocalTime().toString(QStringLiteral("MM-dd HH:mm:ss")), true, true);
         put(t, 0, 1, eventTypeLabel(e.type));
         put(t, 0, 2, QFileInfo(e.actorPath).fileName());
+        if (auto* cell = t->item(0, 2); cell && !e.actorPath.isEmpty())
+            cell->setToolTip(QDir::toNativeSeparators(e.actorPath)); // 完整路径:悬停即见
         put(t, 0, 3, QString::number(e.actorPid), true, true);
         put(t, 0, 4, QString::number(e.riskScore), true);
         QString vt; QColor vc; verdictPill(p.action, vt, vc);
@@ -547,8 +568,15 @@ QWidget* pages::rules(IpcClient* ipc)
     b.toolbar->addWidget(add);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("rules"), {
+        { 76, 0},              // 状态
+        {290, 4, true},        // 主体(完整路径 / 通配)
+        { 96, 0},              // 类型
+        {170, 2, true},        // 目标(通配)
+        { 82, 0},              // 动作
+        {130, 1},              // 备注
+        { 86, 0},              // 操作
+    });
 
     QObject::connect(ipc, &IpcClient::rulesReceived, b.page,
                      [t, ipc](const QList<bulwark::DefenseRule>& rules) {
@@ -651,8 +679,15 @@ QWidget* pages::trust(IpcClient* ipc)
     b.toolbar->addWidget(add);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    // 这一列是整页的主角(信任的到底是哪个文件/目录),默认给到 450px 并吃掉绝大部分余量:
+    // 信任项写错一个目录就等于对整个目录停掉防护,必须让用户一眼看全路径。
+    ui::columns(t, QStringLiteral("trust"), {
+        {450, 4, true},        // 程序 / 目录(完整路径)
+        { 88, 0},              // 类型
+        {180, 1},              // 备注
+        {108, 0},              // 添加时间
+        { 96, 0},              // 操作
+    });
 
     QObject::connect(ipc, &IpcClient::trustReceived, b.page,
                      [t, ipc](const QList<bulwark::DefenseRule>& entries) {
@@ -742,8 +777,14 @@ QWidget* pages::quarantine(IpcClient* ipc)
     b.toolbar->addWidget(refresh);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("quarantine"), {
+        {170, 1, true},        // 文件
+        {300, 4, true},        // 原始路径(还原到哪里,必须看清)
+        {130, 1},              // 原因
+        { 80, 0},              // 大小
+        {104, 0},              // 隔离时间
+        {146, 0},              // 操作(还原 + 删除两个按钮)
+    });
 
     QObject::connect(ipc, &IpcClient::quarantineReceived, b.page,
                      [t, count, ipc](const QList<bulwark::ipc::QuarantineItemPayload>& items) {
@@ -791,7 +832,14 @@ QWidget* pages::persistence(IpcClient* ipc)
     b.toolbar->addWidget(count);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("persistence"), {
+        {172, 1},              // 名称
+        {120, 0},              // 类别
+        {340, 4, true},        // 路径 / 命令(带参数的命令行,最长)
+        {110, 0},              // ATT&CK
+        {100, 0},              // 风险
+        { 88, 0},              // 状态
+    });
 
     auto* scanning = new bool(false);
     // 保留本次扫描的完整条目:清理请求要把整条 PersistenceEntry 回传(服务端按 category 分派、
@@ -954,8 +1002,16 @@ QWidget* pages::timeline(IpcClient* ipc)
     b.toolbar->addWidget(count);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("timeline"), {
+        {110, 0},              // 时间
+        {112, 0},              // 事件
+        {140, 1, true},        // 程序(文件名;完整路径见悬停提示)
+        { 70, 0},              // PID
+        {150, 2},              // 启动来源(服务名 / 计划任务名)
+        {182, 3, true},        // 目标(长路径 / 注册表键 / URL)
+        { 74, 0},              // 风险
+        { 92, 0},              // 处置
+    });
     wireAttackTimeline(t, b.page, ipc);                         // 双击看单条事件的证据链
     wireTrustContextMenu(t, b.page, ipc, u("从时间线信任"));      // 右键:攻击关系图 / 信任
 
@@ -996,6 +1052,8 @@ QWidget* pages::timeline(IpcClient* ipc)
                 true, true);
             put(t, 0, 1, eventTypeLabel(e.type));
             put(t, 0, 2, QFileInfo(e.actorPath).fileName());
+            if (auto* cell = t->item(0, 2); cell && !e.actorPath.isEmpty())
+                cell->setToolTip(QDir::toNativeSeparators(e.actorPath)); // 完整路径:悬停即见
             putNum(t, 0, 3, QString::number(e.actorPid), e.actorPid, true, true);
             // 这一列是整个溯源改造的落点:svchost.exe 那一行会显示成「服务:Schedule」,
             // 计划任务拉起的进程会显示成「计划任务:\Microsoft\Windows\...」。
@@ -1060,8 +1118,19 @@ QWidget* pages::processes(IpcClient* ipc)
     b.toolbar->addWidget(killBtn);
 
     auto* t = b.table;
-    t->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    t->horizontalHeader()->setSectionResizeMode(7, QHeaderView::Stretch);
+    // 8 列里有一列是完整映像路径:默认宽度先按 1240 窗口排满不出横向滚动条,窗口一放大
+    // (最常见的是最大化)多出来的宽度按 grow 权重几乎全给「路径」——1920 下路径能到 ~650px,
+    // 常见路径可完整显示。仍不够就拖列边界,拖过的宽度会被记住。
+    ui::columns(t, QStringLiteral("processes"), {
+        { 68, 0},              // PID
+        {170, 1},              // 进程(名称 + 文件描述)
+        {140, 1},              // 启动来源(服务名 / 计划任务名)
+        {100, 0},              // 用户
+        { 88, 0},              // 签名
+        { 80, 0},              // 内存
+        { 88, 0},              // 提示
+        {196, 4, true},        // 路径(完整映像路径)
+    });
     // 默认按「提示」列降序:打开页面第一眼就落在最值得看的进程上(未签名 / 签名失配 /
     // 跑在用户可写目录 / 伪装系统进程名)。表头可点,按 PID / 内存 / 名称重排都是数值排序。
     t->horizontalHeader()->setSortIndicator(6, Qt::DescendingOrder);
@@ -1387,24 +1456,21 @@ QWidget* pages::attackChain(IpcClient* ipc)
     b.toolbar->addWidget(clear);
 
     auto* t = b.table;
-    // ui::table() 默认把所有列设为 Stretch。9 列平分后每列只有 ~104px,连时间戳
-    // 「08-01 04:11:12」都会被截成「08-01 04:11:…」。故给内容宽度固定的列钉死宽度,
-    // 把省下来的空间全留给三个真正长的文本列(主体 / 凑齐的动作 / 家族)。
-    auto* hh = t->horizontalHeader();
-    const auto fixWidth = [hh](int col, int px) {
-        hh->setSectionResizeMode(col, QHeaderView::Fixed);
-        hh->resizeSection(col, px);
-    };
-    fixWidth(0, 118);                                        // 时间(MM-dd HH:mm:ss)
-    hh->setSectionResizeMode(1, QHeaderView::Stretch);       // 主体(长路径)
-    fixWidth(2, 74);                                         // PID
-    hh->setSectionResizeMode(3, QHeaderView::Stretch);       // 凑齐的动作(长规则名)
-    // 强度要装得下最长的 4 字标签(确定恶意 / 高度可疑),留够余量,否则胶囊里的字会被挤扁。
-    fixWidth(4, 108);                                        // 强度
-    fixWidth(5, 84);                                         // 严重度
-    fixWidth(6, 76);                                         // 样本数
-    hh->setSectionResizeMode(7, QHeaderView::Stretch);       // 家族
-    fixWidth(8, 92);                                         // 最终裁决
+    // 9 列如果平分,每列只有 ~104px,连时间戳「08-01 04:11:12」都会被截成「08-01 04:11:…」。
+    // 故内容宽度固定的列钉死宽度,余量全留给三个真正长的文本列(主体 / 凑齐的动作 / 家族)。
+    // 用 ui::columns 而不是 QHeaderView::Fixed:Fixed 的列一样拖不动,用户想加宽也没办法。
+    ui::columns(t, QStringLiteral("attackChain"), {
+        {112, 0},              // 时间(MM-dd HH:mm:ss)
+        {170, 4, true},        // 主体(长路径)
+        { 70, 0},              // PID
+        {140, 2},              // 凑齐的动作(长规则名)
+        // 强度要装得下最长的 4 字标签(确定恶意 / 高度可疑),留够余量,否则胶囊里的字会被挤扁。
+        {104, 0},              // 强度
+        { 82, 0},              // 严重度
+        { 72, 0},              // 样本数
+        { 88, 1},              // 家族
+        { 92, 0},              // 最终裁决
+    });
 
     // 保留整份记录用于本地过滤 —— 搜索不该每次都往服务端跑一趟。
     auto* rows = new QList<bulwark::ipc::AttackChainHitPayload>();

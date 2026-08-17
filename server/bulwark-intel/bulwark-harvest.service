@@ -1,0 +1,24 @@
+[Unit]
+Description=Bulwark MalwareBazaar -> VirusTotal hourly harvester (node 245)
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+# A run that ends cleanly (exit 0, including "another run already holds the lock")
+# is the only signal worth syncing on: a run systemd itself had to kill on timeout
+# is marked failed and OnSuccess= correctly does not fire for it, so a half-batch
+# is never pushed. TimeoutStartSec below must stay ABOVE harvest.max_run_seconds in
+# config.json (currently 1500s) so systemd is a backstop, not the usual reason a
+# run ends -- see bulwark-harvest.service.d-timeout.conf for the full reasoning.
+OnSuccess=bulwark-sync.service
+
+[Service]
+Type=oneshot
+User=bulwarkintel
+Group=bulwarkintel
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/harvest.py
+Nice=10
+TimeoutStartSec=1800
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulwark-intel
+PrivateTmp=true
+MemoryMax=512M

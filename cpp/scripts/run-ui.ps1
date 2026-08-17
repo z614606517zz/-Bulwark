@@ -1,4 +1,4 @@
-# 启动 Bulwark 桌面 UI。UI 通过命名管道 Bulwark.Control 连接后台服务,
+﻿# 启动 Bulwark 桌面 UI。UI 通过命名管道 Bulwark.Control 连接后台服务,
 # 因此请先确保 BulwarkService 已在运行(install-service.ps1),否则 UI 会显示未连接。
 #
 # 用法(普通权限即可):

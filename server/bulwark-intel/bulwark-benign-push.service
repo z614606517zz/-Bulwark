@@ -1,0 +1,29 @@
+[Unit]
+Description=Push quarantine-cleared white samples from this node to the master node
+# Triggered by bulwark-benign-verify.service's OnSuccess=, not by its own timer:
+# there is only something new to ship right after a recheck pass.
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root, not bulwarkintel: this needs root's own SSH key (id_sync23) to reach the
+# master over the restricted forced-command channel. It compensates by opening
+# cache.db read-only (mode=ro URI) and keeping its cursor in its own watermark
+# file, so no root-owned journal is ever left for app.py to trip over.
+User=root
+Group=root
+# Deliberately NO ProtectHome here: the key lives in /root/.ssh and ProtectHome
+# would make it unreadable. Same reasoning as bulwark-sync.service.
+Environment=BULWARK_SYNC_KEY=/root/.ssh/id_sync23
+# Fill in your own master before enabling this unit. bulwark-benign-push.py exits 2
+# rather than ssh to an empty destination, so a forgotten value fails loudly.
+Environment=BULWARK_MASTER=root@master.example
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-benign-push.py
+Nice=10
+TimeoutStartSec=960
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulwark-intel
+PrivateTmp=true
+MemoryMax=256M

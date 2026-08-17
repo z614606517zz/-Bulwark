@@ -4,17 +4,35 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>磐垒主动防御 Bulwark · 下载页面</title>
+<!-- 必须放在 <style> 之前、且是内联同步脚本:.bwjs 决定进场动画的初始隐藏是否生效
+     (见 .bwjs .rv 规则)。在首次绘制前打上这个类，才不会「先显示再闪一下藏起来」。
+     JS 没跑通时这个类不存在，内容默认可见 —— 下载入口不建立在 JS 必须成功之上。 -->
+<script>document.documentElement.className+=" bwjs";</script>
 <style>
+  /* 与威胁分析控制台(/)共用同一套配色:同一个产品不该在两个页面上是两种颜色。
+     强调色收成一个 —— 原来 brand(墨绿)+ brand2(青)+ violet 三个都在当强调色,
+     导致页面上同时有三种「这里重要」的信号。
+     强调色避开红/琥珀/绿,那三个是判定语义色。 */
   :root{
-    --bg:#070a10; --bg2:#0b0f18; --panel:#0f1622; --panel2:#121b29;
-    --line:rgba(148,163,184,.14); --line2:rgba(148,163,184,.22);
-    --ink:#f1f5f9; --txt:#c3cede; --muted:#8b98ab; --dim:#5f6f83;
-    --brand:#34d399; --brand2:#22d3ee; --violet:#a78bfa;
-    --mal:#f87171; --susp:#fbbf24; --ok:#34d399;
-    --r0:#22d3ee; --r3:#a78bfa; --uiA:#34d399;
+    /* 页面压暗、面板留纯白：原来两者都是 #ffffff，面板浮不起来，且整页过亮。 */
+    --bg:#edf0f5; --bg2:#f1f4f8; --panel:#ffffff; --panel2:#fbfcfe;
+    --line:rgba(16,24,40,.11); --line2:rgba(16,24,40,.18);
+    /* 两级低强调灰按【灰底页面】重算，不是按白底。
+       原来 --dim:#98a2b3 是给暗底配的，在浅底上只有约 2.3:1(门槛 4.5:1)——
+       代码注释、页脚、目录结构标签用的都是它，所以是一整类文字看不清。
+       而 --muted:#667085 在纯白上有 5.3:1、看着没问题，可页面底色改成 #edf0f5
+       之后掉到 4.29:1，也不合规了:把底色压暗等于同时拉低了所有低强调文字的对比度，
+       这是改背景的连带后果，不是某个颜色选错。
+       现在两个值都按 #edf0f5 这个最不利的底色算，实测 muted≈5.2:1、dim≈4.6:1。
+       在灰底上能塞进 AA 的低强调层级只有两档，所以 dim 和 muted 的差别比原来小 ——
+       可读性优先于层级的精细度。 */
+    --ink:#101828; --txt:#475467; --muted:#556074; --dim:#5f6a7d;
+    --brand:#2563eb; --brand2:#2563eb; --violet:#7c3aed;
+    --mal:#d92d20; --susp:#b54708; --ok:#067647;
+    --r0:#2563eb; --r3:#7c3aed; --uiA:#2563eb;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Cascadia Code",monospace;
-    --sh:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(0,0,0,.35);
-    --sh2:0 1px 0 rgba(255,255,255,.05) inset,0 18px 44px rgba(0,0,0,.5);
+    --sh:0 1px 0 rgba(16,24,40,.04) inset,0 8px 24px rgba(16,24,40,.07);
+    --sh2:0 1px 0 rgba(16,24,40,.05) inset,0 18px 44px rgba(16,24,40,.14);
     --nav-h:60px;
   }
   *{box-sizing:border-box}
@@ -22,65 +40,67 @@
   body{margin:0;color:var(--txt);background:var(--bg);
     font:15px/1.72 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
     -webkit-font-smoothing:antialiased}
+  /* 单一冷色顶光,和控制台一致。三层彩色光晕叠在一起会让整页发灰发脏,
+     文字对比度也跟着掉。 */
   body:before{content:"";position:fixed;inset:0;z-index:-2;background:
-    radial-gradient(1000px 520px at 8% -8%,rgba(52,211,153,.16),transparent 60%),
-    radial-gradient(920px 480px at 96% -4%,rgba(34,211,238,.14),transparent 62%),
-    radial-gradient(800px 700px at 50% 120%,rgba(167,139,250,.10),transparent 60%),
+    radial-gradient(1200px 520px at 50% -12%,rgba(37,99,235,.07),transparent 70%),
     var(--bg)}
-  body:after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
-    background-image:linear-gradient(rgba(148,163,184,.05) 1px,transparent 1px),
-      linear-gradient(90deg,rgba(148,163,184,.05) 1px,transparent 1px);
-    background-size:46px 46px;mask-image:radial-gradient(circle at 50% 0,#000,transparent 78%)}
+  /* 白底上网格线必须是深色低透明度,白线等于不存在 */
+  body:after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.6;
+    background-image:linear-gradient(rgba(16,24,40,.032) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(16,24,40,.032) 1px,transparent 1px);
+    background-size:48px 48px;mask-image:radial-gradient(circle at 50% 0,#000,transparent 78%)}
   a{color:var(--brand2);text-decoration:none}
-  a:hover{color:#67e8f9;text-decoration:underline}
+  a:hover{color:#1d4ed8;text-decoration:underline}
   b{color:var(--ink)}
-  code{font:12.6px var(--mono);background:rgba(148,163,184,.12);border:1px solid var(--line);
-    padding:1.5px 6px;border-radius:6px;color:#7dd3fc}
+  code{font:12.6px var(--mono);background:rgba(16,24,40,.05);border:1px solid var(--line);
+    padding:1.5px 6px;border-radius:6px;color:#1d4ed8}
   .wrap{max-width:1120px;margin:0 auto;padding:0 22px 84px}
 
   /* ============ NAV ============ */
   nav{position:sticky;top:0;z-index:50;height:var(--nav-h);
-    background:rgba(7,10,16,.72);backdrop-filter:saturate(160%) blur(14px);
+    background:rgba(255,255,255,.72);backdrop-filter:saturate(160%) blur(14px);
     -webkit-backdrop-filter:saturate(160%) blur(14px);
     border-bottom:1px solid transparent;transition:border-color .25s,background .25s}
-  nav.stuck{border-bottom-color:var(--line);background:rgba(7,10,16,.86)}
+  nav.stuck{border-bottom-color:var(--line);background:rgba(255,255,255,.86)}
   .nav-in{max-width:1120px;margin:0 auto;height:100%;padding:0 20px;
     display:flex;align-items:center;gap:16px}
   .brand{display:inline-flex;align-items:center;gap:10px;font-weight:800;color:var(--ink);
     letter-spacing:.2px;white-space:nowrap;flex:none}
   .brand:hover{text-decoration:none}
-  .brand .mk{width:26px;height:26px;filter:drop-shadow(0 2px 6px rgba(52,211,153,.4))}
+  .brand .mk{width:26px;height:26px;filter:drop-shadow(0 2px 6px rgba(37,99,235,.4))}
   .brand small{font:600 11px/1 var(--mono);color:var(--brand);letter-spacing:1px;opacity:.85}
   .nav-links{display:flex;align-items:center;gap:2px;overflow-x:auto;flex:1;
     scrollbar-width:none;-ms-overflow-style:none;mask-image:linear-gradient(90deg,transparent,#000 14px,#000 calc(100% - 14px),transparent)}
   .nav-links::-webkit-scrollbar{display:none}
   .nav-links a{color:var(--muted);font-size:13px;font-weight:600;padding:7px 11px;border-radius:8px;
     white-space:nowrap;transition:.15s}
-  .nav-links a:hover{color:var(--ink);background:rgba(148,163,184,.1);text-decoration:none}
-  .nav-links a.active{color:var(--brand);background:rgba(52,211,153,.12)}
+  .nav-links a:hover{color:var(--ink);background:rgba(16,24,40,.05);text-decoration:none}
+  .nav-links a.active{color:var(--brand);background:rgba(37,99,235,.12)}
   .nav-cta{display:flex;align-items:center;gap:8px;flex:none}
   .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;
-    border-radius:9px;color:var(--txt);border:1px solid var(--line);background:rgba(148,163,184,.06);transition:.15s}
+    border-radius:9px;color:var(--txt);border:1px solid var(--line);background:rgba(16,24,40,.03);transition:.15s}
   .icon-btn:hover{color:var(--ink);border-color:var(--line2);text-decoration:none;transform:translateY(-1px)}
   .dl-btn{display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:10px;
     font-size:13.5px;font-weight:700;color:#05221a;white-space:nowrap;
     background:linear-gradient(135deg,var(--brand),var(--brand2));
-    box-shadow:0 6px 18px rgba(52,211,153,.28);transition:.15s}
+    box-shadow:0 6px 18px rgba(37,99,235,.28);transition:.15s}
   .dl-btn:hover{color:#05221a;text-decoration:none;transform:translateY(-1px);
-    box-shadow:0 10px 26px rgba(52,211,153,.4)}
+    box-shadow:0 10px 26px rgba(37,99,235,.4)}
   @media (max-width:720px){ .dl-btn span{display:none} .dl-btn{padding:8px 11px} }
 
   /* ============ HERO ============ */
   .hero{position:relative;overflow:hidden;padding:66px 22px 108px}
   .hero .in{max-width:1120px;margin:0 auto;position:relative;z-index:2}
   .hero .emblem{position:absolute;right:-40px;top:-10px;width:400px;height:400px;opacity:.14;
-    z-index:1;pointer-events:none;filter:drop-shadow(0 0 40px rgba(52,211,153,.5))}
+    z-index:1;pointer-events:none;filter:drop-shadow(0 0 40px rgba(37,99,235,.5))}
   @media (max-width:900px){ .hero .emblem{opacity:.07;right:-90px} }
   .badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;
     font:700 12px/1 var(--mono);letter-spacing:.6px;color:var(--brand);
-    background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.28)}
+    /* .1 → .06:12px 粗体的蓝字压蓝淡底实测只有 3.97:1。 */
+    background:rgba(37,99,235,.06);border:1px solid rgba(37,99,235,.26)}
   .badge .dot{width:7px;height:7px;border-radius:50%;background:var(--brand);
-    box-shadow:0 0 0 4px rgba(52,211,153,.18);animation:pulse 2.4s infinite}
+    box-shadow:0 0 0 4px rgba(37,99,235,.18);animation:pulse 2.4s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
   h1{margin:20px 0 8px;font-size:44px;line-height:1.14;letter-spacing:-1px;color:var(--ink);font-weight:800}
   h1 .g{background:linear-gradient(120deg,var(--brand),var(--brand2) 60%,var(--violet));
@@ -96,8 +116,8 @@
     font-size:14.5px;font-weight:700;transition:.16s;border:1px solid transparent}
   .ab:hover{text-decoration:none;transform:translateY(-2px)}
   .ab.pri{color:#05221a;background:linear-gradient(135deg,var(--brand),var(--brand2));
-    box-shadow:0 10px 26px rgba(52,211,153,.34)}
-  .ab.pri:hover{color:#05221a;box-shadow:0 14px 34px rgba(52,211,153,.46)}
+    box-shadow:0 10px 26px rgba(37,99,235,.34)}
+  .ab.pri:hover{color:#05221a;box-shadow:0 14px 34px rgba(37,99,235,.46)}
   .ab.sec{background:rgba(148,163,184,.07);color:var(--ink);border-color:var(--line2)}
   .ab.sec:hover{background:rgba(148,163,184,.13);color:var(--ink)}
   .ab svg{flex:none}
@@ -120,7 +140,7 @@
   .kicker{font:700 11.5px/1 var(--mono);letter-spacing:2px;color:var(--brand);text-transform:uppercase}
   .sec-title{display:flex;align-items:center;gap:12px;margin:11px 0 0}
   .sec-title .ic{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;
-    border-radius:11px;font-size:19px;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.24)}
+    border-radius:11px;font-size:19px;background:rgba(37,99,235,.1);border:1px solid rgba(37,99,235,.24)}
   h2{font-size:23px;margin:0;color:var(--ink);letter-spacing:-.3px;font-weight:800}
   .sub{color:var(--muted);font-size:14.5px;margin:12px 0 0;max-width:860px}
 
@@ -138,11 +158,11 @@
   .layer.r3:before{background:linear-gradient(180deg,var(--r3),transparent)}
   .layer.ui:before{background:linear-gradient(180deg,var(--uiA),transparent)}
   .layer h3{display:flex;align-items:center;gap:9px}
-  .tag{font:700 11px/1 var(--mono);padding:4px 8px;border-radius:6px;background:rgba(148,163,184,.1);
+  .tag{font:700 11px/1 var(--mono);padding:4px 8px;border-radius:6px;background:rgba(16,24,40,.05);
     border:1px solid var(--line);color:var(--muted);letter-spacing:.3px}
-  .layer.r0 .tag{color:var(--r0);border-color:rgba(34,211,238,.3);background:rgba(34,211,238,.08)}
-  .layer.r3 .tag{color:var(--r3);border-color:rgba(167,139,250,.3);background:rgba(167,139,250,.08)}
-  .layer.ui .tag{color:var(--uiA);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.08)}
+  .layer.r0 .tag{color:var(--r0);border-color:rgba(37,99,235,.3);background:rgba(37,99,235,.08)}
+  .layer.r3 .tag{color:var(--r3);border-color:rgba(124,58,237,.3);background:rgba(124,58,237,.08)}
+  .layer.ui .tag{color:var(--uiA);border-color:rgba(37,99,235,.3);background:rgba(37,99,235,.08)}
   .layer p{margin:0;font-size:13.8px;color:var(--muted)}
 
   /* ============ PIPELINE ============ */
@@ -154,13 +174,18 @@
   ol.pipe li:last-child{border-bottom:none}
   ol.pipe li:before{content:counter(p);position:absolute;left:0;top:11px;width:28px;height:28px;
     border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#05221a;
-    font:800 12.5px/28px var(--mono);text-align:center;box-shadow:0 4px 12px rgba(52,211,153,.3)}
+    font:800 12.5px/28px var(--mono);text-align:center;box-shadow:0 4px 12px rgba(37,99,235,.3)}
   ol.pipe b{color:var(--ink)}
   ol.pipe em{font-style:normal;color:var(--muted);font-size:13.6px}
   .hit{display:inline-block;font:700 11px/1 var(--mono);padding:4px 8px;border-radius:6px;margin-left:7px}
-  .hit.b{background:rgba(248,113,113,.14);color:var(--mal);border:1px solid rgba(248,113,113,.3)}
-  .hit.a{background:rgba(251,191,36,.14);color:var(--susp);border:1px solid rgba(251,191,36,.3)}
-  .hit.p{background:rgba(52,211,153,.14);color:var(--ok);border:1px solid rgba(52,211,153,.3)}
+  /* 淡底透明度从 .14 降到 .07。这三个是 11px 粗体小标签，文字色是判定语义色(不能
+     为了对比度去改)，所以只能让底色更接近白:.14 时实测 Block 3.45:1、Ask 3.91:1、
+     Allow 4.14:1，都够不到 4.5 —— 小号字压同色淡底是最容易踩这条线的组合。
+     另外 .hit.p 原来是【绿字压蓝底】(background 用了 37,99,235 而 color 用 --ok)，
+     色相不匹配，像是批量替换时漏改的一处；一并改回绿底。 */
+  .hit.b{background:rgba(217,45,32,.07);color:var(--mal);border:1px solid rgba(217,45,32,.26)}
+  .hit.a{background:rgba(181,71,8,.07);color:var(--susp);border:1px solid rgba(181,71,8,.26)}
+  .hit.p{background:rgba(6,118,71,.07);color:var(--ok);border:1px solid rgba(6,118,71,.26)}
 
   ul.list{margin:0;padding-left:20px}
   ul.list li{margin:7px 0;font-size:14px}
@@ -175,7 +200,7 @@
   th,td{text-align:left;padding:12px 15px;border-bottom:1px solid var(--line);vertical-align:top}
   tr:last-child td{border-bottom:none}
   thead th,table tr:first-child th{font:700 11.5px/1.3 var(--mono);color:var(--brand);
-    text-transform:uppercase;letter-spacing:.6px;background:rgba(52,211,153,.05)}
+    text-transform:uppercase;letter-spacing:.6px;background:rgba(37,99,235,.05)}
   tbody tr:hover td,table tr:hover td{background:rgba(148,163,184,.05)}
   td b{color:var(--ink)}
 
@@ -183,22 +208,34 @@
   .note{border-radius:12px;padding:14px 16px;font-size:13.8px;line-height:1.68;margin-top:16px;
     display:flex;gap:11px;align-items:flex-start}
   .note .em{flex:none;font-size:15px;line-height:1.5}
-  .note.warn{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.28);color:#f7d488}
-  .note.warn b{color:#fde9b8}
-  .note.info{background:rgba(34,211,238,.07);border:1px solid rgba(34,211,238,.26);color:#a5e9f5}
-  .note.info b{color:#d4f6fc}
-  .note.good{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.26);color:#a7eccf}
-  .note.good b{color:#d6f7e8}
+  /* 三种说明框的文字色原来是暗色主题的高亮浅色(#f7d488 淡黄 / #a5e9f5 淡青 /
+     #a7eccf 淡绿)。底色在翻浅色主题时改了，文字色漏改，于是浅色字压在浅色底上:
+     .note.good 的 #a7eccf 对比度约 1.4:1，基本等于隐形 —— 而这个框里写的正是
+     解压密码，是这页最需要看清的一行字之一。
+     现在统一用深色文字 + 淡底:框的语义(提醒/信息/要点)靠左侧色条和底色色相表达，
+     文字一律走 --ink / --txt 这一级，保证可读。 */
+  .note.warn{background:rgba(181,71,8,.07);border:1px solid rgba(181,71,8,.24);
+    border-left:3px solid var(--susp);color:var(--txt)}
+  .note.warn b{color:#8a4b0c}
+  .note.info{background:rgba(37,99,235,.06);border:1px solid rgba(37,99,235,.22);
+    border-left:3px solid var(--brand);color:var(--txt)}
+  .note.info b{color:var(--brand)}
+  .note.good{background:rgba(37,99,235,.06);border:1px solid rgba(37,99,235,.22);
+    border-left:3px solid var(--brand);color:var(--txt)}
+  .note.good b{color:var(--ink)}
 
   /* ============ TERMINAL / TREE ============ */
-  .term{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#0a0f18;box-shadow:var(--sh)}
+  /* 终端块转浅底。原来是 #0a0f18 近黑底，而文字色是 var(--txt)=#475467 深灰 ——
+     主题翻成浅色时这里的底色漏改了，结果深灰字压近黑底，几乎读不出来。
+     这不是好不好看的问题，是可读性缺陷。改浅底后文字色不用动就够对比度了。 */
+  .term{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#f8fafc;box-shadow:var(--sh)}
   .term-bar{display:flex;align-items:center;gap:8px;padding:11px 15px;border-bottom:1px solid var(--line);
     background:rgba(148,163,184,.05)}
   .term-bar .d{width:11px;height:11px;border-radius:50%;background:#3a4658}
-  .term-bar .d.r{background:#f87171}.term-bar .d.y{background:#fbbf24}.term-bar .d.g{background:#34d399}
+  .term-bar .d.r{background:#d92d20}.term-bar .d.y{background:#b54708}.term-bar .d.g{background:#2563eb}
   .term-bar .fn{margin-left:8px;font:12px var(--mono);color:var(--dim)}
   .term pre,pre.cmd{margin:0;font:12.8px/1.9 var(--mono);white-space:pre;overflow-x:auto;color:var(--txt);padding:16px 18px}
-  pre.cmd{background:#0a0f18;border:1px solid var(--line);border-radius:12px;margin-top:16px}
+  pre.cmd{background:#f8fafc;border:1px solid var(--line);border-radius:12px;margin-top:16px}
   pre .c{color:var(--dim)}
   .tree-c{color:var(--brand2)}
 
@@ -211,20 +248,26 @@
 
   .totop{position:fixed;right:20px;bottom:20px;width:46px;height:46px;border-radius:13px;z-index:40;
     display:inline-flex;align-items:center;justify-content:center;color:#05221a;
-    background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 10px 26px rgba(52,211,153,.4);
+    background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 10px 26px rgba(37,99,235,.4);
     opacity:0;transform:translateY(14px) scale(.9);pointer-events:none;transition:.22s}
   .totop.show{opacity:1;transform:none;pointer-events:auto}
   .totop:hover{text-decoration:none;transform:translateY(-2px)}
 
   /* ============ MOTION ============ */
   @keyframes rvup{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
-  .rv{opacity:0}
+  /* 隐藏只在 .bwjs 存在时生效 —— 那个类是 <head> 里的内联脚本加的。
+     原来是无条件 .rv{opacity:0}，靠 JS 再把它显示回来：一旦 JS 没跑（脚本报错、
+     被拦截、用户禁用），整页除首屏之外的内容全部永久不可见。这是这个页面唯一的
+     下载入口和密钥说明所在，不能建立在「JS 一定会成功」之上。
+     现在默认可见，JS 起来了才接管动画；配合 head 里的内联脚本，在首次绘制前就
+     决定好，不会先显示再闪一下藏起来。 */
+  .bwjs .rv{opacity:0}
   .rv.in{animation:rvup .55s cubic-bezier(.22,.7,.25,1) both}
   .card,.stat{transition:box-shadow .2s,transform .2s,border-color .2s}
   .card:hover,.stat:hover{box-shadow:var(--sh2);transform:translateY(-2px);border-color:var(--line2)}
   @media (prefers-reduced-motion:reduce){
     html{scroll-behavior:auto}
-    .rv{opacity:1;animation:none}
+    .bwjs .rv,.rv{opacity:1;animation:none}
     .card:hover,.stat:hover,.totop{transform:none}
     .badge .dot{animation:none}
   }
@@ -238,10 +281,10 @@
     <a href="/" class="brand" title="返回主页">
       <svg class="mk" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+          <stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#2563eb"/></linearGradient></defs>
         <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" fill="url(#bg1)" opacity=".22"/>
         <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" stroke="url(#bg1)" stroke-width="1.6"/>
-        <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#34d399" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#2563eb" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       磐垒 <small>BULWARK</small>
     </a>
@@ -269,8 +312,8 @@
 
 <header class="hero">
   <svg class="emblem" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" stroke="#34d399" stroke-width=".7"/>
-    <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#22d3ee" stroke-width=".9" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M12 2 4 5v6.5c0 4.6 3.2 8.4 8 9.5 4.8-1.1 8-4.9 8-9.5V5l-8-3Z" stroke="#2563eb" stroke-width=".7"/>
+    <path d="m8.5 12 2.4 2.4L15.8 9.6" stroke="#2563eb" stroke-width=".9" stroke-linecap="round" stroke-linejoin="round"/>
   </svg>
   <div class="in">
     <span class="badge"><span class="dot"></span>HOST INTRUSION PREVENTION SYSTEM · WINDOWS</span>
@@ -764,6 +807,15 @@ Bulwark.Driver/     <span class="tree-c">内核驱动 R0(MSBuild + WDK):Minifilt
       });
     }, {rootMargin: "0px 0px -8% 0px", threshold: 0.06});
     Array.prototype.forEach.call(rv, function(e){ io.observe(e); });
+
+    /* 保险网。head 里的 .bwjs 只证明 JS 起了个头，不保证走到了这里 —— 上面任何一行
+       抛异常，剩下的 .rv 就永久停在 opacity:0。observer 也有不触发的情况（元素因
+       布局问题从不进入视口）。4 秒后把还没显示的一律显示出来：动画是锦上添花，
+       内容不可见是故障。 */
+    setTimeout(function(){
+      Array.prototype.forEach.call(document.querySelectorAll(".rv:not(.in)"),
+        function(e){ e.classList.add("in"); e.style.opacity = 1; });
+    }, 4000);
   }
 
   /* nav elevate + back-to-top visibility */

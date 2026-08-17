@@ -2,4 +2,46 @@
 // taskbar and shortcuts show it (the runtime window icon is set separately in
 // main.cpp via AppIcon::appBadge()). The .ico is generated from that same badge
 // with:  bulwark_ui.exe --export-icon app.ico
+//
+// Also carries the VERSIONINFO block. Two reasons it has to exist:
+//   1) The in-app updater compares "what am I" against the server manifest. A
+//      product whose binaries report no version at all is a product where that
+//      comparison can only ever be done against a hardcoded literal.
+//   2) Right-click > Properties > Details showing nothing is a real trust
+//      signal for a security tool -- users and other AV products both look.
+// Numbers come from bulwark/Version.h so there is exactly one place to bump.
+//
+// ASCII-only on purpose: rc.exe decodes a BOM-less .rc with the system ANSI
+// codepage, so CJK literals here would ship as mojibake in the file properties.
+#include <winresrc.h>
+#include <bulwark/VersionNumbers.h>
+
 IDI_ICON1 ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    BULWARK_VERSION_MAJOR,BULWARK_VERSION_MINOR,BULWARK_VERSION_PATCH,0
+ PRODUCTVERSION BULWARK_VERSION_MAJOR,BULWARK_VERSION_MINOR,BULWARK_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"    // zh-CN (0x0804), Unicode (1200)
+        BEGIN
+            VALUE "CompanyName",      BULWARK_COMPANY_NAME_A
+            VALUE "FileDescription",  "Bulwark HIPS Console"
+            VALUE "FileVersion",      BULWARK_VERSION_STRING
+            VALUE "InternalName",     "bulwark_ui"
+            VALUE "OriginalFilename", "bulwark_ui.exe"
+            VALUE "ProductName",      BULWARK_PRODUCT_NAME_A
+            VALUE "ProductVersion",   BULWARK_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

@@ -78,6 +78,12 @@ struct RuntimeSettings {
     bool kernelConnected = false;
     QString kernelStatus;
 
+    // 【只读状态位,服务 -> UI】部署方在 appsettings 里选择了「本机不动用任何第三方情报源」
+    //(ReputationProxy.ServerOnly):云端只向中央服务器查「这个哈希收录了吗」。为真时上面那六个
+    // 情报源开关与 API Key 在服务端一律按关处理,UI 据此把它们禁掉并说明原因 —— 否则那些开关
+    // 看着可点、点了却毫无效果,正是最难排查的一类「设置不生效」。UI 回传的值一律被服务忽略。
+    bool cloudServerOnly = false;
+
     bool quarantineOnBlock = false;
 
     bool anyReputationEnabled() const {

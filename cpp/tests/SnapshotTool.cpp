@@ -13,6 +13,13 @@
       --record    <corpus.json> <gold.json> 回放语料,记录黄金裁决
       --verify    <corpus.json> <gold.json> 回放语料,逐字段比对,不一致则非零退出
 
+    另有一个不进 ctest 的辅助模式:
+      --bench     <corpus.json> [rounds]    在同一份语料上量 evaluate() 的单条耗时
+
+    --bench 不是回归门禁(耗时随机器而变,钉不住),它是【做性能改动时给出改前 / 改后可比
+    数字】的工具。之所以放在这里而不是另建一个工程:它需要的正是 --verify 那一套可复现设置
+    (钉死时钟 + 固定规则集 + 同一份语料),复用即可,不必再造一份。
+
     --verify 变红时的正确处置:先确认裁决变化是有意的、并说明为什么,然后 --record 重录黄金。
     不要为了让它变绿而反手改语料 —— 那等于把回归测试本身删掉。
 
@@ -50,11 +57,13 @@
 #include "bulwark/ipc/Payloads.h"
 #include "bulwark/ipc/PipeNames.h"
 #include "bulwark/models/AttackGraph.h"
+#include "bulwark/models/JunkEntry.h"
 #include "bulwark/models/PersistenceEntry.h"
 #include "bulwark/models/ProcessEntry.h"
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
 #include <QJsonArray>
@@ -67,6 +76,7 @@
 #include <QVector>
 
 #include <cstdio>
+#include <limits>
 
 using namespace bulwark;
 using namespace bulwark::engine;
@@ -1699,6 +1709,170 @@ int dumpIpc(const QString &path)
         p[QStringLiteral("processActionResultWithHash")] = ar.toJson();
     }
 
+    // ---- 磁盘垃圾清理 ----
+    //
+    // 两条钉住的要点(它们各自都曾是别处出过问题的形态):
+    //   · 扫描请求的 categories 为空时【键不出现】(空 = 全部,靠键缺失表达即可);
+    //   · 清理请求的 categories 为空时【键仍要出现】—— 空数组在那里有明确含义(什么都不清理),
+    //     靠键缺失表达会让解析侧分不清「用户没选」和「旧版本没这个字段」。
+    {
+        JunkScanRequestPayload sq;
+        sq.requestId = QUuid{};
+        p[QStringLiteral("junkScanRequestDefaults")] = sq.toJson();
+        sq.requestId = stableId(QStringLiteral("ipc-junk-scan-req"));
+        sq.categories << static_cast<int>(bulwark::junk::Category::WindowsTemp)
+                      << static_cast<int>(bulwark::junk::Category::BrowserCache);
+        sq.minAgeHours = 48;
+        p[QStringLiteral("junkScanRequestFilled")] = sq.toJson();
+
+        bulwark::JunkLocation loc;
+        loc.path = QStringLiteral("C:\\Windows\\Temp");
+        loc.note = QString::fromUtf8("仅统计 24 小时前的文件");
+        loc.bytes = 5368709120LL;   // > 2^32,确认大数走 double 仍能原样往返
+        loc.fileCount = 18342;
+        loc.skipped = 27;
+        loc.unreadable = 4;         // 「有子目录读不进去」这一状态必须能过线
+        p[QStringLiteral("junkLocationFilled")] = loc.toJson();
+        p[QStringLiteral("junkLocationDefaults")] = bulwark::JunkLocation{}.toJson();
+
+        bulwark::JunkCategoryResult cat;
+        cat.category = bulwark::junk::Category::WindowsTemp;
+        cat.risk = bulwark::junk::Risk::Safe;
+        cat.title = QString::fromUtf8("系统与用户临时文件");
+        cat.description = QString::fromUtf8("程序运行时留下的中间文件。");
+        cat.recommended = true;
+        cat.available = true;
+        cat.cleanable = true;
+        cat.bytes = loc.bytes;
+        cat.fileCount = loc.fileCount;
+        cat.skipped = loc.skipped;
+        cat.unreadable = loc.unreadable;
+        cat.elapsedMs = 1234;
+        cat.locations << loc;
+        p[QStringLiteral("junkCategoryFilled")] = cat.toJson();
+        // 全默认:categoryKey 仍要出现(它由 category 派生,不是可选字段)。
+        p[QStringLiteral("junkCategoryDefaults")] = bulwark::JunkCategoryResult{}.toJson();
+
+        // 「只统计不清理」那一类的形态:available 为真但 cleanable 为假。
+        bulwark::JunkCategoryResult scanOnly;
+        scanOnly.category = bulwark::junk::Category::WindowsOld;
+        scanOnly.risk = bulwark::junk::Risk::Caution;
+        scanOnly.title = QString::fromUtf8("旧版 Windows 升级残留");
+        scanOnly.description = QString::fromUtf8("只报告体积,不代为删除。");
+        scanOnly.available = true;
+        scanOnly.cleanable = false;
+        scanOnly.bytes = 21474836480LL;
+        scanOnly.message = QString::fromUtf8("仅统计体积,本产品不代为删除。");
+        p[QStringLiteral("junkCategoryScanOnly")] = scanOnly.toJson();
+
+        JunkScanResponsePayload sr;
+        sr.requestId = sq.requestId;
+        sr.scannedUtc = t0;   // 默认是 currentDateTimeUtc(),必须显式给
+        sr.enabled = true;
+        sr.categories << cat << scanOnly;
+        sr.totalBytes = cat.bytes;
+        sr.totalFiles = cat.fileCount;
+        sr.minAgeHours = 24;
+        sr.truncated = true;
+        sr.unreadable = 4;
+        sr.elapsedMs = 4210;
+        sr.message = QString::fromUtf8("扫描达到上限,结果为下限估计。");
+        p[QStringLiteral("junkScanResponseFilled")] = sr.toJson();
+        {
+            JunkScanResponsePayload empty;
+            empty.scannedUtc = t0;
+            p[QStringLiteral("junkScanResponseEmpty")] = empty.toJson();
+        }
+
+        JunkCleanRequestPayload cq;
+        cq.requestId = QUuid{};
+        p[QStringLiteral("junkCleanRequestEmptySelection")] = cq.toJson();
+        cq.requestId = stableId(QStringLiteral("ipc-junk-clean-req"));
+        cq.categories << static_cast<int>(bulwark::junk::Category::WindowsTemp)
+                      << static_cast<int>(bulwark::junk::Category::RecycleBin);
+        cq.minAgeHours = 12;
+        p[QStringLiteral("junkCleanRequestFilled")] = cq.toJson();
+
+        bulwark::JunkCleanOutcome ok;
+        ok.category = bulwark::junk::Category::WindowsTemp;
+        ok.title = cat.title;
+        ok.success = true;
+        ok.freedBytes = 4294967296LL;
+        ok.deletedFiles = 17900;
+        ok.deletedDirs = 812;
+        ok.skipped = 442;
+        ok.message = QString::fromUtf8("已删除 17900 个文件,跳过 442 个。");
+        p[QStringLiteral("junkOutcomeFilled")] = ok.toJson();
+        p[QStringLiteral("junkOutcomeDefaults")] = bulwark::JunkCleanOutcome{}.toJson();
+
+        bulwark::JunkCleanOutcome failed;
+        failed.category = bulwark::junk::Category::WindowsOld;
+        failed.title = scanOnly.title;
+        failed.success = false;
+        failed.message = QString::fromUtf8("本产品不代为删除该类内容。");
+
+        JunkCleanResponsePayload cr;
+        cr.requestId = cq.requestId;
+        cr.finishedUtc = t0;  // 默认是 currentDateTimeUtc(),必须显式给
+        cr.success = true;
+        cr.outcomes << ok << failed;
+        cr.freedBytes = ok.freedBytes;
+        cr.deletedFiles = ok.deletedFiles;
+        cr.skipped = ok.skipped;
+        cr.message = QString::fromUtf8("清理完成。");
+        p[QStringLiteral("junkCleanResponseFilled")] = cr.toJson();
+
+        // 大文件查找。注意这一对【没有】对应的删除请求 —— 本功能纯只读,详见
+        // bulwark/models/JunkEntry.h 里 LargeFileEntry 的说明。
+        LargeFileScanRequestPayload lq;
+        lq.requestId = QUuid{};
+        p[QStringLiteral("largeFileRequestDefaults")] = lq.toJson();
+        lq.requestId = stableId(QStringLiteral("ipc-largefile-req"));
+        lq.minBytes = 209715200LL;   // 200 MB
+        lq.limit = 30;
+        p[QStringLiteral("largeFileRequestFilled")] = lq.toJson();
+
+        bulwark::LargeFileEntry lf;
+        lf.path = QStringLiteral("C:\\hiberfil.sys");
+        lf.bytes = 13647200256LL;    // > 2^32,确认大数走 double 仍原样往返
+        lf.lastModifiedUtc = t0.addSecs(-3600);
+        lf.suffix = QStringLiteral("sys");
+        p[QStringLiteral("largeFileEntryFilled")] = lf.toJson();
+        p[QStringLiteral("largeFileEntryDefaults")] = bulwark::LargeFileEntry{}.toJson();
+
+        LargeFileScanResponsePayload lr;
+        lr.requestId = lq.requestId;
+        lr.scannedUtc = t0;          // 默认是 currentDateTimeUtc(),必须显式给
+        lr.enabled = true;
+        lr.files << lf;
+        lr.minBytes = lq.minBytes;
+        lr.totalBytes = lf.bytes;
+        lr.scannedFiles = 557486;
+        lr.unreadable = 55;
+        lr.truncated = false;
+        lr.elapsedMs = 44392;
+        lr.message = QString::fromUtf8("检视 557486 个文件,列出最大的 1 个。");
+        p[QStringLiteral("largeFileResponseFilled")] = lr.toJson();
+        {
+            LargeFileScanResponsePayload empty;
+            empty.scannedUtc = t0;
+            p[QStringLiteral("largeFileResponseEmpty")] = empty.toJson();
+        }
+
+        JunkProgressPayload pg;
+        pg.requestId = QUuid{};
+        p[QStringLiteral("junkProgressDefaults")] = pg.toJson();
+        pg.requestId = sq.requestId;
+        pg.cleaning = true;
+        pg.categoryIndex = 2;
+        pg.categoryTotal = 5;
+        pg.categoryTitle = QString::fromUtf8("浏览器缓存");
+        pg.currentPath = QStringLiteral("C:\\Users\\u\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache");
+        pg.bytesSoFar = 1073741824LL;
+        pg.filesSoFar = 9312;
+        p[QStringLiteral("junkProgressFilled")] = pg.toJson();
+    }
+
     root[QStringLiteral("payloads")] = p;
 
     if (!writeJson(path, root))
@@ -1709,9 +1883,88 @@ int dumpIpc(const QString &path)
     return 0;
 }
 
+// ======================= 裁决热路径耗时测量(--bench)=======================
+//
+// --verify 钉住的是「裁决对不对」,这里钉住的是「裁决要花多久」。两者共用同一份语料与同一套
+// 可复现设置(钉死时钟 + 内置规则集 + 语料自带用户规则),所以量到的就是生产管线本身。
+//
+// 为什么值得常驻:evaluate() 是每条内核/ETW 事件都要走一遍的路径,而它在服务主线程上与出队、
+// IPC、弹窗超时巡检串行。事件风暴(勒索批量改文件 / 进程爆发)时,这个单条耗时直接决定队列
+// 会不会堆到丢弃 —— 也就是会不会漏检。所以它是一个安全指标,不只是性能指标;做性能改动时
+// 必须能给出改前改后的可比数字,而不是"感觉快了"。
+//
+// 读数方式:同一批事件跑 rounds 遍、重复 reps 次,报【最快一次】。最快值比平均值更能代表
+// 代码本身的成本 —— 平均值里混进的是本机其它进程造成的调度噪声。
+int benchmark(const QString &corpusPath, int rounds)
+{
+    QJsonObject corpus;
+    if (!readJson(corpusPath, &corpus))
+        return 1;
+
+    const QString nowIso = corpus.value(QLatin1String("fixedNowUtc")).toString();
+    const QDateTime pinned =
+        QDateTime::fromString(nowIso, Qt::ISODateWithMs).toTimeZone(QTimeZone::UTC);
+    setFixedNowUtcForTest(pinned);
+
+    RuleEngine engine;
+    const QJsonObject eng = corpus.value(QLatin1String("engine")).toObject();
+    engine.enableBaseline = eng.value(QLatin1String("enableBaseline")).toBool(true);
+    engine.trustSignedActors = eng.value(QLatin1String("trustSignedActors")).toBool(true);
+    for (const QJsonValue &v : corpus.value(QLatin1String("selfDirectories")).toArray())
+        engine.addSelfDirectory(v.toString());
+    for (const QJsonValue &v : corpus.value(QLatin1String("canaryFiles")).toArray())
+        engine.addCanaryFile(v.toString());
+
+    QVector<DefenseRule> rules = DefaultRules::build();
+    for (const QJsonValue &v : corpus.value(QLatin1String("rules")).toArray())
+        rules.push_back(DefenseRule::fromJson(v.toObject()));
+    engine.loadRules(rules);
+
+    QVector<SecurityEvent> base;
+    for (const QJsonValue &cv : corpus.value(QLatin1String("cases")).toArray())
+        base.push_back(SecurityEvent::fromJson(cv.toObject().value(QLatin1String("event")).toObject()));
+
+    // 预热:让分支预测 / 分配器进入稳态,不计入。
+    for (int w = 0; w < 3; ++w)
+        for (const SecurityEvent &src : base) {
+            SecurityEvent e = src;
+            engine.evaluate(e);
+        }
+
+    qint64 best = std::numeric_limits<qint64>::max();
+    qint64 total = 0;
+    const int reps = 5;
+    for (int rep = 0; rep < reps; ++rep) {
+        QElapsedTimer t;
+        t.start();
+        for (int i = 0; i < rounds; ++i)
+            for (const SecurityEvent &src : base) {
+                SecurityEvent e = src;
+                engine.evaluate(e);
+            }
+        const qint64 ns = t.nsecsElapsed();
+        best = qMin(best, ns);
+        total += ns;
+    }
+
+    const qint64 evts = static_cast<qint64>(rounds) * base.size();
+    out() << "规则集 " << rules.size() << " 条,语料 " << base.size() << " 条事件,每轮 "
+          << rounds << " 遍 x " << reps << " 次\n";
+    out() << "  最快一次: " << (best / 1000000.0) << " ms  ->  "
+          << (static_cast<double>(best) / static_cast<double>(evts) / 1000.0)
+          << " us/event\n";
+    out() << "  平均:     " << (total / reps / 1000000.0) << " ms  ->  "
+          << (static_cast<double>(total / reps) / static_cast<double>(evts) / 1000.0)
+          << " us/event\n";
+    out().flush();
+    setFixedNowUtcForTest(QDateTime());
+    return 0;
+}
+
 void usage()
 {
     err() << "用法:\n"
+          << "  bulwark_snapshot --bench         <corpus.json> [rounds]\n"
           << "  bulwark_snapshot --gen-corpus    <corpus.json>\n"
           << "  bulwark_snapshot --record        <corpus.json> <golden.json>\n"
           << "  bulwark_snapshot --verify        <corpus.json> <golden.json>\n"
@@ -1740,6 +1993,15 @@ int main(int argc, char **argv)
         const int rc = checkRuleset();
         setFixedNowUtcForTest(QDateTime());
         return rc;
+    }
+
+    if (mode == QLatin1String("--bench")) {
+        if (args.size() < 2) {
+            usage();
+            return 2;
+        }
+        const int rounds = args.size() >= 3 ? args.at(2).toInt() : 200;
+        return benchmark(args.at(1), rounds > 0 ? rounds : 200);
     }
 
     if (mode == QLatin1String("--dump-rules")) {

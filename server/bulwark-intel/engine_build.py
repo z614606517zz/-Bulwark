@@ -108,6 +108,117 @@ BENIGN_GENERIC_RATIO = 0.30
 BENIGN_ASK_RATIO = 0.02
 BENIGN_DROP_RATIO = 0.10
 
+# ---- 区分力闸门(condition specificity) --------------------------------------- #
+#
+# 这一段修的是本引擎最严重的一处结构性缺陷,实测数据:v19 下发 32 条组合,其中 9 条
+# (28%)含一个【零区分力】标记,而 26 条装载组合里有 12 条依赖同一个这样的标记。
+#
+#   System File Execution Location Anomaly          -> {"unsigned": true}
+#   Files With System Process Name In Unsuspected... -> {"unsigned": true}
+#   Suspicious Network Connection to IP Lookup APIs  -> {}          (匹配每一条外联)
+#   Uncommon Svchost Command Line Parameter          -> {"actor":"*\\svchost.exe"}
+#
+# 前两条按本产品自己的底线就是【软信号】——「软信号单独出现绝不该触发拦截或弹窗,
+# 必须由硬指标互证」。第三条连信号都不是。第四条匹配 Windows 上每一次 svchost 启动。
+# 于是「N 个动作互相作证」在这些组合上退化成「一个动作 + 一个恒真项」,而客户端的
+# applyHitToEvent 在强制模式下会把命中登记为【硬指标】—— 等于把软信号提拔成处置依据。
+#
+# 客户端已有一道「证据重复」护栏(指纹去重),但它只能发现【两个标记条件完全相同】,
+# 发现不了「其中一个条件恒真」。故必须在服务端按区分力把这类标记挡在证据之外。
+#
+# 评分只需要区分「这是一个真实产物」还是「这在任何机器上都成立」,故刻意做得粗:
+MARKER_SPEC_NONE = 0      # 无条件 / 只有 unsigned -> 不构成证据
+MARKER_SPEC_WEAK = 1      # 只有一个常驻系统程序作主体 -> 信息量极低
+MARKER_SPEC_OK = 2        # 有指向性,可以算一份证据
+# 一条组合至少要有这么多份【真证据】才允许下发。低于此数即丢弃 ——
+# 这是本引擎「必须互证」前提的机械保证,而不是靠人去看表。
+MIN_EVIDENCE_MARKERS = 2
+
+# ---- 「不含」条件的下发开关 --------------------------------------------------- #
+#
+# 【这是一个版本耦合闸门,不是调优项。改它之前先读完这段。】
+#
+# cmdline_absent / target_absent / parent_absent 由客户端的
+# ChainMarker::matchesEvent 消费。老客户端【不认识这几个键,会静默忽略】,于是:
+#   · 客户端看到的仍是 actor=*\svchost.exe —— 在 Windows 上恒真;
+#   · 而服务端因为条件里有 _absent,给它算了「实质条件」-> 当成一份真证据。
+# 两边一叠加,结果比不加这个功能更糟:一个恒真项被正式承认为互证的一半,
+# 而组合命中在强制模式下是按【硬指标】登记的。
+#
+# 所以顺序是硬的:【先让认识这些键的客户端铺开,再打开这个开关】。
+# 打开时要一并确认:endpoint 的 bulwark_service.exe 已包含 ChainMarker::matchesEvent
+# (grep 二进制里的 cmdline_absent 即可验证),而不是只确认代码进了仓库。
+ABSENT_CONDITIONS_ENABLED = False
+
+
+def _strip_absent(cond):
+    """按开关剥掉「不含」条件。关闭时连带把它对区分力的贡献一起去掉 ——
+    只剥键不剥评分,才是最危险的那种半开状态。"""
+    if ABSENT_CONDITIONS_ENABLED or not isinstance(cond, dict):
+        return cond
+    return {k: v for k, v in cond.items()
+            if k not in ("cmdline_absent", "target_absent", "parent_absent")}
+
+# 在健康的 Windows 上不停启动的程序。「主体是它」这件事本身几乎不携带信息,
+# 所以只有它一项时算 WEAK,必须再有 target/cmdline 之类的实质条件才算证据。
+COMMON_HOST_BINARIES = (
+    "svchost.exe", "services.exe", "lsass.exe", "explorer.exe", "cmd.exe",
+    "conhost.exe", "rundll32.exe", "regsvr32.exe", "msiexec.exe", "dllhost.exe",
+    "taskhostw.exe", "wmiprvse.exe", "schtasks.exe", "reg.exe", "sc.exe",
+    "powershell.exe", "powershell", "wscript.exe", "cscript.exe", "csc.exe",
+    "curl.exe", "mshta.exe", "certutil.exe", "bitsadmin.exe",
+)
+
+
+def condition_specificity(cond):
+    """一条匹配条件能提供多少区分力。返回 (分档, 可读理由)。
+
+    判据顺序即重要性顺序:先看有没有实质条件(target/cmdline/parent 的字面片段),
+    再看主体是不是常驻程序,最后才考虑 unsigned —— unsigned 永远只是加成,
+    单独出现不构成证据。
+    """
+    if not isinstance(cond, dict):
+        return MARKER_SPEC_NONE, "条件缺失"
+    slots = {k: str(cond.get(k) or "").strip()
+             for k in ("actor", "target", "cmdline", "parent",
+                       "cmdline_absent", "target_absent", "parent_absent")}
+    uns = bool(cond.get("unsigned"))
+    if not any(slots.values()):
+        return (MARKER_SPEC_NONE,
+                "只有 unsigned -> 软信号,不能算互证的一份" if uns
+                else "无任何条件 -> 匹配该类型的每一条事件")
+
+    def literals(pat):
+        # 通配式里剩下的连续常量串。少于 4 个字符的碎片(如 "\\"、".exe")不算指向性。
+        return [s for s in pat.replace("?", "*").split("*") if len(s) >= 4]
+
+    why = []
+    substantive = 0
+    for k in ("target", "cmdline", "parent"):
+        if slots[k] and literals(slots[k]):
+            substantive += 1
+            why.append("%s 有字面片段" % k)
+    # 「不含」条件同样算实质条件 —— 它恰恰是把恒真项变成真判据的那一半。
+    # 门槛比肯定条件低(2 个字符即可):"-k " 这种开关本身就短,而它的区分力很高
+    # (带 -k 的 svchost 是绝大多数,排除掉之后剩下的才是异常)。
+    for k in ("cmdline_absent", "target_absent", "parent_absent"):
+        if slots[k] and any(len(s) >= 2 for s in slots[k].replace("?", "*").split("*")):
+            substantive += 1
+            why.append("%s=%s(排除常态)" % (k, slots[k]))
+    if slots["actor"]:
+        low = slots["actor"].lower()
+        common = any(b in low for b in COMMON_HOST_BINARIES)
+        why.append("actor=%s%s" % (slots["actor"], "(常驻程序,信息量低)" if common else ""))
+        if not common and literals(slots["actor"]):
+            substantive += 1
+    if uns:
+        why.append("+unsigned(仅加成)")
+    if substantive >= 1:
+        return MARKER_SPEC_OK, "; ".join(why)
+    # 走到这里 = 只有一个常驻程序主体,或者只有纯通配的槽位。
+    return MARKER_SPEC_WEAK, "; ".join(why) + " -> 无实质条件,不能算互证的一份"
+
+
 # ---- 标记 -> 磐垒可观测事件的映射 -------------------------------------------- #
 #
 # 组合挖出来只是「知道哪几个动作凑一起是病毒」,客户端还得知道「这个动作在我这儿长什么样」。
@@ -206,10 +317,20 @@ MARKER_RULES = {
         "event": "ProcessCreate", "actor": "*\\schtasks.exe"},
 
     # ---- 系统进程伪装 / svchost 异常 ----
+    #
+    # 这两条的信号都是【缺少某个东西】,而不是含有什么:
+    #   · 真正的 svchost 永远带 `-k <组名>` 启动,该规则命中的是【没有 -k】的那种;
+    #   · 真正的 svchost 永远由 services.exe 拉起,该规则命中的是【父进程不是它】的那种。
+    # 此前只能下发肯定的那一半(actor=*\svchost.exe),而那一半在 Windows 上恒真 ——
+    # 实测 v19 的 26 条装载组合里 12 条依赖它,等于让一个恒真项冒充互证的一半。
+    # 客户端现已支持 *_absent(见 ChainMarker::matchesEvent),故补上否定的那一半。
+    # context 佐证:该标记 226 个样本的 CommandLine 全是裸的 svchost 路径,无任何参数。
     "uncommon_svchost_command_line_parameter": {
-        "event": "ProcessCreate", "actor": "*\\svchost.exe"},
+        "event": "ProcessCreate", "actor": "*\\svchost.exe",
+        "cmdline_absent": "*-k *"},
     "uncommon_svchost_parent_process": {
-        "event": "ProcessCreate", "actor": "*\\svchost.exe"},
+        "event": "ProcessCreate", "actor": "*\\svchost.exe",
+        "parent_absent": "*\\services.exe"},
     "files_with_system_process_name_in_unsuspected_locations": {
         "event": "ProcessCreate", "unsigned": True},
     "system_file_execution_location_anomaly": {
@@ -292,6 +413,481 @@ def slug(text):
     return s[:70] or "unknown"
 
 
+# ---- 「这是不是 Windows 端点用得上的样本」 ------------------------------------- #
+#
+# 原判据是单一的 `type_tag in WIN_TYPES`,而 VT 并不总给 type_tag。实测:
+#   · benign_reports 63 份里 39 份(62%)type_tag 为空 -> 全被判成非本平台
+#     -> 可用语料只剩 13 份,低于 BENIGN_MIN_CORPUS(50),区分度环节整体空转;
+#   · vt_reports 4621 行里 2877 行被判「非本平台」,其中有多少是同一个原因,
+#     在改成多字段判据之前无从知道。
+# 一个可选字段缺失就让整份样本被丢弃,这是判据本身太脆,不是数据的问题。
+#
+# 判据做成【有明确证据就用它,没有才逐级退让】,每一级都写清为什么可信:
+WIN_EXTS = {
+    "exe", "dll", "sys", "msi", "msp", "scr", "cpl", "ocx", "com", "drv",
+    "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+    "lnk", "chm", "doc", "docx", "xls", "xlsx", "xlsm", "ppt", "pptx", "rtf",
+    "docm", "pub", "vsd", "one",
+}
+# type_description / magic 里出现即可判定为 Windows 的字样。
+WIN_TEXT_HINTS = (
+    "win32", "win64", "pe32", "pe32+", "ms windows", "windows executable",
+    "windows setup", "microsoft installer", "msi installer", "dos executable",
+    "html application", "windows shortcut", "compiled html", "rich text format",
+    "microsoft word", "microsoft excel", "microsoft powerpoint", "office open xml",
+    "composite document file",
+)
+# 明确不是 Windows 的字样。放在肯定判据【之前】判 —— "shell script" 里也含 "script",
+# 单靠肯定词表会把 ELF 与脚本捞进来,而归档里 ELF 占了很大一块。
+NON_WIN_TEXT_HINTS = (
+    "elf ", "elf,", "elf 32", "elf 64", "mach-o", "shell script", "bourne-again",
+    "python script", "perl script", "ruby script", "php script",
+    "java archive", "java class", "android", "dalvik", "apk", "debian binary",
+    "rpm ", "iso 9660", "macintosh",
+)
+
+
+def _ext_of(name):
+    n = (name or "").strip().lower().rstrip(".")
+    if "." not in n:
+        return ""
+    return n.rsplit(".", 1)[-1][:8]
+
+
+def is_windows_sample(attr):
+    """这份报告是不是 Windows 端点用得上的样本。
+
+    逐级退让,前一级有结论就不再往下:
+      1. type_tag —— VT 自己的归类,最可信;
+      2. type_extension —— 同样来自 VT 的解析结果;
+      3. type_description / magic 的字样 —— 先排除明确的非 Windows,再看肯定词;
+      4. meaningful_name 的扩展名 —— 最弱的一级,但对【已经存下来的老语料】是唯一
+         还剩的线索(slim_benign_report 当初只留了 type_tag 和 meaningful_name)。
+    四级都没结论 -> 判否。宁可少一份语料,不可把 ELF 当成 Windows 正常软件的分母。
+    """
+    if not isinstance(attr, dict):
+        return False
+    tag = (attr.get("type_tag") or "").strip().lower()
+    if tag:
+        return tag in WIN_TYPES
+    ext = (attr.get("type_extension") or "").strip().lower().lstrip(".")
+    if ext:
+        return ext in WIN_EXTS
+    blob = " ".join(str(attr.get(k) or "") for k in
+                    ("type_description", "magic")).strip().lower()
+    if blob:
+        if any(h in blob for h in NON_WIN_TEXT_HINTS):
+            return False
+        if any(h in blob for h in WIN_TEXT_HINTS):
+            return True
+    return _ext_of(attr.get("meaningful_name")) in WIN_EXTS
+
+
+# ============================================================================= #
+#  从 sigma 的 match_context 推导事件类型与匹配条件                              #
+# ============================================================================= #
+#
+# 【这一段是本次升级的核心】。此前挖掘器只读 sigma_analysis_results 的 rule_title 与
+# rule_level,把每条命中自带的 match_context 整个扔掉了 —— 而那里面正是「让这条规则
+# 命中的那些字段原值」,Sysmon 口径。实测 308 个标记 100% 都带 context。
+#
+# 扔掉它的代价是双重的:
+#   1. 事件类型只能靠标题关键词猜(KEYWORD_EVENT_HINTS),猜不中就整条标记不可观测;
+#      而 context 里的 EventID 是【权威的】。
+#   2. 匹配条件只能人工登记(MARKER_RULES 手写 43 条),于是 287 个挖出来的标记里
+#      只有 37 个能下发给客户端 —— 引擎的词表被一张手写表卡住,不随数据增长。
+#
+# 而且手写表本身被数据证明有两处错:
+#   · unsigned_image_loaded_into_lsass_process 被标为「表达不出」,理由是「ImageLoad 的
+#     target 是被加载模块路径,不会叫 lsass.exe」。context 显示 Image=lsass.exe 是
+#     【加载方】(即 actor)、ImageLoaded 才是模块(即 target)—— 字段填错了位置而已,
+#     actor=*\lsass.exe 完全可表达。该标记有 395 个样本,是第二高频。
+#   · files_with_system_process_name_in_unsuspected_locations 被写成
+#     ProcessCreate + unsigned,而 context 是 EventID 11 + TargetFilename=
+#     「...\Startup\SecurityHealthService.exe」「...\Temp\svchost.exe」—— 它是个
+#     FileWrite 标记,事件类型与条件都错了。
+#
+# 推导出的条件【一律不覆盖 MARKER_RULES】:那张表里有人工判断(包括刻意标注
+# unobservable 的语义理由),数据推导只补它没覆盖到的部分,以及在人工条目区分力不足时
+# 追加实质条件。顺序见 resolve_mapping。
+
+# Sysmon EventID -> 磐垒事件类型。取值对应 bulwark::EventType 的成员名。
+# 空串 = 磐垒没有对应的事件维度,该标记按不可观测处理(如 PowerShell ScriptBlock 4104)。
+SYSMON_EVENT_BY_ID = {
+    "1": "ProcessCreate",
+    "3": "NetworkConnect",
+    "7": "ImageLoad",
+    "8": "RemoteThread",
+    "11": "FileWrite",
+    "23": "FileDelete",
+    "26": "FileDelete",
+    "29": "FileWrite",          # Sysmon 29 = 可执行文件被创建
+    "12": "RegistryWrite",
+    "13": "RegistryWrite",
+    "14": "RegistryWrite",
+    "22": "DnsQuery",
+    "4104": "",                 # PowerShell 脚本块日志:磐垒无此维度
+    "4103": "",
+    "10": "",                   # ProcessAccess:磐垒无此维度
+}
+
+# 事件类型 -> (context 字段, 条件槽位)。顺序即优先级:先试更有指向性的槽位。
+#
+# 关键是 Image 的语义随事件类型而变:进程创建里它是被创建的进程(actor),
+# 注册表/文件/模块加载里它是【发起动作的进程】(也是 actor)。两种都落在 actor,
+# 所以这张表统一把 Image 映到 actor —— 与客户端 DefenseRule 的 actorPattern 同义。
+CTX_FIELD_BY_EVENT = {
+    "ProcessCreate":   [("CommandLine", "cmdline"), ("Image", "actor"),
+                        ("ParentImage", "parent")],
+    "RegistryWrite":   [("TargetObject", "target"), ("Image", "actor")],
+    "FileWrite":       [("TargetFilename", "target"), ("Image", "actor")],
+    "FileDelete":      [("TargetFilename", "target"), ("Image", "actor")],
+    "ImageLoad":       [("ImageLoaded", "target"), ("Image", "actor")],
+    "NetworkConnect":  [("DestinationHostname", "target"), ("Image", "actor")],
+    "DnsQuery":        [("QueryName", "target"), ("Image", "actor")],
+    "RemoteThread":    [("TargetImage", "target"), ("SourceImage", "actor")],
+}
+
+# 样本数低于此值的标记【不做推导】。
+#
+# 比例门槛在小样本上形同虚设:n=2 时「1 个样本同意」就是 50%,直接过关。实测首版就因此
+# 把单个样本的 C2 域名(potalgonabunbunsed.blogspot.com,1/2)和另一个样本的临时文件名
+# (setup_gitlog.txt,3/8)推成了规则条件。取 6:配合下面 0.5 的路径门槛,至少要 3 个
+# 互不相同的样本给出同一个片段。
+MIN_DERIVE_SAMPLES = 6
+
+# 各槽位的覆盖率门槛。【刻意不统一】,因为它们的失配代价完全不同:
+#
+#   target(主机名/域名):0.25 —— 这类取值本身就是精确值,不是片段。一条只认
+#       icanhazip.com 的标记覆盖率虽低,但精度极高;而本引擎要求互证,单个标记的
+#       召回不足由组合里的另一份证据补,不会因此误报。
+#   target(路径)/cmdline:0.50 —— 片段要足够普遍才算「这条规则的特征」而非某个样本的痕迹。
+#   actor:0.90 —— 只在「几乎总是这个程序」时才加。
+#   parent:0.95 —— 父进程在真实攻击里变化极大(实测 cmd.exe 作父只占 37/115),
+#       凭它收窄条件是在悄悄丢检出。
+SLOT_MIN_RATIO = {"host": 0.25, "target": 0.50, "cmdline": 0.50,
+                  "actor": 0.90, "parent": 0.95}
+# 同一个片段在正常语料里的出现率上限。语料还小(63 份),所以它只是第二道保险,
+# 主力是下面两张停用表 —— 靠 63 个样本去判「正常软件是否普遍如此」并不可靠。
+ARTIFACT_MAX_BENIGN_RATIO = 0.02
+
+# VT 沙箱会把样本改名再投放,这几个名字【全是沙箱产物】,推成 actor 条件等于
+# 让规则去匹配一个真机上不存在的文件名。实测 context 里 Image 的前几名就是它们。
+SANDBOX_BASENAMES = {
+    "software.exe", "file.exe", "program.exe", "executable.exe", "sample.exe",
+    "malware.exe", "default.dat.exe", "sample.bin", "taskdl.exe",
+}
+# 含这些片段的取值一律不采纳:沙箱专有路径、环境变量占位符、以及本次运行的临时目录。
+SANDBOX_VALUE_BITS = (
+    "%samplepath%", "<current_dir>", "<user>", "<hklm>", "<hkcu>",
+    "\\users\\bruno\\", "capeoutput", "\\cape\\", "%windir%", "%temp%",
+    "%appdata%", "%programfiles", "%localappdata%", "%userprofile%", "%programdata%",
+)
+# 通用到没有指向性的片段。判据是【全等】而不是包含 —— 否则 "\CurrentVersion\Run"
+# 会被 "\CurrentVersion" 连坐否掉,而前者恰恰是最有价值的一条。
+# 与客户端 derivedRegistryWatch 的 kTooWide 同一思路、同一判据。
+UNIVERSAL_FRAGMENTS = {
+    "\\windows", "\\windows\\system32", "\\windows\\syswow64", "\\system32",
+    "\\program files", "\\program files (x86)", "\\programdata", "\\users",
+    "\\users\\public", "\\appdata", "\\appdata\\local", "\\appdata\\roaming",
+    "\\appdata\\local\\temp", "\\temp", "\\desktop", "\\documents",
+    "hklm", "hkcu", "hku", "hklm\\software", "hkcu\\software", "\\software",
+    "\\software\\microsoft", "\\microsoft", "\\microsoft\\windows",
+    "\\windows\\currentversion", "\\currentversion", "\\policies", "\\classes",
+    "\\control", "\\services", "\\parameters", "\\explorer", "\\shell",
+    ".exe", ".dll", ".sys", ".bat", ".cmd", ".ps1", ".vbs", ".js",
+}
+# 命令行里出现即无意义的词(解释器自己的名字、通用开关)。
+CMDLINE_STOP = {
+    "powershell", "powershell.exe", "cmd", "cmd.exe", "cscript", "wscript",
+    "rundll32", "regsvr32", "schtasks", "reg", "windowspowershell",
+    "command", "true", "false", "null", "http", "https", "system32",
+    "syswow64", "windows", "users", "temp", "appdata", "roaming", "local",
+    "program", "files", "microsoft", "desktop", "bruno", "user",
+}
+
+
+def _norm_value(s):
+    """把 context 里的取值归一到「客户端在真机上会看到的形状」。
+
+    只做无歧义的替换:注册表根键的长写法 -> 短写法(客户端拿到的是内核路径,
+    两种写法都可能出现,统一成短的再取片段);去掉角括号包装;统一小写与反斜杠。
+    刻意【不】展开 %ENV% —— 展开成什么取决于机器,猜错比不猜更糟,故含 % 的取值直接弃用。
+    """
+    v = str(s or "").strip().strip('"').replace("/", "\\")
+    v = v.replace("<HKLM>", "HKLM").replace("<HKCU>", "HKCU")
+    v = re.sub(r"^HKEY_LOCAL_MACHINE", "HKLM", v, flags=re.I)
+    v = re.sub(r"^HKEY_CURRENT_USER", "HKCU", v, flags=re.I)
+    v = re.sub(r"^HKEY_USERS", "HKU", v, flags=re.I)
+    # HKU\S-1-5-21-...\ 是按机器变的 SID,归一成 HKCU 才能跨机器比对。
+    v = re.sub(r"^HKU\\S-1-[0-9\-]+\\", "HKCU\\\\", v, flags=re.I)
+    return v.lower()
+
+
+def _usable_value(v):
+    if not v or len(v) < 5:
+        return False
+    if "%" in v:
+        return False                      # 环境变量占位符,真机上匹配不到
+    for bit in SANDBOX_VALUE_BITS:
+        if bit in v:
+            return False
+    base = v.rsplit("\\", 1)[-1]
+    if base in SANDBOX_BASENAMES:
+        return False
+    return True
+
+
+# 用户名一段:\users\<某人>\ 里的 <某人> 是【本机事实】,跨机器一定失配。
+# 用正则按结构剔除,而不是往停用表里堆名字 —— 首版只列了 bruno,于是另一个沙箱账户
+# george 直接漏了过去,推出 "*\users\george\appdata\local*" 这种真机上永不命中的条件。
+_USER_SEG_RE = re.compile(r"\\users\\(?!public\\|default\\|all users\\)[^\\]+\\", re.I)
+# 长十六进制段 = GUID / 证书指纹 / NativeImages 目录名,同样是本机事实。
+# 实测漏过一条:"...\nativeimages_v4.0.30319_64\system.manaa57fc8cc#\ace3bea4...\..."。
+_HEXY_SEG_RE = re.compile(r"(^|\\)[0-9a-f]{8,}(\\|$)", re.I)
+
+
+def _machine_specific(frag):
+    """这个片段是不是只在某一台机器/某一次运行上成立。"""
+    if _USER_SEG_RE.search(frag) or _HEXY_SEG_RE.search(frag):
+        return True
+    # 纯数字段(进程 ID、随机后缀)也没有跨机器意义。
+    for seg in frag.split("\\"):
+        if seg and seg.isdigit() and len(seg) >= 4:
+            return True
+    return False
+
+
+def _path_candidates(v):
+    """从一个路径型取值里取出所有「有指向性的连续片段」。
+
+    做法:按 \\ 切段,枚举长度 2~4 段的连续子串。随机段(GUID、指纹、随机文件名)
+    自然会因为跨样本覆盖率低而在后面被淘汰,不必在这里识别它们。
+    额外单独产出 basename —— 「Temp 目录下有个叫 svchost.exe 的文件」这类特征
+    全部信息都在文件名上。
+    """
+    segs = [s for s in v.split("\\") if s]
+    out = set()
+    for n in (2, 3, 4):
+        for i in range(len(segs) - n + 1):
+            frag = "\\" + "\\".join(segs[i:i + n])
+            if len(frag) >= 6:
+                out.add(frag)
+    if segs:
+        base = segs[-1]
+        if len(base) >= 6 and "." in base:
+            out.add("\\" + base)
+    return out
+
+
+def _cmdline_candidates(v):
+    """从命令行里取出「像开关/关键词」的片段。
+
+    只要词形片段,不要路径:路径部分随机性太高(样本自己的落地路径),而真正的特征
+    是 Add-MpPreference / Set-ExecutionPolicy / -EncodedCommand 这类词。
+    """
+    out = set()
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9\-_\.]{3,}", v):
+        t = tok.strip(".-_").lower()
+        if len(t) < 5 or t in CMDLINE_STOP:
+            continue
+        if t.endswith((".exe", ".dll", ".sys")):
+            continue
+        out.add(t)
+    return out
+
+
+def _host_candidates(v):
+    """域名 / 主机名取值:整串就是特征,不切片。"""
+    if re.match(r"^[a-z0-9\.\-]+\.[a-z]{2,}$", v) and len(v) >= 6:
+        return {v}
+    return set()
+
+
+# 推导只用得到这几个字段。其余(Hashes / Product / FileVersion / IntegrityLevel ...)
+# 一律不留 —— 这不是洁癖:context 一份可达几十个字段、单个样本命中数百次,
+# 全量留存会把 995 个样本的证据堆成几百 MB,而这台机器同时在扛信誉查询。
+CTX_KEEP_FIELDS = (
+    "EventID", "Image", "CommandLine", "ParentImage", "TargetObject",
+    "TargetFilename", "ImageLoaded", "QueryName", "DestinationHostname",
+    "TargetImage", "SourceImage",
+)
+# 一个样本里同一条规则最多取几次命中。取 8:候选片段是按【样本】投票的,
+# 同一样本内再多几次命中也只贡献同一票,留着纯占内存。
+CTX_MAX_ENTRIES_PER_SAMPLE = 8
+# 一个标记最多留几个样本的证据。覆盖率是比例估计,几百个样本足够稳定;
+# 最高频标记有 629 个样本,不设上限只是让内存白涨。
+CTX_MAX_GROUPS_PER_MARKER = 400
+
+
+def extract_context(rep):
+    """一份报告 -> {marker_id: [match_context 的 values 字典, ...]}(已按需裁剪)。
+
+    与 extract_markers 分开而不是改它的返回值:后者有三个调用方(恶意侧、正常侧、
+    正常侧重建),改签名要同时动三处,而这份证据只有推导阶段用得到。
+    """
+    out = collections.defaultdict(list)
+    b = rep.get("behaviour") or {}
+    if not isinstance(b, dict):
+        return out
+    for x in (b.get("sigma_analysis_results") or []):
+        if not isinstance(x, dict):
+            continue
+        title = (x.get("rule_title") or "").strip()
+        level = (x.get("rule_level") or "").strip().lower()
+        if not title or level not in SIGMA_LEVELS:
+            continue
+        mid = slug(SYNONYMS.get(title.lower(), title.lower()))
+        ctx = x.get("match_context")
+        if not isinstance(ctx, list):
+            continue
+        for entry in ctx[:CTX_MAX_ENTRIES_PER_SAMPLE]:
+            if not isinstance(entry, dict):
+                continue
+            vals = entry.get("values")
+            if not isinstance(vals, dict):
+                continue
+            slim = {k: vals[k] for k in CTX_KEEP_FIELDS if vals.get(k)}
+            if slim:
+                out[mid].append(slim)
+    return out
+
+
+def _slot_candidates(ev, slot, field, group):
+    """一个【样本】在某个槽位上贡献的候选片段集合(已去重 -> 一个样本一票)。
+
+    按样本取并集而不是逐条计数,是本函数存在的全部理由:一份报告里同一条 Sigma 规则
+    可能命中几百次(实测 registry_keys_set 最长 674 项),按条计数的话一个疯狂写注册表的
+    样本就能独自决定这条规则的条件,而那恰恰是最不该被当作「跨样本一致特征」的情形。
+    """
+    out = set()
+    for vals in group:
+        raw = vals.get(field)
+        if raw is None:
+            continue
+        v = _norm_value(raw)
+        if not _usable_value(v):
+            continue
+        if slot == "cmdline":
+            out |= _cmdline_candidates(v)
+        elif slot == "target" and ev in ("NetworkConnect", "DnsQuery"):
+            out |= _host_candidates(v)
+        elif slot in ("actor", "parent"):
+            # 主体只取文件名:完整路径是样本自己的落地位置,跨机器没有意义。
+            base = v.rsplit("\\", 1)[-1]
+            if len(base) >= 5 and base not in SANDBOX_BASENAMES:
+                out.add("\\" + base)
+        else:
+            out |= _path_candidates(v)
+    return out
+
+
+def derive_conditions(evidence, benign_evidence):
+    """从 match_context 推导 {marker_id: (event, cond_dict, 可读说明)}。
+
+    evidence / benign_evidence 的形状是 {marker_id: [每个样本的 values 列表, ...]} ——
+    【按样本分组】,不是拉平的。分组是承重的,理由见 _slot_candidates。
+
+    推导只在【有足够跨样本一致性】时才产出:一个片段要覆盖 ARTIFACT_MIN_RATIO 以上的
+    样本才算这条规则的特征。这是「宁可不给条件,也不给一个错条件」—— 不给条件只是少一个
+    标记,给错条件要么变死规则、要么变误报源,两种在这个引擎上都实际发生过。
+    """
+    out = {}
+    for mid, groups in evidence.items():
+        n_samples = len(groups)
+        if n_samples < 2:
+            continue                       # 单样本推不出「跨样本一致的特征」
+
+        # ---- 1) 事件类型:EventID 说了算(权威),取该标记里出现最多的那个 ----
+        eids = collections.Counter()
+        for group in groups:
+            for vals in group:
+                e = str(vals.get("EventID") or "").strip()
+                if e:
+                    eids[e] += 1
+        if not eids:
+            continue
+        ev = ""
+        for eid, _n in eids.most_common():
+            ev = SYSMON_EVENT_BY_ID.get(eid, "")
+            if ev:
+                break
+        if not ev:
+            continue                       # 磐垒没有对应的事件维度(如 PowerShell 4104)
+        slots = CTX_FIELD_BY_EVENT.get(ev)
+        if not slots:
+            continue
+
+        if n_samples < MIN_DERIVE_SAMPLES:
+            continue                       # 小样本上比例门槛形同虚设,见该常量处的说明
+
+        ben_groups = benign_evidence.get(mid) or []
+        nben = max(1, len(ben_groups))
+
+        def pick(field, slot):
+            """该槽位上最有代表性的片段,或 None。"""
+            kind = "host" if (slot == "target" and ev in ("NetworkConnect", "DnsQuery")) else slot
+            floor = n_samples * SLOT_MIN_RATIO.get(kind, 0.5)
+            votes = collections.Counter()
+            for group in groups:
+                for cnd in _slot_candidates(ev, slot, field, group):
+                    votes[cnd] += 1
+            for cnd, hits in sorted(votes.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0])):
+                if hits < floor:
+                    break                  # 已按票数降序,后面只会更低
+                low = cnd.strip("\\").lower()
+                if low in UNIVERSAL_FRAGMENTS or cnd.lower() in UNIVERSAL_FRAGMENTS:
+                    continue
+                if _machine_specific(cnd):
+                    continue
+                # 正常语料里也常见的片段一律弃用(第二道保险,主力是停用表)。
+                bhit = sum(1 for bg in ben_groups
+                           if cnd in _slot_candidates(ev, slot, field, bg))
+                if bhit / nben > ARTIFACT_MAX_BENIGN_RATIO:
+                    return None, "正常语料里也有 %d/%d" % (bhit, nben)
+                return (cnd, hits), ""
+            return None, ""
+
+        # ---- 2) 最小充分条件,而不是「把相关的都 AND 上」----
+        #
+        # 这一段的取舍是本函数最容易做错的地方,首版就做错了:它把每个能填的槽位都填上,
+        # 于是 powershell_defender_exclusion 被推成
+        #   actor=*\powershell.exe AND cmdline=*add-mppreference* AND parent=*\cmd.exe
+        # 而 cmd.exe 只是其中 37/115 个样本的父进程 —— 多出来的那个 AND 让这个标记
+        # 【比事实更窄】,直接放掉另外 68%。标记是「一个动作」,不是「一条规则」:
+        # 每多一个 AND 只可能降低召回,而精度已由「组合必须互证」那一层保证。
+        #
+        # 故:先取最有指向性的一个槽位(target / cmdline);只有当它单独还不够格
+        # (区分力 < OK)时,才补 actor / parent —— 而且那两个槽位的覆盖率门槛极高。
+        cond = {}
+        notes = []
+        primary = [(f, s) for f, s in slots if s in ("target", "cmdline")]
+        secondary = [(f, s) for f, s in slots if s in ("actor", "parent")]
+        for field, slot in primary:
+            got, why = pick(field, slot)
+            if got:
+                cnd, hits = got
+                cond[slot] = "*" + cnd + "*"
+                notes.append("%s=%s(%d/%d)" % (slot, cond[slot], hits, n_samples))
+                break                      # 一个实质条件就够
+            elif why:
+                notes.append("%s 候选被弃(%s)" % (slot, why))
+        if condition_specificity(cond)[0] < MARKER_SPEC_OK:
+            for field, slot in secondary:
+                got, why = pick(field, slot)
+                if not got:
+                    continue
+                cnd, hits = got
+                cond[slot] = "*" + cnd     # actor/parent 用后缀式
+                notes.append("%s=%s(%d/%d)" % (slot, cond[slot], hits, n_samples))
+                if condition_specificity(cond)[0] >= MARKER_SPEC_OK:
+                    break
+        if not cond:
+            continue
+        out[mid] = (ev, cond, "; ".join(notes))
+    return out
+
+
 # ---- 从一份报告里提取行为标记 ------------------------------------------------ #
 
 def extract_markers(rep):
@@ -347,6 +943,8 @@ def collect(con):
     """
     samples = []
     catalog = {}          # marker_id -> (title, level, source)
+    # marker_id -> [每个样本贡献的 match_context values 列表]。按样本分组,见 derive_conditions。
+    evidence = collections.defaultdict(list)
     skipped_platform = 0
     skipped_nobehav = 0
     total = 0
@@ -359,7 +957,8 @@ def collect(con):
             continue
         total += 1
         f = rep.get("file") or {}
-        if (f.get("type_tag") or "").lower() not in WIN_TYPES:
+        # 多字段判据,不再只看 type_tag(见 is_windows_sample 的说明)。
+        if not is_windows_sample(f):
             skipped_platform += 1
             continue
         if not _is_threat(row[0], f):
@@ -374,9 +973,14 @@ def collect(con):
             prev = catalog.get(mid)
             if prev is None or _level_rank(meta[1]) > _level_rank(prev[1]):
                 catalog[mid] = meta
+        # 条件推导的原料。在【同一次扫描里】顺便收走 —— 报告是几百 KB 的 JSON,
+        # 4600 份再解一遍纯属白花时间。
+        for mid, vals in extract_context(rep).items():
+            if vals and len(evidence[mid]) < CTX_MAX_GROUPS_PER_MARKER:
+                evidence[mid].append(vals)
         samples.append((set(marks.keys()), sample_family(rep)))
 
-    return samples, catalog, {
+    return samples, catalog, evidence, {
         "total_reports": total,
         "skipped_other_platform": skipped_platform,
         "skipped_not_threat": skipped_clean,
@@ -409,10 +1013,11 @@ def collect_benign(con, catalog):
     have = con.execute("""SELECT COUNT(*) FROM sqlite_master
                           WHERE type='table' AND name='benign_reports'""").fetchone()[0]
     if not have:
-        return [], {"benign_reports": 0, "benign_usable": 0}
+        return [], {}, {"benign_reports": 0, "benign_usable": 0}
 
     known = set(catalog.keys())
     out = []
+    evidence = collections.defaultdict(list)
     total = 0
     skipped_platform = 0
     for (rep_s,) in con.execute("SELECT report FROM benign_reports"):
@@ -422,16 +1027,24 @@ def collect_benign(con, catalog):
             continue
         total += 1
         f = rep.get("file") or {}
-        if (f.get("type_tag") or "").lower() not in WIN_TYPES:
+        if not is_windows_sample(f):
             skipped_platform += 1
             continue
         if not rep.get("behaviour_available"):
             continue
         # 只保留恶意侧也见过的标记:正常软件独有的标记不影响任何组合的区分度。
         out.append(set(extract_markers(rep).keys()) & known)
-    return out, {"benign_reports": total,
-                 "benign_other_platform": skipped_platform,
-                 "benign_usable": len(out)}
+        # 正常侧的 context 用于否掉「正常软件里也有」的候选片段。
+        # 注意 app.py 存的正常语料是 slim_benign_report 削过的,只保留了
+        # sigma_analysis_results —— 削的时候没带 match_context,所以这里通常拿不到东西。
+        # 空着也没关系:候选片段的主力过滤是 UNIVERSAL_FRAGMENTS 与沙箱停用表,
+        # 而 63 份语料本来也支撑不了「正常软件是否普遍如此」这个判断。
+        for mid, vals in extract_context(rep).items():
+            if vals:
+                evidence[mid].append(vals)
+    return out, evidence, {"benign_reports": total,
+                           "benign_other_platform": skipped_platform,
+                           "benign_usable": len(out)}
 
 
 class BenignCorpus:
@@ -498,28 +1111,134 @@ def _normalized_marker_rules():
 
 
 _MARKER_RULES_N = None
+# 由 main() 在推导完成后填入:{marker_id: (event, cond, note)}。
+# 做成模块级而不是逐层传参:resolve_mapping 有四个调用点(observable_ids / persist /
+# 统计 / 打印),逐个改签名只会让漏改某一处时静默走回旧逻辑。
+DERIVED = {}
+# {marker_id: {被判定为「填错字段」的槽位名}}。由 audit_hand_rules 填。
+HAND_BAD_SLOTS = {}
+# 槽位在 context 里对应哪个字段(按事件类型)。CTX_FIELD_BY_EVENT 的反向索引。
+SLOT_TO_CTX_FIELD = {ev: {slot: field for field, slot in pairs}
+                     for ev, pairs in CTX_FIELD_BY_EVENT.items()}
+# 手写条目里的字面片段,在对应 context 字段里的出现率低于此值即判定为「填错了字段」。
+# 取 0.10 而不是 0:沙箱取值里总有少量异常样本(如 lsass.exe 被投放到 Temp),
+# 留一点余量,免得把「基本正确但有例外」的条目也判错。
+HAND_SLOT_MIN_PRESENCE = 0.10
+
+
+def audit_hand_rules(catalog, evidence):
+    r"""拿 match_context 反向校验手写表的每个槽位,找出「字面片段填错了字段」的条目。
+
+    为什么需要:手写映射的错法不是「条件写宽了」,而是【把值放进了错误的槽位】——
+    这种错在服务端的任何统计里都看不见,只会让规则永不命中(死规则),或者让组合
+    因为「主体互相冲突」被客户端整条剔除。实测三处:
+      · unsigned_image_loaded_into_lsass_process:lsass 被填进 target,而它是 actor;
+      · files_with_system_process_name_in_unsuspected_locations:事件类型填成
+        ProcessCreate,而 context 是 EventID 11(文件创建);
+      · script_interpreter_execution_from_suspicious_folder:\Temp\ 被填进 actor,
+        而 context 里 Image 全是 System32 下的 powershell —— Temp 出现在【命令行】里。
+        后果是它与 actor=*\powershell*.exe 的标记撞成「互斥主体」,让那条 support=19
+        的 hard 组合在每个端点上都装不进去。
+      判据:该槽位的字面片段在对应 context 字段的取值里出现率 < HAND_SLOT_MIN_PRESENCE。
+    返回 {marker_id: {坏槽位...}},同时返回可读报告行供打印。
+    """
+    bad = {}
+    lines = []
+    hand = _normalized_marker_rules()
+    for mid, rule in hand.items():
+        if rule.get("unobservable"):
+            continue
+        groups = evidence.get(mid) or []
+        if len(groups) < MIN_DERIVE_SAMPLES:
+            continue                       # 样本太少,不足以判手写表错
+        ev = rule.get("event", "")
+        fields = SLOT_TO_CTX_FIELD.get(ev) or {}
+        for slot in ("actor", "target", "cmdline", "parent"):
+            pat = str(rule.get(slot) or "").strip()
+            if not pat:
+                continue
+            lits = [s.lower() for s in pat.replace("?", "*").split("*") if len(s) >= 4]
+            if not lits:
+                continue
+            field = fields.get(slot)
+            if not field:
+                # 该事件类型下这个槽位在 context 里没有对应字段 -> 无法校验,保持原状。
+                continue
+            seen = 0
+            for group in groups:
+                vals = [_norm_value(v.get(field)) for v in group if v.get(field)]
+                if any(all(l in val for l in lits) or any(l in val for l in lits)
+                       for val in vals):
+                    seen += 1
+            ratio = seen / len(groups)
+            if ratio < HAND_SLOT_MIN_PRESENCE:
+                bad.setdefault(mid, set()).add(slot)
+                lines.append("  %-58s 槽位 %-7s 「%s」在 context 的 %s 里只出现 %d/%d"
+                             % ((catalog.get(mid, (mid, "", ""))[0] or mid)[:58],
+                                slot, pat, field, seen, len(groups)))
+    return bad, lines
 
 
 def resolve_mapping(marker_id, title):
     """标记 -> (是否可观测, 事件类型, 匹配条件 JSON)。
 
-    三级:登记表命中 -> 关键词兜底(只给事件类型,标为待确认) -> 不可观测。
-    不可观测的标记仍然入库、仍参与组合统计,只是客户端拿不到匹配条件,无法自行置位。
+    四级,顺序即可信度:
+      1. MARKER_RULES 登记表 —— 人工判断优先,包括刻意标注 unobservable 的那些;
+         但若人工条目的【区分力不足】,用推导结果给它补上实质条件(见下方 augment)。
+      2. 从 match_context 推导 —— 数据说话,覆盖手写表没登记的标记。
+      3. 关键词兜底 —— 只给事件类型,不给条件(observable=0,网页上标为待确认)。
+      4. 不可观测。
+    不可观测的标记仍然入库、仍参与组合统计,只是客户端拿不到条件,无法自行置位。
     """
     global _MARKER_RULES_N
     if _MARKER_RULES_N is None:
         _MARKER_RULES_N = _normalized_marker_rules()
     rule = _MARKER_RULES_N.get(marker_id)
+    derived = DERIVED.get(marker_id)
+
     if rule:
-        # 显式标注「客户端表达不出这个条件」的标记:仍留在表里(便于下一个人看到理由,
-        # 而不是以为漏配),但不下发条件 -> 客户端不会置位它,含它的组合会被整条剔除。
-        # 之所以需要这个开关:有些 Sigma 规则的语义落在客户端没有的字段上,硬映射成近似条件
-        # 反而更糟 —— 要么永不匹配(死规则),要么过宽(误报源)。两种都实际发生过,见下方各条注释。
         if rule.get("unobservable"):
+            # 【人工标注的不可观测可以被数据推翻】,但只在推导结果确实给出实质条件时。
+            # 这正是 lsass 那条的情形:人工结论「表达不出」建立在「lsass 要填 target」
+            # 这个错误前提上,而 context 证明它属于 actor。没有推导结果时保持原状。
+            if derived:
+                ev, cond, _note = derived
+                if condition_specificity(cond)[0] >= MARKER_SPEC_OK:
+                    return _observable_or_none(ev, cond)
             return 0, rule.get("event", ""), ""
-        cond = {k: v for k, v in rule.items()
-                if k not in ("event", "unobservable", "why")}
-        return 1, rule["event"], json.dumps(cond, ensure_ascii=False)
+        cond = _strip_absent({k: v for k, v in rule.items()
+                              if k not in ("event", "unobservable", "why")})
+        ev = rule["event"]
+        # 【被 context 判定为填错字段的槽位一律去掉】。留着它只有两种结局:永不命中
+        # (死规则),或者与别的标记撞成「主体互相冲突」把整条组合剔除 —— 后者实测
+        # 让一条 support=19 的 hard 组合在每个端点上都装不进去。
+        # 去掉之后条件若不够格,下面会用推导结果补上。
+        for slot in (HAND_BAD_SLOTS.get(marker_id) or ()):
+            cond.pop(slot, None)
+        if not cond and derived:
+            # 手写条件被判全错 -> 整条改用推导结果(含它推出的事件类型)。
+            dev, dcond, _n = derived
+            if condition_specificity(dcond)[0] >= MARKER_SPEC_OK:
+                return _observable_or_none(dev, dcond)
+        spec, _why = condition_specificity(cond)
+        if spec < MARKER_SPEC_OK and derived:
+            dev, dcond, _n = derived
+            # 只在事件类型一致时合并:类型不一致说明人工表判错了维度(实测有此情形),
+            # 那种情况整条改用推导结果,而不是把两个维度的条件掺在一起。
+            if dev == ev:
+                merged = dict(cond)
+                for k, v in dcond.items():
+                    merged.setdefault(k, v)
+                if condition_specificity(merged)[0] >= MARKER_SPEC_OK:
+                    return _observable_or_none(ev, merged)
+            elif condition_specificity(dcond)[0] >= MARKER_SPEC_OK:
+                return _observable_or_none(dev, dcond)
+        return _observable_or_none(ev, cond)
+
+    if derived:
+        ev, cond, _note = derived
+        if condition_specificity(cond)[0] >= MARKER_SPEC_OK:
+            return 1, ev, json.dumps(cond, ensure_ascii=False)
 
     low = (title or "").lower()
     for words, ev in KEYWORD_EVENT_HINTS:
@@ -527,6 +1246,96 @@ def resolve_mapping(marker_id, title):
             # 只猜事件类型、不给条件:observable=0 表示「还需人工补条件」,网页上可筛出来。
             return 0, ev, ""
     return 0, "", ""
+
+
+def _observable_or_none(ev, cond):
+    # 收口处统一剥掉未启用的「不含」条件:resolve_mapping 有多条返回路径,
+    # 在每条上各剥一次必然漏掉一条,而漏掉的那条正好是最危险的半开状态。
+    cond = _strip_absent(cond)
+    """收口:【没有区分力的条件不算可观测】。
+
+    这条不变式是补上来的,因为漏了它就出过一次真事故形态:手写条目的 actor 槽位被
+    context 判定填错后被剔除,剩下一个空条件 {},却仍然以 observable=1 下发 ——
+    那是一个匹配【该类型每一条事件】的标记。它还会让多个标记的指纹撞在一起,
+    在客户端触发「证据重复」剔除(实测 redundant 从 1 条涨到 3 条),
+    表面上像是挖掘变差了,实际是这里漏了收口。
+
+    区分力为 NONE 时一律回退成不可观测:含它的组合会被客户端整条剔除,
+    这正是应有的结果 —— 宁可少一条组合,不可让恒真项冒充证据。
+    """
+    if condition_specificity(cond)[0] <= MARKER_SPEC_NONE:
+        return 0, ev, ""
+    return 1, ev, json.dumps(cond, ensure_ascii=False)
+
+
+def marker_specificity(marker_id, title):
+    """标记在【最终下发形态】下的区分力。组合能不能算互证,以此为准。"""
+    obs, _ev, cond_s = resolve_mapping(marker_id, title)
+    if not obs:
+        return MARKER_SPEC_NONE
+    try:
+        cond = json.loads(cond_s) if cond_s else {}
+    except Exception:
+        return MARKER_SPEC_NONE
+    return condition_specificity(cond)[0]
+
+
+def evidence_count(markers, catalog):
+    """一条组合里有几个标记【真的能算一份证据】(区分力 >= OK)。"""
+    n = 0
+    for m in markers:
+        title = catalog.get(m, (m, "", ""))[0]
+        if marker_specificity(m, title) >= MARKER_SPEC_OK:
+            n += 1
+    return n
+
+
+def client_would_reject(markers, catalog):
+    """客户端 applyTable 会不会把这条组合剔掉。返回原因,不剔则返回空串。
+
+    【为什么服务端要自己先算一遍】:服务端的组合数一直不等于端点的生效数 ——
+    实测 v19 服务端 32 条、客户端只装 26 条,而这 6 条的损失在服务端的任何统计、
+    网页上的任何计数里都看不见。「数字好看、实际不干活」是这个引擎反复出现的问题形态,
+    根因就是两侧各有一套判据而只有一侧被统计。
+    这里把客户端那两条【服务端可以提前算出来的】判据搬过来,使下发数 == 装载数。
+    剩下两条(标记不可观测 / 单动作)已由 obs 过滤与 MIN_EVIDENCE_MARKERS 覆盖。
+
+    判据必须与 AttackChainEngine::applyTable 逐字对齐,故这里照抄它的构造方式:
+      · 主体冲突:>=2 个互不相同的非空 actor 模式 —— 客户端按【单个进程】记账,
+        一个进程不可能同时是两个程序。
+      · 证据重复:把每个标记归约成「事件类型 + 全部条件」的指纹,去重后少于标记数,
+        说明这条组合声称的 N 个动作里有重复 —— 一个信号冒充多个。
+    """
+    conds = []
+    for m in sorted(markers):
+        title = catalog.get(m, (m, "", ""))[0]
+        obs, ev, cond_s = resolve_mapping(m, title)
+        if not obs:
+            return "unobservable"
+        try:
+            cond = json.loads(cond_s) if cond_s else {}
+        except Exception:
+            cond = {}
+        conds.append((ev, cond))
+    actors = {str(c.get("actor") or "").strip().lower() for _e, c in conds}
+    actors.discard("")
+    if len(actors) >= 2:
+        return "actor_conflict"
+    # 指纹必须与客户端逐字对齐,含「不含」条件 —— 少了它,两个只在否定条件上不同的
+    # 标记会被误判成「证据重复」,而它们判的是两件不同的事。
+    fps = {"%s|%s|%s|%s|%s|%s|%s|%s|%s" % (ev,
+                                 str(c.get("actor") or "").lower(),
+                                 str(c.get("target") or "").lower(),
+                                 str(c.get("cmdline") or "").lower(),
+                                 str(c.get("parent") or "").lower(),
+                                 "1" if c.get("unsigned") else "0",
+                                 str(c.get("cmdline_absent") or "").lower(),
+                                 str(c.get("target_absent") or "").lower(),
+                                 str(c.get("parent_absent") or "").lower())
+           for ev, c in conds}
+    if len(fps) < len(conds):
+        return "redundant"
+    return ""
 
 
 def observable_ids(catalog):
@@ -713,6 +1522,17 @@ def select_cover(samples, patterns, catalog, min_gain=1, bsup=None, btotal=0, ob
         # (实测未加此过滤时,35 条下发里 15 条如此,客户端只装载了 18 条。)
         if obs is not None and not (set(p) <= obs):
             continue
+        # 【互证闸门】与上面的可达性过滤同一个道理:一条组合若只有不足两份真证据,
+        # 它在客户端上等于「一个动作 + 一个恒真项」,而客户端会把命中登记为硬指标 ——
+        # 于是软信号被提拔成处置依据。这种组合不该占用覆盖额度,否则它会把真正能
+        # 补位的组合挤掉,自己又在下发后毫无判别力。
+        # 实测 v19:32 条下发里 9 条含零区分力标记,26 条装载组合里 12 条依赖同一条。
+        if evidence_count(p, catalog) < MIN_EVIDENCE_MARKERS:
+            continue
+        # 客户端装载时必然剔除的组合,不该占用覆盖额度 —— 它会把能补位的挤掉,
+        # 自己又在端点上被丢弃,等于白丢检出(见 client_would_reject 的说明)。
+        if client_would_reject(p, catalog):
+            continue
         # 定级要带上正常侧:被正常语料判死的组合不该进覆盖选择,否则它会占掉覆盖额度,
         # 把本来能补位的组合挤掉,最后又在 persist 里被丢弃 —— 白白丢检出。
         g = grade(p, catalog, sup, bsup.get(p, 0), btotal)
@@ -849,7 +1669,19 @@ def persist(con, catalog, df, implies, patterns, stats, benign=None, bsup=None):
     pattern_benign = {}
     capped = 0
     dropped_by_benign = 0
+    dropped_by_evidence = 0
+    dropped_client_side = {}
     for markers, (support, fams) in patterns.items():
+        # 互证闸门在这里【再挡一次】。select_cover 已经过滤过,但这是最后一道:
+        # 表是按 marker_rows 落库并下发的,任何绕过 select_cover 的调用路径
+        # (例如以后有人直接拿 deduped 去 persist)都不能把不足两份证据的组合发出去。
+        if evidence_count(markers, catalog) < MIN_EVIDENCE_MARKERS:
+            dropped_by_evidence += 1
+            continue
+        _rej = client_would_reject(markers, catalog)
+        if _rej:
+            dropped_client_side[_rej] = dropped_client_side.get(_rej, 0) + 1
+            continue
         bh = bsup.get(markers, 0)
         g = grade(markers, catalog, support, bh, btotal)
         if g == "weak":
@@ -872,6 +1704,9 @@ def persist(con, catalog, df, implies, patterns, stats, benign=None, bsup=None):
     stats["patterns_kept"] = len(pattern_rows)
     stats["benign_capped"] = capped
     stats["benign_dropped"] = dropped_by_benign
+    stats["patterns_dropped_no_evidence"] = dropped_by_evidence
+    for _k, _v in dropped_client_side.items():
+        stats["patterns_dropped_" + _k] = _v
 
     # ---- 内容指纹:只覆盖【客户端真正消费的东西】 ----
     #
@@ -967,21 +1802,98 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印结果,不写库")
     ap.add_argument("--min-support", type=int, default=MIN_SUPPORT)
     ap.add_argument("--top", type=int, default=15, help="打印前 N 条组合")
+    # 拿一份副本演练。挖掘会重写 engine_* 三张表并升版本号,而版本一升客户端就会去拉 ——
+    # 没有一个能安全试跑的入口,就等于每次改挖掘逻辑都直接拿线上端点当试验场。
+    ap.add_argument("--db", default="", help="指定数据库路径(演练用,默认读配置)")
+    ap.add_argument("--explain-derived", action="store_true",
+                    help="逐条打印从 match_context 推导出的条件及其依据")
+    # 把「服务器会下发什么」原样吐出来,不写库。
+    #
+    # 为什么必须有它:服务端的组合数不等于客户端装载数 —— applyTable 还有四条剔除判据
+    # (不可观测 / 单动作 / 主体冲突 / 证据重复)。实测 v19 服务端 32 条、客户端只装 26 条,
+    # 而那 6 条的损失在服务端的任何统计里都看不见。没有这个出口,「改完之后端点上到底
+    # 有几条生效」只能等上线后去客户端日志里数。
+    ap.add_argument("--emit-payload", default="",
+                    help="把下发用的 JSON 写到指定文件(不写库),供客户端装载模拟")
     args = ap.parse_args()
 
-    db = load_db_path()
+    db = args.db or load_db_path()
     con = sqlite3.connect(db, timeout=30)
 
-    samples, catalog, stats = collect(con)
+    samples, catalog, evidence, stats = collect(con)
     if not samples:
         print("没有可用样本(归档里没有带沙箱行为的 Windows 报告)。")
         return 1
 
     # 正常语料。没有也能跑 —— 全部区分度逻辑在 n=0 时自动退化为「不生效」,
     # 结果与加入本机制之前完全一致,不会因为语料还没攒起来就把规则库砍空。
-    benign_sets, bstats = collect_benign(con, catalog)
+    benign_sets, benign_ctx, bstats = collect_benign(con, catalog)
     stats.update(bstats)
     benign = BenignCorpus(benign_sets)
+
+    # ---- 从 match_context 推导条件(本次升级的核心,见该函数上方的长注释)----
+    # 必须在任何 resolve_mapping 调用【之前】填好 DERIVED:observable_ids / select_cover /
+    # persist 都会经它判定,填晚了就会有一部分判定走回旧的手写表结果。
+    global DERIVED, HAND_BAD_SLOTS
+    DERIVED = derive_conditions(evidence, benign_ctx)
+    # 手写表校验要在 DERIVED 之后、任何 resolve_mapping 之前:被判错的槽位要靠
+    # 推导结果补位,顺序颠倒就会先按错条件算出一批判定。
+    HAND_BAD_SLOTS, _hand_bad_lines = audit_hand_rules(catalog, evidence)
+    stats["hand_rules_mismapped"] = sum(len(v) for v in HAND_BAD_SLOTS.values())
+    if _hand_bad_lines:
+        print("=" * 66)
+        print("手写映射表校验:以下槽位的字面片段在 match_context 里几乎不出现,")
+        print("判定为【填错了字段】,已剔除该槽位(必要时改用推导结果)")
+        print("=" * 66)
+        for ln in _hand_bad_lines:
+            print(ln)
+        print()
+    stats["markers_with_context"] = len(evidence)
+    stats["markers_derived"] = len(DERIVED)
+    # 手写表覆盖不到、纯靠推导才可观测的标记数 —— 这个数字就是本次升级解开的天花板。
+    _hand = _normalized_marker_rules()
+    stats["markers_derived_new"] = sum(1 for m in DERIVED if m not in _hand)
+    spec_hist = collections.Counter()
+    for mid, (title, _lv, _src) in catalog.items():
+        spec_hist[marker_specificity(mid, title)] += 1
+    stats["markers_spec_none"] = spec_hist[MARKER_SPEC_NONE]
+    stats["markers_spec_weak"] = spec_hist[MARKER_SPEC_WEAK]
+    stats["markers_spec_ok"] = spec_hist[MARKER_SPEC_OK]
+
+    if args.explain_derived:
+        # 打印【最终决定】而不是 DERIVED 的原始内容:两者可以不同(手写表优先、
+        # 事件类型不一致时整条换用推导结果),只看原始内容会误以为推导直接生效了。
+        print("=" * 66)
+        print("标记的最终下发形态(手写表 / 推导 / 兜底 三者裁决之后)")
+        print("=" * 66)
+        rows = []
+        for mid, (title, lv, _src) in catalog.items():
+            obs, ev, cond_s = resolve_mapping(mid, title)
+            try:
+                cond = json.loads(cond_s) if cond_s else {}
+            except Exception:
+                cond = {}
+            spec, why = condition_specificity(cond) if obs else (MARKER_SPEC_NONE, "不可观测")
+            src = "手写表" if mid in _hand else ("推导" if mid in DERIVED else "兜底")
+            # 样本数用推导原料的分组数:df 要等归约之后才算出来,而这里只是排序用的量级。
+            rows.append((spec, -len(evidence.get(mid) or []), mid, title,
+                         obs, ev, cond, why, src))
+        rows.sort(key=lambda r: (-r[0], r[1], r[2]))
+        for spec, negn, mid, title, obs, ev, cond, why, src in rows:
+            if not obs:
+                continue
+            print("\n[区分力 %d · 来源 %s · %d 样本] %s" % (spec, src, -negn, title))
+            print("    id     %s" % mid)
+            print("    event  %s" % ev)
+            print("    cond   %s" % json.dumps(cond, ensure_ascii=False, sort_keys=True))
+            print("    评估   %s" % why)
+            if mid in DERIVED:
+                print("    推导依据 %s" % DERIVED[mid][2])
+        print("\n---- 不可观测(客户端无法置位,含它的组合会被整条剔除)----")
+        for spec, negn, mid, title, obs, ev, cond, why, src in rows:
+            if obs:
+                continue
+            print("    %5d 样本  %-52s %s" % (-negn, title[:52], src))
 
     generic = drop_generic(samples, catalog, GENERIC_DF_RATIO)
     ben_generic = drop_benign_generic(samples, benign, BENIGN_GENERIC_RATIO)
@@ -1034,6 +1946,12 @@ def main():
     for k, v in stats.items():
         print("  %-26s %s" % (k, v))
     print("  分级:", dict(graded))
+    # 互证闸门的效果单独说清楚 —— 它是本次升级里唯一会【减少】下发条数的改动,
+    # 不写明白就会被当成「挖掘退化了」。
+    _blocked = [p for p in deduped
+                if evidence_count(p, catalog) < MIN_EVIDENCE_MARKERS]
+    print("  互证闸门:去冗余后 %d 条里有 %d 条不足 %d 份真证据(含恒真/软信号标记),"
+          "已挡在覆盖选择之外" % (len(deduped), len(_blocked), MIN_EVIDENCE_MARKERS))
     if not benign.usable:
         print("  ⚠ 正常样本语料 %d 个,不足 %d —— 区分度【未参与】定级。"
               "组合只由恶意侧证据定档,无法判断是否误伤正常软件。"
@@ -1064,6 +1982,47 @@ def main():
         for m in sorted(markers):
             title, level, source = catalog.get(m, (m, "?", "?"))
             print("      · [%-8s] %s" % (level, title))
+
+    if args.emit_payload:
+        # 形状必须与 app.py 的 Store.engine_patterns() 逐字段一致 —— 这份 JSON 的用途是
+        # 拿客户端的装载判据去过它,形状对不上就白测了。
+        # 同样要过一遍互证闸门,否则吐出来的不是「会被存下来的那张表」。
+        emit_pats = []
+        used = set()
+        for markers, (support, fams) in sorted(patterns.items(),
+                                               key=lambda kv: sorted(kv[0])):
+            if evidence_count(markers, catalog) < MIN_EVIDENCE_MARKERS:
+                continue
+            g = g_of(markers, support)
+            if g == "weak":
+                continue
+            lv = max((_level_rank(catalog.get(m, ("", "", ""))[1]) for m in markers),
+                     default=0)
+            ids = sorted(markers)
+            used.update(ids)
+            emit_pats.append({
+                "markers": ids, "n": len(ids), "support": support, "grade": g,
+                "max_level": {3: "critical", 2: "high", 1: "medium"}.get(lv, "medium"),
+                "families": ", ".join(fams), "benign_support": bsup.get(markers, 0),
+            })
+        emit_mk = {}
+        for mid in sorted(used):
+            title, level, source = catalog.get(mid, (mid, "medium", "sigma"))
+            obs, ev, cond_s = resolve_mapping(mid, title)
+            try:
+                cond = json.loads(cond_s) if cond_s else {}
+            except Exception:
+                cond = {}
+            emit_mk[mid] = {"title": title, "level": level, "source": source,
+                            "samples": df.get(mid, 0),
+                            "benign_samples": int((benign.df or {}).get(mid, 0)),
+                            "observable": bool(obs), "event": ev, "match": cond}
+        payload = {"version": 0, "label": "(dry-run)", "unchanged": False,
+                   "patterns": emit_pats, "markers": emit_mk}
+        with open(args.emit_payload, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print("\n已写出下发 JSON:%s(%d 条组合 / %d 个标记)"
+              % (args.emit_payload, len(emit_pats), len(emit_mk)))
 
     if args.dry_run:
         print("\n(dry-run:未写库)")

@@ -48,21 +48,64 @@ int gradeRank(const QString& g) {
     return 0;
 }
 
+// 档位内按支持度加分的两个常数。
+//
+// 服务器的分档门槛是 10 / 8 / 5 个样本(SUPPORT_FOR_HARD / STRONG / ASK),实测下发的
+// 支持度大多落在 5~40 之间,故步长取 3 才有区分度(取 8 的话典型值只能加 0~1 分,等于没做)。
+constexpr int kSupportPerPoint = 3;    // 超出本档门槛每 3 个样本 +1 分
+constexpr int kMaxSupportBonus = 20;   // 加分上限
+
 // 组合命中该加多少分。依据 ThreatDetector 的既有阈值(HighRisk=80 / Suspicious=50),
 // 让「服务器给出的强度」直接落到「既有流水线的处置档位」上,不另立一套判定标准:
 //   hard   -> 80: 独立即可触达高危 -> 流水线判 Block(服务器口径:>=3 动作 + 含高危 + >=10 样本作证)
-//   strong -> 55: 落在可疑档     -> 判 Ask
-//   ask    -> 50: 恰好可疑档      -> 判 Ask
-int gradeScore(const QString& g) {
-    if (g == QLatin1String("hard")) return bulwark::engine::ThreatDetector::HighRisk;
-    if (g == QLatin1String("strong")) return bulwark::engine::ThreatDetector::Suspicious + 5;
-    return bulwark::engine::ThreatDetector::Suspicious;
+//   strong -> 55 起: 落在可疑档     -> 判 Ask
+//   ask    -> 50 起: 恰好可疑档      -> 判 Ask
+//
+// ---- 为什么要把 support 算进来 ----
+// support(多少真实样本为这条组合作证)一路从服务器带到客户端、写进证据文案,却对分数
+// 【毫无影响】—— 一条 200 个样本作证的组合与一条勉强够 5 个的完全同分。而这两者的可信度
+// 显然不同,「有多少真实样本作证」本来就是本引擎唯一的置信来源。
+//
+// ---- 为什么必须硬钳位 ----
+// 非 hard 档一律钳在 HighRisk - 1(79)。79 跨到 80 就是「询问」变「拦截」,那是实质的处置
+// 变更,不是打分微调。支持度多寡绝不该让一条 ask/strong 组合【单凭自己】越过闸门 ——
+// 它仍然只能靠与其它独立指标互证(analyze 里 score += chainScore 之后还会叠加各自的信号)
+// 才可能到 80,而那正是本产品的互证模型要的效果。
+// hard 档保持恒定 80:它本就直接 Block,再加分不改变任何行为。
+int gradeScore(const QString& g, int support) {
+    using bulwark::engine::ThreatDetector;
+    if (g == QLatin1String("hard"))
+        return ThreatDetector::HighRisk;
+
+    int base, floorSupport;
+    if (g == QLatin1String("strong")) {
+        base = ThreatDetector::Suspicious + 5;   // 55
+        floorSupport = 8;                        // 服务器 SUPPORT_FOR_STRONG
+    } else {
+        base = ThreatDetector::Suspicious;       // 50
+        floorSupport = 5;                        // 服务器 SUPPORT_FOR_ASK
+    }
+    const int bonus =
+        std::clamp((support - floorSupport) / kSupportPerPoint, 0, kMaxSupportBonus);
+    // 钳位:非 hard 档永远到不了 HighRisk。
+    return std::min(base + bonus, ThreatDetector::HighRisk - 1);
 }
 
 QString gradeLabel(const QString& g) {
     if (g == QLatin1String("hard")) return QStringLiteral("可直接阻断");
     if (g == QLatin1String("strong")) return QStringLiteral("阻断或强提示");
     return QStringLiteral("弹窗询问");
+}
+
+// 降一档,以 ask 为地板。
+//
+// 刻意【不】降到「丢弃」:降档的依据(正常软件里见过 / 靠稀疏事件点亮)说明的是
+// 「不该凭它直接拦」,不是「这条组合没用」。降到 ask 仍然会弹窗问用户,检出不丢;
+// 直接丢掉才是真的损失检出,而那属于服务器侧 _cap_by_benign 的职责(它有完整语料可依)。
+QString downgradeGrade(const QString& g) {
+    if (g == QLatin1String("hard")) return QStringLiteral("strong");
+    if (g == QLatin1String("strong")) return QStringLiteral("ask");
+    return QStringLiteral("ask");
 }
 
 // ---- 可达性诊断用的小工具 ---------------------------------------------------- #
@@ -115,6 +158,24 @@ bool watchSetCovers(const QString& targetPattern, const QStringList& watch) {
 
 } // namespace
 
+// ============================== ChainMarker ==================================
+
+bool ChainMarker::matchesEvent(const bulwark::SecurityEvent& e) const {
+    if (!matcher.matches(e))
+        return false;
+    // 「不含」条件:命中即判否。用同一个 wildcardMatch,不引入第二套通配语义。
+    if (!cmdlineAbsent.isEmpty()
+        && bulwark::DefenseRule::wildcardMatch(cmdlineAbsent, e.commandLine))
+        return false;
+    if (!targetAbsent.isEmpty()
+        && bulwark::DefenseRule::wildcardMatch(targetAbsent, e.target))
+        return false;
+    if (!parentAbsent.isEmpty()
+        && bulwark::DefenseRule::wildcardMatch(parentAbsent, e.parentPath))
+        return false;
+    return true;
+}
+
 // ============================ ChainHitRecord =================================
 
 QJsonObject ChainHitRecord::toJson() const {
@@ -122,10 +183,16 @@ QJsonObject ChainHitRecord::toJson() const {
     o[QStringLiteral("whenUtc")] = whenUtc.toUTC().toString(Qt::ISODate);
     o[QStringLiteral("actorPath")] = actorPath;
     o[QStringLiteral("actorPid")] = actorPid;
+    // 组合的稳定标识。排查「哪条组合在刷误报」只能靠它 —— titles 里的标题来自 Sigma
+    // 规则名,服务器改名后整段历史就与新表对不上号(见 ChainHitRecord::patternKey)。
+    o[QStringLiteral("patternKey")] = patternKey;
     o[QStringLiteral("titles")] = QJsonArray::fromStringList(titles);
     o[QStringLiteral("grade")] = grade;
+    o[QStringLiteral("serverGrade")] = serverGrade;
+    o[QStringLiteral("capReason")] = capReason;
     o[QStringLiteral("maxLevel")] = maxLevel;
     o[QStringLiteral("support")] = support;
+    o[QStringLiteral("benignSupport")] = benignSupport;
     o[QStringLiteral("families")] = families;
     o[QStringLiteral("dryRun")] = dryRun;
     o[QStringLiteral("action")] = action;
@@ -141,11 +208,19 @@ ChainHitRecord ChainHitRecord::fromJson(const QJsonObject& o) {
         r.whenUtc.setTimeZone(QTimeZone::UTC);
     r.actorPath = o.value(QLatin1String("actorPath")).toString();
     r.actorPid = o.value(QLatin1String("actorPid")).toInt();
+    r.patternKey = o.value(QLatin1String("patternKey")).toString();
     for (const QJsonValue& v : o.value(QLatin1String("titles")).toArray())
         r.titles << v.toString();
     r.grade = o.value(QLatin1String("grade")).toString();
+    // 老记录没有这两个字段(本版之前落的盘):serverGrade 缺失时退回 grade,
+    // 使「grade != serverGrade 即说明本机压过档」这个判据对老记录不会给出假阳。
+    r.serverGrade = o.value(QLatin1String("serverGrade")).toString();
+    if (r.serverGrade.isEmpty())
+        r.serverGrade = r.grade;
+    r.capReason = o.value(QLatin1String("capReason")).toString();
     r.maxLevel = o.value(QLatin1String("maxLevel")).toString();
     r.support = o.value(QLatin1String("support")).toInt();
+    r.benignSupport = o.value(QLatin1String("benignSupport")).toInt();
     r.families = o.value(QLatin1String("families")).toString();
     r.dryRun = o.value(QLatin1String("dryRun")).toBool(true);
     r.action = o.value(QLatin1String("action")).toString();
@@ -155,9 +230,14 @@ ChainHitRecord ChainHitRecord::fromJson(const QJsonObject& o) {
 
 // ============================ AttackChainEngine ==============================
 
-AttackChainEngine::AttackChainEngine(const AttackChainOptions& opt) : opt_(opt) {
-    cachePath_ = QDir(programDataDir()).filePath(QStringLiteral("attackchain.json"));
-    hitsPath_ = QDir(programDataDir()).filePath(QStringLiteral("attackchain_hits.jsonl"));
+AttackChainEngine::AttackChainEngine(const AttackChainOptions& opt,
+                                     const QString& dataDirOverride) : opt_(opt) {
+    // 留空 -> %ProgramData%\Bulwark(生产路径)。非空仅用于回归测试的状态隔离,
+    // 见头文件里 dataDirOverride 的说明。
+    const QString dir = dataDirOverride.trimmed().isEmpty() ? programDataDir()
+                                                            : dataDirOverride.trimmed();
+    cachePath_ = QDir(dir).filePath(QStringLiteral("attackchain.json"));
+    hitsPath_ = QDir(dir).filePath(QStringLiteral("attackchain_hits.jsonl"));
     loadHits();
 }
 
@@ -191,10 +271,14 @@ ChainHitRecord AttackChainEngine::recordHit(const ChainHit& hit, const bulwark::
     r.whenUtc = QDateTime::currentDateTimeUtc();
     r.actorPath = e.actorPath;
     r.actorPid = e.actorPid;
+    r.patternKey = hit.pattern.key;
     r.titles = hit.titles;
     r.grade = hit.pattern.grade;
+    r.serverGrade = hit.pattern.serverGrade;
+    r.capReason = hit.pattern.capReason;
     r.maxLevel = hit.pattern.maxLevel;
     r.support = hit.pattern.support;
+    r.benignSupport = hit.pattern.benignSupport;
     r.families = hit.pattern.families;
     r.dryRun = opt_.DryRun;
     r.action = action;
@@ -318,6 +402,11 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         cm.matcher.commandLinePattern = cond.value(QLatin1String("cmdline")).toString();
         cm.matcher.parentPattern    = cond.value(QLatin1String("parent")).toString();
         cm.matcher.requireUnsigned  = cond.value(QLatin1String("unsigned")).toBool();
+        // 「不含」条件(见 ChainMarker 的说明)。老服务器不下发这几个键时为空 -> 不限,
+        // 行为与本字段加入之前逐字节相同。
+        cm.cmdlineAbsent = cond.value(QLatin1String("cmdline_absent")).toString();
+        cm.targetAbsent  = cond.value(QLatin1String("target_absent")).toString();
+        cm.parentAbsent  = cond.value(QLatin1String("parent_absent")).toString();
         // expiresUtc 保持未设置:一旦有值,matches() 会在到期后静默恒假,标记再也不会置位。
         cm.matcher.action = bulwark::VerdictAction::Ask; // 占位,本引擎不用它的 action
         cm.matcher.note = QStringLiteral("[攻击链标记] ") + cm.title;
@@ -393,14 +482,21 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         {
             QSet<QString> fingerprints;
             for (const QString& id : cp.markers) {
-                const bulwark::DefenseRule& r = marks.value(id).matcher;
-                fingerprints.insert(QStringLiteral("%1|%2|%3|%4|%5|%6")
+                const ChainMarker& cmk = marks.value(id);
+                const bulwark::DefenseRule& r = cmk.matcher;
+                // 指纹【必须带上「不含」条件】。否则两个只在「不含」上不同的标记会被
+                // 归约成同一个指纹 —— 而它们其实判的是两件不同的事(有 -k / 没有 -k),
+                // 结果是整条组合被误当成「证据重复」剔除。
+                fingerprints.insert(QStringLiteral("%1|%2|%3|%4|%5|%6|%7|%8|%9")
                                         .arg(r.type ? static_cast<int>(*r.type) : -1)
                                         .arg(r.actorPattern.toLower(),
                                              r.targetPattern.toLower(),
                                              r.commandLinePattern.toLower(),
                                              r.parentPattern.toLower())
-                                        .arg(r.requireUnsigned ? 1 : 0));
+                                        .arg(r.requireUnsigned ? 1 : 0)
+                                        .arg(cmk.cmdlineAbsent.toLower(),
+                                             cmk.targetAbsent.toLower(),
+                                             cmk.parentAbsent.toLower()));
             }
             if (fingerprints.size() < cp.markers.size()) {
                 ++redundant;
@@ -409,8 +505,14 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         }
 
         cp.markers.sort();
+        // 去重键在此算一次,而不是在每次「组合凑齐」判定里现拼(见 ChainPattern::key)。
+        cp.key      = cp.markers.join(QLatin1Char('|'));
         cp.support  = p.value(QLatin1String("support")).toInt();
-        cp.grade    = grade;
+        // serverGrade 保存原始强度;grade 是生效强度,稍后由 regradeLocked 从 serverGrade 推出。
+        cp.serverGrade = grade;
+        cp.grade       = grade;
+        // 服务器一直在下发这个字段,此前解析时被丢掉了(见 ChainPattern::benignSupport)。
+        cp.benignSupport = p.value(QLatin1String("benign_support")).toInt();
         cp.maxLevel = p.value(QLatin1String("max_level")).toString();
         cp.families = p.value(QLatin1String("families")).toString();
         pats.append(cp);
@@ -421,6 +523,7 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
                                     "保持原表不变。").arg(parr.size()));
         return false;
     }
+    int capped = 0;   // 本机降档的组合数(由下面持锁段里的 regradeLocked 填)
 
     // ---- 建索引:标记 -> 含该标记的组合 ----
     // 组合只可能在「某个标记刚刚置位」时才新凑齐,故每条事件只需检查含新置位标记的那几条组合,
@@ -430,9 +533,21 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         for (const QString& id : pats[i].markers)
             idx[id].append(i);
 
+    // ---- 按事件类型给标记分桶(热路径用)----
+    // observe() 每条事件只需要试同类型的那一桶,不必遍历全表(见 markersByType_ 的说明)。
+    // 与上面的 idx 一并在此重建,保证两份索引和 marks 永远同源。
+    QHash<int, QVector<ChainMarker>> byType;
+    for (auto it = marks.constBegin(); it != marks.constEnd(); ++it) {
+        const ChainMarker& m = it.value();
+        // 装载时已要求 event 名可解析(解析失败的标记在上面被 continue 掉),故此处必有值。
+        byType[static_cast<int>(m.matcher.type.value_or(bulwark::EventType::ProcessCreate))]
+            .append(m);
+    }
+
     {
         QMutexLocker lk(&tableLock_);
-        markers_  = std::move(marks);
+        markers_       = std::move(marks);
+        markersByType_ = std::move(byType);
         patterns_ = std::move(pats);
         index_    = std::move(idx);
         version_  = ver;
@@ -440,6 +555,10 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         srvPatterns_   = parr.size();
         dropConflict_  = unreachable;
         dropRedundant_ = redundant;
+        // 立刻按已知的覆盖面 / 正常语料定档。首次装表时覆盖面通常还不知道(要等
+        // derivedRegistryWatch 之后),那时这里只应用正常语料那条;调用方随后调
+        // setCoverage 会再算一遍(幂等,见 regradeLocked)。
+        capped = regradeLocked();
     }
 
     // 落盘:下次启动 / 断网期间仍有表可用。
@@ -450,7 +569,7 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
         f.close();
     }
 
-    log_.info(QStringLiteral("攻击链组合表已装载:版本 %1,组合 %2 条,可观测标记 %3 个%4%5%6。")
+    log_.info(QStringLiteral("攻击链组合表已装载:版本 %1,组合 %2 条,可观测标记 %3 个%4%5%6%7。")
                   .arg(versionLabel()).arg(patternCount()).arg(markerCount())
                   .arg(unreachable > 0
                            ? QStringLiteral(",已剔除主体冲突(单进程不可能命中)的组合 %1 条")
@@ -460,9 +579,87 @@ bool AttackChainEngine::applyTable(const QJsonObject& payload) {
                            ? QStringLiteral(",已剔除证据重复(多个标记条件相同,不构成互证)的组合 %1 条")
                                  .arg(redundant)
                            : QString())
+                  .arg(capped > 0
+                           ? QStringLiteral(",已按本机情况降档 %1 条").arg(capped)
+                           : QString())
                   .arg(opt_.DryRun ? QStringLiteral("(dry-run:只记录不影响裁决)")
                                    : QStringLiteral("(强制生效)")));
     return true;
+}
+
+// 按「正常语料出现率」与「本机可观测性」重算生效强度。只降不升。
+//
+// 幂等的关键:每次都从 serverGrade 重新算,而不是在当前 grade 上继续降 —— 否则
+// applyTable 与 setCoverage 各调一次就会把同一条组合降两档。
+int AttackChainEngine::regradeLocked() {
+    // 每个标记只判一次(一个标记会出现在多条组合里)。无覆盖面时整段跳过。
+    QHash<QString, MarkerReach> reach;
+    if (haveCoverage_) {
+        for (auto it = markers_.constBegin(); it != markers_.constEnd(); ++it)
+            reach.insert(it.key(), classifyMarker(it.value(), coverage_).reach);
+    }
+
+    int capped = 0;
+    for (ChainPattern& p : patterns_) {
+        QString g = p.serverGrade;
+        QStringList why;
+
+        // ---- 1) 正常软件语料里见过 -> 不许「不问就拦」 ----
+        //
+        // 与服务端 _cap_by_benign 的第一条规则同口径(hits > 0 即封顶到 strong),所以
+        // 【幂等】:服务端有语料时它已经降过了,这里的判定自然不成立,不会重复降;
+        // 服务端语料不足 BENIGN_MIN_CORPUS 而整个环节空转时,这里补上那一刀。
+        if (p.benignSupport > 0 && g == QLatin1String("hard")) {
+            g = downgradeGrade(g);
+            why << QStringLiteral("正常软件语料中出现过 %1 次").arg(p.benignSupport);
+        }
+
+        // ---- 2) 靠稀疏事件点亮的组合,实际强度不到服务器给的档 ----
+        //
+        // 服务器给 hard 的含义是「>=3 动作 + 含高危 + >=10 样本作证」,而这个信心【隐含假设
+        // 那些动作会被可靠观测到】。本机的观测能力是本地事实:一个建立在「驱动偏移 0 写的
+        // 全局 1/32 采样」或「模块加载只在 \Temp\ 与 \Users\Public\ 才上报」之上的动作,
+        // 单次发生被看到的概率远小于 1,那么「凑齐即定性」的前提就不成立 —— 它更可能是
+        // 「恰好被采到的那一次」,而不是「这个进程确实把这几件事都做了」。
+        //
+        // 只看 Sparse,不看 Dead:含 Dead 标记的组合永远凑不齐,降不降档都不会命中,
+        // 由可达性诊断如实报出即可(analyzeReachability),不必在这里动它。
+        if (!reach.isEmpty()) {
+            QStringList sparseTitles;
+            for (const QString& id : p.markers) {
+                if (reach.value(id, MarkerReach::Reachable) != MarkerReach::Sparse)
+                    continue;
+                const auto mi = markers_.constFind(id);
+                sparseTitles << (mi != markers_.constEnd() && !mi->title.isEmpty() ? mi->title : id);
+            }
+            if (!sparseTitles.isEmpty()) {
+                g = downgradeGrade(g);
+                why << QStringLiteral("依赖本机稀疏事件(%1)").arg(sparseTitles.join(QStringLiteral("、")));
+            }
+        }
+
+        p.grade = g;
+        p.capReason = why.join(QStringLiteral(";"));
+        if (g != p.serverGrade)
+            ++capped;
+    }
+    return capped;
+}
+
+int AttackChainEngine::setCoverage(const CoverageProfile& cov) {
+    int capped = 0, total = 0;
+    {
+        QMutexLocker lk(&tableLock_);
+        coverage_ = cov;
+        haveCoverage_ = true;
+        capped = regradeLocked();
+        total = patterns_.size();
+    }
+    if (capped > 0)
+        log_.info(QStringLiteral("攻击链:按本机可观测性与正常语料,%1/%2 条组合的生效强度已下调"
+                                 "(只降不升 —— 服务器的强度假设动作会被可靠观测到,而本机能不能"
+                                 "可靠看到是本地事实)。").arg(capped).arg(total));
+    return capped;
 }
 
 bool AttackChainEngine::loadFromDisk() {
@@ -489,27 +686,55 @@ QVector<int> AttackChainEngine::patternsFor(const QString& markerId) const {
 void AttackChainEngine::evictIfNeeded() {
     // 没有「进程已退出」事件可依赖(ProcessTerminate 只表示"有人要求结束"),所以记账无法在
     // 进程消失时精确回收 —— 只能按时间窗淘汰 + 容量兜底,与 ProcessChainTracker 同一取舍。
+    //
+    // ---- 触发节流(这一段是本函数能不能真正起作用的关键)----
+    //
+    // 遍历整张记账表不该每条事件都做;但原实现把本函数放在 observe() 的【末尾】、两处
+    // early-return 之后,等于「只有组合命中时才淘汰」—— 而组合命中是罕见事件(那正是本
+    // 引擎存在的意义)。后果:LedgerRetentionMinutes(30 分钟)与 LedgerMaxProcesses(4096)
+    // 这两个配置项从未真正生效,记账表实际是只增不减的,一台机器跑一天就攒下当天出现过的
+    // 每一个 PID;而真的有组合命中时,又要在持锁的裁决前置路径上一次性排序整张巨表。
+    //
+    // 现在由调用方【无条件】调用、节流判定收在这里:
+    //   · 每 kEvictEveryEvents 条事件跑一次(常态);
+    //   · 一旦已经超过容量上限就立即跑,不等计数(异常突发时的兜底,size() 是 O(1),免费)。
+    const int cap = std::max(64, opt_.LedgerMaxProcesses);
+    const bool overCap = ledger_.size() > cap;
+    if (!overCap && ++sinceEvict_ < kEvictEveryEvents)
+        return;
+    sinceEvict_ = 0;
+
+    // 按【不活动时长】淘汰,而不是按建账时长(见 ProcLedger::lastSeen 的说明):
+    // 原先用 firstSeen,等于把长驻进程的证据每 30 分钟无条件抹一次,慢速攻击链永远凑不齐。
     const QDateTime cutoff =
         QDateTime::currentDateTimeUtc().addSecs(-60LL * std::max(1, opt_.LedgerRetentionMinutes));
     for (auto it = ledger_.begin(); it != ledger_.end(); ) {
-        if (it.value().firstSeen < cutoff)
+        // lastSeen 为空 = 老版本留下的账(或尚未置位过标记),退回 firstSeen 判定。
+        const QDateTime anchor =
+            it.value().lastSeen.isValid() ? it.value().lastSeen : it.value().firstSeen;
+        if (anchor < cutoff)
             it = ledger_.erase(it);
         else
             ++it;
     }
-    const int cap = std::max(64, opt_.LedgerMaxProcesses);
     if (ledger_.size() <= cap)
         return;
-    // 仍超容量:按最早首见逐个淘汰(而不是清空 —— 清空会把正在进行中的攻击链证据一起丢掉)。
+    // 仍超容量:按「最久没有活动」淘汰(LRU),而不是按建账最早 —— 后者会优先丢掉长驻
+    // 进程正在累积的链条,恰好是最该留住的那些。也绝不清空:清空会把全部进行中的证据一起丢。
+    // 用 nth_element 而非全排序:这里只需要知道「最旧的 excess 个是谁」,不需要把整张表排好序,
+    // O(n) 就够,而全排序是 O(n log n) 且发生在持锁的裁决前置路径上。
+    const int excess = ledger_.size() - cap;
     QVector<QPair<QDateTime, int>> byAge;
     byAge.reserve(ledger_.size());
     for (auto it = ledger_.constBegin(); it != ledger_.constEnd(); ++it)
-        byAge.append({ it.value().firstSeen, it.key() });
-    std::sort(byAge.begin(), byAge.end(),
-              [](const QPair<QDateTime, int>& a, const QPair<QDateTime, int>& b) {
-                  return a.first < b.first;
-              });
-    for (int i = 0; i < byAge.size() && ledger_.size() > cap; ++i)
+        byAge.append({ it.value().lastSeen.isValid() ? it.value().lastSeen
+                                                     : it.value().firstSeen,
+                       it.key() });
+    std::nth_element(byAge.begin(), byAge.begin() + excess, byAge.end(),
+                     [](const QPair<QDateTime, int>& a, const QPair<QDateTime, int>& b) {
+                         return a.first < b.first;
+                     });
+    for (int i = 0; i < excess; ++i)
         ledger_.remove(byAge[i].second);
 }
 
@@ -517,70 +742,95 @@ std::optional<ChainHit> AttackChainEngine::observe(const bulwark::SecurityEvent&
     if (!opt_.Enabled || e.actorPid <= 0)
         return std::nullopt;
 
-    // 先在锁内把「本次命中的标记」摘出来,随后的记账与组合检查都不再持锁。
-    QStringList newlySet;
-    QVector<ChainPattern> candidates;
-    QHash<QString, QString> titleOf;
-    {
-        QMutexLocker lk(&tableLock_);
-        if (patterns_.isEmpty())
-            return std::nullopt;
+    // 全程持锁。淘汰必须在【持锁】状态做:它会 erase/remove ledger_(可能重排哈希桶、
+    // 释放节点)。只要有第二个线程读 ledger_(UI 的攻击链页面就会经 IPC 读
+    // trackedProcessCount),锁外操作就是无保护的并发读写,后果是堆被写坏而且崩在
+    // 毫不相干的地方。
+    QMutexLocker lk(&tableLock_);
+    if (patterns_.isEmpty())
+        return std::nullopt;
 
-        ProcLedger& led = ledger_[e.actorPid];
-        const QString key = e.actorPath.toLower();
-        if (led.firstSeen.isNull()) {
-            led.actorKey = key;
-            led.firstSeen = QDateTime::currentDateTimeUtc();
-        } else if (!key.isEmpty() && !led.actorKey.isEmpty() && led.actorKey != key) {
-            // 同一 PID 换了映像 = PID 被复用(Windows 会回收 PID)。旧账必须清掉,
-            // 否则前一个进程的动作会被算到新进程头上 —— 那是最典型的误报来源。
-            led = ProcLedger{};
-            led.actorKey = key;
-            led.firstSeen = QDateTime::currentDateTimeUtc();
-        }
+    // 淘汰放在最前面、【无条件调用】—— 节流判定收在 evictIfNeeded 内部。
+    // 原先它挂在本函数末尾、两处 early-return 之后,只有组合命中时才跑,而命中是罕见的;
+    // 结果保留窗口与容量上限从未生效。详见 evictIfNeeded 开头的说明。
+    evictIfNeeded();
 
-        for (auto it = markers_.constBegin(); it != markers_.constEnd(); ++it) {
-            const ChainMarker& m = it.value();
-            if (led.markers.contains(m.id))
-                continue;                       // 已置位,不必重复判定
-            if (!m.matcher.matches(e))
-                continue;
-            led.markers.insert(m.id);
-            newlySet << m.id;
-        }
-        if (newlySet.isEmpty())
-            return std::nullopt;                // 没有新证据 -> 组合状态不可能改变
+    const QString key = e.actorPath.toLower();
 
-        // 只检查「含刚置位标记」的组合(见 index_ 的说明)。
-        QSet<int> toCheck;
-        for (const QString& id : newlySet)
-            for (int i : patternsFor(id))
-                toCheck.insert(i);
-
-        for (int i : toCheck) {
-            const ChainPattern& p = patterns_[i];
-            bool complete = true;
-            for (const QString& id : p.markers)
-                if (!led.markers.contains(id)) { complete = false; break; }
-            if (!complete)
-                continue;
-            const QString fired = p.markers.join(QLatin1Char('|'));
-            if (led.firedPatterns.contains(fired))
-                continue;                       // 同一进程同一组合只报一次
-            led.firedPatterns.insert(fired);
-            candidates.append(p);
-        }
-        if (candidates.isEmpty())
-            return std::nullopt;
-
-        for (auto it = markers_.constBegin(); it != markers_.constEnd(); ++it)
-            titleOf.insert(it.key(), it.value().title);
-
-        // 淘汰必须在【持锁】状态做:它会 erase/remove ledger_(可能重排哈希桶、释放节点)。
-        // 原来放在锁外 —— 只要有第二个线程读 ledger_(UI 的攻击链页面就会经 IPC 读
-        // trackedProcessCount),就是无保护的并发读写,后果是堆被写坏而且崩在毫不相干的地方。
-        evictIfNeeded();
+    // PID 复用检测必须在「用旧标记集去跳过重复判定」【之前】做,否则会拿上一个进程的
+    // 标记集来过滤本进程的匹配。
+    // 这里用 find() 而不是 operator[]:后者会为不存在的键默认插入(见下方记账处的说明)。
+    auto ledIt = ledger_.find(e.actorPid);
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    if (ledIt != ledger_.end() && !key.isEmpty() && !ledIt->actorKey.isEmpty()
+        && ledIt->actorKey != key) {
+        // 同一 PID 换了映像 = PID 被复用(Windows 会回收 PID)。旧账必须清掉,
+        // 否则前一个进程的动作会被算到新进程头上 —— 那是最典型的误报来源。
+        *ledIt = ProcLedger{};
+        ledIt->actorKey = key;
+        ledIt->firstSeen = nowUtc;
+        ledIt->lastSeen = nowUtc;
     }
+
+    // 本次事件命中了哪些【尚未置位】的标记。只试与本条事件同类型的那一桶
+    // (见 markersByType_ 的说明:类型不符的标记在 matches() 第三步必然返回假)。
+    const auto typeIt = markersByType_.constFind(static_cast<int>(e.type));
+    if (typeIt == markersByType_.constEnd())
+        return std::nullopt;                // 本事件类型下没有任何标记 -> 不可能有新证据
+    const QSet<QString>* already = (ledIt != ledger_.end()) ? &ledIt->markers : nullptr;
+
+    QStringList newlySet;
+    for (const ChainMarker& m : typeIt.value()) {
+        if (already && already->contains(m.id))
+            continue;                       // 已置位,不必重复判定
+        // matchesEvent 而不是 matcher.matches:后者不含「不含」条件(见 ChainMarker)。
+        if (!m.matchesEvent(e))
+            continue;
+        newlySet << m.id;
+    }
+    if (newlySet.isEmpty())
+        return std::nullopt;                // 没有新证据 -> 组合状态不可能改变
+
+    // ---- 到这里才真正写记账表 ----
+    //
+    // 原实现一进函数就 `ProcLedger& led = ledger_[e.actorPid];`,而 QHash::operator[] 会为
+    // 不存在的键【默认插入】一项。于是每个产生过任意事件的 PID 都会留下一条记账,哪怕它
+    // 一个标记都没命中 —— 而绝大多数进程正是如此。配合上面那个「淘汰几乎不跑」的问题,
+    // 这就是一条纯泄漏:内存随开机时长单调增长,trackedProcessCount() 报的数字也失真
+    //(它本该是「正在被记账的可疑进程数」,实际成了「开机以来见过的 PID 数」)。
+    ProcLedger& led = (ledIt != ledger_.end()) ? ledIt.value() : ledger_[e.actorPid];
+    if (led.firstSeen.isNull()) {
+        led.actorKey = key;
+        led.firstSeen = nowUtc;
+    }
+    // lastSeen 只在【确实置位了标记】时前移(此处已确认 newlySet 非空)—— 保留窗口因此是
+    // 「距上次可疑动作」而不是「距上次任何事件」,忙碌但正常的进程照旧会到期淘汰。
+    led.lastSeen = nowUtc;
+    for (const QString& id : newlySet)
+        led.markers.insert(id);
+
+    // 只检查「含刚置位标记」的组合(见 index_ 的说明)。
+    QSet<int> toCheck;
+    for (const QString& id : newlySet)
+        for (int i : patternsFor(id))
+            toCheck.insert(i);
+
+    QVector<ChainPattern> candidates;
+    for (int i : toCheck) {
+        const ChainPattern& p = patterns_[i];
+        bool complete = true;
+        for (const QString& id : p.markers)
+            if (!led.markers.contains(id)) { complete = false; break; }
+        if (!complete)
+            continue;
+        // p.key 在装载时算好(见 ChainPattern::key)—— 不在这里现拼字符串。
+        if (led.firedPatterns.contains(p.key))
+            continue;                       // 同一进程同一组合只报一次
+        led.firedPatterns.insert(p.key);
+        candidates.append(p);
+    }
+    if (candidates.isEmpty())
+        return std::nullopt;
 
     // 同时凑齐多条时取最强的一条上报(强度 -> 动作数 -> 支持度)。
     std::sort(candidates.begin(), candidates.end(),
@@ -593,8 +843,12 @@ std::optional<ChainHit> AttackChainEngine::observe(const bulwark::SecurityEvent&
 
     ChainHit hit;
     hit.pattern = candidates.first();
-    for (const QString& id : hit.pattern.markers)
-        hit.titles << titleOf.value(id, id);
+    // 只取【命中那一条】用到的标题(2~4 个)。原实现在这里把全表标记的标题拷进一个临时
+    // QHash 再查,命中一次就白拷一遍整张表。
+    for (const QString& id : hit.pattern.markers) {
+        const auto mi = markers_.constFind(id);
+        hit.titles << (mi != markers_.constEnd() ? mi->title : id);
+    }
     return hit;
 }
 
@@ -682,10 +936,58 @@ QPair<int, int> AttackChainEngine::verdictPathSelfTest(QStringList* outDetail) c
                               .arg(ok ? QStringLiteral("通过") : QStringLiteral("失败")).arg(what);
     };
 
+    // ---- 支持度加分的钳位不变量 ----
+    //
+    // 这是本批改动里【唯一可能让处置变强】的一处,所以必须有一条断言钉住它:
+    // 无论支持度多大,非 hard 档的分数都不得达到 HighRisk。否则「弹窗询问」会在某个
+    // 支持度之上悄悄变成「直接拦截」—— 那是实质的处置变更,不是打分微调。
+    for (const char* g : { "ask", "strong" }) {
+        const int extreme = gradeScore(QString::fromLatin1(g), 100000);
+        check(extreme < ThreatDetector::HighRisk,
+              QStringLiteral("[%1] 支持度极大时分数 %2 仍 < 高危阈值 %3(钳位生效)")
+                  .arg(QLatin1String(g)).arg(extreme).arg(ThreatDetector::HighRisk));
+    }
+    // 支持度确实参与打分(否则等于这条改动没生效)。
+    check(gradeScore(QStringLiteral("ask"), 60) > gradeScore(QStringLiteral("ask"), 5),
+          QStringLiteral("[ask] 支持度高的组合得分高于勉强达标的"));
+
+    // ---- 降档不是装饰 ----
+    //
+    // 降一档,且以 ask 为地板(不降到「丢弃」——那会真的丢检出,见 downgradeGrade)。
+    check(downgradeGrade(QStringLiteral("hard")) == QLatin1String("strong")
+              && downgradeGrade(QStringLiteral("strong")) == QLatin1String("ask")
+              && downgradeGrade(QStringLiteral("ask")) == QLatin1String("ask"),
+          QStringLiteral("降档链 hard->strong->ask,并以 ask 为地板"));
+
+    // 【这条是关键】打分必须用【生效】强度,不能用服务器原始强度。
+    // 若日后有人把 applyHitToEvent 里的 hit.pattern.grade 改回 serverGrade,
+    // 全套降档就变成纯装饰 —— 组合照样按 hard 直接拦,而降档理由还照样写在证据里。
+    // 这里造一条「服务器给 hard、本机已降到 strong」的命中,断言它拿不到 80。
+    if (!opt_.DryRun) {
+        ChainHit capped;
+        capped.pattern.serverGrade = QStringLiteral("hard");
+        capped.pattern.grade       = QStringLiteral("strong");   // 本机降档后
+        capped.pattern.support     = 12;
+        capped.pattern.capReason   = QStringLiteral("自测:模拟本机降档");
+        capped.pattern.markers = QStringList{ QStringLiteral("a"), QStringLiteral("b") };
+        capped.titles = QStringList{ QStringLiteral("动作甲"), QStringLiteral("动作乙") };
+
+        bulwark::SecurityEvent ce;
+        ce.type = bulwark::EventType::ProcessCreate;
+        ce.actorPid = 999002;
+        ce.actorPath = QStringLiteral("C:\\x\\selftest.exe");
+        ce.actorSigned = true;
+        applyHitToEvent(ce, capped);
+        check(ce.chainScore < ThreatDetector::HighRisk,
+              QStringLiteral("降档后的组合按生效强度打分(%1 < %2),不会仍按服务器的 hard 直接拦")
+                  .arg(ce.chainScore).arg(ThreatDetector::HighRisk));
+    }
+
     // 造一条最小的合成命中,逐档验证贡献能不能活过 analyze 并触达闸门。
     for (const char* g : { "ask", "strong", "hard" }) {
         ChainHit hit;
         hit.pattern.grade = QString::fromLatin1(g);
+        hit.pattern.serverGrade = hit.pattern.grade;   // 未降档
         hit.pattern.support = 12;
         hit.pattern.markers = QStringList{ QStringLiteral("a"), QStringLiteral("b") };
         hit.titles = QStringList{ QStringLiteral("动作甲"), QStringLiteral("动作乙") };
@@ -697,7 +999,7 @@ QPair<int, int> AttackChainEngine::verdictPathSelfTest(QStringList* outDetail) c
         e.actorSigned = true;   // 刻意给「签名健康」,确保分数只可能来自组合命中
 
         applyHitToEvent(e, hit);
-        const int wantScore = gradeScore(hit.pattern.grade);
+        const int wantScore = gradeScore(hit.pattern.grade, hit.pattern.support);
         if (opt_.DryRun) {
             check(!e.chainHardIndicator && e.chainScore == 0,
                   QStringLiteral("[%1] dry-run 下不产生任何裁决贡献").arg(QLatin1String(g)));
@@ -928,6 +1230,11 @@ QVector<ChainMarker> AttackChainEngine::markerSnapshot() const {
     return out;
 }
 
+QVector<ChainPattern> AttackChainEngine::patternSnapshot() const {
+    QMutexLocker lk(&tableLock_);
+    return patterns_;
+}
+
 ReachabilityReport AttackChainEngine::analyzeReachability(const CoverageProfile& cov) const {
     ReachabilityReport rep;
     QVector<ChainPattern> pats;
@@ -1026,11 +1333,22 @@ void AttackChainEngine::applyHitToEvent(bulwark::SecurityEvent& e, const ChainHi
     // hasThreatIndicator、并用赋值覆盖 riskScore。早先这里直接写那两个字段,结果贡献被
     // 全部擦掉 —— 组合表上线后一次都没生效过。addEvidence 的 scoreDelta 也只进证据链、
     // 不改 riskScore(见 SecurityEvent::addEvidence 的注释),所以光传它同样没有作用。
-    const int add = gradeScore(hit.pattern.grade);
+    // 分数按【生效】强度算,并在档位内计入支持度(见 gradeScore 的说明)。
+    // 生效强度可能已被本机降档 —— 用 serverGrade 打分就等于把降档白做了。
+    const int add = gradeScore(hit.pattern.grade, hit.pattern.support);
     e.chainHardIndicator = true;
     e.chainScore = qMax(e.chainScore, add);   // 同一事件命中多条时取最强的一条,不叠加
+
+    // 降过档就把原因写进证据。否则服务器页面上这条组合显示 hard、端点上却只是询问,
+    // 看的人无从解释这个差异,只会当成 bug 去查。
+    const QString capNote =
+        hit.pattern.capReason.isEmpty()
+            ? QString()
+            : QStringLiteral("(服务器定级 ") + gradeLabel(hit.pattern.serverGrade)
+                  + QStringLiteral(",本机下调:") + hit.pattern.capReason + QStringLiteral(")");
     e.addEvidence(QStringLiteral("AttackChain"), bulwark::EvidenceKind::HardIndicator,
-                  base + QStringLiteral(" [") + gradeLabel(hit.pattern.grade) + QStringLiteral("]"),
+                  base + QStringLiteral(" [") + gradeLabel(hit.pattern.grade) + QStringLiteral("]")
+                      + capNote,
                   add);
 }
 

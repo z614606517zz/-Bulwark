@@ -2,11 +2,38 @@
 ; Bulwark.inf - 磐垒主动防御内核驱动安装信息
 ; 这是一个借用 Filter Manager 通信端口的轻量过滤驱动 + 进程创建回调。
 ;
+; =====================================================================
+;  这个文件到底给谁用(先说清楚,否则很容易改错地方)
+;  ------------------------------------------------------------------
+;  1) 【正式签名的必备件】。把驱动提交到 Microsoft 硬件开发中心(Partner Center)
+;     做 attestation 签名时,CAB 里必须含 .inf,且 HDC 会用 InfVerif 校验它:
+;     Desktop 规则集(/k)+ 驱动隔离规则集(/h)。任一条报 Error,提交直接被退回,
+;     驱动拿不到微软签名 —— 也就永远只能靠 testsigning 在自己机器上跑。
+;     所以这个文件的正确性直接决定产品能不能发出去。
+;  2) 手工右键安装的备用路径。
+;
+;  产品运行时【不走 INF 安装】:DriverControl.cpp::ensureRegistered() 和
+;  packaging\portable-scripts\bulwark.ps1 都是 sc create + reg add 直接注册的。
+;  故本文件的改动不影响已部署机器的行为,只影响「能否提交签名」和「右键安装」。
+;
+;  【编码】UTF-8 无 BOM。SetupAPI 只认 ANSI 与 UTF-16LE 两种编码,所以:
+;     · 注释里的中文在安装时会被按 ANSI 解读(乱码,但注释不参与安装,无害);
+;     · [Strings] 里的【值】故意全用 ASCII —— 它们会进 services.msc 显示,
+;       用中文就会显示成乱码。要用中文描述,得先把整个文件转成 UTF-16LE(带 BOM)。
+;
+;  改完务必本地先过一遍(WDK 自带,零 Error 才提交):
+;     infverif /k Bulwark.Driver\Bulwark.inf
+;     infverif /h Bulwark.Driver\Bulwark.inf
+; =====================================================================
+;
 
 [Version]
 Signature   = "$Windows NT$"
 Class       = "ActivityMonitor"
-ClassGuid   = {b86dff51-a31d-4f34-1f76-fa75d6f1a0b7}
+; FSFilter Activity Monitor 的注册类 GUID。原值 {b86dff51-a31d-4f34-1f76-fa75d6f1a0b7}
+; 是拼错的(系统里没有注册这个类),右键"安装"会失败。正确值可在目标机上核对:
+;   HKLM\SYSTEM\CurrentControlSet\Control\Class\<GUID>\Class == "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
 Provider    = %ProviderName%
 DriverVer   = 06/06/2026,1.0.0.0
 CatalogFile = Bulwark.cat
@@ -14,21 +41,56 @@ PnpLockdown = 1
 
 [DestinationDirs]
 DefaultDestDir          = 12
-Bulwark.DriverFiles   = 12            ; %windir%\system32\drivers
+Bulwark.DriverFiles     = 12            ; %windir%\system32\drivers
+; 说明:驱动隔离的终极形态是 DIRID 13(驱动存储,run-from-DriverStore)。这里刻意
+; 保留 12,因为整个产品(stageDriverBinary、自保护足迹、bulwark.ps1、诊断脚本)都按
+; %SystemRoot%\System32\drivers\Bulwark.sys 这个路径写死。改 13 是一次跨模块重构,
+; 不该混在「让签名提交通过」这件事里做。当前 infverif /h 接受 12(DIRID 限制只在
+; /w 规则集里才是 Error);若 HDC 将来收紧,改这两行 + ServiceBinary 即可。
 
+; =====================================================================
+;  安装段:按 OS 版本分成两套,不是冗余,是为了两头都不掉
+;  ------------------------------------------------------------------
+;  minifilter 的实例配置(DefaultInstance / Altitude / Flags)从 Windows 11 24H2
+;  起要求写在服务键的 Parameters 子键下面;写在老位置会被 InfVerif /h 判为
+;  ERROR(1323) "must be under the Parameters subkey",提交过不去。
+;
+;  但老位置不能直接扔掉:24H2 之前的 FltMgr 只认 Services\<name>\Instances。
+;  只写 Parameters 的话,在 Win10 上右键安装会「装上了、服务在、但过滤器附不到卷」
+;  —— 驱动看着加载成功,文件防护静默失效。这正是本项目最不能接受的那类失败。
+;
+;  所以用 TargetOSVersion 装饰把两套隔开:SetupAPI 取最具体的匹配段,
+;  26100(24H2)及以上走 Parameters 那套,更老的系统落回未装饰的老位置那套。
+;  两套 AddReg 分处不同的 ServiceInstall 段,InfVerif 才不会把老位置也一起查。
+; =====================================================================
+
+; ---- 24H2 及以上(驱动隔离合规写法) ----
+[DefaultInstall.NTamd64.10.0...26100]
+OptionDesc  = %ServiceDesc%
+CopyFiles   = Bulwark.DriverFiles
+
+[DefaultInstall.NTamd64.10.0...26100.Services]
+AddService  = %ServiceName%,,Bulwark.Service
+
+; ---- 24H2 之前(老位置,保住 Win10 的右键安装) ----
 [DefaultInstall.NTamd64]
 OptionDesc  = %ServiceDesc%
 CopyFiles   = Bulwark.DriverFiles
 
 [DefaultInstall.NTamd64.Services]
-AddService  = %ServiceName%,,Bulwark.Service
+AddService  = %ServiceName%,,Bulwark.Service.Legacy
 
+; DefaultUninstall 自 Win10 1903 起原则上被禁止(primitive driver 不该自带卸载段),
+; LegacyUninstall=1 是官方留的例外:声明「这段只在老平台用」,新平台走 pnputil 卸载。
+; 少了这一行就是 ERROR(1422),/k 和 /h 都会拦。
 [DefaultUninstall.NTamd64]
-DelFiles    = Bulwark.DriverFiles
+LegacyUninstall = 1
+DelFiles    = Bulwark.DelFiles
 
 [DefaultUninstall.NTamd64.Services]
 DelService  = %ServiceName%,0x200       ; SPSVCINST_STOPSERVICE
 
+; ---- ServiceInstall:两段只差 AddReg 指向的位置 ----
 [Bulwark.Service]
 DisplayName     = %ServiceName%
 Description     = %ServiceDesc%
@@ -40,12 +102,37 @@ ErrorControl    = 1                      ; SERVICE_ERROR_NORMAL
 LoadOrderGroup  = "FSFilter Activity Monitor"
 AddReg          = Bulwark.AddRegistry
 
+[Bulwark.Service.Legacy]
+DisplayName     = %ServiceName%
+Description     = %ServiceDesc%
+ServiceBinary   = %12%\Bulwark.sys
+Dependencies    = "FltMgr"
+ServiceType     = 2
+StartType       = 1
+ErrorControl    = 1
+LoadOrderGroup  = "FSFilter Activity Monitor"
+AddReg          = Bulwark.AddRegistry.Legacy
+
+; 24H2+:实例配置在 Parameters 子键下。
 [Bulwark.AddRegistry]
+HKR,"Parameters\Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Parameters\Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
+HKR,"Parameters\Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
+
+; 24H2 之前:老位置。这与 DriverControl.cpp / bulwark.ps1 运行时写的位置一致
+; (它们写的是 Services\Bulwark\Instances)—— 换句话说,产品当前的注册方式仍走老位置,
+; 而老位置在 24H2 上依然被 FltMgr 接受,所以运行时无需跟着这次改动动刀。
+[Bulwark.AddRegistry.Legacy]
 HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
 HKR,"Instances\"%Instance1.Name%,"Altitude",0x00000000,%Instance1.Altitude%
 HKR,"Instances\"%Instance1.Name%,"Flags",0x00010001,%Instance1.Flags%
 
+; CopyFiles 与 DelFiles 必须用两个不同的段(同一个段被两种指令引用会得到
+; WARNING(1205);HDC 对警告宽容,但没理由留着)。
 [Bulwark.DriverFiles]
+Bulwark.sys
+
+[Bulwark.DelFiles]
 Bulwark.sys
 
 [SourceDisksFiles]
@@ -54,10 +141,11 @@ Bulwark.sys = 1,,
 [SourceDisksNames]
 1 = %DiskId1%,,,
 
+; [Strings] 的值全部 ASCII —— 见文件头「编码」一节。
 [Strings]
 ProviderName        = "Bulwark"
 ServiceName         = "Bulwark"
-ServiceDesc         = "磐垒主动防御内核驱动"
+ServiceDesc         = "Bulwark Active Defense kernel driver"
 DiskId1             = "Bulwark Installation Disk"
 DefaultInstance     = "Bulwark Instance"
 Instance1.Name      = "Bulwark Instance"

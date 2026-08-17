@@ -1,0 +1,24 @@
+[Unit]
+Description=Bulwark master dashboard (read-only view of ingest batches / source nodes / inventory)
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bulwarkintel
+Group=bulwarkintel
+Environment=BULWARK_MDASH_HOST=0.0.0.0
+Environment=BULWARK_MDASH_PORT=8789
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/master_dash.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Read-only by design: a reporting service must not be able to corrupt the master DB.
+ReadOnlyPaths=/var/lib/bulwark-intel /etc/bulwark-intel
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

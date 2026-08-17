@@ -157,6 +157,32 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::AttackChainResponse:
         emit attackChainReceived(msg->payloadAs<AttackChainResponsePayload>());
         break;
+    // ---- 在线更新 ----
+    case IpcMessageType::UpdateCheckResponse:
+        emit updateCheckReceived(msg->payloadAs<UpdateCheckResponsePayload>());
+        break;
+    case IpcMessageType::UpdateProgressNotification:
+        emit updateProgress(msg->payloadAs<UpdateProgressPayload>());
+        break;
+    case IpcMessageType::UpdateDownloadResponse:
+        emit updateDownloadFinished(msg->payloadAs<UpdateDownloadResponsePayload>());
+        break;
+    case IpcMessageType::UpdateApplyResponse:
+        emit updateApplyFinished(msg->payloadAs<UpdateApplyResponsePayload>());
+        break;
+    // ---- 磁盘垃圾清理 ----
+    case IpcMessageType::JunkScanResponse:
+        emit junkScanReceived(msg->payloadAs<JunkScanResponsePayload>());
+        break;
+    case IpcMessageType::JunkCleanResponse:
+        emit junkCleanDone(msg->payloadAs<JunkCleanResponsePayload>());
+        break;
+    case IpcMessageType::JunkProgressNotification:
+        emit junkProgress(msg->payloadAs<JunkProgressPayload>());
+        break;
+    case IpcMessageType::LargeFileScanResponse:
+        emit largeFilesReceived(msg->payloadAs<LargeFileScanResponsePayload>());
+        break;
     case IpcMessageType::VtScanUpdate:
         emit vtScanUpdate(msg->payloadAs<bulwark::VtScanRecord>());
         break;
@@ -340,6 +366,48 @@ void IpcClient::requestAttackChain()
 void IpcClient::clearAttackChainHits()
 {
     send(IpcMessage::create(IpcMessageType::AttackChainClearRequest, {}));
+}
+
+void IpcClient::checkForUpdate()
+{
+    send(IpcMessage::create(IpcMessageType::UpdateCheckRequest, {}));
+}
+
+void IpcClient::downloadUpdate()
+{
+    send(IpcMessage::create(IpcMessageType::UpdateDownloadRequest, {}));
+}
+
+void IpcClient::applyUpdate()
+{
+    send(IpcMessage::create(IpcMessageType::UpdateApplyRequest, {}));
+}
+
+QUuid IpcClient::requestJunkScan(const QList<int>& categories, int minAgeHours)
+{
+    JunkScanRequestPayload p;
+    p.categories = categories;
+    p.minAgeHours = minAgeHours;
+    send(IpcMessage::from(IpcMessageType::JunkScanRequest, p));
+    return p.requestId;
+}
+
+QUuid IpcClient::requestJunkClean(const QList<int>& categories, int minAgeHours)
+{
+    JunkCleanRequestPayload p;
+    p.categories = categories;
+    p.minAgeHours = minAgeHours;
+    send(IpcMessage::from(IpcMessageType::JunkCleanRequest, p));
+    return p.requestId;
+}
+
+QUuid IpcClient::requestLargeFiles(qint64 minBytes, int limit)
+{
+    LargeFileScanRequestPayload p;
+    p.minBytes = minBytes;
+    p.limit = limit;
+    send(IpcMessage::from(IpcMessageType::LargeFileScanRequest, p));
+    return p.requestId;
 }
 
 void IpcClient::manualQuarantine(const QString& path)

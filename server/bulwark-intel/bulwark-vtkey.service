@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply VT API key requests from the dashboard (validates, then restarts bulwark-intel)
+
+[Service]
+Type=oneshot
+# root: it rewrites 640 root:bulwarkintel config.json and restarts a unit. The
+# dashboard deliberately does NOT have either capability -- it only drops a
+# request file into a spool directory it owns.
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-vtkey.py
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true
+# Not ProtectSystem=strict: this needs to write /etc/bulwark-intel/config.json.
+ProtectSystem=full
+ReadWritePaths=/etc/bulwark-intel /var/lib/bulwark-intel
+MemoryMax=128M

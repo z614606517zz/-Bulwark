@@ -43,6 +43,8 @@ qt_add_executable(bulwark_service
     src/reputation/ThreatFoxFeed.cpp
     # 攻击链组合引擎:下载服务器挖出的行为组合表 + 给每个进程记账 + 凑齐即喂证据
     src/AttackChainEngine.cpp
+    # 在线更新:取清单 + 下载 + 四道校验(名字白名单/大小/SHA-256/签名指纹钉死)
+    src/UpdateService.cpp
     # monitoring (Authenticode/PE/hash forensics + process control)
     src/monitoring/ProcessInspector.cpp
     # monitoring: 进程启动来源溯源(PID -> 具体服务名 / 具体计划任务名)+ 在跑进程快照
@@ -54,6 +56,8 @@ qt_add_executable(bulwark_service
     src/ThreatRemediator.cpp
     # persistence audit (read-only enumeration of 7 autostart points + risk scoring)
     src/PersistenceScanner.cpp
+    # 磁盘垃圾清理:编译期固定的类别/根目录表 + 扫描 + 删除,七道安全护栏见 JunkCleaner.h
+    src/JunkCleaner.cpp
     # ipc + orchestration (Q_OBJECT headers listed so AUTOMOC processes them)
     include/bulwark/service/EventSource.h
     include/bulwark/service/EtwProcessEventSource.h
@@ -107,7 +111,9 @@ if(WIN32)
     # ole32/uuid/oleaut32: COM + IShellLink (UserModeBehaviorSource resolves startup .lnk
     #   targets) + ITaskService (ProcessOriginResolver matches a PID to its scheduled task;
     #   oleaut32 provides VariantInit/SysFreeString used on that path).
-    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32)
+    # shell32: SHQueryRecycleBin / SHEmptyRecycleBin (JunkCleaner 的回收站维度 —— 刻意走
+    #   Shell API 而不是手工遍历 $Recycle.Bin,见 JunkCleaner.h 的产品决定)。
+    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32 shell32)
 endif()
 
 target_compile_features(bulwark_service PRIVATE cxx_std_20)

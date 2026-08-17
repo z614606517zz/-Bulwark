@@ -834,3 +834,302 @@ AttackChainResponsePayload AttackChainResponsePayload::fromJson(const QJsonObjec
 }
 
 } // namespace bulwark::ipc
+
+// ===== 在线更新 =====
+// 大小走 double:QJsonValue 没有独立的 64 位整型,qint64 一律经 double 存取。
+// 载荷大小是几 MB 量级,远在 double 能精确表示整数的范围(2^53)之内。
+
+namespace bulwark::ipc {
+
+QJsonObject UpdateCheckResponsePayload::toJson() const {
+    QJsonArray arr;
+    for (const UpdateFileBrief& f : files) {
+        QJsonObject o;
+        o[QStringLiteral("name")] = f.name;
+        o[QStringLiteral("size")] = static_cast<double>(f.size);
+        arr.append(o);
+    }
+    QJsonObject o;
+    o[QStringLiteral("ok")] = ok;
+    o[QStringLiteral("available")] = available;
+    o[QStringLiteral("error")] = error;
+    o[QStringLiteral("currentVersion")] = currentVersion;
+    o[QStringLiteral("version")] = version;
+    o[QStringLiteral("label")] = label;
+    o[QStringLiteral("notes")] = notes;
+    o[QStringLiteral("publishedUtc")] = publishedUtc;
+    o[QStringLiteral("endpointMasked")] = endpointMasked;
+    o[QStringLiteral("totalBytes")] = static_cast<double>(totalBytes);
+    o[QStringLiteral("files")] = arr;
+    return o;
+}
+
+UpdateCheckResponsePayload UpdateCheckResponsePayload::fromJson(const QJsonObject& o) {
+    UpdateCheckResponsePayload p;
+    p.ok = o.value(QStringLiteral("ok")).toBool();
+    p.available = o.value(QStringLiteral("available")).toBool();
+    p.error = o.value(QStringLiteral("error")).toString();
+    p.currentVersion = o.value(QStringLiteral("currentVersion")).toString();
+    p.version = o.value(QStringLiteral("version")).toString();
+    p.label = o.value(QStringLiteral("label")).toString();
+    p.notes = o.value(QStringLiteral("notes")).toString();
+    p.publishedUtc = o.value(QStringLiteral("publishedUtc")).toString();
+    p.endpointMasked = o.value(QStringLiteral("endpointMasked")).toString();
+    p.totalBytes = static_cast<qint64>(o.value(QStringLiteral("totalBytes")).toDouble());
+    for (const QJsonValue& v : o.value(QStringLiteral("files")).toArray()) {
+        const QJsonObject f = v.toObject();
+        UpdateFileBrief b;
+        b.name = f.value(QStringLiteral("name")).toString();
+        b.size = static_cast<qint64>(f.value(QStringLiteral("size")).toDouble());
+        p.files.append(b);
+    }
+    return p;
+}
+
+QJsonObject UpdateProgressPayload::toJson() const {
+    QJsonObject o;
+    o[QStringLiteral("done")] = done;
+    o[QStringLiteral("total")] = total;
+    o[QStringLiteral("fileName")] = fileName;
+    o[QStringLiteral("stage")] = stage;
+    return o;
+}
+
+UpdateProgressPayload UpdateProgressPayload::fromJson(const QJsonObject& o) {
+    UpdateProgressPayload p;
+    p.done = o.value(QStringLiteral("done")).toInt();
+    p.total = o.value(QStringLiteral("total")).toInt();
+    p.fileName = o.value(QStringLiteral("fileName")).toString();
+    p.stage = o.value(QStringLiteral("stage")).toString();
+    return p;
+}
+
+QJsonObject UpdateDownloadResponsePayload::toJson() const {
+    QJsonObject o;
+    o[QStringLiteral("ok")] = ok;
+    o[QStringLiteral("error")] = error;
+    o[QStringLiteral("version")] = version;
+    o[QStringLiteral("stagingDir")] = stagingDir;
+    o[QStringLiteral("verified")] = verified;
+    return o;
+}
+
+UpdateDownloadResponsePayload UpdateDownloadResponsePayload::fromJson(const QJsonObject& o) {
+    UpdateDownloadResponsePayload p;
+    p.ok = o.value(QStringLiteral("ok")).toBool();
+    p.error = o.value(QStringLiteral("error")).toString();
+    p.version = o.value(QStringLiteral("version")).toString();
+    p.stagingDir = o.value(QStringLiteral("stagingDir")).toString();
+    p.verified = o.value(QStringLiteral("verified")).toInt();
+    return p;
+}
+
+QJsonObject UpdateApplyResponsePayload::toJson() const {
+    QJsonObject o;
+    o[QStringLiteral("ok")] = ok;
+    o[QStringLiteral("error")] = error;
+    o[QStringLiteral("version")] = version;
+    o[QStringLiteral("replaced")] = replaced;
+    o[QStringLiteral("rolledBack")] = rolledBack;
+    o[QStringLiteral("needsRestart")] = needsRestart;
+    return o;
+}
+
+UpdateApplyResponsePayload UpdateApplyResponsePayload::fromJson(const QJsonObject& o) {
+    UpdateApplyResponsePayload p;
+    p.ok = o.value(QStringLiteral("ok")).toBool();
+    p.error = o.value(QStringLiteral("error")).toString();
+    p.version = o.value(QStringLiteral("version")).toString();
+    p.replaced = o.value(QStringLiteral("replaced")).toInt();
+    p.rolledBack = o.value(QStringLiteral("rolledBack")).toBool();
+    // 默认 true:老服务端不下发这个字段时,「需要重启才生效」是安全的一侧 ——
+    // 反过来会让界面宣称已经在跑新版,而实际上没有。
+    p.needsRestart = o.value(QStringLiteral("needsRestart")).toBool(true);
+    return p;
+}
+
+// ===== 磁盘垃圾清理 =====
+
+QJsonObject JunkScanRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    if (!categories.isEmpty()) o["categories"] = intListToArray(categories);
+    o["minAgeHours"] = minAgeHours;
+    return o;
+}
+JunkScanRequestPayload JunkScanRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    JunkScanRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.categories = intListFromArray(o.value(QLatin1String("categories")).toArray());
+    p.minAgeHours = getInt(o, "minAgeHours");
+    return p;
+}
+
+QJsonObject JunkScanResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray arr;
+    for (const bulwark::JunkCategoryResult& c : categories) arr.append(c.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["scannedUtc"] = dateTimeToIso(scannedUtc);
+    o["enabled"] = enabled;
+    o["categories"] = arr;
+    o["totalBytes"] = static_cast<double>(totalBytes);
+    o["totalFiles"] = totalFiles;
+    o["minAgeHours"] = minAgeHours;
+    o["truncated"] = truncated;
+    o["unreadable"] = unreadable;
+    o["elapsedMs"] = static_cast<double>(elapsedMs);
+    o["message"] = message;
+    return o;
+}
+JunkScanResponsePayload JunkScanResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    JunkScanResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.scannedUtc = dateTimeFromIso(getStr(o, "scannedUtc"));
+    p.enabled = getBool(o, "enabled", true);
+    for (const QJsonValue& v : o.value(QLatin1String("categories")).toArray())
+        if (v.isObject()) p.categories.append(bulwark::JunkCategoryResult::fromJson(v.toObject()));
+    p.totalBytes = getI64(o, "totalBytes");
+    p.totalFiles = getInt(o, "totalFiles");
+    p.minAgeHours = getInt(o, "minAgeHours");
+    p.truncated = getBool(o, "truncated");
+    p.unreadable = getInt(o, "unreadable");
+    p.elapsedMs = getI64(o, "elapsedMs");
+    p.message = getStr(o, "message");
+    return p;
+}
+
+QJsonObject JunkCleanRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    // 清理请求刻意【无条件】写出 categories,即便为空 —— 空数组在这里是有含义的
+    // (「什么都不清理」),不能靠键缺失来表达,否则解析侧分不清「没选」和「旧版本没这个字段」。
+    o["categories"] = intListToArray(categories);
+    o["minAgeHours"] = minAgeHours;
+    return o;
+}
+JunkCleanRequestPayload JunkCleanRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    JunkCleanRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.categories = intListFromArray(o.value(QLatin1String("categories")).toArray());
+    p.minAgeHours = getInt(o, "minAgeHours");
+    return p;
+}
+
+QJsonObject JunkCleanResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray arr;
+    for (const bulwark::JunkCleanOutcome& c : outcomes) arr.append(c.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["finishedUtc"] = dateTimeToIso(finishedUtc);
+    o["success"] = success;
+    o["outcomes"] = arr;
+    o["freedBytes"] = static_cast<double>(freedBytes);
+    o["deletedFiles"] = deletedFiles;
+    o["skipped"] = skipped;
+    o["message"] = message;
+    return o;
+}
+JunkCleanResponsePayload JunkCleanResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    JunkCleanResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.finishedUtc = dateTimeFromIso(getStr(o, "finishedUtc"));
+    p.success = getBool(o, "success");
+    for (const QJsonValue& v : o.value(QLatin1String("outcomes")).toArray())
+        if (v.isObject()) p.outcomes.append(bulwark::JunkCleanOutcome::fromJson(v.toObject()));
+    p.freedBytes = getI64(o, "freedBytes");
+    p.deletedFiles = getInt(o, "deletedFiles");
+    p.skipped = getInt(o, "skipped");
+    p.message = getStr(o, "message");
+    return p;
+}
+
+QJsonObject LargeFileScanRequestPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["minBytes"] = static_cast<double>(minBytes);
+    o["limit"] = limit;
+    return o;
+}
+LargeFileScanRequestPayload LargeFileScanRequestPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    LargeFileScanRequestPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.minBytes = getI64(o, "minBytes");
+    p.limit = getInt(o, "limit");
+    return p;
+}
+
+QJsonObject LargeFileScanResponsePayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonArray arr;
+    for (const bulwark::LargeFileEntry& f : files) arr.append(f.toJson());
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["scannedUtc"] = dateTimeToIso(scannedUtc);
+    o["enabled"] = enabled;
+    o["files"] = arr;
+    o["minBytes"] = static_cast<double>(minBytes);
+    o["totalBytes"] = static_cast<double>(totalBytes);
+    o["scannedFiles"] = scannedFiles;
+    o["unreadable"] = unreadable;
+    o["truncated"] = truncated;
+    o["elapsedMs"] = static_cast<double>(elapsedMs);
+    o["message"] = message;
+    return o;
+}
+LargeFileScanResponsePayload LargeFileScanResponsePayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    LargeFileScanResponsePayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.scannedUtc = dateTimeFromIso(getStr(o, "scannedUtc"));
+    p.enabled = getBool(o, "enabled", true);
+    for (const QJsonValue& v : o.value(QLatin1String("files")).toArray())
+        if (v.isObject()) p.files.append(bulwark::LargeFileEntry::fromJson(v.toObject()));
+    p.minBytes = getI64(o, "minBytes");
+    p.totalBytes = getI64(o, "totalBytes");
+    p.scannedFiles = getInt(o, "scannedFiles");
+    p.unreadable = getInt(o, "unreadable");
+    p.truncated = getBool(o, "truncated");
+    p.elapsedMs = getI64(o, "elapsedMs");
+    p.message = getStr(o, "message");
+    return p;
+}
+
+QJsonObject JunkProgressPayload::toJson() const {
+    using namespace bulwark::json;
+    QJsonObject o;
+    o["requestId"] = guidToString(requestId);
+    o["cleaning"] = cleaning;
+    o["categoryIndex"] = categoryIndex;
+    o["categoryTotal"] = categoryTotal;
+    o["categoryTitle"] = categoryTitle;
+    o["currentPath"] = currentPath;
+    o["bytesSoFar"] = static_cast<double>(bytesSoFar);
+    o["filesSoFar"] = filesSoFar;
+    return o;
+}
+JunkProgressPayload JunkProgressPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    JunkProgressPayload p;
+    p.requestId = guidFromString(getStr(o, "requestId"));
+    p.cleaning = getBool(o, "cleaning");
+    p.categoryIndex = getInt(o, "categoryIndex");
+    p.categoryTotal = getInt(o, "categoryTotal");
+    p.categoryTitle = getStr(o, "categoryTitle");
+    p.currentPath = getStr(o, "currentPath");
+    p.bytesSoFar = getI64(o, "bytesSoFar");
+    p.filesSoFar = getInt(o, "filesSoFar");
+    return p;
+}
+
+} // namespace bulwark::ipc

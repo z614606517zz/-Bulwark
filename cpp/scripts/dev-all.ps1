@@ -1,4 +1,4 @@
-# =====================================================================
+﻿# =====================================================================
 #  Bulwark one-click dev launcher:
 #    compile (service + ui + kernel driver) -> deploy to cpp\dist
 #    -> install & start BulwarkService -> load the kernel driver -> open the UI

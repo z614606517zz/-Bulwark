@@ -21,15 +21,54 @@
   body{background:var(--bg);color:var(--ink);font:14.5px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
   a{color:var(--brand);text-decoration:none}
   ::selection{background:rgba(99,102,241,.18)}
-  .top{position:sticky;top:0;z-index:30;background:rgba(255,255,255,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
-  .top .in{max-width:1080px;margin:0 auto;display:flex;align-items:center;gap:14px;padding:12px 20px}
-  .brand{display:flex;align-items:center;gap:10px;font-weight:750;font-size:16px}
+  /* ── 顶栏:两层 ──────────────────────────────────────────────
+     第一层 = 品牌 + 今日额度 + 反馈;第二层 = 导航。
+     之前八个元素挤在同一个 flex 行里,总宽超过 1080 容器,flex 就去压缩
+     每一项,把「银狐情报」断成了「银狐情 / 报」。所以导航项一律
+     flex:0 0 auto + white-space:nowrap(永不压缩、永不断行),放不下时
+     由第二层自己横向滚动,而不是挤压文字。 */
+  .top{position:sticky;top:0;z-index:30;background:rgba(255,255,255,.86);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+  .top .in{max-width:1080px;margin:0 auto;display:flex;align-items:center;gap:12px;padding:11px 20px}
+  .brand{flex:0 0 auto;display:flex;align-items:center;gap:10px;font-weight:750;font-size:16px;white-space:nowrap}
   .brand .logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--brand),var(--brand2));
     display:grid;place-items:center;color:#fff;font-size:16px;box-shadow:0 6px 16px rgba(99,102,241,.35)}
-  .grow{flex:1}
-  .metrics{color:var(--muted);font-size:12.5px}.metrics b{color:var(--ink)}
-  .histbtn{border:1px solid var(--line);background:var(--card);color:var(--ink2);border-radius:10px;padding:8px 13px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;display:flex;gap:7px;align-items:center}
-  .histbtn:hover{border-color:var(--brand);color:var(--brand)}
+  .grow{flex:1;min-width:8px}
+  /* 圆角胶囊 = 只读状态,跟下面可点的圆角矩形在形状上区分开 */
+  .metrics{flex:0 0 auto;white-space:nowrap;color:var(--muted);font-size:12.5px;
+    background:var(--soft);border:1px solid var(--line2);border-radius:999px;padding:5px 12px}
+  /* JS 填之前它是空的,不藏起来就先闪一个空胶囊 */
+  .metrics:empty{display:none}
+  .metrics b{color:var(--ink);font-weight:700}
+  .iconbtn{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;
+    border:1px solid var(--line);background:var(--card);color:var(--ink2);border-radius:10px;
+    padding:7px 12px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;
+    transition:border-color .15s,color .15s}
+  .iconbtn:hover{border-color:var(--brand);color:var(--brand)}
+  /* 未处理反馈用红点徽标,跟导航里的灰色计数区分:这个是待办,不是统计。
+     inline-block 是必须的 —— <b> 默认 inline,min-width 对 inline 元素无效。
+     但作者样式里的 display 会盖掉 [hidden] 的 display:none,所以要补一条
+     [hidden] 规则,否则 0 条未处理时徽标也一直挂着。 */
+  .iconbtn b{display:inline-block;font-weight:700;font-size:11.5px;color:#fff;background:var(--mal);
+    border-radius:999px;padding:1px 6px;min-width:18px;text-align:center;line-height:1.5}
+  .iconbtn b[hidden]{display:none}
+  .nav{border-top:1px solid var(--line2)}
+  .navin{max-width:1080px;margin:0 auto;padding:8px 20px 9px;display:flex;align-items:center;gap:8px;
+    overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none}
+  .navin::-webkit-scrollbar{display:none}
+  .navi{flex:0 0 auto;white-space:nowrap;display:inline-flex;align-items:center;gap:7px;
+    border:1px solid var(--line);background:var(--card);color:var(--ink2);border-radius:10px;
+    padding:7px 12px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;
+    transition:border-color .15s,color .15s,box-shadow .15s}
+  .navi:hover{border-color:var(--brand);color:var(--brand);box-shadow:0 2px 8px rgba(99,102,241,.12)}
+  .navi .i{font-size:14px;line-height:1}
+  .navi b{display:inline-block;font-weight:700;font-size:12px;color:var(--muted);background:var(--soft);
+    border-radius:6px;padding:1px 6px;min-width:20px;text-align:center}
+  .navi:hover b{background:rgba(99,102,241,.10);color:var(--brand)}
+  @media(max-width:700px){
+    .metrics{display:none}
+    .iconbtn .lbl{display:none}
+    .brand{font-size:15px}
+  }
   .wrap{max-width:1080px;margin:0 auto;padding:26px 20px 60px}
   /* hero scan card */
   .hero{background:linear-gradient(180deg,#fff, #fbfcfe);border:1px solid var(--line);border-radius:18px;box-shadow:var(--sh);padding:26px;margin-bottom:20px}
@@ -96,6 +135,12 @@
   .fbtns{display:flex;gap:7px;margin-bottom:12px}
   .fbtn{font-size:12.5px;padding:5px 12px;border-radius:8px;background:var(--soft);border:1px solid var(--line);color:var(--muted);cursor:pointer}
   .fbtn.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  /* feedback modal fields */
+  .fblab{display:block;font-size:13px;font-weight:650;margin-bottom:6px;color:var(--ink2)}
+  .fbinput{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+    background:var(--soft);color:var(--ink);font:14px/1.55 var(--sans);outline:none}
+  .fbinput:focus{border-color:var(--brand);background:var(--card)}
+  textarea.fbinput{resize:vertical;min-height:110px}
   /* history modal — threat archive */
   .hmodal{position:fixed;inset:0;background:rgba(16,24,40,.42);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s,visibility .2s;z-index:40;
     display:flex;align-items:flex-start;justify-content:center;padding:40px 20px}
@@ -275,15 +320,86 @@
 </style>
 </head>
 <body>
-<div class="top"><div class="in">
-  <div class="brand"><span class="logo">🛡️</span> Bulwark 威胁分析</div>
-  <div class="grow"></div>
-  <div class="metrics" id="metrics"></div>
-  <button class="histbtn" id="sfbtn">🦊 银狐情报 <b id="sfcount">0</b></button>
-  <a class="histbtn" href="/api/docs" target="_blank" style="text-decoration:none">🔌 API</a>
-  <a class="histbtn" href="/engine" style="text-decoration:none">🧬 攻击链引擎 <b id="enginecount">0</b></a>
-  <a class="histbtn" href="/online" style="text-decoration:none">📡 在线客户端 <b id="onlinecount">0</b></a>
-  <button class="histbtn" id="histbtn">🗄️ 威胁档案 <b id="rcount">0</b></button>
+<div class="top">
+  <div class="in">
+    <div class="brand"><span class="logo">🛡️</span><span>Bulwark 威胁分析</span></div>
+    <div class="grow"></div>
+    <div class="metrics" id="metrics"></div>
+    <button class="iconbtn" id="fbbtn" title="提交问题反馈">
+      <!-- id 用 fbnew 而不是 fbcount:后者已被弹窗里的字数计数器占用,
+           同名会让 $("#fbcount") 命中这里,把字数计数器和徽标同时搞坏 -->
+      <span aria-hidden="true">💬</span><span class="lbl">反馈</span><b id="fbnew" hidden>0</b>
+    </button>
+  </div>
+  <nav class="nav" aria-label="主导航"><div class="navin">
+    <button class="navi" id="sfbtn"><span class="i" aria-hidden="true">🦊</span>银狐情报<b id="sfcount">0</b></button>
+    <button class="navi" id="normalbtn"><span class="i" aria-hidden="true">&#9989;</span>正常样本<b id="normalcount">0</b></button>
+    <a class="navi" href="/engine"><span class="i" aria-hidden="true">🧬</span>攻击链引擎<b id="enginecount">0</b></a>
+    <a class="navi" href="/online"><span class="i" aria-hidden="true">📡</span>在线客户端<b id="onlinecount">0</b></a>
+    <!-- 在线客服。刻意不挂徽标:另外三个 .navi 的 <b> 是从 /stats 拉来的计数,
+         而这一条对访客没有可计的数;API 文档同样没有徽标,所以「无徽标」在这排
+         里已经是既有形态,不是漏写。 -->
+    <a class="navi" href="/support"><span class="i" aria-hidden="true">🎧</span>在线客服</a>
+    <button class="navi" id="histbtn"><span class="i" aria-hidden="true">🗄️</span>威胁档案<b id="rcount">0</b></button>
+    <!-- 🔌 写成数字实体:这个码位是代理对,直接写字面量在编辑链路上被替换成过 U+FFFD -->
+    <a class="navi" href="/api/docs" target="_blank" rel="noopener"><span class="i" aria-hidden="true">&#128268;</span>API 文档</a>
+  </div></nav>
+</div>
+
+<!-- 问题反馈。提交口 POST /feedback 是公开的(普通用户没有 token),
+     所以服务端配了 per-IP 限流 + 每日条数上限 + 字段长度上限。 -->
+<div class="hmodal" id="fbmodal"><div class="hpanel" style="max-width:580px">
+  <div class="hhead">
+    <div class="htitle">💬 问题反馈</div>
+    <button class="x" id="fbclose">✕</button>
+  </div>
+  <div style="padding:18px 22px;overflow:auto">
+    <div id="fbtabs" style="display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid var(--line)">
+      <div class="fbtab on" data-t="new" style="padding:8px 14px;cursor:pointer;font-weight:600;
+        font-size:13.5px;border-bottom:2px solid var(--brand);color:var(--brand)">提交问题</div>
+      <div class="fbtab" data-t="mine" style="padding:8px 14px;cursor:pointer;font-weight:600;
+        font-size:13.5px;border-bottom:2px solid transparent;color:var(--muted)">我的反馈 <span id="fbmc"></span></div>
+    </div>
+    <div id="fbmine" hidden></div>
+    <div id="fbform">
+    <div style="margin-bottom:14px">
+      <label class="fblab">类型</label>
+      <select id="fbkind" class="fbinput">
+        <option value="bug">功能异常</option>
+        <option value="fp">误报(把正常程序当成了病毒)</option>
+        <option value="fn">漏报(病毒没被拦住)</option>
+        <option value="feature">功能建议</option>
+        <option value="other">其它</option>
+      </select>
+    </div>
+    <div style="margin-bottom:14px">
+      <label class="fblab">问题描述 <span style="color:var(--dim);font-weight:400">(必填,最多 4000 字)</span></label>
+      <textarea id="fbmsg" class="fbinput" rows="7" maxlength="4000"
+        placeholder="请尽量写清楚:什么操作触发的、涉及哪个程序、出现了什么现象。&#10;误报/漏报请附上文件名或哈希,便于核查。"></textarea>
+      <div style="text-align:right;color:var(--dim);font-size:12px"><span id="fbcount">0</span>/4000</div>
+    </div>
+    <div style="margin-bottom:14px">
+      <label class="fblab">联系方式 <span style="color:var(--dim);font-weight:400">(可选,便于回复)</span></label>
+      <input id="fbcontact" class="fbinput" maxlength="200" placeholder="邮箱 / QQ / 微信,留空也能提交">
+    </div>
+    <div style="margin-bottom:14px">
+      <label class="fblab">截图 <span style="color:var(--dim);font-weight:400">(可选,张数与大小不限;处理完成后会自动删除)</span></label>
+      <input id="fbfiles" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+      <div id="fbdrop" style="border:1.5px dashed var(--line);border-radius:12px;padding:14px;
+        text-align:center;cursor:pointer;color:var(--muted);font-size:13px;background:var(--soft);transition:.14s">
+        点击选择图片,或把截图拖进来 / 直接 Ctrl+V 粘贴
+      </div>
+      <div id="fbshots" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:9px"></div>
+    </div>
+    <div id="fbnote" style="font-size:12.5px;color:var(--dim);margin-bottom:14px">
+      提交内容会连同你的 IP 前两段与浏览器类型一并记录,仅用于排查问题。请勿填写密码等敏感信息。
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn" id="fbsend" style="padding:10px 20px">提交</button>
+      <span id="fbstatus" style="font-size:13px"></span>
+    </div>
+    </div>
+  </div>
 </div></div>
 
 <div class="wrap">
@@ -296,10 +412,11 @@
     </div>
     <div class="or">或</div>
     <label class="drop" id="drop" for="fileinput">
-      <div class="ic">📥</div><b>拖拽文件到此,或点击选择(支持多选批量)</b>
-      <small>VT 已收录 → 直接出报告;未收录 → 可一键送检(样本会共享给安全社区,勿传机密文件)<span id="uplimit"></span></small>
+      <div class="ic">📥</div><b>拖拽单个文件到此,或点击选择</b>
+      <small>每次一个文件。VT 已收录 → 直接出报告;未收录 → 可送检(样本会共享给安全社区,勿传机密文件)<span id="uplimit"></span></small>
     </label>
-    <input id="fileinput" type="file" multiple>
+    <!-- 刻意没有 multiple:这一页每次只处理一个文件,见 onFiles() 上方的说明 -->
+    <input id="fileinput" type="file">
   </section>
 
   <div class="status" id="status"></div>
@@ -343,7 +460,8 @@ let MAXUP=650;  // max upload MB; refreshed from /stats
 let hFilter="all",hSort="recent";  // threat-archive view state
 let sfFilter="all";                // 银狐 sub-family filter
 let statsData=null;let archStats=null,sfReports=[];  /* whole-DB counters + full SilverFox list */               // last /stats payload
-let viewMode="dashboard";         // dashboard | report | batch
+let benignReports=[],benignStats=null,bnFilter="all";  // 正常样本区:清单 + 概况 + 子筛选
+let viewMode="dashboard";         // dashboard | report | silverfox | normal
 
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),2400);}
 function setStatus(m,k){const el=$("#status");if(!m){el.innerHTML="";el.className="status";return;}
@@ -358,17 +476,187 @@ async function jpost(p,o){const r=await fetch(p,{method:"POST",headers:{"Content
 function openHistory(v){$("#hmodal").classList.toggle("open",v);if(v)drawReports();}
 $("#histbtn").onclick=()=>openHistory(!$("#hmodal").classList.contains("open"));
 $("#sfbtn").onclick=()=>renderSilverfox();
+$("#normalbtn").onclick=()=>{renderNormal();loadBenign();};
 $("#hclose").onclick=()=>openHistory(false);
 $("#hmodal").addEventListener("click",e=>{if(e.target===$("#hmodal"))openHistory(false);});
 $("#hsort").addEventListener("change",e=>{hSort=e.target.value;drawReports();});
 document.querySelectorAll("#hfilters .hchip").forEach(c=>c.onclick=()=>{hFilter=c.dataset.f;drawReports();});
 document.addEventListener("keydown",e=>{if(e.key==="Escape")openHistory(false);});
 
+// ---- 问题反馈 ----
+function openFeedback(v){
+  $("#fbmodal").classList.toggle("open",v);
+  if(v){$("#fbstatus").textContent="";fbSwitch("new");$("#fbmsg").focus();loadMine();}
+}
+// ---- 我的反馈 ----
+// 服务端按调用方 IP 认领,不需要账号。返回里没有 contact/ip/agent —— IP 会被
+// NAT 共享,同一出口下的另一个人不该看到别人留的联系方式。
+const FBST={new:["待处理","var(--warn,#d97706)"],done:["已处理","var(--clean)"]};
+function fbSwitch(t){
+  document.querySelectorAll(".fbtab").forEach(el=>{
+    const on=el.dataset.t===t;
+    el.style.borderBottomColor=on?"var(--brand)":"transparent";
+    el.style.color=on?"var(--brand)":"var(--muted)";
+  });
+  $("#fbform").hidden=(t!=="new");
+  $("#fbmine").hidden=(t!=="mine");
+}
+document.querySelectorAll(".fbtab").forEach(el=>el.onclick=()=>{
+  fbSwitch(el.dataset.t); if(el.dataset.t==="mine")loadMine();});
+async function loadMine(){
+  const box=$("#fbmine");
+  try{
+    const d=await jget("/feedback/mine");
+    const items=d.items||[];
+    const nNew=items.filter(x=>x.status!=="done").length;
+    const mc=$("#fbmc");
+    if(mc)mc.textContent=items.length?("("+items.length+")"):"";
+    if(!items.length){
+      box.innerHTML='<div style="padding:40px 0;text-align:center;color:var(--dim);font-size:13px">'
+        +'还没有提交过反馈。<br><span style="font-size:12px">按来源 IP 识别('+esc(d.ip||"")+'),'
+        +'换网络或换设备会看不到之前的记录。</span></div>';
+      return;
+    }
+    box.innerHTML='<div style="font-size:12.5px;color:var(--dim);margin-bottom:10px">'
+      +'共 '+items.length+' 条,'+nNew+' 条待处理 · 按来源 IP 识别('+esc(d.ip||"")+')</div>'
+      +items.map(x=>{
+      const s=FBST[x.status]||["未知","var(--muted)"];
+      return `<div style="border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:var(--soft)">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:11.5px;font-weight:700;padding:2px 9px;border-radius:99px;
+            background:${s[1]};color:#fff">${s[0]}</span>
+          <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">#${x.id}</span>
+          <span style="font-size:12px;color:var(--dim);margin-left:auto">${esc((x.at||"").replace("T"," ").slice(0,16))}</span>
+        </div>
+        <div style="font-size:13.5px;white-space:pre-wrap;word-break:break-word">${esc(x.message||"")||'<span style="color:var(--dim)">(只有截图)</span>'}</div>
+        ${x.image_count?`<div style="font-size:12px;color:var(--dim);margin-top:5px">附 ${x.image_count} 张截图</div>`:""}
+        ${x.status==="done"&&!x.image_count?'<div style="font-size:12px;color:var(--dim);margin-top:5px">截图已随处理完成自动删除</div>':""}
+        ${x.reply?`<div style="margin-top:9px;padding:9px 11px;border-left:3px solid var(--clean);
+          background:#fff;border-radius:0 8px 8px 0">
+          <div style="font-size:11.5px;font-weight:700;color:var(--clean);margin-bottom:3px">处理结果</div>
+          <div style="font-size:13px;white-space:pre-wrap;word-break:break-word">${esc(x.reply)}</div>
+          <div style="font-size:11.5px;color:var(--dim);margin-top:4px">${esc((x.replied_at||"").replace("T"," ").slice(0,16))}</div>
+        </div>`:(x.status==="done"?'<div style="font-size:12px;color:var(--dim);margin-top:8px">已处理,未留说明。</div>':"")}
+      </div>`;}).join("");
+  }catch(e){
+    box.innerHTML='<div style="padding:30px 0;text-align:center;color:var(--mal);font-size:13px">'
+      +'读取失败:'+esc(e.message||"连接不上服务器")+'</div>';
+  }
+}
+$("#fbbtn").onclick=()=>openFeedback(!$("#fbmodal").classList.contains("open"));
+$("#fbclose").onclick=()=>openFeedback(false);
+$("#fbmodal").addEventListener("click",e=>{if(e.target===$("#fbmodal"))openFeedback(false);});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")openFeedback(false);});
+$("#fbmsg").addEventListener("input",()=>{$("#fbcount").textContent=$("#fbmsg").value.length;});
+// ---- 反馈截图 ----
+// 走 JSON 里的 base64:提交口本来就是 JSON,不为了带图另开一条 multipart 通道 ——
+// 那等于在公开无鉴权的口子上多写一个解析器。
+// 这里的类型/大小检查只为即时反馈;服务端会按魔术字节重新验一遍,前端校验从来
+// 不算安全边界。
+// 张数与单张大小不在前端设限 —— 服务端按 feedback.max_images / max_image_mb
+// 决定,前端只在超限被拒时把结果说清楚。这样改配置不用同步改页面。
+const FB_DROP_HINT="点击选择图片,或把截图拖进来 / 直接 Ctrl+V 粘贴";
+let fbImgs=[];
+function fbRenderShots(){
+  const box=$("#fbshots");
+  box.innerHTML=fbImgs.map((im,i)=>
+    `<div style="position:relative;line-height:0">
+       <img src="${im.url}" alt="" style="width:84px;height:60px;object-fit:cover;
+         border:1px solid var(--line);border-radius:8px;display:block">
+       <button data-i="${i}" class="fbdel" title="移除" style="position:absolute;top:-6px;right:-6px;
+         width:20px;height:20px;border:none;border-radius:50%;background:var(--mal);color:#fff;
+         font-size:13px;line-height:1;cursor:pointer">\u00d7</button>
+     </div>`).join("");
+  box.querySelectorAll(".fbdel").forEach(b=>b.onclick=()=>{fbImgs.splice(+b.dataset.i,1);fbRenderShots();});
+  const tot=fbImgs.reduce((n,x)=>n+(x.size||0),0);
+  $("#fbdrop").textContent=fbImgs.length
+    ?("已选 "+fbImgs.length+" 张 · "+fmtSize(tot)+"(点这里继续添加)")
+    :FB_DROP_HINT;
+}
+function fbAddFiles(files){
+  const st=$("#fbstatus");
+  for(const f of files){
+    // 只挡类型:PNG/JPEG/GIF/WebP 之外服务端一律不收,先说比传完再说好。
+    // 大小和张数不在这里挡 —— 上限由服务端配置决定,前端写死就会两边不一致。
+    if(!/^image\/(png|jpeg|gif|webp)$/.test(f.type)){
+      st.textContent="只支持 PNG / JPEG / GIF / WebP("+(f.name||"该文件")+" 不是)。";
+      st.style.color="var(--mal)";continue;}
+    const rd=new FileReader();
+    rd.onload=()=>{fbImgs.push({url:rd.result,size:f.size});fbRenderShots();};
+    rd.readAsDataURL(f);
+  }
+}
+$("#fbdrop").onclick=()=>$("#fbfiles").click();
+$("#fbfiles").onchange=e=>{fbAddFiles(e.target.files);e.target.value="";};
+$("#fbdrop").addEventListener("dragover",e=>{e.preventDefault();$("#fbdrop").style.borderColor="var(--brand)";});
+$("#fbdrop").addEventListener("dragleave",()=>{$("#fbdrop").style.borderColor="var(--line)";});
+$("#fbdrop").addEventListener("drop",e=>{e.preventDefault();$("#fbdrop").style.borderColor="var(--line)";
+  if(e.dataTransfer&&e.dataTransfer.files)fbAddFiles(e.dataTransfer.files);});
+// 粘贴只在反馈弹窗开着时接管 —— 否则会把主页面往哈希框粘贴的行为也吃掉。
+document.addEventListener("paste",e=>{
+  if(!$("#fbmodal").classList.contains("open"))return;
+  const items=(e.clipboardData&&e.clipboardData.items)||[];
+  const files=[];
+  for(const it of items){if(it.kind==="file"){const f=it.getAsFile();if(f)files.push(f);}}
+  if(files.length){e.preventDefault();fbAddFiles(files);}
+});
+
+$("#fbsend").onclick=async()=>{
+  const msg=$("#fbmsg").value.trim();
+  const st=$("#fbstatus");
+  // 一张截图常比一段文字说得清,所以有图就不再强制写描述(服务端同一规则)。
+  if(!msg&&!fbImgs.length){
+    st.textContent="请填写问题描述,或附上截图。";st.style.color="var(--mal)";$("#fbmsg").focus();return;}
+  const btn=$("#fbsend");btn.disabled=true;
+  st.textContent="提交中…";st.style.color="var(--muted)";
+  try{
+    const r=await fetch("/feedback",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({kind:$("#fbkind").value,message:msg,
+                           contact:$("#fbcontact").value.trim(),page:location.pathname,
+                           images:fbImgs.map(x=>x.url)})});
+    let d={};try{d=await r.json();}catch(e){d={ok:false,error:"服务端返回异常(HTTP "+r.status+")"};}
+    if(!d.ok){
+      // 429 是限流(每日条数或滑窗),413 是整个请求体超限(基本只可能是截图太大),
+      // 和「内容不合法」都不是一回事,分开说清楚
+      st.textContent=(r.status===429?"提交过于频繁,请稍后再试。":
+                      r.status===413?"截图太大,请减少张数或压缩后再试。":
+                      ("提交失败:"+(d.error||"未知错误")));
+      st.style.color="var(--mal)";btn.disabled=false;return;
+    }
+    // 服务端按魔术字节复验,可能丢掉伪装成图片的文件 —— 丢了就必须说,否则用户
+    // 以为截图传上去了,而管理员那边什么也看不到。
+    st.textContent="已收到,感谢反馈(编号 #"+d.id+")。"
+      +(d.images?(" 含 "+d.images+" 张截图。"):"")
+      +(d.images_rejected?(" 有 "+d.images_rejected+" 张未被接受(格式不支持或过大)。"):"");
+    st.style.color=d.images_rejected?"var(--mal)":"var(--clean)";
+    $("#fbmsg").value="";$("#fbcontact").value="";$("#fbcount").textContent="0";
+    fbImgs=[];fbRenderShots();
+    toast("反馈已提交 #"+d.id);
+    // 提交完直接切到「我的反馈」,让人立刻看见它进了列表、状态是待处理 ——
+    // 否则弹窗一关,用户不知道这条到底有没有收到。
+    loadMine().then(()=>fbSwitch("mine"));
+    btn.disabled=false;
+    refreshMetrics();
+  }catch(e){
+    st.textContent="提交失败:"+(e.message||"连接不上服务器");
+    st.style.color="var(--mal)";btn.disabled=false;
+  }
+};
+
 async function refreshMetrics(){try{const d=await jget("/stats");statsData=d;const q=d.quota_today||{};
   if(d.max_upload_mb)MAXUP=d.max_upload_mb;
   const ul=$("#uplimit");if(ul)ul.textContent=" · 单文件上限 "+MAXUP+"MB";
   $("#metrics").innerHTML=`今日 VT <b>${q.VirusTotal||0}</b> · 微步 <b>${q.ThreatBook||0}</b>`;
   const oc=$("#onlinecount");if(oc&&d.clients)oc.textContent=(d.clients.online||0);
+  // 未处理的反馈条数挂在按钮上,否则收到反馈没人知道。
+  // 只改徽标这一个节点 —— 之前这里重写整个 innerHTML,会把按钮内部的
+  // 图标/文字/徽标结构冲掉,窄屏隐藏文字的 .lbl 也跟着没了。
+  const fb=$("#fbbtn"),fc=$("#fbnew");
+  if(fb&&fc&&d.feedback){
+    const n=d.feedback.new||0;
+    fc.textContent=n;fc.hidden=!n;
+    fb.title=n?("有 "+n+" 条未处理 · 管理页 /feedback"):"提交问题反馈";
+  }
   const ec=$("#enginecount");if(ec&&d.engine)ec.textContent=(d.engine.patterns||0);
   if(viewMode==="dashboard")renderDashboard();}catch(e){}}
 async function loadReports(){try{const d=await jget("/vt/reports");allReports=d.reports||[];
@@ -376,6 +664,9 @@ async function loadReports(){try{const d=await jget("/vt/reports");allReports=d.
   $("#rcount").textContent=((archStats&&archStats.total)||d.count||0);
   const sfc=$("#sfcount");if(sfc)sfc.textContent=(archStats?archStats.silverfox:sfReports.length);
   if($("#hmodal").classList.contains("open"))drawReports();if(viewMode==="silverfox")renderSilverfox();await refreshMetrics();}catch(e){}}
+async function loadBenign(){try{const d=await jget("/benign/reports");benignReports=d.reports||[];benignStats=d.stats||null;
+  const nc=$("#normalcount");if(nc)nc.textContent=((benignStats&&benignStats.total)||d.count||0);
+  if(viewMode==="normal")renderNormal();}catch(e){}}
 function drawReports(){
   /* Cards report the whole database (archStats) so they stop drifting every
      time the hourly harvester rotates rows out of the capped list. */
@@ -512,6 +803,83 @@ function renderSilverfox(){
   rep.querySelectorAll(".sfbar .hchip").forEach(c=>c.onclick=()=>{sfFilter=c.dataset.sf;renderSilverfox();});
   rep.querySelectorAll(".sflist .hcard").forEach(el=>el.onclick=()=>openStored(el.dataset.id));
 }
+// ---- 正常样本 page ----
+// 干净文件不进威胁库(会污染家族/分类统计),单独存在服务端 benign_reports。
+// 这个页面把它们单独列出来,和「银狐情报」同一套卡片样式,只是判定色改成安全绿。
+// 卡片点击复制哈希(不做详情页:精简语料不适配威胁报告的完整渲染器,硬塞会渲染空白)。
+function renderNormal(){
+  viewMode="normal";setStatus("","");
+  const list=(benignReports||[]).slice();
+  const st=benignStats||{};
+  const total=(st.total!=null)?st.total:list.length;
+  const nSigned=(st.signed!=null)?st.signed:list.filter(x=>x.signed).length;
+  const nBeh=(st.with_behaviour!=null)?st.with_behaviour:list.filter(x=>x.has_behaviour).length;
+  const cap=st.cap||0;
+  const cnt={all:list.length,signed:list.filter(x=>x.signed).length,unsigned:list.filter(x=>!x.signed).length,behaviour:list.filter(x=>x.has_behaviour).length};
+  const stat=(v,k,cls)=>`<div class="hstat ${cls||''}"><div class="v">${v}</div><div class="k">${k}</div></div>`;
+  const defs=[["all","全部"],["signed","已签名"],["unsigned","未签名"],["behaviour","含沙箱行为"]];
+  const chips=defs.map(([f,lbl])=>`<span class="hchip ${f===bnFilter?'on':''}" data-bn="${f}">${lbl} <b>${cnt[f]||0}</b></span>`).join("");
+  let l=list;
+  if(bnFilter==="signed")l=l.filter(x=>x.signed);
+  else if(bnFilter==="unsigned")l=l.filter(x=>!x.signed);
+  else if(bnFilter==="behaviour")l=l.filter(x=>x.has_behaviour);
+  l.sort((a,b)=>Date.parse(b.stored_at||"")-Date.parse(a.stored_at||""));
+  const rows=l.length?l.map(x=>{
+    const sig=x.signed?`<span class="pill clean">已签名</span>`:`<span class="pill">未签名</span>`;
+    const typ=x.type_tag?`<span class="pill" style="margin-left:5px">${esc(x.type_tag)}</span>`:"";
+    const beh=x.has_behaviour?`<span class="pill" style="margin-left:5px">沙箱行为</span>`:"";
+    return `<div class="hcard clean" data-id="${esc(x.sha256)}">
+      <div class="hv"><span class="chip">安全</span></div>
+      <div class="hmain"><div class="hnm">${esc(x.name||(x.sha256||"").slice(0,32))}</div>
+        <div class="hfam">${sig}${typ}${beh}</div>
+        <div class="hmeta">${esc(x.sha256)}</div></div>
+      <div class="hdet"><div class="hdate">${esc((x.stored_at||"").replace("T"," ").slice(0,16))}</div></div>
+    </div>`;}).join("")
+    :'<div class="dempty" style="padding:50px 0;text-align:center">暂无正常样本。查询或拖入一个 VirusTotal 判为安全的文件后,会自动收录并显示在这里。</div>';
+  $("#report").innerHTML=`<style>.hcard.clean{border-left-color:var(--clean)}.hcard.clean .hv .chip{background:var(--clean)}.hcard.clean .hnm{color:var(--ink)}.pill.clean{background:var(--cleanbg);color:var(--clean);border-color:transparent}.hstat.clean .v{color:var(--clean)}</style>
+    <div class="sfpage">
+    <div class="sfhead"><div class="sftitle">&#9989; 正常样本 <span class="hsub">共 ${total} 个 · 已确认安全</span></div></div>
+    <div class="dstats" style="margin-bottom:14px">
+      ${stat(total,"正常样本","clean")}${stat(nSigned,"已签名")}${stat(nBeh,"含沙箱行为")}${stat(cap||"—","留存上限")}
+    </div>
+    <div class="sfbar">${chips}</div>
+    <div class="sflist">${rows}</div>
+  </div>`;
+  const rep=$("#report");
+  rep.querySelectorAll(".sfbar .hchip").forEach(c=>c.onclick=()=>{bnFilter=c.dataset.bn;renderNormal();});
+  rep.querySelectorAll(".sflist .hcard").forEach(el=>el.onclick=()=>{const id=el.dataset.id;if(id&&navigator.clipboard){navigator.clipboard.writeText(id);toast("已复制哈希");}});
+}
+// VT 没这个文件,但别的云认识它。以前这里只显示一句「VT 未收录」就结束了,
+// 其他云已经拿到的结论被整个丢掉 —— 而这些云恰恰是 VT 盲区的补充。
+// 刻意不复用 render():那个函数按完整 VT 报告的字段形状写的,而这种响应里
+// report.file 是空的,硬塞进去只会渲染出一片空白,甚至在取字段时抛错。
+function renderSecondaryOnly(h,d){
+  viewMode="report";
+  const srcs=((d.report||{}).sources||[]).filter(s=>s&&s.querySucceeded&&s.source!=="VirusTotal");
+  const v=d.verdict||"unknown";
+  const rows=srcs.length?srcs.map(s=>{
+    const m=s.malicious||0,t=s.total_engines||0,sv=s.verdict||"unknown";
+    return `<div class="hcard ${esc(sv)}">
+      <div class="hv"><span class="chip">${esc(VMAP[sv]||sv)}</span></div>
+      <div class="hmain"><div class="hnm">${esc(s.source||"")}</div>
+        ${s.threat_label?`<div class="hfam"><span class="pill ${sv==='malicious'?'mal':'susp'}">${esc(s.threat_label)}</span></div>`:""}
+        <div class="hmeta">${t?(m+" / "+t+" \u4e2a\u5f15\u64ce\u5224\u4e3a\u6076\u610f"):"\u672a\u63d0\u4f9b\u5f15\u64ce\u8ba1\u6570"}</div></div>
+    </div>`;}).join("")
+    :'<div class="dempty" style="padding:30px 0;text-align:center">\u6ca1\u6709\u60c5\u62a5\u6e90\u5e94\u7b54\u3002</div>';
+  $("#report").innerHTML=`<div class="sfpage">
+    <div class="sfhead"><div class="sftitle">\u5176\u4ed6\u5a01\u80c1\u60c5\u62a5\u4e91\u7684\u7ed3\u8bba
+      <span class="hsub">VirusTotal \u65e0\u6b64\u6587\u4ef6\u8bb0\u5f55</span></div></div>
+    <div class="dstats" style="margin-bottom:14px">
+      <div class="hstat ${v==='malicious'?'mal':(v==='suspicious'?'susp':'')}">
+        <div class="v">${esc(VMAP[v]||v)}</div><div class="k">\u7efc\u5408\u5224\u5b9a</div></div>
+      <div class="hstat"><div class="v">${srcs.length}</div><div class="k">\u5e94\u7b54\u60c5\u62a5\u6e90</div></div>
+      <div class="hstat"><div class="v">${d.malicious||0}<small>/${d.total_engines||0}</small></div>
+        <div class="k">\u5f15\u64ce\u547d\u4e2d</div></div>
+    </div>
+    <div class="hmeta" style="margin-bottom:10px;font-family:var(--mono)">${esc(h)}</div>
+    <div class="sflist">${rows}</div>
+  </div>`;
+}
 async function openStored(id){setStatus("加载已保存报告…","busy");
   try{const d=await jget("/vt/report/"+encodeURIComponent(id));if(!d.ok){setStatus(d.error||"未找到","err");return;}
     render(d.report,d.stored_at,true);setStatus("已保存报告 · "+(d.stored_at||""),"ok");}catch(e){setStatus("加载失败:"+e.message,"err");}}
@@ -521,7 +889,9 @@ async function doLookup(){const h=$("#hash").value.trim().toLowerCase();
   if(!/^([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$/.test(h)){setStatus("请输入合法的 MD5 / SHA-1 / SHA-256 哈希。","err");return;}
   $("#go").disabled=true;setStatus("正在查询 VirusTotal(含沙箱行为报告)…","busy");
   try{const d=await lookupHash(h,false);
-    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,不留存"),"ok");loadReports();}
+    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,已收录到正常样本"),"ok");loadReports();loadBenign();}
+    else if(d.vt_unknown&&(d.sources_ok||0)>0){renderSecondaryOnly(h,d);
+      setStatus("VirusTotal 无此文件记录 · 以下结论来自其他 "+d.sources_ok+" 个情报源","err");}
     else setStatus(d.error||"查询失败","err");}catch(e){setStatus("查询失败:"+e.message,"err");}finally{$("#go").disabled=false;}
 }
 async function sha256File(f){const b=await f.arrayBuffer();const d=await crypto.subtle.digest("SHA-256",b);return Array.from(new Uint8Array(d)).map(x=>x.toString(16).padStart(2,"0")).join("");}
@@ -530,7 +900,11 @@ async function onFile(f){if(!f)return;if(!crypto.subtle){setStatus("需要 HTTPS
   try{const sha=await sha256File(f);$("#hash").value=sha;setStatus("SHA-256 "+sha.slice(0,20)+"… · 查询 VT 中…","busy");
     const d=await lookupHash(sha,false);
     if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("已查到报告","ok");loadReports();}
-    else uploadPrompt(f,sha,d.error||"VT 未收录");}catch(e){setStatus("处理文件失败:"+e.message,"err");}}
+    else{
+      // 别的云已经有结论就先摆出来,再照旧给出上传提示 —— 两者不矛盾:
+      // VT 确实没这个文件,样本还是该传给它分析。
+      if(d.vt_unknown&&(d.sources_ok||0)>0)renderSecondaryOnly(sha,d);
+      uploadPrompt(f,sha,d.error||"VT 未收录");}}catch(e){setStatus("处理文件失败:"+e.message,"err");}}
 function uploadPrompt(f,sha,why){setStatus("VirusTotal 未收录此文件("+why+")","err");
   $("#report").innerHTML=`<div class="card"><div class="pane on" style="display:block">
     <div style="font-size:16px;font-weight:700;margin-bottom:8px">🆕 VT 未收录该文件</div>
@@ -549,97 +923,18 @@ function poll(sha,n){const MAX=24,MS=20000;if(n>=MAX){setStatus("分析仍在进
     if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("VT 分析完成"+(d.stored?",威胁报告已留存":",安全文件不留存"),"ok");loadReports();}
     else{setStatus("VT 分析中…(第 "+(n+1)+" 次 · 约 "+((n+1)*MS/1000)+"s)","busy");poll(sha,n+1);}}catch(e){poll(sha,n+1);}},MS);}
 
-// ---- batch upload ----
-let batch=null;
-const BST={queued:"排队",hashing:"计算哈希",looking:"查询中",done:"完成",notfound:"未收录",uploading:"上传中",analyzing:"分析中",error:"错误",timeout:"超时"};
-function statsOf(report){const f=(report&&report.file)||{};const s=f.last_analysis_stats||{};
-  const mal=s.malicious||0,susp=s.suspicious||0;const total=Object.values(s).reduce((a,c)=>a+(+c||0),0);
-  if(!Object.keys(s).length){
-    const ok=((report&&report.sources)||[]).filter(x=>x.querySucceeded);
-    if(ok.length){
-      const vs=ok.map(x=>x.verdict);
-      const rated=ok.filter(x=>(+x.total_engines||0)>0);
-      const best=rated.length?rated.reduce((a,x)=>((+x.malicious||0)>(+a.malicious||0)?x:a),rated[0]):null;
-      return {mal:best?(+best.malicious||0):0,susp:0,total:best?(+best.total_engines||0):0,
-              verdict:vs.includes("malicious")?"malicious":(vs.includes("suspicious")?"suspicious":(vs.includes("clean")?"clean":"unknown"))};
-    }
-  }
-  const verdict=mal>=5?"malicious":((mal>0||susp>0)?"suspicious":(Object.keys(s).length?"clean":"unknown"));
-  return {mal,susp,total,verdict};}
+// ---- 单文件送检 ----
+// 这一页刻意【不做】批量。2026-08-13 去掉了多选批量，两个原因都不是界面偏好：
+//   * VirusTotal 已经在成批拒绝本项目的采集节点（245 上每一把密钥都是 429，连刚添加的也是），额度是稀缺资源，
+//     而一次批量能在几十秒里把它花完；
+//   * 这一页在公网上没有口令门，任何人都能打开。批量意味着任何人都能一次提交几十个文件，
+//     既烧掉额度，又把这些样本公开共享给安全社区 —— 送检是不可撤回的。
+// 单个文件的整条路径（算哈希 → 查 VT → 未收录再问要不要上传）原样保留，见 onFile()。
 function onFiles(files){const arr=Array.from(files||[]);if(!arr.length)return;
-  if(arr.length===1)return onFile(arr[0]);
-  runBatch(arr);}
-function runBatch(arr){
-  if(!crypto.subtle){setStatus("需要 HTTPS 才能本地算哈希。","err");return;}
-  batch={items:arr.map(f=>({file:f,name:f.name,size:f.size,sha:"",status:"queued",verdict:"",mal:0,total:0,stored:"",err:""}))};
-  setStatus("批量分析 "+arr.length+" 个文件…","busy");renderBatch();
-  let i=0,active=0;const LIM=3;
-  const next=()=>{
-    if(i>=batch.items.length&&active===0){onBatchLookupDone();return;}
-    while(active<LIM&&i<batch.items.length){const idx=i++;active++;processItem(idx).finally(()=>{active--;next();});}
-  };next();
-}
-async function processItem(idx){const it=batch.items[idx];
-  try{it.status="hashing";updateRow(idx);
-    it.sha=await sha256File(it.file);it.status="looking";updateRow(idx);
-    const d=await lookupHash(it.sha,false);
-    if(d.ok){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";}
-    else{it.status="notfound";it.err=d.error||"VT 未收录";}
-  }catch(e){it.status="error";it.err=e.message;}
-  updateRow(idx);updateBatchBar();}
-function onBatchLookupDone(){updateBatchBar();
-  const done=batch.items.filter(x=>x.status==="done").length;
-  const nf=batch.items.filter(x=>x.status==="notfound").length;
-  setStatus("批量查询完成:"+done+" 有报告"+(nf?(" · "+nf+" 未收录,可送检"):""),"ok");loadReports();}
-function submitAllUnknown(){batch.items.forEach((x,i)=>{if(["notfound","error","timeout"].includes(x.status))submitItem(i);});}
-async function submitItem(idx){const it=batch.items[idx];if(!["notfound","error","timeout"].includes(it.status))return;
-  if(it.size>MAXUP*1024*1024){it.status="error";it.err="超过上限 "+MAXUP+"MB";updateRow(idx);return;}
-  it.status="uploading";it.err="";updateRow(idx);
-  try{const r=await fetch("/vt/upload?name="+encodeURIComponent(it.name),{method:"POST",body:it.file});const d=await r.json();
-    if(!d.ok){it.status="notfound";it.err=d.error||"上传失败";updateRow(idx);return;}
-    if(d.found){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";updateRow(idx);loadReports();return;}
-    it.status="analyzing";updateRow(idx);pollItem(idx,0);
-  }catch(e){it.status="notfound";it.err=e.message;updateRow(idx);}}
-function pollItem(idx,n){const it=batch.items[idx];const MAX=24,MS=20000;
-  if(n>=MAX){it.status="timeout";it.err="分析超时,稍后重试";updateRow(idx);return;}
-  setTimeout(async()=>{try{const d=await lookupHash(it.sha,true);
-    if(d.ok){const s=statsOf(d.report);it.verdict=s.verdict;it.mal=s.mal;it.total=s.total;it.stored=!!d.stored;it.status="done";updateRow(idx);loadReports();}
-    else{it.status="analyzing";it.err="分析中("+(n+1)+")";updateRow(idx);pollItem(idx,n+1);}}catch(e){pollItem(idx,n+1);}},MS);}
-function rowHtml(it,idx){const busy=["hashing","looking","uploading","analyzing"].includes(it.status);
-  const vd=it.status==="done"?`<span class="pill ${it.verdict==='malicious'?'mal':it.verdict==='suspicious'?'susp':''}">${VMAP[it.verdict]||it.verdict}</span>`:"—";
-  const cnt=it.status==="done"?`${it.mal}/${it.total}`:"";
-  const act=(["notfound","error","timeout"].includes(it.status))?`<button class="fbtn" data-sub="${idx}">送检</button>`:
-    ((it.status==="done"&&it.stored)?`<button class="fbtn" data-open="${esc(it.sha)}">报告</button>`:"");
-  const stt=(busy?'<span class="spin" style="width:12px;height:12px"></span> ':"")+(BST[it.status]||it.status)+(it.err?(' <span style="color:var(--dim)">'+esc(it.err)+'</span>'):"");
-  return `<tr data-row="${idx}"><td>${idx+1}</td><td class="mono" style="max-width:280px;word-break:break-all">${esc(it.name)}</td>
-    <td>${fmtSize(it.size)}</td><td>${stt}</td><td>${vd}</td><td class="mono">${cnt}</td><td>${act}</td></tr>`;}
-function renderBatch(){viewMode="batch";const its=batch.items;
-  $("#report").innerHTML=`<div class="card"><div class="pane on" style="display:block">
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
-      <div style="font-size:16px;font-weight:700">📦 批量分析 <span id="bcount" class="mono" style="color:var(--muted);font-weight:500;font-size:13px"></span></div>
-      <div style="flex:1"></div>
-      <button class="btn" id="bsubmit" style="padding:9px 16px;font-size:13px">送检全部未收录</button>
-    </div>
-    <table><thead><tr><th>#</th><th>文件</th><th>大小</th><th>状态</th><th>判定</th><th>检出</th><th></th></tr></thead>
-    <tbody id="btbody">${its.map((it,i)=>rowHtml(it,i)).join("")}</tbody></table>
-    <p style="color:var(--susp);font-size:12px;margin-top:10px">送检会把样本上传到 VirusTotal 并共享给安全社区,勿传机密文件。分析为分钟级,页面会自动轮询。</p></div></div>`;
-  bindBatch();updateBatchBar();}
-function bindBatch(){const rep=$("#report");
-  rep.querySelectorAll("[data-sub]").forEach(b=>b.onclick=()=>submitItem(+b.dataset.sub));
-  rep.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>showReportFor(b.dataset.open));
-  const bs=$("#bsubmit");if(bs)bs.onclick=submitAllUnknown;}
-function updateRow(idx){const tb=$("#btbody");if(!tb)return;const tr=tb.querySelector(`tr[data-row="${idx}"]`);
-  if(tr){tr.outerHTML=rowHtml(batch.items[idx],idx);bindBatch();}}
-function updateBatchBar(){if(!batch)return;const c=$("#bcount");
-  if(c)c.textContent=batch.items.filter(x=>x.status==="done").length+"/"+batch.items.length+" 完成";
-  const nf=batch.items.filter(x=>["notfound","error","timeout"].includes(x.status)).length;
-  const bs=$("#bsubmit");if(bs){bs.style.display=nf?"":"none";bs.textContent="送检全部未收录 ("+nf+")";}}
-async function showReportFor(sha){setStatus("加载报告…","busy");
-  try{const d=await jget("/vt/report/"+encodeURIComponent(sha));if(!d.ok){setStatus("未找到","err");return;}
-    render(d.report,d.stored_at,true);
-    const rep=$("#report");const back=document.createElement("button");back.className="histbtn";
-    back.textContent="← 返回批量结果";back.style.margin="0 0 12px";back.onclick=renderBatch;
-    rep.insertBefore(back,rep.firstChild);setStatus("","");}catch(e){setStatus("加载失败:"+e.message,"err");}}
+  // 多选或多拖时不静默丢掉其余文件，明确说一句只取了第一个——悄悄少做事比做不到更糟。
+  // 用 toast 而不是 setStatus：下一行的 onFile() 立即就会把状态条改成「计算 SHA-256」。
+  if(arr.length>1)toast("每次只分析一个文件，已取第一个："+arr[0].name+"（其余 "+(arr.length-1)+" 个未处理）");
+  onFile(arr[0]);}
 
 // ---- render ----
 function asText(v){if(v==null)return"";if(typeof v==="string"||typeof v==="number")return String(v);
@@ -894,11 +1189,12 @@ dz.addEventListener("drop",e=>{const ff=e.dataTransfer.files;if(ff&&ff.length)on
 const brand=$(".brand");if(brand){brand.style.cursor="pointer";brand.title="返回首页";brand.onclick=()=>{setStatus("","");renderDashboard();};}
 renderDashboard();
 loadReports();
+loadBenign();
 </script>
 <script>
 /* Degraded-mode banner: when VirusTotal is unavailable the backend answers from
    the other feeds and marks the report degraded. Wrap render() so every entry
-   point (lookup, batch, stored report) shows why the VT panel is empty.
+   point (hash lookup, dropped file, stored report) shows why the VT panel is empty.
    Text uses \u escapes so the file stays pure ASCII. */
 (function(){
   if (typeof render !== "function") return;
@@ -970,8 +1266,12 @@ loadReports();
 }
 </style>
 <script>
-/* Motion layer: hooks every user action (query, upload, batch, tabs, history,
+/* Motion layer: hooks every user action (query, upload, tabs, history,
    status changes) without touching the existing markup or handlers.
+   A few entries below still name the old batch controls (#bsubmit, #bretry,
+   [data-sub], btbody). They are inert -- the batch list was removed on 2026-08-13,
+   so those selectors simply never match. Left in place rather than surgically
+   pruned: this is a lookup table, and editing it risks the effects that DO fire.
    Animation classes are removed on animationend so :hover transforms keep
    working (an animation with fill-mode:both would otherwise pin transform). */
 (function(){
@@ -1106,6 +1406,374 @@ loadReports();
   a.addEventListener("mouseenter", function(){ a.style.transform = "translateY(-2px)"; });
   a.addEventListener("mouseleave", function(){ a.style.transform = "none"; });
   document.body.appendChild(a);
+})();
+</script>
+<style>
+/* ---- per-feature click effects (appended; no rule above is modified) --------
+   The motion layer added earlier gives every control the SAME white ripple, so
+   pressing "analyse", opening the fox-intel page and submitting feedback all
+   looked identical. This block gives each feature its own signature: a colour
+   for the ripple that already exists, plus one short effect that matches what
+   the action actually does -- a scan beam for analysis, embers for the fox page,
+   a drawer pulling open for the archive, radar pings for the client list.
+
+   It re-uses the existing ripple instead of adding a second one. The earlier
+   layer creates .bwa-rip on pointerdown and hard-codes its colour; re-declaring
+   that colour as a custom property here (same selectors, later in the document,
+   so it wins on order) lets each feature tint it without a second element and
+   without touching that code.
+
+   Everything else is drawn in ONE fixed, pointer-events:none overlay. Effects
+   therefore cannot shift layout, cannot swallow a click, and never need the
+   clicked element to be position:relative -- which matters because most of
+   these controls (.navi, .hrow, .dfam-i, .g-btn) are not.
+
+   All of it is inert under prefers-reduced-motion. */
+
+/* 1. tint the ripple that already exists, per feature */
+.bwa-rip{background:var(--bwx-rip,rgba(255,255,255,.45))}
+.hcard .bwa-rip,.seg .s .bwa-rip,.hchip .bwa-rip{background:var(--bwx-rip,rgba(99,102,241,.28))}
+/* The earlier layer only ripples .btn/.fbtn/.seg .s/.hchip/.hcard, so a tint on
+   anything else was dead CSS until the JS below started emitting a ripple for
+   these three shapes too. They need to clip it: .navi/.iconbtn become positioned
+   so an absolute child anchors to them, while .fbdel is already absolutely
+   positioned (top:-6px;right:-6px) and must NOT be re-positioned or it moves. */
+.navi,.iconbtn{position:relative;overflow:hidden}
+.fbdel{overflow:hidden}
+#sfbtn{--bwx-rip:rgba(249,115,22,.34)}
+#histbtn{--bwx-rip:rgba(107,118,136,.30)}
+#fbbtn{--bwx-rip:rgba(13,148,136,.30)}
+a.navi[href="/engine"]{--bwx-rip:rgba(139,92,246,.30)}
+a.navi[href="/online"]{--bwx-rip:rgba(15,157,88,.30)}
+/* 与 #fbbtn 同一个青色:反馈和客服是同一类「找人说话」的入口,涟漪颜色跟着语义走
+   而不是各挑一个。缺这一行不会报错,只会静默回落到默认色,是那种没人会去查的差异。 */
+a.navi[href="/support"]{--bwx-rip:rgba(13,148,136,.30)}
+a.navi[href="/api/docs"]{--bwx-rip:rgba(107,118,136,.26)}
+#fbsend{--bwx-rip:rgba(255,255,255,.5)}
+#bretry,[data-retry]{--bwx-rip:rgba(224,134,0,.32)}
+.fbdel{--bwx-rip:rgba(255,255,255,.55)}
+.seg .s[data-t="det"]{--bwx-rip:rgba(229,72,77,.26)}
+.seg .s[data-t="beh"]{--bwx-rip:rgba(224,134,0,.26)}
+.seg .s[data-t="graph"]{--bwx-rip:rgba(139,92,246,.26)}
+.seg .s[data-t="meta"]{--bwx-rip:rgba(107,118,136,.26)}
+.hchip[data-f="malicious"]{--bwx-rip:rgba(229,72,77,.26)}
+.hchip[data-f="suspicious"]{--bwx-rip:rgba(224,134,0,.26)}
+.hcard.malicious{--bwx-rip:rgba(229,72,77,.22)}
+.hcard.suspicious{--bwx-rip:rgba(224,134,0,.22)}
+
+/* 2. press feedback for the controls the earlier layer does not cover.
+      That layer only reached .btn/.fbtn/.seg .s/.hchip/.hcard, which left the
+      whole nav bar, the hash rows and the graph toolbar with no reaction at all.
+
+      The transition is re-declared per group rather than as one shared rule:
+      .navi and .iconbtn already animate border-color/color/box-shadow, and a
+      blanket `transition:transform` here would win on source order and silently
+      turn their hover colour change into a jump. */
+.navi{transition:border-color .15s,color .15s,box-shadow .15s,transform .11s ease}
+.iconbtn{transition:border-color .15s,color .15s,transform .11s ease}
+.g-btn,.dfam-i,.hrow,.fbtab,.dmore,.hhead .x,.brand{transition:transform .11s ease}
+.navi:active,.iconbtn:active,.g-btn:active,.dfam-i:active,.hrow:active,
+.fbtab:active,.dmore:active,.hhead .x:active,#fbdrop:active,.brand:active{
+  transform:translateY(1px) scale(.99)}
+
+/* 3. the overlay. z-index 58 clears the modals (40) and the download link (50)
+      while staying under the toast (60), so a toast is never hidden by sparks.
+      contain is layout+paint only: `strict` would add size containment, which
+      this element does not want to reason about. overflow:hidden keeps an effect
+      near the viewport edge from ever producing a scrollbar. */
+#bwxfx{position:fixed;inset:0;z-index:58;pointer-events:none;overflow:hidden;
+  contain:layout paint}
+#bwxfx>*{position:absolute}
+
+@keyframes bwx-ring{from{transform:scale(.2);opacity:.85}to{transform:scale(1);opacity:0}}
+@keyframes bwx-ringin{from{transform:scale(1);opacity:.75}to{transform:scale(.2);opacity:0}}
+@keyframes bwx-part{from{transform:translate(0,0) scale(1);opacity:.95}
+                    to{transform:translate(var(--dx,0),var(--dy,0)) scale(.25);opacity:0}}
+@keyframes bwx-in{from{transform:translate(var(--dx,0),var(--dy,0)) scale(.5);opacity:0}
+                  55%{opacity:.95}
+                  to{transform:translate(0,0) scale(.4);opacity:0}}
+@keyframes bwx-beam{from{left:-42%}to{left:104%}}
+@keyframes bwx-shelf{0%{transform:scaleX(0);opacity:.9}70%{transform:scaleX(1);opacity:.75}100%{transform:scaleX(1);opacity:0}}
+@keyframes bwx-glyph{0%{opacity:0;transform:translate(-50%,-50%) scale(.6)}
+                     28%{opacity:1}
+                     100%{opacity:0;transform:translate(calc(-50% + var(--gx,0px)),calc(-50% + var(--gy,-26px))) scale(1.15)}}
+@keyframes bwx-spin{from{transform:rotate(0);opacity:.9}to{transform:rotate(540deg);opacity:0}}
+@keyframes bwx-unfold{0%{transform:scaleY(0);opacity:.85}100%{transform:scaleY(1);opacity:0}}
+
+.bwx-ring{border-radius:50%;border:2px solid var(--bwx-c);animation:bwx-ring .6s cubic-bezier(.2,.7,.3,1) forwards}
+.bwx-ring.in{animation-name:bwx-ringin}
+.bwx-part{border-radius:50%;background:var(--bwx-c);animation:bwx-part .62s cubic-bezier(.2,.6,.3,1) forwards}
+.bwx-part.slow{animation-duration:.95s;animation-timing-function:ease-out}
+.bwx-part.hollow{background:transparent;border:1.5px solid var(--bwx-c)}
+.bwx-part.inward{animation-name:bwx-in;animation-duration:.5s}
+.bwx-beam{border-radius:12px;overflow:hidden}
+.bwx-beam i{position:absolute;top:0;bottom:0;width:36%;
+  background:linear-gradient(90deg,transparent,var(--bwx-c),transparent);
+  animation:bwx-beam .6s ease-in-out forwards}
+.bwx-shelf{height:2px;border-radius:2px;background:var(--bwx-c);transform-origin:0 50%;
+  animation:bwx-shelf .5s ease-out forwards}
+.bwx-glyph{transform:translate(-50%,-50%);color:var(--bwx-c);font:700 15px var(--mono);
+  white-space:nowrap;animation:bwx-glyph .72s ease-out forwards}
+.bwx-spin{border-radius:50%;border:2px solid transparent;border-top-color:var(--bwx-c);
+  border-right-color:var(--bwx-c);animation:bwx-spin .6s linear forwards}
+.bwx-unfold{width:2px;border-radius:2px;background:var(--bwx-c);transform-origin:50% 0;
+  animation:bwx-unfold .45s ease-out forwards}
+
+/* the archive card lifts as it hands off to the report view */
+@keyframes bwx-lift{0%{transform:none}100%{transform:translateY(-6px) scale(1.01);opacity:.75}}
+.hcard.bwx-lift{animation:bwx-lift .28s ease forwards}
+
+@media (prefers-reduced-motion: reduce){
+  #bwxfx{display:none}
+  .navi:active,.iconbtn:active,.g-btn:active,.dfam-i:active,.hrow:active,
+  .fbtab:active,.dmore:active,.hhead .x:active,#fbdrop:active,.brand:active{transform:none}
+  .hcard.bwx-lift{animation:none}
+}
+</style>
+<script>
+/* Per-feature click effects. One delegated listener, one overlay, a registry
+   that maps a control to the effect that matches its meaning.
+
+   Delegation is not a style preference here: .hcard, .seg .s, .fbtn, [data-sub]
+   and friends are re-created every time innerHTML is rewritten, so anything
+   bound per element would silently stop firing after the first render.
+
+   The listener is capture-phase and passive, never calls preventDefault or
+   stopPropagation, and returns before doing any work when the press is not a
+   primary button. It can therefore never change what a control does. */
+(function(){
+  var D = document;
+  if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+  var BRAND="99,102,241", PURPLE="139,92,246", MAL="229,72,77", SUSP="224,134,0",
+      CLEAN="15,157,88", FOX="249,115,22", TEAL="13,148,136", SLATE="107,118,136";
+
+  var layer=null;
+  function fx(){
+    if (!layer || !layer.parentNode){
+      layer = D.getElementById("bwxfx");
+      if (!layer){ layer = D.createElement("div"); layer.id = "bwxfx"; D.body.appendChild(layer); }
+    }
+    return layer;
+  }
+  /* Rapid clicking must not be able to pile up unbounded DOM. Effects are all
+     sub-second, so a live count this high only happens under a stuck finger. */
+  function busy(){ return fx().childNodes.length > 64; }
+
+  function add(cls, css, life){
+    var d = D.createElement("div");
+    d.className = cls;
+    d.style.cssText = css;
+    fx().appendChild(d);
+    setTimeout(function(){ if (d.parentNode) d.parentNode.removeChild(d); }, life || 800);
+    return d;
+  }
+  function box(el){ return el.getBoundingClientRect(); }
+  function mid(el){ var b = box(el); return [b.left + b.width/2, b.top + b.height/2]; }
+
+  /* ---- primitives ------------------------------------------------------- */
+
+  function ring(x, y, c, size, delay, inward){
+    var s = size || 64;
+    add("bwx-ring" + (inward ? " in" : ""),
+        "left:" + x + "px;top:" + y + "px;width:" + s + "px;height:" + s + "px;" +
+        "margin:" + (-s/2) + "px 0 0 " + (-s/2) + "px;--bwx-c:rgba(" + c + ",.55);" +
+        (delay ? "animation-delay:" + delay + "ms" : ""), 700 + (delay || 0));
+  }
+  function radar(x, y, c, n){ for (var i = 0; i < (n || 3); i++) ring(x, y, c, 22 + i*10, i*150); }
+
+  function part(x, y, c, dx, dy, extra, life){
+    var sz = 6;
+    add("bwx-part" + (extra ? " " + extra : ""),
+        "left:" + x + "px;top:" + y + "px;width:" + sz + "px;height:" + sz + "px;" +
+        "margin:" + (-sz/2) + "px 0 0 " + (-sz/2) + "px;--bwx-c:rgba(" + c + ",.9);" +
+        "--dx:" + dx + "px;--dy:" + dy + "px", life || 700);
+  }
+  function burst(x, y, c, n, dist){
+    n = n || 8;
+    for (var i = 0; i < n; i++){
+      var a = (Math.PI*2/n)*i - Math.PI/2;
+      var r = dist || 30;
+      part(x, y, c, Math.cos(a)*r, Math.sin(a)*r);
+    }
+  }
+  /* embers / bubbles: same rise, different silhouette. Warm solid dots read as
+     sparks; hollow rings read as bubbles. */
+  function rise(x, y, c, n, hollow){
+    for (var i = 0; i < (n || 7); i++){
+      part(x + (Math.random()*22 - 11), y,
+           c, (Math.random()*18 - 9), -(26 + Math.random()*28),
+           "slow" + (hollow ? " hollow" : ""), 1000);
+    }
+  }
+  function suck(el, c){
+    var b = box(el), n = 8;
+    for (var i = 0; i < n; i++){
+      var a = (Math.PI*2/n)*i;
+      var rx = Math.cos(a) * (b.width/2 - 6), ry = Math.sin(a) * (b.height/2 - 6);
+      part(b.left + b.width/2 + rx, b.top + b.height/2 + ry, c, -rx*0.9, -ry*0.9, "inward", 600);
+    }
+  }
+  function beam(el, c){
+    if (!el) return;
+    var b = box(el);
+    var d = add("bwx-beam",
+      "left:" + b.left + "px;top:" + b.top + "px;width:" + b.width + "px;height:" + b.height +
+      "px;--bwx-c:rgba(" + c + ",.5)", 700);
+    d.appendChild(D.createElement("i"));
+  }
+  function glyph(x, y, txt, c, gx, gy){
+    var d = add("bwx-glyph",
+      "left:" + x + "px;top:" + y + "px;--bwx-c:rgba(" + c + ",.95);" +
+      "--gx:" + (gx || 0) + "px;--gy:" + (gy == null ? -26 : gy) + "px", 800);
+    d.textContent = txt;
+  }
+  function shelves(el, c){
+    var b = box(el);
+    for (var i = 0; i < 3; i++){
+      add("bwx-shelf",
+        "left:" + b.left + "px;top:" + (b.top + b.height*(0.3 + i*0.2)) + "px;" +
+        "width:" + (b.width*1.5) + "px;--bwx-c:rgba(" + c + ",.6);" +
+        "animation-delay:" + (i*70) + "ms", 700 + i*70);
+    }
+  }
+  function spin(x, y, c){
+    var s = 26;
+    add("bwx-spin", "left:" + x + "px;top:" + y + "px;width:" + s + "px;height:" + s + "px;" +
+        "margin:" + (-s/2) + "px 0 0 " + (-s/2) + "px;--bwx-c:rgba(" + c + ",.85)", 700);
+  }
+  function unfold(el, c){
+    var b = box(el);
+    add("bwx-unfold", "left:" + (b.left + b.width/2) + "px;top:" + b.bottom + "px;" +
+        "height:" + Math.min(46, b.height*3) + "px;--bwx-c:rgba(" + c + ",.6)", 550);
+  }
+
+  /* ---- composed, per-feature effects ------------------------------------ */
+
+  function analyse(el, x, y){            /* scanning a hash: a beam sweeps the row */
+    beam(D.querySelector(".scan"), BRAND);
+    ring(x, y, BRAND, 76);
+  }
+  function launch(x, y, c){              /* anything that uploads a sample */
+    glyph(x, y, "\u2191", c, 0, -30);
+    for (var i = 0; i < 5; i++) part(x + (i-2)*7, y, c, (i-2)*5, -(22 + Math.random()*16), "slow", 900);
+  }
+  function copied(el, x, y){             /* hash row -> clipboard */
+    beam(el, CLEAN);
+    glyph(x, y, "\u2713", CLEAN, 0, -22);
+  }
+  function tab(el){                      /* the four report tabs, one look each */
+    var t = el.dataset.t, m = mid(el);
+    if (t === "det")        { burst(m[0], m[1], MAL, 6, 26); ring(m[0], m[1], MAL, 52); }
+    else if (t === "beh")   { radar(m[0], m[1], SUSP, 3); }
+    else if (t === "graph") { burst(m[0], m[1], PURPLE, 7, 34); }
+    else                    { unfold(el, SLATE); ring(m[0], m[1], SLATE, 46); }
+  }
+  function chip(el){                      /* archive verdict filters */
+    var f = el.dataset.f, m = mid(el);
+    ring(m[0], m[1], f === "malicious" ? MAL : f === "suspicious" ? SUSP : SLATE, 54);
+  }
+  function cardOpen(el, x, y){            /* threat card hands off to the report */
+    var c = el.classList.contains("malicious") ? MAL
+          : el.classList.contains("suspicious") ? SUSP : BRAND;
+    ring(x, y, c, 70);
+    el.classList.remove("bwx-lift");
+    void el.offsetWidth;
+    el.classList.add("bwx-lift");
+    setTimeout(function(){ el.classList.remove("bwx-lift"); }, 340);
+  }
+  function graphBtn(el, x, y){            /* toolbar: outward, inward, or scale */
+    var a = el.dataset.gact;
+    if (a === "expand")        burst(x, y, BRAND, 8, 32);
+    else if (a === "collapse") { for (var i = 0; i < 8; i++){
+                                   var an = (Math.PI*2/8)*i, r = 30;
+                                   part(x + Math.cos(an)*r, y + Math.sin(an)*r, BRAND,
+                                        -Math.cos(an)*r, -Math.sin(an)*r, "inward", 600); } }
+    else if (a === "zoomin")   ring(x, y, BRAND, 54);
+    else if (a === "zoomout")  ring(x, y, BRAND, 54, 0, true);
+    else                       { ring(x, y, SLATE, 40); glyph(x, y, "100%", SLATE, 0, -22); }
+  }
+
+  /* ---- registry. First match wins, so specific ids precede shared classes.
+         .fbtn is last on purpose: it is the fallback shape shared by the batch
+         row buttons and the detection filter, both of which want their own
+         effect above. */
+  var REG = [
+    ["#go",                  function(el,x,y){ analyse(el,x,y); }],
+    ["#drop",                function(el){ suck(el, BRAND); }],
+    ["#upbtn",               function(el,x,y){ launch(x,y,BRAND); }],
+
+    ["#sfbtn",               function(el,x,y){ rise(x,y,FOX,9); ring(x,y,FOX,60); }],
+    ["#histbtn",             function(el){ shelves(el, SLATE); }],
+    ["#fbbtn",               function(el,x,y){ rise(x,y,TEAL,6,true); }],
+    ["#bwAboutLink",         function(el,x,y){ glyph(x,y,"\u2193",BRAND,0,30);
+                                               part(x,y,BRAND,0,26,"slow",800); }],
+    ['a[href="/engine"]',    function(el,x,y){ radar(x,y,PURPLE,3); }],
+    ['a[href="/online"]',    function(el,x,y){ radar(x,y,CLEAN,4); }],
+    ['a[href="/api/docs"]',  function(el,x,y){ glyph(x,y,"{ }",SLATE); }],
+    [".brand",               function(el){ var l = el.querySelector(".logo") || el, m = mid(l);
+                                           ring(m[0],m[1],BRAND,58); ring(m[0],m[1],PURPLE,58,120); }],
+
+    [".seg .s",              function(el){ tab(el); }],
+    [".hrow",                function(el,x,y){ copied(el,x,y); }],
+    [".g-btn",               function(el,x,y){ graphBtn(el,x,y); }],
+    [".ipq",                 function(el,x,y){ radar(x,y,BRAND,2); }],
+
+    [".hchip",               function(el){ chip(el); }],
+    [".hcard",               function(el,x,y){ cardOpen(el,x,y); }],
+    [".hhead .x",            function(el,x,y){ ring(x,y,SLATE,46,0,true); }],
+
+    ["#dallthreats",         function(el,x,y){ glyph(x,y,"\u2192",BRAND,26,0); }],
+    [".dfam-i",              function(el,x,y){ glyph(x,y,"\u2192",MAL,24,0); }],
+
+    ["#bsubmit",             function(el,x,y){ launch(x,y,BRAND); }],
+    ["[data-sub]",           function(el,x,y){ launch(x,y,BRAND); }],
+    ["#bretry",              function(el,x,y){ spin(x,y,SUSP); }],
+    ["[data-retry]",         function(el,x,y){ spin(x,y,SUSP); }],
+    ["[data-open]",          function(el){ unfold(el, BRAND); }],
+
+    ["#fbsend",              function(el,x,y){ glyph(x,y,"\u27a4",TEAL,22,-18);
+                                               burst(x,y,TEAL,5,22); }],
+    ["#fbdrop",              function(el){ suck(el, BRAND); }],
+    [".fbdel",               function(el,x,y){ burst(x,y,MAL,7,20); }],
+    [".fbtab",               function(el){ var b = box(el);
+                                           add("bwx-shelf","left:" + b.left + "px;top:" +
+                                               (b.bottom - 2) + "px;width:" + b.width +
+                                               "px;--bwx-c:rgba(" + BRAND + ",.85)", 600); }],
+
+    [".fbtn",                function(el,x,y){ ring(x,y,BRAND,44); }]
+  ];
+
+  /* Controls the earlier layer already ripples. Anything here must NOT get a
+     second one; anything in RIPPLE_MINE gets ours so its tint is not dead CSS. */
+  var RIPPLE_THEIRS = ".btn,.fbtn,.seg .s,.hchip,.hcard";
+  var RIPPLE_MINE   = ".navi,.iconbtn,.fbdel";
+  function ripple(el, x, y){
+    if (!el.matches) return;
+    if (el.matches(RIPPLE_THEIRS) || !el.matches(RIPPLE_MINE)) return;
+    var b = el.getBoundingClientRect();
+    var s = D.createElement("span");
+    s.className = "bwa-rip";                   /* reuse their class and keyframes */
+    s.style.left = (x - b.left) + "px";
+    s.style.top  = (y - b.top) + "px";
+    el.appendChild(s);
+    setTimeout(function(){ if (s.parentNode) s.parentNode.removeChild(s); }, 620);
+  }
+
+  D.addEventListener("pointerdown", function(e){
+    if (e.button !== 0 || e.isPrimary === false) return;
+    var t = e.target;
+    if (!t || !t.closest) return;
+    for (var i = 0; i < REG.length; i++){
+      var el = t.closest(REG[i][0]);
+      if (!el) continue;
+      if (el.disabled) return;                 /* a disabled control did nothing */
+      if (busy()) return;
+      try { REG[i][1](el, e.clientX, e.clientY); } catch (err) {}
+      try { ripple(el, e.clientX, e.clientY); } catch (err) {}
+      return;
+    }
+  }, true);
 })();
 </script>
 </body>

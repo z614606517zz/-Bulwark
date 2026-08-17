@@ -1,4 +1,4 @@
-# 磐垒 · Windows Sandbox 行为采集脚本
+﻿# 磐垒 · Windows Sandbox 行为采集脚本
 # 在沙盒内运行,记录所有进程/文件/注册表/网络行为
 
 param(

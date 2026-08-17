@@ -1,4 +1,4 @@
-# 磐垒 - 停止内核驱动(Bypass 自保护)
+﻿# 磐垒 - 停止内核驱动(Bypass 自保护)
 # 需管理员权限
 $ErrorActionPreference = 'Stop'
 

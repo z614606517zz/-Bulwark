@@ -376,7 +376,7 @@ BlwHashWorkerThread(_In_ PVOID Context)
     UNREFERENCED_PARAMETER(Context);
 
     // 读缓冲整个线程生命周期只分配一次(原实现每扫一个文件分配 / 释放一次 64KB)。
-    buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_PAGED, BLW_HASH_CHUNK, BLW_TAG);
+    buf = (PUCHAR)BlwAllocPool(PagedPool, BLW_HASH_CHUNK, BLW_TAG);
     if (buf == NULL) {
         // 分配不到就直接退出:哈希研判不可用(非致命),其余防护不受影响。
         // 入队方仍会照常入队并因无人消费而自然丢弃,绝不阻塞任何回调。

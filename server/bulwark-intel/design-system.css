@@ -1,0 +1,880 @@
+/* ===========================================================================
+   Bulwark 控制台设计系统 —— 单一色源
+   ===========================================================================
+
+   为什么要有这个文件
+   ------------------
+   之前七个页面各自维护一份 :root、各自定义 .wrap 宽度（760/900/1020/1080/1180）、
+   各自写一套组件样式。后果不是"不好看"，是一整类反复出现的故障：
+     · 主题从暗色翻浅色时，五份副本逐条改，每次都漏几条 —— 深灰字压近黑底、
+       hover 变亮反而消失、说明框用暗色主题的高亮浅色，都是这么来的；
+     · 判定色（红/琥珀/绿）没有约束，被拿去当分类标签、HTTP 动词、剔除原因、
+       文档正反例的颜色 —— 满页都是红，红就不再是"出事了"；
+     · 字号没有阶，14.5/13.6/12.4/11.5/10.5/9.5 并存，页面之间对不齐。
+
+   这个文件是唯一色源。三个产物（webui.html / about.html / app.py 内嵌页）都从
+   它生成，并由 bw_ds.py 校验三份没有漂移 —— 靠人记住去同步是不可能的，前面
+   已经证明过了。
+
+   硬规则（可被脚本检查，不是口头约定）
+   ------------------------------------
+   1. 颜色只能来自本文件的令牌。组件里不许出现字面量色值。
+   2. --mal / --sus / --ok 是【判定语义色】，只允许用于表达"恶意/可疑/安全"这个
+      判定本身。不得用于分类、标识、动词、原因、正反例。
+   3. 同一条记录上判定色只出现一次。判定已由徽标说明时，标签、数字、边框一律中性。
+   4. 大面积填充用 --mal-fill / --sus-fill / --ok-fill（明度按面积调过），
+      小面积标记用 --mal / --sus / --ok 原值。同一色相，不同强度。
+   5. 所有文字色必须对 --bg 与 --panel 两个底色都 >= 4.5:1。
+      注意：--bg 是灰的，比白底更不利，必须按 --bg 算。
+   6. hover 一律【加深】。浅色主题里变亮等于消失。
+   7. 图标只用 BMP 内的单色字形，不用彩色 emoji。emoji 自带不受控的配色。
+   =========================================================================== */
+
+:root{
+  /* ---- 表面。只有三层，多一层就会开始出现"这块算面板还是算底"的争论 ---- */
+  --bg:      #eef1f6;   /* 页面底：灰的。面板靠自身亮度浮起来，不靠边框描 */
+  --panel:   #ffffff;   /* 面板：内容真正所在的层 */
+  --inset:   #f5f7fa;   /* 内凹：表头条纹、代码块、只读区。始终介于两者之间 */
+
+  /* ---- 描边。低透明度深色，不用固定灰：叠在任何底色上都成立 ---- */
+  --line:    rgba(16,24,40,.10);
+  --line-2:  rgba(16,24,40,.16);
+
+  /* ---- 文字。四阶，每一阶都对 --bg（最不利底色）算过对比度 ---- */
+  --ink:     #0f172a;   /* 标题、关键数字        ~15.8:1 */
+  --ink-2:   #33415c;   /* 正文                  ~ 9.1:1 */
+  --muted:   #556074;   /* 次要说明              ~ 5.2:1 */
+  --dim:     #5f6a7d;   /* 最弱：单位、时间、脚注 ~ 4.6:1 */
+  /* 灰底上能塞进 AA 的低强调层级只有两阶，所以 muted 和 dim 差别不大。
+     可读性优先于层级的精细度 —— 之前 --dim 是 #98a2b3，只有 2.3:1。 */
+
+  /* ---- 强调。整套系统只有一个，且刻意避开红/琥珀/绿 ---- */
+  --acc:     #2563eb;
+  --acc-ink: #1d4ed8;   /* hover：加深，不是变亮 */
+  --acc-bg:  rgba(37,99,235,.07);
+  --acc-ln:  rgba(37,99,235,.24);
+
+  /* ---- 判定语义色。见硬规则 2/3/4 ---- */
+  --mal:     #c62d20;  --mal-fill: #ef7a70;  --mal-bg: rgba(198,45,32,.07);
+  --sus:     #9a5c06;  --sus-fill: #e0a668;  --sus-bg: rgba(154,92,6,.07);
+  --ok:      #04663d;  --ok-fill:  #4fae85;  --ok-bg:  rgba(4,102,61,.07);
+  --unk:     #475467;  --unk-fill: #a6afbe;  --unk-bg: rgba(71,84,103,.06);
+
+  /* ---- 排版阶。六级，没有中间值 ---- */
+  --t-xs: 11px;  --t-sm: 12px;  --t-md: 13px;
+  --t-lg: 15px;  --t-xl: 20px;  --t-2xl: 28px;
+
+  /* ---- 间距阶。四的倍数 ---- */
+  --s-1: 4px;  --s-2: 8px;   --s-3: 12px;  --s-4: 16px;
+  --s-5: 24px; --s-6: 32px;  --s-7: 48px;
+
+  /* ---- 圆角。三档 ---- */
+  --r-sm: 6px; --r-md: 10px; --r-lg: 14px;
+
+  /* ---- 阴影。浅色主题上阴影必须极淡，否则白卡边缘会发脏 ---- */
+  --sh-1: 0 1px 2px rgba(16,24,40,.05);
+  --sh-2: 0 4px 16px rgba(16,24,40,.08);
+
+  /* ---- 结构尺寸 ---- */
+  --side-w: 232px;      /* 常驻左侧导航宽度 */
+  --head-h: 56px;       /* 页头高度 */
+
+  --sans: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Microsoft YaHei",
+          system-ui,sans-serif;
+  --mono: "Cascadia Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+
+/* ===========================================================================
+   骨架：常驻左侧导航 + 内容区
+   ---------------------------------------------------------------------------
+   取代原来的"顶栏 + 第二行导航"。原结构把品牌、实时钟、额度、反馈按钮、下载 CTA
+   全塞在一条 56px 的横栏里，宽度不够就开始互相压 —— 那个下载 CTA 曾经是
+   position:fixed 浮在顶栏上，把时钟盖掉了半截。竖排导航天然没有这个问题：
+   导航项数量增长走纵向，不和任何东西抢横向空间；页头只留标题和本页动作。
+   =========================================================================== */
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);color:var(--ink-2);
+  font:var(--t-md)/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+a{color:var(--acc);text-decoration:none}
+a:hover{color:var(--acc-ink)}          /* 加深，见硬规则 6 */
+
+.bw-shell{display:flex;min-height:100vh;align-items:stretch}
+
+/* ---- 左侧导航 ---- */
+.bw-side{
+  width:var(--side-w);flex:none;
+  background:var(--panel);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;
+  position:sticky;top:0;height:100vh;
+}
+.bw-brand{
+  display:flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-4) var(--s-4) var(--s-4);
+  border-bottom:1px solid var(--line);
+}
+.bw-brand .mk{
+  width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--acc);color:#fff;font-size:15px;border-radius:var(--r-sm);
+}
+/* 压在色块上的文字固定 #fff，不用 var(--panel)：--panel 的语义是"面板底色"，
+   换主题时会变成浅字压浅底。 */
+.bw-brand b{display:block;font-size:var(--t-md);font-weight:750;letter-spacing:.4px;
+  color:var(--ink);line-height:1.2}
+.bw-brand s{display:block;text-decoration:none;font-size:9px;color:var(--dim);
+  letter-spacing:1.1px;margin-top:1px}
+
+.bw-nav{padding:var(--s-3) var(--s-2);display:flex;flex-direction:column;gap:2px;
+  overflow-y:auto;flex:1}
+.bw-nav .grp{font-size:9px;letter-spacing:1.2px;color:var(--dim);
+  padding:var(--s-3) var(--s-2) var(--s-1);font-weight:700}
+.bw-nav a,.bw-nav button{
+  display:flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-2) var(--s-2);border-radius:var(--r-sm);
+  font:600 var(--t-md)/1.3 var(--sans);color:var(--ink-2);
+  background:none;border:none;cursor:pointer;text-align:left;width:100%;
+  transition:background .12s,color .12s;
+}
+.bw-nav a:hover,.bw-nav button:hover{background:var(--acc-bg);color:var(--acc-ink)}
+.bw-nav .on{background:var(--acc-bg);color:var(--acc);font-weight:700;
+  box-shadow:inset 2px 0 0 var(--acc)}
+.bw-nav .i{width:16px;flex:none;text-align:center;font-size:13px;opacity:.85}
+.bw-nav .n{margin-left:auto;font:700 var(--t-xs)/1 var(--mono);color:var(--dim);
+  font-variant-numeric:tabular-nums}
+.bw-nav .on .n{color:var(--acc)}
+
+/* 侧栏底部：时钟和状态。放这里而不是页头 —— 它们是环境信息，不是本页内容 */
+.bw-side-foot{border-top:1px solid var(--line);padding:var(--s-3) var(--s-4);
+  font-size:var(--t-xs);color:var(--dim)}
+.bw-side-foot .clk{font:700 var(--t-lg)/1.1 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:.5px}
+.bw-side-foot .clkd{display:block;margin-top:2px}
+
+/* ---- 内容区 ---- */
+.bw-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.bw-head{
+  height:var(--head-h);flex:none;
+  display:flex;align-items:center;gap:var(--s-3);
+  padding:0 var(--s-5);
+  background:rgba(255,255,255,.86);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+  position:sticky;top:0;z-index:20;
+}
+.bw-head h1{margin:0;font-size:var(--t-lg);font-weight:700;color:var(--ink);
+  letter-spacing:-.01em;white-space:nowrap}
+.bw-head .sub{font-size:var(--t-sm);color:var(--dim);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.bw-head .grow{flex:1}
+.bw-body{padding:var(--s-5);max-width:1360px;width:100%}
+
+@media(max-width:900px){
+  .bw-shell{flex-direction:column}
+  .bw-side{width:auto;height:auto;position:static;flex-direction:row;
+    border-right:none;border-bottom:1px solid var(--line);align-items:center}
+  .bw-nav{flex-direction:row;overflow-x:auto;padding:var(--s-2)}
+  .bw-nav .grp,.bw-side-foot{display:none}
+  .bw-body{padding:var(--s-4)}
+}
+
+/* ===========================================================================
+   组件词汇表。每个组件只定义一次，所有页面用同一套。
+   =========================================================================== */
+
+/* ---- 面板 ---- */
+.bw-panel{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--sh-1);overflow:hidden}
+.bw-panel+.bw-panel{margin-top:var(--s-4)}
+.bw-panel-h{display:flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-3) var(--s-4);border-bottom:1px solid var(--line);
+  font-size:var(--t-sm);font-weight:700;color:var(--ink)}
+/* 标题和图标必须包在同一个元素里再和右侧动作分开 —— 直接用 space-between
+   会把图标顶到最左、标题甩到最右。这个坑踩过。 */
+.bw-panel-h .grow{flex:1}
+.bw-panel-h .act{font-size:var(--t-sm);font-weight:600;color:var(--acc);cursor:pointer}
+.bw-panel-b{padding:var(--s-4)}
+
+/* ---- 统计瓦片 ---- */
+.bw-stats{display:grid;gap:var(--s-3);
+  grid-template-columns:repeat(auto-fit,minmax(168px,232px));
+  justify-content:start;margin-bottom:var(--s-4)}
+.bw-stat{background:var(--panel);border:1px solid var(--line);
+  border-top:2px solid var(--line-2);border-radius:var(--r-md);
+  padding:var(--s-3) var(--s-4);box-shadow:var(--sh-1)}
+.bw-stat .v{font:800 var(--t-2xl)/1.05 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-1px}
+.bw-stat .v small{font-size:var(--t-lg);color:var(--dim);font-weight:600}
+.bw-stat .k{font-size:var(--t-xs);color:var(--muted);margin-top:var(--s-1);
+  letter-spacing:.4px;background:none;padding:0;border-radius:0;display:block}
+/* .k 显式清零 background/padding/border-radius：各页面残留着给旧标记用的
+   药丸样式，不写这几条就会漏进来，标签变成一颗药丸。 */
+/* 判定色由【数值】决定，不由标签决定：为 0 时不得亮判定色。
+   "恶意 0" 是好状态，涂红等于在没有警情时报警。 */
+.bw-stat.mal{border-top-color:var(--mal)} .bw-stat.mal .v{color:var(--mal)}
+.bw-stat.sus{border-top-color:var(--sus)} .bw-stat.sus .v{color:var(--sus)}
+.bw-stat.ok {border-top-color:var(--ok)}  .bw-stat.ok  .v{color:var(--ok)}
+.bw-stat.acc{border-top-color:var(--acc)}
+
+/* ---- 表格。密集数据用"面板 + 细线分隔行"，不用一行一个盒子 ---- */
+.bw-table{width:100%;border-collapse:collapse;font-size:var(--t-md)}
+.bw-table th{text-align:left;padding:var(--s-2) var(--s-3);
+  background:var(--inset);color:var(--dim);
+  font-size:var(--t-xs);font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  border-bottom:1px solid var(--line);white-space:nowrap}
+.bw-table td{padding:var(--s-3);border-bottom:1px solid var(--line);
+  vertical-align:top;color:var(--ink-2)}
+.bw-table tbody tr:last-child td{border-bottom:none}
+.bw-table tbody tr:hover td{background:var(--acc-bg)}
+.bw-table .num{text-align:right;font-family:var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.bw-table .mono{font-family:var(--mono);font-size:var(--t-sm);word-break:break-all}
+
+/* ---- 标签。默认中性；判定色变体只允许用在判定上 ---- */
+.bw-tag{display:inline-block;padding:2px var(--s-2);border-radius:var(--r-sm);
+  font:700 var(--t-xs)/1.6 var(--sans);
+  background:var(--inset);color:var(--muted);border:1px solid var(--line)}
+.bw-tag.mono{font-family:var(--mono);font-weight:600}
+.bw-tag.mal{background:var(--mal-bg);color:var(--mal);border-color:rgba(198,45,32,.22)}
+.bw-tag.sus{background:var(--sus-bg);color:var(--sus);border-color:rgba(154,92,6,.22)}
+.bw-tag.ok {background:var(--ok-bg); color:var(--ok); border-color:rgba(4,102,61,.22)}
+.bw-tag.acc{background:var(--acc-bg);color:var(--acc);border-color:var(--acc-ln)}
+/* 淡底透明度刻意压到 .07：11~12px 的粗体小字压同色淡底最容易掉到 4.5:1 以下，
+   .14 时实测只有 3.4~4.1:1。 */
+
+/* ---- 按钮 ---- */
+.bw-btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s-2);
+  padding:var(--s-2) var(--s-4);border-radius:var(--r-md);
+  font:700 var(--t-md)/1.4 var(--sans);cursor:pointer;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);
+  transition:background .13s,border-color .13s,color .13s}
+.bw-btn:hover{border-color:var(--acc-ln);color:var(--acc-ink);background:var(--acc-bg)}
+.bw-btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+.bw-btn.pri:hover{background:var(--acc-ink);border-color:var(--acc-ink);color:#fff}
+.bw-btn.danger:hover{border-color:rgba(198,45,32,.4);color:var(--mal);
+  background:var(--mal-bg)}
+.bw-btn[disabled]{opacity:.5;cursor:not-allowed}
+
+/* ---- 输入 ---- */
+.bw-field{width:100%;padding:var(--s-3);border-radius:var(--r-md);
+  border:1px solid var(--line);border-left:2px solid var(--acc);
+  background:var(--panel);color:var(--ink);font:var(--t-md) var(--mono);
+  letter-spacing:.4px;transition:border-color .13s,box-shadow .13s}
+/* 输入框底色用 --panel 而不是 --bg：它是可写的面板，跟着页面底色走的话
+   页面一调暗它就变灰，看着像被禁用了。 */
+.bw-field::placeholder{color:var(--dim)}
+.bw-field:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px var(--acc-bg)}
+
+/* ---- 代码块。浅底深字：暗底 + 亮语法色是暗色主题的做法 ---- */
+.bw-code{background:var(--inset);color:var(--ink);border:1px solid var(--line);
+  border-radius:var(--r-md);padding:var(--s-3) var(--s-4);overflow:auto;
+  font:var(--t-sm)/1.7 var(--mono);margin:0}
+.bw-code .k{color:var(--acc-ink);font-weight:700}
+.bw-code .s{color:var(--ok)}
+.bw-code .c{color:var(--dim)}
+
+/* ---- 说明框。语义靠左侧色条表达，文字一律走可读的深色 ---- */
+.bw-note{border:1px solid var(--line);border-left:3px solid var(--acc);
+  background:var(--acc-bg);border-radius:var(--r-md);
+  padding:var(--s-3) var(--s-4);font-size:var(--t-md);color:var(--ink-2);
+  display:flex;gap:var(--s-3);align-items:flex-start}
+.bw-note b{color:var(--ink)}
+.bw-note.warn{border-left-color:var(--sus);background:var(--sus-bg)}
+.bw-note.bad{border-left-color:var(--mal);background:var(--mal-bg)}
+
+/* ---- 状态灯 ---- */
+.bw-dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  vertical-align:middle;margin-right:var(--s-2);background:var(--unk-fill)}
+.bw-dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.bw-dot.off{background:var(--unk-fill)}
+
+/* ---- 比例条。大面积填充用 -fill 变体 ---- */
+.bw-bar{height:6px;border-radius:99px;background:var(--inset);
+  overflow:hidden;display:flex}
+.bw-bar i{display:block;height:100%}
+.bw-bar .mal{background:var(--mal-fill)}
+.bw-bar .sus{background:var(--sus-fill)}
+.bw-bar .ok {background:var(--ok-fill)}
+
+/* ---- 空状态 ---- */
+.bw-empty{padding:var(--s-6) var(--s-4);text-align:center;color:var(--dim);
+  font-size:var(--t-sm)}
+
+/* ===========================================================================
+   组件层 —— JS 生成标记的类名，外观从零重写
+   ===========================================================================
+
+   这一层的存在方式需要说清楚，否则下一个人会以为它是遗留代码：
+
+   控制台的报告、仪表盘、档案、进程树全部由 JS 在运行时拼字符串生成，用到 162 个
+   类名。那 1500 行 JS 是不能动的（批量队列的 429 退避与重排、送检判据都在里面），
+   所以【类名是接口，必须原样保留】—— 但外观没有任何理由沿用。
+
+   所以：旧样式表整块删除，下面按类名重新定义一遍外观。类名照旧，长相全新。
+   这是"彻底重新设计"在有 JS 契约约束下唯一诚实的做法：换掉的是设计，不是接口。
+
+   所有规则只用上面 :root 的令牌，不出现字面量色值（R1），
+   判定色只用于判定（R2/R3），大面积用 -fill 变体（R4）。
+   =========================================================================== */
+
+/* ---------- 采集区。原来是一个带标题和大段说明的面板，占掉近三分之一首屏；
+              现在压成一条：输入框 + 主按钮 + 一行折叠说明。 ---------- */
+.cmd{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);
+  box-shadow:var(--sh-1);padding:var(--s-4);margin-bottom:var(--s-4)}
+.cmd h1{margin:0 0 var(--s-1);font-size:var(--t-md);font-weight:700;color:var(--ink);
+  letter-spacing:.3px}
+.cmd .lead{margin:0 0 var(--s-3);font-size:var(--t-sm);color:var(--muted);
+  max-width:76ch}
+.scan{display:flex;gap:var(--s-2);align-items:stretch}
+.scan .field{flex:1;min-width:0}
+.scan input{width:100%;height:40px;padding:0 var(--s-3);border-radius:var(--r-md);
+  border:1px solid var(--line);border-left:2px solid var(--acc);
+  background:var(--panel);color:var(--ink);font:var(--t-md) var(--mono);
+  letter-spacing:.4px;transition:border-color .13s,box-shadow .13s}
+.scan input::placeholder{color:var(--dim);letter-spacing:0;font-family:var(--sans)}
+.scan input:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px var(--acc-bg)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s-2);
+  height:40px;padding:0 var(--s-5);border-radius:var(--r-md);border:1px solid var(--acc);
+  background:var(--acc);color:#fff;font:700 var(--t-md)/1 var(--sans);cursor:pointer;
+  transition:background .13s,border-color .13s}
+.btn:hover{background:var(--acc-ink);border-color:var(--acc-ink)}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+
+/* 分隔线式的「或」。原来是一整行居中大字，现在收成一条细线上的小字 */
+.or{display:flex;align-items:center;gap:var(--s-3);margin:var(--s-3) 0;
+  font-size:var(--t-xs);color:var(--dim);letter-spacing:1px}
+.or::before,.or::after{content:"";height:1px;background:var(--line);flex:1}
+
+/* 拖放区。虚线 + 极淡内凹，不用蓝色调 —— 它是待命状态，不是可点的主行动 */
+.drop{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:var(--s-1);padding:var(--s-5) var(--s-4);text-align:center;cursor:pointer;
+  border:1px dashed var(--line-2);border-radius:var(--r-md);background:var(--inset);
+  transition:border-color .15s,background .15s}
+.drop:hover,.drop.drag{border-color:var(--acc);background:var(--acc-bg)}
+.drop .ic{font-size:18px;line-height:1;color:var(--dim)}
+.drop b{font-size:var(--t-md);font-weight:700;color:var(--ink-2)}
+.drop small{font-size:var(--t-xs);color:var(--dim);max-width:70ch;line-height:1.6}
+
+/* ---------- 状态行 / 提示条 ---------- */
+.status{font-size:var(--t-sm);color:var(--muted);margin-bottom:var(--s-3);
+  display:flex;align-items:center;gap:var(--s-2);min-height:20px}
+.status:empty{display:none;margin:0}
+.status.err{color:var(--mal)}
+.status.ok{color:var(--ok)}
+.spin{width:12px;height:12px;flex:none;border-radius:50%;
+  border:2px solid var(--acc-ln);border-top-color:var(--acc);
+  animation:bwspin .7s linear infinite}
+@keyframes bwspin{to{transform:rotate(360deg)}}
+.toast{position:fixed;left:50%;bottom:var(--s-5);transform:translate(-50%,8px);
+  background:var(--ink);color:#fff;padding:var(--s-2) var(--s-4);
+  border-radius:var(--r-md);font-size:var(--t-sm);opacity:0;pointer-events:none;
+  transition:opacity .2s,transform .2s;z-index:70;box-shadow:var(--sh-2)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+/* ---------- 仪表盘骨架 ---------- */
+.dash{display:block}
+.dstats,.hstats{display:grid;gap:var(--s-3);
+  grid-template-columns:repeat(auto-fit,minmax(168px,232px));
+  justify-content:start;margin-bottom:var(--s-4)}
+/* 瓦片和 .bw-stat 同源。判定色由数值决定，为 0 不亮 —— 见 .bw-stat 处的说明 */
+.hstat{background:var(--panel);border:1px solid var(--line);
+  border-top:2px solid var(--line-2);border-radius:var(--r-md);
+  padding:var(--s-3) var(--s-4);box-shadow:var(--sh-1)}
+.hstat .v{font:800 var(--t-2xl)/1.05 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-1px}
+.hstat .v small{font-size:var(--t-lg);color:var(--dim);font-weight:600}
+.hstat .k{font-size:var(--t-xs);color:var(--muted);margin-top:var(--s-1);
+  letter-spacing:.4px;background:none;padding:0;border-radius:0;display:block}
+.hstat.mal{border-top-color:var(--mal)} .hstat.mal .v{color:var(--mal)}
+.hstat.susp{border-top-color:var(--sus)} .hstat.susp .v{color:var(--sus)}
+
+.dgrid{display:grid;grid-template-columns:minmax(0,1fr) 312px;gap:var(--s-4);
+  align-items:start}
+.dmain,.dside{min-width:0;display:flex;flex-direction:column;gap:var(--s-4)}
+@media(max-width:1180px){.dgrid{grid-template-columns:1fr}}
+
+/* 分区面板 */
+.dsec{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--sh-1);overflow:hidden}
+.dsec-h{display:flex;align-items:center;justify-content:space-between;
+  gap:var(--s-3);padding:var(--s-3) var(--s-4);
+  border-bottom:1px solid var(--line);
+  font-size:var(--t-sm);font-weight:700;color:var(--ink)}
+/* 标题和图标必须包在同一个子元素里，否则 space-between 会把图标顶到最左、
+   标题甩到最右 —— 这个坑在旧版上真实发生过。 */
+.dsec-h .ic{margin-right:var(--s-2);color:var(--dim);font-weight:400}
+.dmore{font-size:var(--t-sm);font-weight:600;color:var(--acc);cursor:pointer;
+  letter-spacing:0}
+.dmore:hover{color:var(--acc-ink)}
+.dempty{padding:var(--s-6) var(--s-4);text-align:center;color:var(--dim);
+  font-size:var(--t-sm)}
+
+/* 分类 / 家族列表。标签一律中性 —— 家族名和分类是标识，不是判定 */
+.dfam{display:flex;flex-direction:column;padding:var(--s-2) var(--s-4) var(--s-3)}
+.dfam-i{display:flex;align-items:center;justify-content:space-between;
+  gap:var(--s-3);padding:var(--s-2) 0;cursor:pointer;
+  border-bottom:1px solid var(--line)}
+.dfam-i:last-child{border-bottom:none}
+.dfam-i:hover{background:var(--acc-bg)}
+.dfam-i b{font:700 var(--t-sm)/1 var(--mono);color:var(--muted);
+  font-variant-numeric:tabular-nums;flex:none}
+
+/* 情报源清单 */
+.dsrc-i{display:flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-2) var(--s-4);border-bottom:1px solid var(--line);
+  font-size:var(--t-sm)}
+.dsrc-i:last-child{border-bottom:none}
+.dsrc-i .nm{flex:1;font-weight:600;color:var(--ink-2)}
+.dsrc-i .ks{font-family:var(--mono);font-size:var(--t-xs);color:var(--dim)}
+
+/* 判定分布条。大面积用 -fill 变体：100% 恶意时满宽的饱和红只是在喊，
+   不传达任何比例信息（比例是 100:0:0，图例已经写明了）。 */
+.dist{display:flex;height:7px;border-radius:99px;background:var(--inset);
+  overflow:hidden;margin:var(--s-4) 0 0}
+.dist i{display:block;height:100%}
+.dist .dmal{background:var(--mal-fill)}
+.dist .dsus{background:var(--sus-fill)}
+.dist .doth{background:var(--unk-fill)}
+.distk{display:flex;gap:var(--s-4);margin-top:var(--s-2);
+  font:var(--t-xs) var(--mono);color:var(--muted)}
+.distk span{display:inline-flex;align-items:center;gap:var(--s-2)}
+.distk em{width:8px;height:8px;border-radius:2px;display:inline-block}
+.distk .dmal{background:var(--mal-fill)}
+.distk .dsus{background:var(--sus-fill)}
+.distk .doth{background:var(--unk-fill)}
+
+/* ---------- 7 日趋势 ---------- */
+.trend{display:flex;align-items:flex-end;gap:var(--s-2);height:132px;
+  padding:var(--s-4) var(--s-4) 0}
+.tcol{flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:flex-end;height:100%;gap:var(--s-1)}
+.tcol .tv{font:var(--t-xs) var(--mono);color:var(--muted);height:14px;
+  font-variant-numeric:tabular-nums}
+.tbar{width:100%;max-width:40px;display:flex;flex-direction:column;
+  justify-content:flex-end;border-radius:3px 3px 0 0;overflow:hidden;
+  background:var(--inset);transition:height .45s cubic-bezier(.2,.7,.3,1)}
+.tbar i{display:block;width:100%}
+.tbar .tm{background:var(--mal-fill)}
+.tbar .ts{background:var(--sus-fill)}
+.tcol:hover .tbar{background:var(--acc-bg)}
+
+/* ---------- 基础原子 ---------- */
+.pill,.chip{display:inline-block;padding:2px var(--s-2);border-radius:var(--r-sm);
+  font:700 var(--t-xs)/1.6 var(--sans);
+  background:var(--inset);color:var(--muted);border:1px solid var(--line)}
+.pill.mal,.chip.mal,.ipv.mal{background:var(--mal-bg);color:var(--mal);
+  border-color:rgba(198,45,32,.22)}
+.pill.susp,.chip.susp,.ipv.susp{background:var(--sus-bg);color:var(--sus);
+  border-color:rgba(154,92,6,.22)}
+.pill.clean,.chip.clean,.ipv.clean{background:var(--ok-bg);color:var(--ok);
+  border-color:rgba(4,102,61,.22)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none;
+  background:var(--unk-fill)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.dot.off{background:var(--unk-fill)}
+.empty{padding:var(--s-6) var(--s-4);text-align:center;color:var(--dim);
+  font-size:var(--t-sm)}
+.card{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--sh-1);overflow:hidden}
+.bx{border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--panel);overflow:hidden}
+.bx h4{margin:0;padding:var(--s-2) var(--s-3);font-size:var(--t-xs);
+  font-weight:700;color:var(--ink);background:var(--inset);
+  border-bottom:1px solid var(--line);letter-spacing:.5px;
+  display:flex;align-items:center;justify-content:space-between}
+.bx ul{margin:0;padding:var(--s-2) var(--s-3) var(--s-2) var(--s-5);
+  font-size:var(--t-sm);color:var(--ink-2)}
+.bx .n{font:700 var(--t-xs) var(--mono);color:var(--dim)}
+
+/* ---------- 弹窗。必须排在最前面被想到的一类:旧规则里 .hmodal 是
+              position:fixed + opacity:0 + visibility:hidden。删掉旧样式后它退化成
+              普通块级元素，两个弹窗会直接铺在页面顶部把正文顶下去 —— 这不是
+              "样式没跟上"，是页面结构坏掉。 ---------- */
+.hmodal{position:fixed;inset:0;z-index:60;
+  background:rgba(15,23,42,.42);
+  display:flex;align-items:flex-start;justify-content:center;
+  padding:var(--s-6) var(--s-4);
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .18s,visibility .18s}
+.hmodal.open{opacity:1;visibility:visible;pointer-events:auto;
+  backdrop-filter:blur(4px)}
+.hpanel{position:relative;width:100%;max-width:1180px;
+  max-height:calc(100vh - var(--s-7) * 2);
+  display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--sh-2);overflow:hidden}
+.hhead{display:flex;align-items:center;gap:var(--s-3);flex:none;
+  padding:var(--s-3) var(--s-4);border-bottom:1px solid var(--line)}
+.htitle{font-size:var(--t-md);font-weight:700;color:var(--ink);
+  display:flex;align-items:center;gap:var(--s-2)}
+.hsub{font:var(--t-xs) var(--sans);font-weight:500;color:var(--dim)}
+.x{margin-left:auto;flex:none;width:28px;height:28px;border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--panel);color:var(--muted);
+  cursor:pointer;font-size:13px;line-height:1;
+  display:inline-flex;align-items:center;justify-content:center}
+.x:hover{border-color:var(--line-2);color:var(--ink);background:var(--inset)}
+
+/* 档案库工具条 */
+.hbar{display:flex;align-items:center;gap:var(--s-2);flex:none;flex-wrap:wrap;
+  padding:var(--s-3) var(--s-4);border-bottom:1px solid var(--line);
+  background:var(--inset)}
+.hfilters{display:flex;gap:var(--s-1);flex-wrap:wrap}
+.hchip{cursor:pointer;user-select:none;padding:var(--s-1) var(--s-2);
+  border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel);
+  font:600 var(--t-xs)/1.6 var(--sans);color:var(--muted)}
+.hchip:hover{border-color:var(--acc-ln);color:var(--acc-ink)}
+.hchip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.hchip b{font-family:var(--mono)}
+.hspace{flex:1}
+.hsort,.hsearch{height:30px;border-radius:var(--r-sm);border:1px solid var(--line);
+  background:var(--panel);color:var(--ink);font:var(--t-sm) var(--sans);
+  padding:0 var(--s-2)}
+.hsearch{width:220px;font-family:var(--mono)}
+.hsearch::placeholder{font-family:var(--sans);color:var(--dim)}
+.hsort:focus,.hsearch:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px var(--acc-bg)}
+.hlist{flex:1;overflow-y:auto;padding:var(--s-3) var(--s-4) var(--s-4)}
+
+/* ---------- 威胁记录行。密集列表用「细线分隔」，不用一行一个盒子:
+              一行一个圆角卡片时，十几行白卡在灰底上会连成一片白板。 ---------- */
+.hcard{display:flex;align-items:flex-start;gap:var(--s-3);
+  padding:var(--s-3) var(--s-2);border-bottom:1px solid var(--line);
+  border-left:2px solid transparent;cursor:pointer;transition:background .12s}
+.hcard:last-child{border-bottom:none}
+.hcard:hover{background:var(--acc-bg)}
+/* 判定色在这一行只出现两次:左侧色条 + 判定徽标。检出比数字和家族标签一律中性 ——
+   它们是数据和标识，不是判定。样本几乎全恶意时，一行四处红会把整页染红。 */
+.hcard.malicious{border-left-color:var(--mal)}
+.hcard.suspicious{border-left-color:var(--sus)}
+.hv{flex:none;width:56px}
+.hmain{flex:1;min-width:0}
+.hnm{font-size:var(--t-md);font-weight:700;color:var(--ink);
+  word-break:break-all;line-height:1.4}
+.hfam{display:flex;gap:var(--s-1);flex-wrap:wrap;margin:var(--s-1) 0}
+.hmeta{font:var(--t-xs) var(--mono);color:var(--dim);word-break:break-all}
+.hdet{flex:none;width:132px;text-align:right}
+.hratio{font:800 var(--t-lg)/1.1 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums}
+.hratio small{font-size:var(--t-xs);color:var(--dim);font-weight:600}
+.hbarwrap{height:3px;border-radius:99px;background:var(--inset);
+  margin-top:var(--s-1);overflow:hidden}
+.hbarfill{height:100%;background:var(--unk-fill)}
+.hcard.malicious .hbarfill{background:var(--mal-fill)}
+.hcard.suspicious .hbarfill{background:var(--sus-fill)}
+.hdate{font:var(--t-xs) var(--mono);color:var(--dim);margin-top:var(--s-1)}
+
+/* 最近威胁用同一套行样式，只是外层容器不同 */
+.drecent{padding:var(--s-2) var(--s-4) var(--s-3)}
+
+/* ---------- 反馈弹窗内的表单件 ---------- */
+.fbtabs,.fbtns{display:flex;gap:var(--s-1);flex-wrap:wrap}
+.fbtab,.fbtn{cursor:pointer;user-select:none;padding:var(--s-1) var(--s-3);
+  border-radius:var(--r-sm);border:1px solid var(--line);background:var(--panel);
+  font:600 var(--t-sm)/1.6 var(--sans);color:var(--muted)}
+.fbtab:hover,.fbtn:hover{border-color:var(--acc-ln);color:var(--acc-ink)}
+.fbtab.on,.fbtn.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.fblab{display:block;font-size:var(--t-xs);font-weight:700;color:var(--muted);
+  letter-spacing:.5px;margin:var(--s-3) 0 var(--s-1)}
+.fbinput{width:100%;padding:var(--s-2) var(--s-3);border-radius:var(--r-md);
+  border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  font:var(--t-md) var(--sans)}
+.fbinput:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px var(--acc-bg)}
+textarea.fbinput{resize:vertical;min-height:104px;font-family:var(--mono);
+  font-size:var(--t-sm)}
+.fbdel{border:1px solid var(--line);background:var(--panel);color:var(--muted);
+  border-radius:50%;width:20px;height:20px;cursor:pointer;line-height:1;
+  font-size:11px}
+.fbdel:hover{border-color:rgba(198,45,32,.4);color:var(--mal);
+  background:var(--mal-bg)}
+
+/* ---------- 侧栏额度读数 ---------- */
+.metrics{display:flex;flex-wrap:wrap;gap:var(--s-2);margin-top:var(--s-2)}
+.mx{display:flex;flex-direction:column;gap:1px;font-size:var(--t-xs)}
+.mx u{text-decoration:none;color:var(--dim);letter-spacing:.3px}
+.mx b{font:700 var(--t-sm) var(--mono);color:var(--ink-2);
+  font-variant-numeric:tabular-nums}
+
+/* 原生 file input 必须隐藏:旧规则里是 #fileinput{display:none}，
+   删掉后浏览器默认的「选择文件 / 未选择文件」会直接露在拖放区下面。 */
+#fileinput{display:none}
+
+/* ---------- <s> / <u> 复位 ----------
+   这份代码把 <s> 和 <u> 当成无语义的小标签容器在用（品牌副标题、时钟日期、
+   额度标签…），而浏览器默认给它们加删除线和下划线。逐处去清会漏 —— 侧栏那行
+   「2026-08-09 周日 UTC+8」就是漏掉后顶着删除线上线的。
+   在这里一次性清掉，需要真正的删除线时显式写 text-decoration。 */
+.bw-shell s,.bw-shell u,.dsec s,.dsec u,.hpanel s,.hpanel u{text-decoration:none}
+
+/* ===========================================================================
+   报告详情 —— 查一个哈希之后才出现的区域
+   ===========================================================================
+   这几块在首屏看不到，所以最容易被漏掉：删掉旧样式后如果不补，页面第一屏
+   完全正常，一查哈希就是一堆裸标记。所以它们和首屏是同一轮工作，不是"以后再说"。
+   =========================================================================== */
+
+/* ---------- 判定横幅。原来是一整块判定色底的大色块；现在是白面板 +
+              一个检出比圆环，判定色只出现在圆环、徽标和左侧色条上。
+              大面积色底在样本几乎全恶意时会让每份报告都变成一片红。 ---------- */
+.vbanner{display:flex;align-items:center;gap:var(--s-5);
+  background:var(--panel);border:1px solid var(--line);
+  border-left:3px solid var(--line-2);
+  border-radius:var(--r-lg);box-shadow:var(--sh-1);
+  padding:var(--s-4) var(--s-5);margin-bottom:var(--s-4)}
+.v-malicious{border-left-color:var(--mal)}
+.v-suspicious{border-left-color:var(--sus)}
+.v-clean{border-left-color:var(--ok)}
+.v-unknown{border-left-color:var(--unk)}
+
+/* 检出比圆环。conic-gradient 读 --pct（JS 以内联样式传入）。
+   环形而不是长条：检出比是"占比"，圆环一眼能读出满没满，且占位固定。 */
+.ring{flex:none;width:84px;height:84px;border-radius:50%;
+  display:grid;place-items:center;
+  background:conic-gradient(var(--unk-fill) calc(var(--pct) * 1%),
+                            var(--inset) 0);
+  position:relative}
+.ring::after{content:"";position:absolute;inset:8px;border-radius:50%;
+  background:var(--panel)}
+.ring .n{position:relative;text-align:center;line-height:1.05}
+.ring .n b{display:block;font:800 var(--t-xl)/1 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums}
+.ring .n small{font-size:var(--t-xs);color:var(--dim);font-family:var(--mono)}
+.v-malicious .ring{background:conic-gradient(var(--mal-fill)
+  calc(var(--pct) * 1%),var(--inset) 0)}
+.v-suspicious .ring{background:conic-gradient(var(--sus-fill)
+  calc(var(--pct) * 1%),var(--inset) 0)}
+.v-clean .ring{background:conic-gradient(var(--ok-fill)
+  calc(var(--pct) * 1%),var(--inset) 0)}
+
+.vmain{flex:1;min-width:0}
+.vname{font-size:var(--t-xl);font-weight:750;color:var(--ink);
+  letter-spacing:-.015em;line-height:1.25;word-break:break-all;
+  margin-top:var(--s-1)}
+.vmeta{font-size:var(--t-sm);color:var(--muted);margin-top:var(--s-1)}
+.vlabel{display:inline-block;margin-left:var(--s-2);padding:1px var(--s-2);
+  border-radius:var(--r-sm);font:700 var(--t-xs) var(--mono);
+  background:var(--inset);color:var(--muted);border:1px solid var(--line)}
+.vside{flex:none;display:flex;flex-direction:column;gap:var(--s-1);
+  text-align:right;font-size:var(--t-sm);color:var(--ink-2)}
+.vside .k{display:inline-block;min-width:44px;text-align:left;
+  font-size:var(--t-xs);color:var(--dim);letter-spacing:.4px}
+@media(max-width:820px){
+  .vbanner{flex-direction:column;align-items:flex-start;gap:var(--s-3)}
+  .vside{text-align:left}
+}
+
+/* ---------- 键值表。两列网格 + 细线，不用表格：值里有长哈希要能换行 ---------- */
+.kv{display:grid;grid-template-columns:104px minmax(0,1fr);
+  border-top:1px solid var(--line)}
+.kv>.k{padding:var(--s-2) var(--s-3);background:var(--inset);
+  font-size:var(--t-xs);font-weight:700;color:var(--muted);letter-spacing:.4px;
+  border-bottom:1px solid var(--line)}
+.kv>.v{padding:var(--s-2) var(--s-3);font-size:var(--t-sm);color:var(--ink-2);
+  border-bottom:1px solid var(--line);min-width:0;word-break:break-all}
+
+/* 哈希行。点击复制，所以要看得出可点 */
+.hashes{display:flex;flex-direction:column;margin-top:var(--s-3)}
+.hrow{display:flex;gap:var(--s-3);align-items:baseline;cursor:pointer;
+  padding:var(--s-2) var(--s-3);border-radius:var(--r-sm);
+  font:var(--t-sm) var(--mono);color:var(--ink-2);word-break:break-all}
+.hrow:hover{background:var(--acc-bg);color:var(--acc-ink)}
+.hrow>span:first-child{flex:none;width:58px;font-family:var(--sans);
+  font-size:var(--t-xs);font-weight:700;color:var(--dim);letter-spacing:.4px}
+
+/* ---------- 多源情报条 ---------- */
+.srcstrip{border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--panel);overflow:hidden;margin-top:var(--s-3)}
+.srcstrip-h{display:flex;align-items:center;justify-content:space-between;
+  padding:var(--s-2) var(--s-3);background:var(--inset);
+  border-bottom:1px solid var(--line);
+  font-size:var(--t-xs);font-weight:700;color:var(--ink);letter-spacing:.4px}
+.srcstrip-h span{font-family:var(--mono);font-weight:600;color:var(--dim)}
+.srcstrip-b{display:flex;flex-wrap:wrap;gap:var(--s-1);padding:var(--s-3)}
+.src-item{display:inline-flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-1) var(--s-2);border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--panel);font-size:var(--t-xs)}
+.src-nm{font-weight:700;color:var(--ink-2)}
+.src-v{font-family:var(--mono);color:var(--muted)}
+.src-v.mal{color:var(--mal)} .src-v.susp{color:var(--sus)}
+.src-v.clean{color:var(--ok)}
+.src-x{font-family:var(--mono);color:var(--dim)}
+
+/* ---------- 报告内分段页签 ---------- */
+.seg{display:flex;gap:var(--s-1);padding:0 var(--s-4);
+  border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+.seg .s{padding:var(--s-3) var(--s-3);cursor:pointer;
+  font:600 var(--t-md)/1 var(--sans);color:var(--muted);
+  border-bottom:2px solid transparent;display:flex;align-items:center;
+  gap:var(--s-2)}
+.seg .s:hover{color:var(--ink)}
+.seg .s.on{color:var(--acc);border-bottom-color:var(--acc);font-weight:700}
+.seg .s .c{font:700 var(--t-xs) var(--mono);color:var(--dim)}
+.seg .s.on .c{color:var(--acc)}
+.pane{display:none;padding:var(--s-4)}
+.pane.on{display:block}
+
+/* IP 查询芯片 */
+.ipq{cursor:pointer;color:var(--acc);font-family:var(--mono);
+  text-decoration:underline dotted;text-underline-offset:3px}
+.ipq:hover{color:var(--acc-ink)}
+.ipq-load{opacity:.5}
+.ipv{display:inline-block;margin-left:var(--s-1);padding:0 var(--s-2);
+  border-radius:var(--r-sm);font:700 var(--t-xs) var(--mono);
+  background:var(--inset);color:var(--muted);border:1px solid var(--line)}
+
+/* ===========================================================================
+   沙箱行为
+   =========================================================================== */
+.beh-sum{font-size:var(--t-sm);color:var(--ink-2);margin-bottom:var(--s-3)}
+.beh-tags{display:flex;flex-wrap:wrap;gap:var(--s-1);margin-bottom:var(--s-3)}
+
+/* 行为分类摘要芯片。数量用等宽，便于横向比较 */
+.beh-chip{display:inline-flex;align-items:center;gap:var(--s-2);
+  padding:var(--s-1) var(--s-2);border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--inset);
+  font:600 var(--t-xs)/1.6 var(--sans);color:var(--muted)}
+.beh-chip .i{color:var(--dim)}
+.beh-chip b{font-family:var(--mono);color:var(--ink-2)}
+.beh-chip.mitre{border-color:var(--acc-ln);background:var(--acc-bg);
+  color:var(--acc)}
+.beh-chip.mitre b{color:var(--acc)}
+
+.beh-sec{border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--panel);overflow:hidden;margin-bottom:var(--s-3)}
+.beh-h{display:flex;align-items:center;justify-content:space-between;
+  gap:var(--s-3);padding:var(--s-2) var(--s-3);background:var(--inset);
+  border-bottom:1px solid var(--line);
+  font-size:var(--t-sm);font-weight:700;color:var(--ink)}
+.beh-h .t{display:flex;align-items:center;gap:var(--s-2)}
+.beh-h .t .i{color:var(--dim);font-weight:400}
+.cbadge{font:700 var(--t-xs) var(--mono);color:var(--dim);
+  background:var(--panel);border:1px solid var(--line);
+  border-radius:99px;padding:0 var(--s-2)}
+.beh-body{padding:var(--s-3)}
+.beh-cat{margin-bottom:var(--s-3)}
+.beh-cat:last-child{margin-bottom:0}
+.beh-cat-h{display:flex;align-items:center;justify-content:space-between;
+  font-size:var(--t-xs);font-weight:700;color:var(--muted);
+  letter-spacing:.4px;padding-bottom:var(--s-1);
+  border-bottom:1px solid var(--line);margin-bottom:var(--s-2)}
+.beh-cat-h span{font-family:var(--mono);color:var(--dim)}
+.beh-items{display:flex;flex-direction:column;gap:2px}
+.beh-item{font:var(--t-sm)/1.6 var(--mono);color:var(--ink-2);
+  padding:var(--s-1) var(--s-2);border-radius:var(--r-sm);
+  background:var(--inset);word-break:break-all}
+.beh-item.more{background:none;color:var(--dim);font-family:var(--sans);
+  font-size:var(--t-xs)}
+
+/* MITRE 技术行 */
+.mitre-row{display:flex;gap:var(--s-3);align-items:baseline;
+  padding:var(--s-1) var(--s-2);border-bottom:1px solid var(--line);
+  font-size:var(--t-sm)}
+.mitre-row:last-child{border-bottom:none}
+.mid{flex:none;width:78px;font:700 var(--t-xs) var(--mono);color:var(--acc)}
+.mdesc{color:var(--ink-2);min-width:0}
+
+/* ===========================================================================
+   进程树
+   ===========================================================================
+   节点用等宽 + 细线连接。原来是深色画布上的发光节点（暗色主题时期），
+   在浅底上那套发光会糊成脏灰。
+   =========================================================================== */
+.g-wrap{border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--panel);overflow:hidden}
+.g-tools{display:flex;align-items:center;gap:var(--s-2);flex-wrap:wrap;
+  padding:var(--s-2) var(--s-3);background:var(--inset);
+  border-bottom:1px solid var(--line)}
+.g-btn{padding:var(--s-1) var(--s-2);border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--panel);color:var(--muted);
+  font:600 var(--t-xs)/1.6 var(--sans);cursor:pointer}
+.g-btn:hover{border-color:var(--acc-ln);color:var(--acc-ink);
+  background:var(--acc-bg)}
+.g-zoom{display:inline-flex;align-items:center;gap:var(--s-1);margin-left:auto}
+.g-zlabel{font:700 var(--t-xs) var(--mono);color:var(--dim);min-width:38px;
+  text-align:center}
+.g-tree{overflow:auto;max-height:min(64vh,620px);padding:var(--s-3)}
+.g-canvas{transform-origin:0 0}
+.g-canvas ul{list-style:none;margin:0;padding-left:var(--s-4)}
+.g-canvas>ul{padding-left:0}
+/* 细线连接，靠边框画，不用背景图：缩放时不会失真 */
+.g-canvas ul ul{border-left:1px solid var(--line);margin-left:var(--s-2)}
+.g-canvas li{position:relative;padding:2px 0 2px var(--s-3)}
+.g-canvas ul ul>li::before{content:"";position:absolute;left:0;top:16px;
+  width:var(--s-3);height:1px;background:var(--line)}
+.g-node{display:inline-flex;align-items:flex-start;gap:var(--s-2);
+  padding:var(--s-1) var(--s-2);border-radius:var(--r-sm);
+  border:1px solid var(--line);background:var(--panel);max-width:100%}
+.g-node:hover{border-color:var(--acc-ln);background:var(--acc-bg)}
+.g-ic{flex:none;color:var(--dim);font-size:12px;line-height:1.5}
+.g-tx{min-width:0}
+.g-t{font:600 var(--t-sm)/1.4 var(--mono);color:var(--ink);word-break:break-all}
+.g-s{font:var(--t-xs)/1.5 var(--mono);color:var(--dim);word-break:break-all}
+.g-caret{cursor:pointer;color:var(--muted);font-size:10px;
+  padding:0 var(--s-1);user-select:none}
+.g-cat-li>.g-node{background:var(--inset)}
+.g-node.leaf{border-style:dashed}
+.g-node.net .g-ic{color:var(--acc)}
+.g-node.sys .g-ic{color:var(--muted)}
+.collapsed>ul{display:none}
+.g-hint{padding:var(--s-2) var(--s-3);border-top:1px solid var(--line);
+  font-size:var(--t-xs);color:var(--dim);background:var(--inset)}
+
+/* ===========================================================================
+   银狐情报页
+   =========================================================================== */
+.sfpage{display:block}
+.sfhead{display:flex;align-items:center;justify-content:space-between;
+  gap:var(--s-3);flex-wrap:wrap;margin-bottom:var(--s-3)}
+.sftitle{display:flex;align-items:baseline;gap:var(--s-2);
+  font-size:var(--t-lg);font-weight:750;color:var(--ink);
+  letter-spacing:-.01em}
+.sfbar{display:flex;flex-wrap:wrap;gap:var(--s-1);margin-bottom:var(--s-3)}
+.sflist{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--sh-1);overflow:hidden;
+  padding:0 var(--s-3)}
+
+/* ---------- 批量送检表 ---------- */
+.mono{font-family:var(--mono);font-size:var(--t-sm);word-break:break-all}
+.degbanner{border:1px solid var(--line);border-left:3px solid var(--sus);
+  background:var(--sus-bg);border-radius:var(--r-md);
+  padding:var(--s-3) var(--s-4);font-size:var(--t-sm);color:var(--ink-2);
+  margin-bottom:var(--s-3)}
+
+/* ---------- 新骨架上保留的旧类名 ----------
+   .nav / .stage / .tx / .vi 是新标记上留下的旧钩子（点击特效层按类名挂行为，
+   改名会让特效静默失效）。它们的排版由 .bw-nav / .bw-body / .bw-brand 负责，
+   这里只做不干扰的补充，避免"有类名但完全没有规则"。 */
+.nav{min-width:0}                 /* 由 .bw-nav 布局 */
+.stage{min-width:0}               /* 由 .bw-body 布局 */
+.tx{min-width:0;overflow:hidden}  /* 品牌文字块，窄侧栏下不许把品牌撑开 */
+.mx.vi b{color:var(--ink-2)}      /* 微步额度读数，与 VT 同级 */
+
+/* ---------- 进程树节点的类型变体 ----------
+   .root/.proc/.file/.reg/.net/.hub/.cat 是 JS 按节点类型加的。只用图标颜色区分，
+   不给节点上底色:一棵树里七种底色会让结构本身读不出来，而结构才是这个视图的重点。 */
+.g-node.root{border-color:var(--acc-ln);background:var(--acc-bg)}
+.g-node.root .g-ic,.g-node.proc .g-ic{color:var(--acc)}
+.g-node.root .g-t{font-weight:750}
+.g-node.file .g-ic{color:var(--muted)}
+.g-node.reg .g-ic{color:var(--sus)}
+.g-node.hub{background:var(--inset)}
+.g-node.cat{background:var(--inset);border-style:solid}
+/* 可折叠节点:让人看得出这里能点开，靠指针和 caret，不靠额外颜色 */
+.g-collapsible>.g-node{cursor:pointer}
+.g-collapsible>.g-node:hover{border-color:var(--acc-ln)}
+
+/* ---------- 点击特效层的运行时类 + 两个旧钩子 ----------
+   .bwa-* 是特效层在运行时往元素上加的（涟漪、状态、行进场）。它们本身不该带视觉
+   样式 —— 动画由特效层自己的 style 块负责 —— 但必须在这里登记，否则
+   "无规则类" 检查会一直把它们报成漏样式，检查就失去了意义。
+   .brand / .iconbtn 是新骨架上保留的旧钩子（特效层按类名挂行为，改名会静默失效），
+   排版由 .ws-brand / .ws-nav .navi 负责。 */
+.brand{min-width:0}
+.iconbtn{min-width:0}
+.bwa-t,.bwa-st,.bwa-ok,.bwa-err,.bwa-busy,.bwa-rip,.bwa-drop,.bwa-drag,
+.bwa-row,.bwa-pop,.bwa-anim{}

@@ -1,0 +1,31 @@
+[Unit]
+Description=Push this node's vt_reports delta to the master node
+# Triggered by bulwark-harvest.service's OnSuccess=, not by its own timer: a sync
+# right after a harvest run is when there is actually something new to push, and
+# chaining off success (not the timer) means a run that failed or was skipped by
+# the single-instance lock never sends a half-finished batch.
+After=network-online.target bulwark-intel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root, not bulwarkintel: this needs root's own SSH key (id_sync23) to reach the
+# master over the restricted forced-command channel. bulwark-sync.py compensates
+# by never touching cache.db directly -- it only reads vt_reports over a fresh
+# read-only-ish sqlite3.connect and appends to its own 644 ledger, so a root-owned
+# journal file never gets left behind for app.py (which runs as bulwarkintel).
+User=root
+Group=root
+Environment=BULWARK_SYNC_KEY=/root/.ssh/id_sync23
+# Fill in your own master before enabling this unit. bulwark-sync.py refuses to run
+# (exit 2) rather than ssh to an empty destination, so a forgotten value fails
+# loudly instead of silently doing nothing.
+Environment=BULWARK_MASTER=root@master.example
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-sync.py
+Nice=10
+TimeoutStartSec=960
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulwark-intel
+PrivateTmp=true
+MemoryMax=256M

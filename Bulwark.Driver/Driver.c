@@ -24,14 +24,16 @@ DRIVER_INITIALIZE DriverEntry;
 static NTSTATUS
 BlwFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 {
-    UNREFERENCED_PARAMETER(Flags);
+    NTSTATUS wfpStatus;
+
     PAGED_CODE();
 
     //
     // 卸载顺序至关重要,否则会触发 BugCheck 0xCE
     // (DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS):
     //
-    // 1) 先注销不属于 Minifilter 的独立回调(进程/注册表/对象/WFP),
+    // 0) 先拆 WFP,并且【拆不掉就整体放弃卸载】(详见下方)。
+    // 1) 再注销其余不属于 Minifilter 的独立回调(进程/注册表/对象),
     //    这些回调的函数指针都指向本驱动镜像,卸载前必须全部摘除。
     // 2) 关闭通信端口,停止与用户态的收发。
     // 3) 最后调用 FltUnregisterFilter —— 这是关键的一步:
@@ -42,13 +44,44 @@ BlwFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     //    Filter Manager 仍调用已释放内存中的 BlwPreCreate → 蓝屏。
     //
 
+    //
+    // 【WFP 必须第一个拆,而且是唯一可以否决整次卸载的一步】
+    //
+    // 其余回调的注销都是"一定成功"的(Ps*/Cm*/Ob* 的 Remove 系列没有失败语义),
+    // 只有 WFP callout 的注销会因为过滤引擎仍持有引用而返回 STATUS_DEVICE_BUSY。
+    // 一旦出现这种情况,WFP 里还留着指向本镜像 BlwClassifyFn 的指针,镜像卸载后
+    // 下一条外发连接就会跳进已释放内存 —— 蓝屏。
+    //
+    // 所以把它提到【所有拆卸动作之前】:失败时什么都还没动,直接返回
+    // STATUS_FLT_DO_NOT_DETACH 让 Filter Manager 保持本驱动加载(fltmc unload 会
+    // 报"设备正忙",用户稍后重试即可,BlwUnregisterWfp 内部状态支持续拆)。
+    // 若换成原来那样"先拆一堆再拆 WFP",发现拆不掉时已经无法回头了。
+    //
+    // 例外:强制卸载(FLTFL_FILTER_UNLOAD_MANDATORY,如系统关机路径)【不允许】否决,
+    // 此时只能记录并继续 —— 但那条路径上系统即将停止调度,风险窗口趋近于零。
+    //
+    wfpStatus = BlwUnregisterWfp();
+    if (!NT_SUCCESS(wfpStatus)) {
+        if (!FlagOn(Flags, FLTFL_FILTER_UNLOAD_MANDATORY)) {
+            KdPrint(("[Bulwark] Unload REFUSED: WFP callout still busy (0x%x). "
+                     "Nothing torn down; retry later.\n", wfpStatus));
+            return STATUS_FLT_DO_NOT_DETACH;
+        }
+        KdPrint(("[Bulwark] Mandatory unload: proceeding despite WFP 0x%x.\n", wfpStatus));
+    }
+
     BlwUnregisterProcessCallback();
     BlwUnregisterImageCallback();
     BlwUnregisterThreadCallback();
     BlwUnregisterRegistryCallback();
     BlwUnregisterObCallbacks();
-    BlwUnregisterWfp();
-    if (g_Blw.WfpDeviceObject != NULL) {
+
+    //
+    // 设备对象只有在 callout 确实注销掉之后才能删 —— callout 是依附在它上面注册的。
+    // WfpCalloutId != 0 表示注销没成功(只可能出现在上面的强制卸载分支),此时宁可
+    // 泄漏一个设备对象,也绝不删掉 WFP 还在引用的对象。
+    //
+    if (g_Blw.WfpDeviceObject != NULL && g_Blw.WfpCalloutId == 0) {
         IoDeleteDevice(g_Blw.WfpDeviceObject);
         g_Blw.WfpDeviceObject = NULL;
     }
@@ -152,6 +185,9 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     ExInitializeFastMutex(&g_Blw.RegLock);
     ExInitializeFastMutex(&g_Blw.RegHardLock);
     ExInitializeFastMutex(&g_Blw.KnownBadLock);   // 已知恶意 SHA-256 集合锁(事后哈希研判)
+    // WFP 状态锁:串行化「拉起 / 拆除 / BFE 状态变更回调」。必须在注册 BFE 订阅之前初始化,
+    // 因为订阅一建立回调就可能立刻触发并取这把锁。
+    ExInitializeFastMutex(&g_Blw.WfpLock);
     // NetLock 用自旋锁:WFP classifyFn 可能在 DISPATCH_LEVEL 运行,
     // FAST_MUTEX 在 > APC_LEVEL 获取会蓝屏。
     KeInitializeSpinLock(&g_Blw.NetLock);
@@ -249,7 +285,16 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         // 不回滚,自保为可选增强
     }
 
-    // 7) 创建设备对象并注册 WFP(网络防护)。失败不致命。
+    //
+    // 7) 创建设备对象并【武装】WFP(网络防护)。失败不致命。
+    //
+    // 注意这里是"武装"而不是"注册成功":本驱动可能被注册成 boot-start
+    //(bulwark.ps1 -BootStart / INF 的 StartType=1),那时 DriverEntry 跑在系统启动极早期,
+    // BFE(基础筛选引擎)服务还没起来,FwpmEngineOpen 必然失败。BlwWfpStart 会为此订阅
+    // BFE 状态变更,等 BFE 就绪后自动把 WFP 补上 —— 所以【绝不能】把"此刻还没注册上"
+    // 当成失败去删设备对象:那样订阅回调将来就没有设备对象可用来注册 callout,
+    // 网络防护会永久缺失(这正是原实现每次开机都拦不住外联的原因)。
+    //
     {
         UNICODE_STRING devName;
         PDEVICE_OBJECT devObj = NULL;
@@ -260,11 +305,22 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
             FILE_DEVICE_NETWORK, FILE_DEVICE_SECURE_OPEN, FALSE, &devObj);
         if (NT_SUCCESS(netStatus)) {
             g_Blw.WfpDeviceObject = devObj;
-            netStatus = BlwRegisterWfp(devObj);
+            netStatus = BlwWfpStart(devObj);
             if (!NT_SUCCESS(netStatus)) {
-                KdPrint(("[Bulwark] BlwRegisterWfp failed 0x%x (网络防护不可用)\n", netStatus));
-                IoDeleteDevice(devObj);
-                g_Blw.WfpDeviceObject = NULL;
+                //
+                // 走到这里意味着【连 BFE 订阅都没建立起来,且当场也拉不起来】——
+                // 确实再没有任何补救路径,可以放弃网络防护了。
+                //
+                // 但设备对象只有在 callout 确实没有残留注册时才能删 —— callout 依附于它。
+                // BlwWfpStart 的回滚分支在"注销不掉 callout"的极端情况下会保留
+                // WfpCalloutId != 0,此时保留设备对象(泄漏一个对象)远好于删掉
+                // WFP 仍在引用的对象;卸载路径也会因此拒绝卸载,不会留下悬空指针。
+                //
+                KdPrint(("[Bulwark] BlwWfpStart failed 0x%x (网络防护不可用)\n", netStatus));
+                if (g_Blw.WfpCalloutId == 0 && g_Blw.WfpBfeSubscription == NULL) {
+                    IoDeleteDevice(devObj);
+                    g_Blw.WfpDeviceObject = NULL;
+                }
             }
         } else {
             KdPrint(("[Bulwark] IoCreateDevice failed 0x%x (网络防护不可用)\n", netStatus));

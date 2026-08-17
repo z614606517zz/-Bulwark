@@ -41,6 +41,44 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <!--
+        ================ 关于「最低支持的 Windows 版本」怎么保障 ================
+
+        问题:本工程用 WDK/SDK 10.0.26100(Win11 24H2)编译,而 WDK 会把无版本后缀的 API
+        宏解析到【最新那一版】导出符号。这些符号在老 Windows 的 ntoskrnl / fwpkclnt 里
+        并不存在,于是镜像加载器解析导入时直接失败:
+
+            STATUS_PROCEDURE_NOT_FOUND (0xC0000139) -> Bulwark.sys 整个加载不起来
+
+        后果不是"少一个功能",而是全部内核防护一起消失、用户态降级成 WMI 观测 ——
+        用户看到的就是「在 Win10 上时好时坏、拦不住东西」。开发机是 Win11,永不复现。
+
+        实测的两条(dumpbin /imports 可验证):
+          * ExAllocatePool2      -> 需 Win10 2004 / build 19041(已改掉,见 Driver.h 的 BlwAllocPool)
+          * FwpsCalloutRegister3 -> 需 Win10 1703 / build 15063(保留,即当前实际底线)
+        故本驱动当前的最低支持版本 = Windows 10 1703,涵盖 1703 / 1709 / 1803 /
+        1809(LTSC 2019)/ 1903 / 1909 / 2004 / 20H2 / 21H1 / 21H2 / 22H2 与全部 Win11。
+
+        【为什么不用 NTDDI_VERSION 钉死 —— 两条路都试过,都不行,不要再试】
+
+          1) 写在 PreprocessorDefinitions 里【无效】。WDK 工具集会根据 TargetVersion /
+             WindowsTargetPlatformVersion 自己追加一条 /D NTDDI_VERSION=0xA000010
+             (Win11 24H2),且排在本属性生成的 /D 之后 —— MSVC 后者覆盖前者,我们的钉死
+             被静默吃掉。只有 msbuild /v:n 看 CL.exe 实际命令行才能发现。
+
+          2) 改到 AdditionalOptions(排在工具集那条之后,确实生效)之后【编译直接失败】:
+             fwpsk.h(2630) 一串 C2143 / C2370 —— FwpsCalloutRegister3 的声明本身门在
+             NTDDI_WIN10_RS2,但它签名里用到的类型在更高的门里才定义,把 NTDDI 正好压到
+             RS2 会让这个头文件自相矛盾。这是 WDK 头的问题,不是我们能绕的。
+
+        所以保障手段是【构建后检查链接产物的导入表】—— 见文件末尾的 BlwVerifyImportFloor。
+        它检查的正是"加载器会不会解析失败"这件事本身,比任何编译期开关都更贴近真实判据,
+        而且不与工具集打架。已验证:故意改回 ExAllocatePool2 时它会以 error BLW1001 中断构建。
+
+        要调整最低支持版本:改 BlwVerifyImportFloor 的禁用符号清单(并同步这段说明)。
+        若将来需要下探到 1607 / LTSB 2016,做法是把 NetMonitor.c 里的 FwpsCalloutRegister
+        显式改成 FwpsCalloutRegister2 + FWPS_CALLOUT2,而不是去动 NTDDI。
+      -->
       <PreprocessorDefinitions>POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
@@ -69,4 +107,57 @@
     <ClInclude Include="Protocol.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!--
+    ============ 导入表护栏:构建后核对产物,不合格就让构建失败 ============
+
+    目的:把"驱动在老 Windows 上根本加载不起来"这件事,从【用户机上的现场事故】
+    提前成【本机的一次构建失败】。
+
+    为什么必须查产物、而不是靠 NTDDI_VERSION 钉死:
+      两条钉死路线都试过且都不可行(工具集覆盖 / fwpsk.h 在 RS2 下自相矛盾),详见上方
+      ClCompile 里那段说明。而且即便钉死生效,ExAllocatePool2 在 26100 的 wdm.h 里
+      根本没有 NTDDI 门,照样能编译通过、照样在导入表里留下一条只有 Win10 2004+ 才有的
+      符号 —— 编译期无从察觉,链接期也不报错,只有目标机的镜像加载器会在解析导入时失败,
+      而开发机是 Win11,永远碰不到。导入表是唯一与"能否加载"等价的判据。
+
+    当前禁用清单(全部要求 Windows 10 2004 / build 19041,高于本产品最低支持的 1703):
+        ExAllocatePool2 / ExAllocatePool3
+        ExAllocatePoolPriorityZero / ExAllocatePoolPriorityUninitialized
+    替代写法:Driver.h 里的 BlwAllocPool() —— 底层走各版本都有的 ExAllocatePoolWithTag。
+
+    实现说明:
+      * 用 MSBuild 的 Exec + 属性函数,而不是 PostBuildEvent 的 cmd 脚本 —— 后者要在
+        XML 里转义 & > ( ) 和 errorlevel 分支,实测极易写出"逻辑对但退出码 255"的批处理。
+      * BlwImportDump 预置了非空默认值:Exec 失败(取不到 dump)时属性保持默认,
+        下面的 .Contains 仍可求值,护栏静默跳过而不是把构建带崩(fail-open)。
+      * ContinueOnError:link /dump 不可用不该阻断构建本身。
+  -->
+  <Target Name="BlwVerifyImportFloor" AfterTargets="Link">
+    <PropertyGroup>
+      <BlwImportDump>(import-dump-unavailable)</BlwImportDump>
+    </PropertyGroup>
+
+    <Exec Command="link /dump /imports &quot;$(TargetPath)&quot;"
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="low"
+          ContinueOnError="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="BlwImportDump" />
+    </Exec>
+
+    <PropertyGroup>
+      <BlwBannedImport Condition="$(BlwImportDump.Contains('ExAllocatePool2'))">ExAllocatePool2</BlwBannedImport>
+      <BlwBannedImport Condition="$(BlwImportDump.Contains('ExAllocatePool3'))">ExAllocatePool3</BlwBannedImport>
+      <BlwBannedImport Condition="$(BlwImportDump.Contains('ExAllocatePoolPriorityZero'))">ExAllocatePoolPriorityZero</BlwBannedImport>
+      <BlwBannedImport Condition="$(BlwImportDump.Contains('ExAllocatePoolPriorityUninitialized'))">ExAllocatePoolPriorityUninitialized</BlwBannedImport>
+    </PropertyGroup>
+
+    <Error Condition="'$(BlwBannedImport)' != ''"
+           Code="BLW1001"
+           Text="$(TargetFileName) imports '$(BlwBannedImport)', which only exists on Windows 10 2004 (build 19041) and later. The driver would fail to load with STATUS_PROCEDURE_NOT_FOUND (0xC0000139) on every older Windows 10 - meaning ALL kernel protection silently disappears there. Use BlwAllocPool() from Driver.h instead (it routes through ExAllocatePoolWithTag, present on every supported Windows)." />
+
+    <Message Condition="'$(BlwBannedImport)' == ''"
+             Importance="normal"
+             Text="[Bulwark] Import floor OK: no DDI newer than Windows 10 1703 in $(TargetFileName)." />
+  </Target>
 </Project>

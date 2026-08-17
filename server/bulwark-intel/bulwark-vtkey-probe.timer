@@ -1,0 +1,23 @@
+[Unit]
+Description=Re-check VirusTotal key status a few times a day
+
+[Timer]
+# Every 6 hours, NOT every few minutes. Probing a healthy key spends one of its
+# 500 daily requests, so a chatty schedule would burn the very quota this page
+# exists to protect: 3 keys every 5 minutes would be 864 requests/day, more than
+# half the pool, spent on drawing a status badge.
+#
+# 6 hours means the badge can be up to 6 hours stale, which is fine because the
+# two cases that matter are covered elsewhere:
+#   * the operator can force a fresh probe from the page at any time (it queues a
+#     probe request that bulwark-vtkey.path picks up within seconds);
+#   * deletion never trusts this file -- it re-probes the key at the moment of
+#     deletion and refuses if the answer is no longer "banned".
+OnUnitActiveSec=6h
+OnBootSec=3min
+AccuracySec=1min
+Persistent=true
+Unit=bulwark-vtkey-probe.service
+
+[Install]
+WantedBy=timers.target

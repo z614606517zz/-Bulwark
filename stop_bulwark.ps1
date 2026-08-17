@@ -1,4 +1,4 @@
-# Bulwark 停止脚本
+﻿# Bulwark 停止脚本
 # 需要以管理员权限运行
 
 Write-Host "正在停止 Bulwark..." -ForegroundColor Green

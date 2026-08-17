@@ -1,6 +1,8 @@
 #include "pages/CardPages.h"
 #include "ipc/IpcClient.h"
 #include "dialogs/AiCleanupDialog.h"
+#include "dialogs/UpdateDialog.h"
+#include "bulwark/Version.h"
 #include "widgets/AppIcon.h"
 #include "widgets/Cards.h"
 #include "widgets/TableKit.h"
@@ -261,7 +263,17 @@ void buildBehaviorGraph(BehaviorGraphView* g, const bulwark::VtScanRecord& r,
     const int hubIdx = nodes.size();
     const QString hubSub = r.totalEngines > 0 ? QStringLiteral("%1/%2 引擎判恶意").arg(r.malicious).arg(r.totalEngines)
                                               : (r.threatLabel.isEmpty() ? u("云端判定") : r.threatLabel);
-    nodes.push_back({1, QStringLiteral("VirusTotal"), hubSub, theme::info(), {}});
+    // 中枢节点写【实际给出结论的那一方】,不再写死 "VirusTotal"。云查毒是分级链路
+    //(中央服务器是否已收录 -> 本机 VT 密钥 -> 其他情报源 -> 上传扫描),服务器命中或
+    // MalwareBazaar 命中时写 VirusTotal 就是错的。旧记录没有 intelSource 字段 -> 退回旧标签。
+    // 「本机缓存·」前缀在这里剥掉:节点讲的是「谁判的」,而缓存只是那条结论的副本,
+    // 留着它只会把有用的那半截(中央服务器 / VirusTotal)挤进省略号里(标题按中部省略)。
+    QString hubName = r.intelSource.trimmed();
+    if (hubName.startsWith(u("本机缓存·")))
+        hubName = hubName.mid(5);
+    if (hubName.isEmpty())
+        hubName = QStringLiteral("VirusTotal");
+    nodes.push_back({1, hubName, hubSub, theme::info(), {}});
     edges.push_back({fileIdx, hubIdx, theme::info()});
 
     QVector<int> fanIdx;
@@ -519,7 +531,13 @@ QWidget* pages::reputation(IpcClient* ipc)
     // History table.
     v->addWidget(ui::label(u("查询历史"), "h2"));
     auto* t = ui::table({u("文件"), u("SHA-256"), u("检出"), u("结论"), u("时间")});
-    t->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("reputation"), {
+        {260, 3, true},        // 文件
+        {220, 1},              // SHA-256
+        {110, 0},              // 检出
+        {130, 0},              // 结论
+        { 90, 0},              // 时间
+    });
     v->addWidget(t, 1);
 
     auto* rowById = new QHash<QUuid, int>;
@@ -567,9 +585,14 @@ QWidget* pages::reputation(IpcClient* ipc)
     });
     QObject::connect(ipc, &IpcClient::settingsReceived, page,
                      [pills](const bulwark::RuntimeSettings& s) {
-        auto set = [pills](const QString& name, bool on) {
+        // 「本机不动用任何第三方情报源」策略下这些源在服务端一律按关处理 —— 状态徽标必须如实
+        // 显示「策略停用」,而不是照着用户保存的开关显示「已启用」(那会让人以为它们在查)。
+        auto set = [pills, &s](const QString& name, bool on) {
             if (auto* p = pills->value(name, nullptr))
-                ui::stylePill(p, on ? u("已启用") : u("未配置"), on ? theme::success() : theme::textMuted());
+                ui::stylePill(p,
+                              s.cloudServerOnly ? u("策略停用") : (on ? u("已启用") : u("未配置")),
+                              s.cloudServerOnly ? theme::warning()
+                                                : (on ? theme::success() : theme::textMuted()));
         };
         set(QStringLiteral("VirusTotal"), s.virusTotalEnabled);
         set(QStringLiteral("MalwareBazaar"), s.malwareBazaarEnabled);
@@ -620,6 +643,7 @@ QWidget* pages::settings(IpcClient* ipc)
         ToggleSwitch* cloudUpload{}; // 威胁情报共享(默认关)
         QSpinBox* timeout{};
         QLineEdit *vtKey{}, *mbKey{}, *otxKey{}, *tbKey{}, *mdcKey{}, *haKey{}; // 各情报源 API Key
+        QLabel* intelPolicyNote{}; // 「本机不动用第三方情报源」策略说明(仅该策略生效时可见)
         QLineEdit *aiBase{}, *aiKey{}, *aiModel{};
         QHash<QUuid, QLabel*> pendingTests; // 测试连接 requestId -> 对应源的状态标签
     };
@@ -710,6 +734,17 @@ QWidget* pages::settings(IpcClient* ipc)
     wg->grayAi = settingRow(s3, u("灰区 AI 会诊"), u("对双击/可疑程序额外调用大模型研判(需配置模型,默认关)"), false);
 
     auto* s4 = section(v, u("威胁情报源"));
+    // 部署策略「本机不动用任何第三方情报源」生效时,下面这些开关在服务端一律按关处理。
+    // 那就必须在这里说出来并把它们禁掉 —— 一个看着可点、点了却毫无效果的开关,是最难排查的
+    // 一类「设置不生效」,也正是这一版特意在别处修掉的那种界面撒谎。
+    wg->intelPolicyNote = ui::label(
+        u("当前部署策略:本机不动用任何第三方情报源 —— 云端只向中央服务器查询「该文件是否已收录」,"
+          "不用本机密钥直连下列情报源、不上传文件。因此下列开关与 Key 暂不生效"
+          "(策略在服务端 appsettings.json 的 ReputationProxy.ServerOnly)。"),
+        "muted");
+    wg->intelPolicyNote->setWordWrap(true);
+    wg->intelPolicyNote->setVisible(false); // 由服务下发的只读状态位决定是否显示
+    s4->addWidget(wg->intelPolicyNote);
     // 每个源:开关 + 其下 API Key 输入框(掩码)。留空则沿用服务端 appsettings.json / 内置默认;
     // 保存后立即热应用到对应客户端,无需改配置文件或重启。
     wg->vt = settingRow(s4, u("VirusTotal"), u("多引擎哈希信誉(内置默认 Key)"), false);
@@ -732,7 +767,9 @@ QWidget* pages::settings(IpcClient* ipc)
     addKeyRow(s4, QStringLiteral("HybridAnalysis"));
 
     auto* s5 = section(v, u("双击查杀 与 AI 研判"));
-    wg->aiDouble = settingRow(s5, u("双击云查杀"), u("双击运行的程序自动做 VirusTotal 云端查毒"), true);
+    // 不写死 VirusTotal:云查毒是分级链路(中央服务器是否已收录 -> 本机密钥查各情报源 -> 上传),
+    // 而「本机不动用第三方情报源」策略下压根不会走到 VirusTotal —— 描述里点名它就是错的。
+    wg->aiDouble = settingRow(s5, u("双击云查杀"), u("双击运行的程序自动做云端查毒"), true);
     wg->aiSuspend = settingRow(s5, u("查杀期间挂起"), u("查杀/研判完成前挂起目标进程"), true);
     wg->aiBlockFail = settingRow(s5, u("查杀失败即拦截"), u("云查杀/AI 无明确结论时从严拦截"), false);
     s5->addWidget(ui::hDivider());
@@ -766,6 +803,43 @@ QWidget* pages::settings(IpcClient* ipc)
     auto* save = new QPushButton(u("保存设置"));
     save->setProperty("variant", "primary");
     save->setCursor(Qt::PointingHandCursor);
+
+    // ---- 关于与更新 --------------------------------------------------------
+    // 版本号来自 bulwark/Version.h(与 exe 的 VERSIONINFO、更新比较同一个数字)。
+    // 「检查更新」不做成开关行:它是一个动作,而 settingRow 只产出 ToggleSwitch。
+    {
+        auto* sUpd = section(v, u("关于与更新"));
+        auto* w = new QWidget;
+        auto* h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 6, 0, 6);
+        auto* col = new QVBoxLayout;
+        col->setSpacing(1);
+        col->addWidget(ui::label(u("检查更新"), "title"));
+        col->addWidget(ui::label(u("向服务器查询新版本;下载后会校验大小、SHA-256 与数字签名,"
+                                   "签名者不符一律拒绝安装"), "muted"));
+        h->addLayout(col);
+        h->addStretch();
+        auto* btn = new QPushButton(u("检查更新"));
+        btn->setProperty("variant", "primary");
+        btn->setProperty("size", "sm");
+        btn->setCursor(Qt::PointingHandCursor);
+        h->addWidget(btn);
+        sUpd->addWidget(w);
+
+        auto* verRow = new QWidget;
+        auto* vh = new QHBoxLayout(verRow);
+        vh->setContentsMargins(0, 2, 0, 2);
+        vh->addWidget(ui::label(u("当前版本"), "title"));
+        vh->addStretch();
+        vh->addWidget(ui::label(bulwark::version::displayString(), "muted"));
+        sUpd->addWidget(verRow);
+
+        QObject::connect(btn, &QPushButton::clicked, page, [ipc, page] {
+            UpdateDialog dlg(ipc, page);
+            dlg.exec();
+        });
+    }
+
     bar->addWidget(save);
     v->addLayout(bar);
     v->addStretch();
@@ -804,6 +878,17 @@ QWidget* pages::settings(IpcClient* ipc)
         wg->tbKey->setText(s.threatBookApiKey);
         wg->mdcKey->setText(s.metaDefenderApiKey);
         wg->haKey->setText(s.hybridAnalysisApiKey);
+        // 「本机不动用任何第三方情报源」策略(只读,来自服务端 appsettings):这六个源在服务端
+        // 一律按关处理,故这里连同 Key 一起禁掉并显示原因。开关的勾选状态照旧显示用户的选择
+        // (它被保存着,策略一撤就恢复生效),只是此刻点不动。
+        {
+            const bool serverOnly = s.cloudServerOnly;
+            for (ToggleSwitch* t : { wg->vt, wg->mb, wg->otx, wg->tb, wg->mdc, wg->ha })
+                if (t) t->setEnabled(!serverOnly);
+            for (QLineEdit* e : { wg->vtKey, wg->mbKey, wg->otxKey, wg->tbKey, wg->mdcKey, wg->haKey })
+                if (e) e->setEnabled(!serverOnly);
+            if (wg->intelPolicyNote) wg->intelPolicyNote->setVisible(serverOnly);
+        }
         wg->aiDouble->setChecked(s.aiScanDoubleClickEnabled);
         wg->aiSuspend->setChecked(s.aiScanSuspendDuringScan);
         wg->aiBlockFail->setChecked(s.aiScanBlockOnFailure);
@@ -1000,7 +1085,13 @@ QWidget* pages::aiScan(IpcClient* ipc)
     recHead->addWidget(clearAiBtn);
     v->addLayout(recHead);
     auto* t = ui::table({u("时间"), u("文件"), u("结论"), u("置信度"), u("摘要")});
-    t->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+    ui::columns(t, QStringLiteral("aiScan"), {
+        { 96, 0},              // 时间
+        {220, 1, true},        // 文件
+        {110, 0},              // 结论
+        { 96, 0},              // 置信度
+        {300, 3},              // 摘要
+    });
     v->addWidget(t, 1);
     QObject::connect(t, &QTableWidget::cellDoubleClicked, page, [t, page](int row, int) {
         auto* c0 = t->item(row, 0); // 双击查看研判溯源详情

@@ -1,4 +1,4 @@
-$k = ($env:BULWARK_MB_AUTHKEY).Trim()
+﻿$k = ($env:BULWARK_MB_AUTHKEY).Trim()
 $api = 'https://mb-api.abuse.ch/api/v1/'
 # 拿一个 PE 家族样本的 hash
 $j = (& curl.exe -sS -m 45 -X POST -H ("Auth-Key: " + $k) -d "query=get_siginfo&signature=RedLineStealer&limit=5" $api 2>&1 | Out-String | ConvertFrom-Json)

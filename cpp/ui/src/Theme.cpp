@@ -117,10 +117,14 @@ QTableView, QTreeView, QListView {
     selection-background-color: #E4EAF3; selection-color: #141C29;
 }
 QTableView::item, QTreeView::item, QListView::item { padding: 6px 8px; border: none; }
+/* 表头列之间画一条竖线:列宽是可拖的(见 ui::columns),没有分隔线用户就看不出
+   哪里能抓、也想不到能拖。最后一列右侧那条线由 :last 去掉,免得贴着边框重影。 */
 QHeaderView::section {
     background-color: #F6F8FC; color: #586576; padding: 8px 10px; border: none;
-    border-bottom: 1px solid #E2E7EF; font-weight: 600; font-size: 9pt;
+    border-bottom: 1px solid #E2E7EF; border-right: 1px solid #E2E7EF;
+    font-weight: 600; font-size: 9pt;
 }
+QHeaderView::section:last, QHeaderView::section:only-one { border-right: none; }
 QTableCornerButton::section { background-color: #F6F8FC; border: none; }
 
 /* ---- scrollbars ---------------------------------------------------- */

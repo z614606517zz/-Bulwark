@@ -114,7 +114,10 @@ ScanProgressWindow::ScanProgressWindow(const QString& key, const QString& fileNa
     // Status row: stage message (left) + countdown (right).
     auto* statusRow = new QHBoxLayout;
     statusRow->setSpacing(10);
-    m_status = ui::label(u("正在查询 VirusTotal…"), "muted");
+    // 占位文案必须与来源无关:真正的阶段文案由服务逐阶段推来(「正在查询中央服务器是否已收录…」
+    // /「服务器未收录,正在查询 VirusTotal…」…),这里写死 VirusTotal 会在卡片刚建、第一条推送
+    // 还没到的那一瞬间谎报查询对象 —— 而这张卡片唯一能说明「云查到底先问了谁」的就是这行字。
+    m_status = ui::label(u("正在查询云端信誉…"), "muted");
     m_status->setWordWrap(true);
     statusRow->addWidget(m_status, 1);
     m_countdown = ui::coloredText(u("预计等待 ") + QString::number(kEstimateSeconds) + u(" 秒"),
@@ -282,11 +285,17 @@ void ScanProgressWindow::applyVt(const bulwark::VtScanRecord& r)
     const QString title = malicious ? u("检测到威胁,已处置")
                           : conclusive ? u("未发现风险,文件安全")
                                        : u("检测未完成");
+    // 兜底文案(服务未附 message 时)。同样不点名 VirusTotal:结论可能来自中央服务器的收录、
+    // 本机直连 VT,或其他情报源;有 intelSource 就如实标出是谁给的。
     QString status = r.message;
-    if (status.isEmpty())
-        status = malicious ? u("VirusTotal 判定该文件为恶意,已结束进程并隔离。")
-                 : conclusive ? u("VirusTotal 多引擎未判定为恶意,文件可放心使用。")
-                              : u("VT 未收录 / 无明确结论,已按放行处理。");
+    if (status.isEmpty()) {
+        const QString by = r.intelSource.trimmed().isEmpty()
+                               ? u("云端多引擎")
+                               : r.intelSource.trimmed();
+        status = malicious ? (by + u(" 判定该文件为恶意,已结束进程并隔离。"))
+                 : conclusive ? (by + u(" 未判定为恶意,文件可放心使用。"))
+                              : u("云查毒未收录 / 无明确结论,已按放行处理。");
+    }
     applyResult(accent, icon, title, status, malicious ? 10 : 6);
 }
 

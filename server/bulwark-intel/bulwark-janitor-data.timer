@@ -1,0 +1,14 @@
+[Unit]
+Description=Every-3-days Bulwark local data trim
+
+[Timer]
+# "Every 3 days" measured from the last run, not from a fixed calendar grid --
+# OnCalendar cannot express a 3-day period without drifting at month boundaries.
+OnBootSec=45min
+OnUnitActiveSec=3d
+RandomizedDelaySec=30m
+Persistent=true
+Unit=bulwark-janitor-data.service
+
+[Install]
+WantedBy=timers.target

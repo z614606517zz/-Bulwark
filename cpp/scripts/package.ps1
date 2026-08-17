@@ -1,4 +1,4 @@
-# Bulwark C++/Qt 打包脚本:Release 构建 + windeployqt 收集 Qt 运行时 -> cpp\dist\
+﻿# Bulwark C++/Qt 打包脚本:Release 构建 + windeployqt 收集 Qt 运行时 -> cpp\dist\
 #
 # 产出一个自包含目录 cpp\dist\,内含 bulwark_service.exe + bulwark_ui.exe + 全部 Qt 运行时
 # DLL/插件 + appsettings.json,可直接拷到目标机运行(无需装 Qt)。

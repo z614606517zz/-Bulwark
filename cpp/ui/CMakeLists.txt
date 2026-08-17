@@ -23,15 +23,22 @@ qt_add_executable(bulwark_ui WIN32
     src/widgets/Ui.h
     src/widgets/Cards.h
     src/widgets/TableKit.h
+    src/widgets/TableColumns.h
+    src/widgets/TableColumns.cpp
     src/pages/DashboardPage.h
     src/pages/DashboardPage.cpp
     src/pages/TablePages.h
     src/pages/TablePages.cpp
     src/pages/CardPages.h
     src/pages/CardPages.cpp
+    # 垃圾清理页(类别树 + 勾选 + 体积汇总 + 进度)。做成类而非 pages:: 工厂函数的理由见头文件。
+    src/pages/CleanupPage.h
+    src/pages/CleanupPage.cpp
     src/dialogs/EventFormat.h
     src/dialogs/PromptDialog.h
     src/dialogs/PromptDialog.cpp
+    src/dialogs/UpdateDialog.h
+    src/dialogs/UpdateDialog.cpp
     src/dialogs/RemediationReportDialog.h
     src/dialogs/RemediationReportDialog.cpp
     src/dialogs/AiCleanupDialog.h

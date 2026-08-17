@@ -145,7 +145,7 @@ BlwMessageNotify(
             want = BLW_CLEANUP_READ_MAX;
         }
 
-        kbuf = ExAllocatePool2(POOL_FLAG_PAGED, want, BLW_TAG);
+        kbuf = BlwAllocPool(PagedPool, want, BLW_TAG);
         if (kbuf == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -523,8 +523,8 @@ BlwStartEventQueue(void)
     NTSTATUS status;
 
     // 预分配环形缓冲(非分页内存,供 DISPATCH_LEVEL 入队访问)
-    g_Blw.EventRing = (PBLW_EVENT_MESSAGE)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
+    g_Blw.EventRing = (PBLW_EVENT_MESSAGE)BlwAllocPool(
+        NonPagedPoolNx,
         (SIZE_T)BLW_EVENT_QUEUE_CAP * sizeof(BLW_EVENT_MESSAGE),
         BLW_TAG);
     if (g_Blw.EventRing == NULL) {

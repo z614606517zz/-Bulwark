@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bulwark · 样板</title>
+
+<!--
+  从零写的样板。不复用旧 webui.html 的任何代码 —— 旧文件只被当作接口说明书读过：
+  需要知道调哪个口、字段叫什么，不继承它的结构、类名、样式或 JS。
+
+  为什么长成这样（这是设计决定，不是随手排的）
+  ============================================
+  前面几版一直在"查单个哈希"和"盯全部样本"两种定位之间摇摆，于是同时塞了查询框、
+  样本列表、仪表盘、右侧面板 —— 怎么摆都乱，因为它们在争同一块主区。
+
+  这份样板明确选一个：这是查询服务。主动作是「拿到一个哈希或文件，看它是什么」。
+  所以：
+    · 没有仪表盘。空闲时页面主体就是查询框，不是四张写着 0 的瓦片。
+    · 没有侧栏、没有三列。报告是一份【文档】，单列纵向读下来。
+    · 没有页签。检测、行为、分歧全在一条滚动线上，细节用折叠收起，
+      而不是藏在四个页签后面让人来回点。
+    · 历史记录退成顶部一个入口，不长期占版面。
+
+  最实质的一处改动是引擎结果
+  --------------------------
+  旧版把 75 家杀软的结论逐行列出来，一行一个红胶囊，竖着刷 75 遍。没有人需要逐行
+  读 75 个字符串。真正要回答的是三件事：多少家报、报成什么家族、有没有分歧。
+  所以这里改成：家族共识（把结论按家族归并计数）+ 只列分歧的那几家 +
+  完整清单折叠在最后备查。同一份数据，从"倒给你看"变成"替你归纳"。
+
+  判定色规则（与之前几轮一致，这部分是对的，保留）
+    红/琥珀/绿 只表达判定本身；分类、家族名、引擎名一律中性。
+    为 0 不亮判定色 ——「恶意 0」是好状态，涂红等于没有警情时报警。
+    大面积填充用调过明度的变体，小面积标记用原值。
+-->
+
+<style>
+:root{
+  /* 表面。深色页头 + 浅色正文：页头是"工具的框"，正文是"内容"，
+     两者不同材质，比整页一个白底更容易分清哪里是操作、哪里是结果。 */
+  --shell:#101725;   --shell-2:#1b2436;  --shell-ink:#e8edf6;  --shell-dim:#8b98ad;
+  --bg:#f6f7f9;      --panel:#ffffff;    --inset:#f1f3f7;
+  --line:rgba(16,24,40,.10);  --line-2:rgba(16,24,40,.17);
+
+  /* 四阶文字。每一阶都对 --bg（灰底，比白底更不利）算过对比度：
+     ink 15.9:1 · ink-2 9.0:1 · muted 5.2:1 · dim 4.6:1 —— 正文门槛 4.5:1。 */
+  --ink:#0d1526;  --ink-2:#33405a;  --muted:#556074;  --dim:#5f6a7d;
+
+  --acc:#2f4fd8;  --acc-ink:#233fb0;  --acc-bg:rgba(47,79,216,.07);
+  --acc-ln:rgba(47,79,216,.22);
+
+  --mal:#c22a1d;  --mal-fill:#ef8279;  --mal-bg:rgba(194,42,29,.07);
+  --sus:#93570a;  --sus-fill:#e2ab6b;  --sus-bg:rgba(147,87,10,.07);
+  --ok:#046239;   --ok-fill:#54ad86;   --ok-bg:rgba(4,98,57,.07);
+  --unk:#4a5568;  --unk-fill:#aab3c2;
+
+  --mono:"Cascadia Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink-2);font:13px/1.65 var(--sans);
+  -webkit-font-smoothing:antialiased}
+a{color:var(--acc);text-decoration:none}
+a:hover{color:var(--acc-ink)}   /* 浅底上 hover 必须加深，变亮等于消失 */
+
+/* ============ 页头 ============ */
+.hd{background:var(--shell);color:var(--shell-ink);position:sticky;top:0;z-index:30}
+.hd-in{max-width:1000px;margin:0 auto;display:flex;align-items:center;gap:20px;
+  padding:0 24px;height:52px}
+.bd{display:flex;align-items:center;gap:9px;flex:none}
+.bd i{width:22px;height:22px;border-radius:5px;background:var(--acc);
+  display:grid;place-items:center;font-style:normal;font-size:11px;color:#fff}
+.bd b{font-size:13px;font-weight:700;letter-spacing:.6px}
+.hd nav{display:flex;gap:2px;margin-left:8px}
+.hd nav a{color:var(--shell-dim);font-size:12.5px;font-weight:600;
+  padding:6px 10px;border-radius:6px}
+.hd nav a:hover{color:var(--shell-ink);background:var(--shell-2)}
+.hd nav a.on{color:#fff;background:var(--shell-2)}
+/* 计数跟在标签后面，等宽、弱化。它是附注不是主体，所以不给它单独的位置。 */
+.hd nav em{font-style:normal;font-family:var(--mono);font-size:10.5px;
+  margin-left:5px;color:var(--shell-dim);font-variant-numeric:tabular-nums}
+.hd nav a.on em{color:#fff}
+.hd .sp{flex:1}
+.hd .clk{font:600 12px var(--mono);color:var(--shell-dim);
+  font-variant-numeric:tabular-nums}
+
+/* ============ 单列文档 ============
+   最大宽度 1000px 居中。报告是读的，不是扫的仪表盘；单列纵向让人从结论读到证据。 */
+.doc{max-width:1000px;margin:0 auto;padding:28px 24px 80px}
+
+/* ---- 查询区。空闲时它就是页面主体 ---- */
+.q{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:20px 22px}
+.q h1{margin:0 0 4px;font-size:15px;font-weight:700;color:var(--ink)}
+.q p{margin:0 0 14px;font-size:12.5px;color:var(--dim)}
+.q-row{display:flex;gap:8px}
+.q-row input{flex:1;min-width:0;height:42px;padding:0 14px;border-radius:9px;
+  border:1px solid var(--line-2);background:var(--panel);color:var(--ink);
+  font:14px var(--mono);letter-spacing:.4px}
+.q-row input::placeholder{font-family:var(--sans);font-size:13px;color:var(--dim);
+  letter-spacing:0}
+.q-row input:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px var(--acc-bg)}
+.btn{height:42px;padding:0 22px;border-radius:9px;border:1px solid var(--acc);
+  background:var(--acc);color:#fff;font:700 13px var(--sans);cursor:pointer;
+  flex:none}
+.btn:hover{background:var(--acc-ink);border-color:var(--acc-ink)}
+.btn.g{background:var(--panel);color:var(--ink-2);border-color:var(--line-2)}
+.btn.g:hover{background:var(--inset);color:var(--ink);border-color:var(--line-2)}
+.q-drop{margin-top:10px;font-size:12px;color:var(--dim)}
+.q-drop b{color:var(--ink-2)}
+
+/* ---- 结论。一句话说清，而不是一块彩色板 ---- */
+.vd{margin-top:20px;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;overflow:hidden}
+.vd-top{display:flex;gap:22px;padding:22px;align-items:flex-start}
+.vd-m{flex:none;width:76px;text-align:center}
+.vd-m .big{font:800 34px/1 var(--mono);letter-spacing:-2px;color:var(--mal)}
+.vd-m .of{font:600 11px var(--mono);color:var(--dim)}
+.vd-m .bar{height:4px;border-radius:99px;background:var(--inset);margin-top:8px;
+  overflow:hidden}
+.vd-m .bar i{display:block;height:100%;background:var(--mal-fill)}
+.vd-t{flex:1;min-width:0}
+.vd-t .say{font-size:19px;font-weight:700;color:var(--ink);letter-spacing:-.2px;
+  line-height:1.35}
+.vd-t .say em{font-style:normal;color:var(--mal)}
+.vd-t .fn{margin-top:6px;font:12.5px var(--mono);color:var(--ink-2);
+  word-break:break-all}
+.vd-t .mt{margin-top:2px;font-size:12px;color:var(--dim)}
+.vd-facts{display:flex;flex-wrap:wrap;gap:0;border-top:1px solid var(--line);
+  background:var(--inset)}
+.vd-facts div{flex:1;min-width:130px;padding:10px 14px;
+  border-right:1px solid var(--line)}
+.vd-facts div:last-child{border-right:none}
+.vd-facts u{display:block;text-decoration:none;font-size:10.5px;color:var(--dim)}
+.vd-facts b{font:700 13px var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums}
+
+/* ---- 区块 ---- */
+.sec{margin-top:18px;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;overflow:hidden}
+.sec>h2{margin:0;padding:12px 18px;font-size:12.5px;font-weight:700;
+  color:var(--ink);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:8px}
+.sec>h2 span{font:600 11px var(--mono);color:var(--dim);margin-left:auto}
+.sec-b{padding:16px 18px}
+
+/* 家族共识。把 75 条结论按家族归并 —— 这是这份样板最实质的改动。
+   条形长度表示有多少家这么报，一眼看出主流命名和杂音。 */
+.fam{display:flex;flex-direction:column;gap:9px}
+.fam-r{display:grid;grid-template-columns:180px 1fr 44px;gap:12px;
+  align-items:center}
+.fam-n{font:600 12.5px var(--mono);color:var(--ink);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.fam-n.w{color:var(--dim)}          /* 泛化命名：中性，它不是一个家族结论 */
+.fam-b{height:8px;border-radius:99px;background:var(--inset);overflow:hidden}
+.fam-b i{display:block;height:100%;background:var(--unk-fill)}
+.fam-r.lead .fam-b i{background:var(--mal-fill)}
+.fam-c{font:700 12px var(--mono);color:var(--ink-2);text-align:right;
+  font-variant-numeric:tabular-nums}
+.note{margin-top:14px;padding:10px 12px;border-radius:8px;
+  border:1px solid var(--line);border-left:3px solid var(--acc);
+  background:var(--acc-bg);font-size:12px;color:var(--ink-2)}
+
+/* 分歧。只列不一致的那几家，这才是需要人判断的部分 */
+.dis{display:flex;flex-direction:column}
+.dis-r{display:flex;align-items:baseline;gap:10px;padding:8px 0;
+  border-bottom:1px solid var(--line);font-size:12.5px}
+.dis-r:last-child{border-bottom:none}
+.dis-e{flex:none;width:150px;font-weight:600;color:var(--ink)}
+.dis-v{flex:none;width:56px;font:700 11px var(--mono)}
+.dis-v.ok{color:var(--ok)} .dis-v.sus{color:var(--sus)}
+.dis-s{flex:1;min-width:0;font:12px var(--mono);color:var(--dim);
+  word-break:break-all}
+
+/* 行为。分组事实，不是一堆折叠面板 */
+.beh{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+  gap:14px}
+.beh-g h3{margin:0 0 6px;font-size:11px;font-weight:700;color:var(--dim);
+  letter-spacing:.5px;padding-bottom:5px;border-bottom:1px solid var(--line)}
+.beh-g ul{margin:0;padding:0;list-style:none;display:flex;
+  flex-direction:column;gap:3px}
+.beh-g li{font:12px/1.55 var(--mono);color:var(--ink-2);word-break:break-all}
+.beh-g li b{color:var(--mal);font-weight:700}
+
+/* 折叠：完整清单备查，不占版面 */
+details.full{margin-top:18px;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;overflow:hidden}
+details.full>summary{cursor:pointer;padding:12px 18px;font-size:12.5px;
+  font-weight:700;color:var(--ink);list-style:none}
+details.full>summary::-webkit-details-marker{display:none}
+details.full>summary::before{content:"▸ ";color:var(--dim)}
+details.full[open]>summary::before{content:"▾ "}
+details.full>summary span{font:600 11px var(--mono);color:var(--dim);
+  margin-left:8px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:7px 18px;border-top:1px solid var(--line)}
+th{background:var(--inset);color:var(--dim);font-size:10.5px;font-weight:700;
+  letter-spacing:.5px}
+td.e{font-weight:600;color:var(--ink);width:190px}
+td.v{width:76px;font:700 11px var(--mono)}
+td.v.m{color:var(--mal)} td.v.s{color:var(--sus)} td.v.c{color:var(--dim)}
+td.r{font-family:var(--mono);color:var(--ink-2)}
+
+.hash{display:flex;flex-direction:column}
+.hash div{display:flex;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);
+  font:12px var(--mono);color:var(--ink-2);word-break:break-all}
+.hash div:last-child{border-bottom:none}
+.hash u{flex:none;width:62px;text-decoration:none;font-family:var(--sans);
+  font-size:11px;font-weight:700;color:var(--dim)}
+
+/* ---- 列表页 ---- */
+.lst-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  padding:11px 18px;border-bottom:1px solid var(--line);background:var(--inset)}
+.lst-q{flex:1;min-width:200px;height:30px;padding:0 10px;border-radius:7px;
+  border:1px solid var(--line-2);background:var(--panel);color:var(--ink);
+  font:12px var(--mono)}
+.lst-q::placeholder{font-family:var(--sans);color:var(--dim)}
+.lst-q:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-bg)}
+.lst-f{cursor:pointer;padding:3px 9px;border-radius:7px;border:1px solid var(--line-2);
+  background:var(--panel);font:600 11.5px var(--sans);color:var(--muted)}
+.lst-f:hover{border-color:var(--acc-ln);color:var(--acc-ink)}
+.lst-f.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.lst-f b{font-family:var(--mono)}
+.lst-f.on b{color:#fff}
+.lst-s{height:30px;border-radius:7px;border:1px solid var(--line-2);
+  background:var(--panel);color:var(--ink);font:12px var(--sans);padding:0 8px}
+
+.row{display:flex;align-items:center;gap:14px;padding:11px 18px;
+  border-bottom:1px solid var(--line);border-left:2px solid transparent;
+  cursor:pointer}
+.row:last-child{border-bottom:none}
+.row:hover{background:var(--acc-bg)}
+.row.m{border-left-color:var(--mal)}
+.row.s{border-left-color:var(--sus)}
+.row-m{flex:1;min-width:0}
+.row-n{font-size:13px;font-weight:700;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row-x{display:flex;gap:10px;align-items:baseline;margin-top:2px}
+.row-h{font:11px var(--mono);color:var(--dim);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.row-f{flex:none;font:600 10px var(--mono);color:var(--muted);
+  background:var(--inset);border:1px solid var(--line);border-radius:4px;
+  padding:0 5px}
+.row-d{flex:none;width:104px;text-align:right}
+.row-r{font:800 14px var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums}
+.row-r i{font-style:normal;font-size:10.5px;color:var(--dim)}
+.row-b{height:2px;border-radius:99px;background:var(--inset);margin-top:5px;
+  overflow:hidden}
+.row-b i{display:block;height:100%;background:var(--unk-fill)}
+.row.m .row-b i{background:var(--mal-fill)}
+.row.s .row-b i{background:var(--sus-fill)}
+.row-t{flex:none;width:96px;font:11px var(--mono);color:var(--dim);
+  text-align:right}
+
+.ft{max-width:1000px;margin:0 auto;padding:0 24px 40px;font-size:11.5px;
+  color:var(--dim)}
+@media(max-width:720px){
+  .vd-top{flex-direction:column;gap:14px}
+  .fam-r{grid-template-columns:120px 1fr 38px}
+  .dis-e{width:110px}
+}
+</style>
+</head>
+<body>
+
+<header class="hd">
+  <div class="hd-in">
+    <div class="bd"><i>●</i><b>BULWARK</b></div>
+    <!-- 八个入口一个不少，和现在线上的侧栏一一对应，只是改成横排：
+         样本(查询) · 银狐 · 全部 · 引擎 · 客户端 · API · 下载 · 反馈
+         横排的理由是这套设计里正文是单列文档，左侧再留一条竖栏会把正文挤窄，
+         而这八项本来就一行放得下。计数跟在标签后面，不另占位置。 -->
+    <nav>
+      <a href="#" class="on">样本</a>
+      <a href="#">银狐<em>62</em></a>
+      <a href="#">全部<em>4477</em></a>
+      <a href="#">引擎<em>32</em></a>
+      <a href="#">客户端<em>0</em></a>
+      <a href="#">API</a>
+      <a href="#">下载</a>
+      <a href="#">反馈</a>
+    </nav>
+    <div class="sp"></div>
+    <div class="clk" id="clk">--:--:--</div>
+  </div>
+</header>
+
+<main class="doc">
+
+  <!-- 查询区。空闲时这就是页面主体，不是四张写着 0 的瓦片 -->
+  <section class="q">
+    <h1>查询文件信誉</h1>
+    <p>粘贴哈希，或把文件拖到页面任意位置。浏览器本地计算 SHA-256，原文件不上传。</p>
+    <div class="q-row">
+      <input id="q" value="50c73ca933a5d95e2f2b0a8f1c4d7e6b9a0c3f5d8e1b4a7c2d9f6e3b0a5c8d1e">
+      <button class="btn" id="go">查询</button>
+      <button class="btn g" id="again">重新分析</button>
+    </div>
+    <div class="q-drop">已收录 → 直接出报告 · 未收录 → 可一键送检 · <b>单文件上限 650MB</b></div>
+  </section>
+
+  <!-- 结论：一句话 + 一个量表，而不是一块彩色板 -->
+  <section class="vd">
+    <div class="vd-top">
+      <div class="vd-m">
+        <div class="big">66</div>
+        <div class="of">/ 75 家</div>
+        <div class="bar"><i style="width:88%"></i></div>
+      </div>
+      <div class="vd-t">
+        <div class="say">判定 <em>恶意</em> · 主流命名指向 <em>NanoCore</em> 远控木马</div>
+        <div class="fn">ohm3fo.exe</div>
+        <div class="mt">Win32 EXE · 3.55 MB · 首次提交 2017-05-17 · 缓存于 2026-08-04 08:02 北京时间</div>
+      </div>
+    </div>
+    <div class="vd-facts">
+      <div><u>家族共识</u><b>NanoCore 41 家</b></div>
+      <div><u>分歧</u><b>3 家不一致</b></div>
+      <div><u>数字签名</u><b>无效</b></div>
+      <div><u>沙箱行为</u><b>已采集</b></div>
+      <div><u>情报源</u><b>6 / 6 命中</b></div>
+    </div>
+  </section>
+
+  <!-- 最实质的改动：把 75 条引擎结论归并成家族共识 -->
+  <section class="sec">
+    <h2>命名共识 <span>66 条报毒结论归并为 5 组</span></h2>
+    <div class="sec-b">
+      <div class="fam">
+        <div class="fam-r lead">
+          <div class="fam-n">NanoCore</div>
+          <div class="fam-b"><i style="width:100%"></i></div>
+          <div class="fam-c">41</div>
+        </div>
+        <div class="fam-r">
+          <div class="fam-n">Nancrat</div>
+          <div class="fam-b"><i style="width:22%"></i></div>
+          <div class="fam-c">9</div>
+        </div>
+        <div class="fam-r">
+          <div class="fam-n">MSIL/Bladabindi</div>
+          <div class="fam-b"><i style="width:15%"></i></div>
+          <div class="fam-c">6</div>
+        </div>
+        <div class="fam-r">
+          <div class="fam-n w">Trojan.Generic（泛化）</div>
+          <div class="fam-b"><i style="width:20%"></i></div>
+          <div class="fam-c">8</div>
+        </div>
+        <div class="fam-r">
+          <div class="fam-n w">Heuristic / ML（启发式）</div>
+          <div class="fam-b"><i style="width:5%"></i></div>
+          <div class="fam-c">2</div>
+        </div>
+      </div>
+      <div class="note">
+        41 家指向同一家族，命名共识很强，可以按 NanoCore 处置。
+        另有 10 条只给了泛化或启发式命名，不构成独立结论 —— 它们被单列出来，
+        避免把「Trojan.Generic」当成一个家族去统计。
+      </div>
+    </div>
+  </section>
+
+  <!-- 分歧：只列不一致的，这是需要人判断的部分 -->
+  <section class="sec">
+    <h2>分歧 <span>3 家与共识不一致</span></h2>
+    <div class="sec-b">
+      <div class="dis">
+        <div class="dis-r">
+          <div class="dis-e">Engine-Alpha</div>
+          <div class="dis-v ok">未检出</div>
+          <div class="dis-s">—</div>
+        </div>
+        <div class="dis-r">
+          <div class="dis-e">Engine-Bravo</div>
+          <div class="dis-v ok">未检出</div>
+          <div class="dis-s">—</div>
+        </div>
+        <div class="dis-r">
+          <div class="dis-e">Engine-Charlie</div>
+          <div class="dis-v sus">可疑</div>
+          <div class="dis-s">Suspicious.Packed.Obfuscated</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 行为：分组事实，直接铺开不藏页签 -->
+  <section class="sec">
+    <h2>沙箱行为 <span>4 类 · 命中 3 项高危调用</span></h2>
+    <div class="sec-b">
+      <div class="beh">
+        <div class="beh-g">
+          <h3>进程</h3>
+          <ul>
+            <li>创建 <b>vssadmin delete shadows /all /quiet</b></li>
+            <li>注入 explorer.exe</li>
+            <li>终止 MSExchange*</li>
+          </ul>
+        </div>
+        <div class="beh-g">
+          <h3>文件</h3>
+          <ul>
+            <li>写入 %PUBLIC%\@Decryptor@.exe</li>
+            <li>释放 taskdl.exe · taskse.exe</li>
+            <li>删除 C:\temp\a.tmp</li>
+          </ul>
+        </div>
+        <div class="beh-g">
+          <h3>注册表</h3>
+          <ul>
+            <li>写入 <b>HKLM\...\Run\wd</b>（开机留驻）</li>
+          </ul>
+        </div>
+        <div class="beh-g">
+          <h3>网络</h3>
+          <ul>
+            <li>DNS iuqerfsodp9ifjaposdfjhgo.com</li>
+            <li>TCP 104.17.244.81:80</li>
+            <li>GET http://104.17.244.81/</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="sec">
+    <h2>标识</h2>
+    <div class="sec-b">
+      <div class="hash">
+        <div><u>SHA-256</u>50c73ca933a5d95e2f2b0a8f1c4d7e6b9a0c3f5d8e1b4a7c2d9f6e3b0a5c8d1e</div>
+        <div><u>SHA-1</u>51e9d1a48c3e0a2f0a9b1c2d3e4f5061728394a5</div>
+        <div><u>MD5</u>84c82835a5d21bbcf75a61706d8ab549</div>
+        <div><u>ssdeep</u>3072:9aBcDeF:gHiJkL</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 完整清单折叠备查。它是证据，不是首要信息 -->
+  <details class="full">
+    <summary>全部引擎结论<span>75 家 · 展开备查</span></summary>
+    <table>
+      <thead><tr><th>引擎</th><th>结论</th><th>检测名</th></tr></thead>
+      <tbody id="tb"></tbody>
+    </table>
+  </details>
+
+  <!-- ================================================================
+       列表页样板（「全部 4477」「银狐 62」用这个模板）
+       ----------------------------------------------------------------
+       报告页和列表页是两个不同模板，得一起看才好判断整套语言是否成立。
+       这里的取舍：
+         · 一行一条，细线分隔。不用一行一个圆角卡片 —— 十几张白卡在灰底上会
+           连成一片白板，反而看不出行的边界。
+         · 判定在一行里只出现两次：左侧 2px 色条 + 检出比。文件名、家族名、
+           哈希全部中性 —— 它们是标识不是判定。库里九成是恶意样本，一行多处
+           红会把整列染红，红就不再是信号。
+         · 检出比用等宽数字 + 一条 2px 量表，扫一列时对齐、可比。
+         · 筛选和搜索一行放完，不给每个控件单独一条横带。
+       ================================================================ -->
+  <section class="sec" style="margin-top:34px">
+    <h2>列表页样板 <span>「全部」与「银狐」用这一套</span></h2>
+    <div class="lst-bar">
+      <input class="lst-q" type="search" placeholder="搜索名称 / 哈希 / 家族">
+      <span class="lst-f on">全部 <b>4477</b></span>
+      <span class="lst-f">恶意 <b>4199</b></span>
+      <span class="lst-f">可疑 <b>278</b></span>
+      <select class="lst-s">
+        <option>最近保存</option><option>检出比</option><option>名称</option>
+      </select>
+    </div>
+    <div id="lst"></div>
+  </section>
+
+</main>
+
+<footer class="ft">
+  样板 · 数据为示例。判定色只用于判定本身；家族名、引擎名、分类一律中性。
+</footer>
+
+<script>
+/* 北京时间。固定 +08:00，不读访问者时区 —— 这是一台中国服务器的运营台，
+   时间应当固定为北京时间，而 toLocaleString 会跟着访问者的系统时区走。 */
+(function(){
+  var e=document.getElementById("clk");
+  function p(n){return (n<10?"0":"")+n;}
+  function t(){
+    var d=new Date(Date.now()+8*3600*1000);
+    e.textContent=p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds())
+      +" 北京";
+  }
+  t();setInterval(t,1000);
+})();
+
+/* 完整清单。示例数据，演示折叠区的密度与配色 —— 判定列用判定色，
+   引擎名和检测名保持中性，避免 75 行里出现 75 处红。 */
+(function(){
+  var names=["NanoCore","Nancrat","MSIL/Bladabindi","Trojan.Generic",
+             "Heuristic.ML"];
+  var rows=[];
+  for(var i=1;i<=75;i++){
+    var v,cls,r;
+    if(i<=66){v="恶意";cls="m";r=names[i%names.length]+".gen!A";}
+    else if(i===67){v="可疑";cls="s";r="Suspicious.Packed.Obfuscated";}
+    else{v="未检出";cls="c";r="—";}
+    rows.push('<tr><td class="e">Engine-'+String(i).padStart(2,"0")
+      +'</td><td class="v '+cls+'">'+v+'</td><td class="r">'+r+'</td></tr>');
+  }
+  document.getElementById("tb").innerHTML=rows.join("");
+})();
+
+/* 列表页示例行。判定只体现在左侧色条和检出比量表上 —— 文件名、家族、哈希一律中性。 */
+(function(){
+  var d=[
+    ["ohm3fo.exe","NanoCore",66,75,"08-04 08:02","m"],
+    ["Installer.exe","trojan.pmax/usblh526",58,75,"08-04 06:41","m"],
+    ["19.exe","trojan.vidar/xcfaix",43,75,"08-03 22:15","m"],
+    ["svchost32.dll","RemcosRAT",41,74,"08-03 19:08","m"],
+    ["update.bin","—",7,73,"08-03 11:52","s"],
+    ["setup_x64.exe","trojan.stealc/vopi",55,75,"08-02 20:31","m"],
+    ["tmp9a2f.tmp","—",4,72,"08-02 15:04","s"]
+  ];
+  document.getElementById("lst").innerHTML=d.map(function(x){
+    var pct=Math.round(x[2]/x[3]*100);
+    return '<div class="row '+x[5]+'">'
+      + '<div class="row-m"><div class="row-n">'+x[0]+'</div>'
+      +   '<div class="row-x"><span class="row-h">'
+      +     '50c73ca933a5d95e2f2b0a8f1c4d7e6b</span>'
+      +     (x[1]!=="—"?'<span class="row-f">'+x[1]+'</span>':'')
+      +   '</div></div>'
+      + '<div class="row-d"><div class="row-r">'+x[2]+'<i>/'+x[3]+'</i></div>'
+      +   '<div class="row-b"><i style="width:'+pct+'%"></i></div></div>'
+      + '<div class="row-t">'+x[4]+'</div>'
+      + '</div>';
+  }).join("");
+})();
+</script>
+</body>
+</html>

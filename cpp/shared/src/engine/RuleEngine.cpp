@@ -54,6 +54,47 @@ bool RuleEngine::isSelfComponent(const SecurityEvent& e) const {
     return matchesSelf(e.actorPath) || matchesSelf(e.parentPath);
 }
 
+bool RuleEngine::isSanctionedMaintenanceActor(const SecurityEvent& e) const {
+    // 三个条件必须【同时】成立,少任何一个都不放行。
+    //
+    // 1) 发起者是系统自带解释器,且映像位于 %SystemRoot% 下。
+    //    只比文件名会被「把自己命名为 powershell.exe 放到别处」冒用,所以要求路径前缀。
+    const QString actorName = fileNameLower(e.actorPath);
+    if (actorName != QLatin1String("powershell.exe") && actorName != QLatin1String("cmd.exe"))
+        return false;
+    QString actorLower = e.actorPath.toLower();
+    actorLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    QString sysRoot = qEnvironmentVariable("SystemRoot", QStringLiteral("C:\\Windows")).toLower();
+    sysRoot.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    if (!sysRoot.endsWith(QLatin1Char('\\'))) sysRoot += QLatin1Char('\\');
+    if (!actorLower.startsWith(sysRoot)) return false;
+
+    // 2) 命令行里必须出现本产品安装目录 —— 也就是它执行的脚本来自我们自己的目录。
+    //    这一条的强度来自内核 SelfGuard:安装目录「仅放行本产品自身进程写入,其余进程
+    //    写/删/改名一律拒绝」,所以攻击者没法把自己的脚本放进去,也没法替换 bulwark.ps1。
+    //    换句话说「脚本在我们目录里」是有实质保证的,不是一句自我声明。
+    const QString cmd = e.commandLine;
+    if (cmd.isEmpty()) return false;
+    QString cmdLower = cmd.toLower();
+    cmdLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    bool inSelfDir = false;
+    {
+        QMutexLocker locker(&selfDirLock_);
+        if (selfDirectories_.isEmpty()) return false;   // 目录还没登记时不猜,直接不放行
+        for (const QString& d : selfDirectories_)
+            if (cmdLower.contains(d)) { inSelfDir = true; break; }
+    }
+    if (!inSelfDir) return false;
+
+    // 3) 被执行的脚本名必须在白名单内。目录条件已经很强,但仍然把「能被当作维护脚本
+    //    执行的东西」限定成我们实际发布的那几个,避免以后往包里加了别的东西就顺带扩权。
+    static const char* kScripts[] = { "bulwark.ps1" };
+    bool named = false;
+    for (const char* s : kScripts)
+        if (cmdLower.contains(QLatin1String(s))) { named = true; break; }
+    return named;
+}
+
 std::optional<QString> RuleEngine::trustNoteForPath(const QString& path) const {
     QString p = path.trimmed();
     if (p.isEmpty()) return std::nullopt;
@@ -68,9 +109,10 @@ std::optional<QString> RuleEngine::trustNoteForPath(const QString& path) const {
 
     const QDateTime now = nowUtc();
     QReadLocker locker(&rulesLock_);
-    for (auto it = rules_.constBegin(); it != rules_.constEnd(); ++it) {
-        const DefenseRule& r = it.value();
-        if (r.action != VerdictAction::Allow || !r.enabled || r.isExpired(now) || !r.isTrustEntry())
+    // 只扫信任项索引:候选集与原先「全表扫 + 过滤 Allow/enabled/未过期/isTrustEntry」完全一致
+    // (索引按 action==Allow && isTrustEntry() 建立,enabled / 到期仍在下面逐条判)。
+    for (const DefenseRule& r : trustEntries_) {
+        if (!r.enabled || r.isExpired(now))
             continue;
         // 文件信任 = actorPath 精确(大小写不敏感);目录信任 = actorPattern 通配("<目录>\*")。
         const bool hitFile = !r.actorPath.isEmpty() && r.actorPath.compare(p, Qt::CaseInsensitive) == 0;
@@ -83,10 +125,13 @@ std::optional<QString> RuleEngine::trustNoteForPath(const QString& path) const {
 
 std::optional<QString> RuleEngine::matchedUserTrust(const SecurityEvent& e) const {
     QReadLocker locker(&rulesLock_);
-    for (auto it = rules_.constBegin(); it != rules_.constEnd(); ++it) {
-        const DefenseRule& r = it.value();
+    // 同上,只扫信任项索引。顺带把一处既有的不确定性收掉:原先遍历的是 QHash,而 Qt6 的
+    // QHash 每进程随机化种子 —— 多条信任项同时命中时,返回【哪一条的备注】每次重启都可能变。
+    // 索引是按 rules_ 装载顺序建立的 QVector,同一份规则集下顺序稳定。命中与否不受影响(只要
+    // 有任一信任项命中就放行,这一点两种写法一致),变的只是提示语里显示哪一条备注。
+    for (const DefenseRule& r : trustEntries_) {
         // 仅「文件信任中心」生成的 Allow 信任项(文件精确 actorPath 或目录通配 actorPattern)。
-        if (r.action == VerdictAction::Allow && r.isTrustEntry() && r.matches(e))
+        if (r.matches(e))
             return r.note.isEmpty() ? QStringLiteral("用户信任") : r.note;
     }
     return std::nullopt;
@@ -107,11 +152,46 @@ int RuleEngine::rulePriority(VerdictAction a) {
     }
 }
 
+// ---------------------- 规则索引维护(见头文件里的等价性说明)----------------------
+
+void RuleEngine::rebuildIndexLocked() {
+    byType_.clear();
+    typeAgnostic_.clear();
+    trustEntries_.clear();
+    // 按 rules_ 的迭代序重建。桶内顺序不影响裁决(步骤 6 的比较器是全序),这里只需要保证
+    // 「同一份规则集重建两次得到同样的桶内容」,而内容与顺序无关的部分由 sort 兜住。
+    for (auto it = rules_.constBegin(); it != rules_.constEnd(); ++it) {
+        const DefenseRule& r = it.value();
+        if (r.type.has_value())
+            byType_[static_cast<int>(*r.type)].append(r);
+        else
+            typeAgnostic_.append(r);
+        if (r.action == VerdictAction::Allow && r.isTrustEntry())
+            trustEntries_.append(r);
+    }
+}
+
+void RuleEngine::indexInsertLocked(const DefenseRule& r) {
+    if (r.type.has_value())
+        byType_[static_cast<int>(*r.type)].append(r);
+    else
+        typeAgnostic_.append(r);
+    if (r.action == VerdictAction::Allow && r.isTrustEntry())
+        trustEntries_.append(r);
+}
+
+const QVector<DefenseRule>& RuleEngine::bucketForLocked(EventType t) const {
+    static const QVector<DefenseRule> kEmpty;
+    const auto it = byType_.constFind(static_cast<int>(t));
+    return it == byType_.constEnd() ? kEmpty : it.value();
+}
+
 void RuleEngine::loadRules(const QVector<DefenseRule>& rules) {
     QHash<QUuid, DefenseRule> fresh;
     for (const DefenseRule& r : rules) fresh.insert(r.id, r);
     QWriteLocker locker(&rulesLock_);
     rules_ = std::move(fresh);
+    rebuildIndexLocked();
 }
 
 QVector<DefenseRule> RuleEngine::getRules() const {
@@ -132,17 +212,25 @@ int RuleEngine::pruneExpired() {
         if (it.value().isExpired(now)) { it = rules_.erase(it); ++removed; }
         else ++it;
     }
+    if (removed > 0) rebuildIndexLocked();
     return removed;
 }
 
 void RuleEngine::addRule(const DefenseRule& rule) {
     QWriteLocker locker(&rulesLock_);
+    // 覆盖同 id 的旧规则时不能只往索引里追加,否则桶里会同时留着新旧两份 ——
+    // 两者 id 相同,排序比较器分不出高下,胜出者变回不确定。这种情况整体重建。
+    const bool replacing = rules_.contains(rule.id);
     rules_.insert(rule.id, rule);
+    if (replacing) rebuildIndexLocked();
+    else indexInsertLocked(rule);
 }
 
 bool RuleEngine::removeRule(const QUuid& id) {
     QWriteLocker locker(&rulesLock_);
-    return static_cast<bool>(rules_.remove(id));
+    const bool removed = static_cast<bool>(rules_.remove(id));
+    if (removed) rebuildIndexLocked();
+    return removed;
 }
 
 void RuleEngine::appendDecisionEvidence(SecurityEvent& e, const Verdict& v) {
@@ -192,6 +280,21 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
     //    即便命中勒索蜜罐/硬指标也不处置,因为这是用户明确的白名单选择。
     if (isSelfComponent(e)) {
         e.addEvidence(QStringLiteral("RuleEngine"), EvidenceKind::Trust, u("本软件自身组件,无条件放行"), 0, false);
+        return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::TrustedSigner);
+    }
+    // a2) 本产品自己的维护脚本(安装 / 卸载 / 更新 / 收集日志)。
+    //     发起者是 cmd.exe / powershell.exe,所以上面那条按映像判定的自身组件通道认不出它,
+    //     而这些脚本必然要开测试签名(bcdedit)并以 -ExecutionPolicy Bypass 运行 ——
+    //     那正是攻击链检测里「破坏影响 + 防御规避」的最强组合。不认这一类的后果是本产品
+    //     把自己的脚本判成勒索软件并内核封禁,实测发生过(收集日志.bat,riskScore 100)。
+    //
+    //     ⚠ 这是一条【规则匹配之前】的无条件放行通道,写 Block 规则盖不住它 ——
+    //     与自身组件、用户信任同级。所以它的三个前置条件一个都不能松:见
+    //     isSanctionedMaintenanceActor() 的说明,其强度最终来自内核 SelfGuard 对安装目录
+    //     的写保护(攻击者无法把脚本放进去或替换掉 bulwark.ps1)。
+    if (isSanctionedMaintenanceActor(e)) {
+        e.addEvidence(QStringLiteral("RuleEngine"), EvidenceKind::Trust,
+                      u("本软件自身的维护脚本(安装目录内),无条件放行"), 0, false);
         return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::TrustedSigner);
     }
     if (const std::optional<QString> trustNote = matchedUserTrust(e)) {
@@ -399,8 +502,13 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
         QVector<DefenseRule> matches;
         {
             QReadLocker locker(&rulesLock_);
-            for (auto it = rules_.constBegin(); it != rules_.constEnd(); ++it)
-                if (it.value().matches(e)) matches.append(it.value());
+            // 候选集 = 本事件类型的桶 + 类型无关桶。这与「扫全表」等价:matches() 的第三道
+            // 判据就是类型不符即不命中,所以其它类型桶里的规则一条都不可能命中本事件。
+            // 详见 RuleEngine.h 里索引那段说明(含「为什么胜出者也不会变」)。
+            for (const DefenseRule& r : bucketForLocked(e.type))
+                if (r.matches(e)) matches.append(r);
+            for (const DefenseRule& r : typeAgnostic_)
+                if (r.matches(e)) matches.append(r);
         }
         if (!matches.isEmpty()) {
             std::sort(matches.begin(), matches.end(), [](const DefenseRule& a, const DefenseRule& b) {

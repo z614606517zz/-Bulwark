@@ -167,7 +167,7 @@ BlwCleanupHandleIsProtected(_In_ HANDLE FileHandle)
     BOOLEAN protectedTarget = TRUE;   // 判不出来就拒绝
     ULONG chars;
 
-    info = (PFILE_NAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, cbInfo, BLW_TAG);
+    info = (PFILE_NAME_INFORMATION)BlwAllocPool(PagedPool, cbInfo, BLW_TAG);
     if (info == NULL) {
         return TRUE;
     }

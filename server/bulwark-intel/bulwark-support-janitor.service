@@ -1,0 +1,23 @@
+[Unit]
+Description=Bulwark support desk cleanup - wipe conversations, messages and attachments
+After=bulwark-intel.service
+
+[Service]
+Type=oneshot
+# MUST be bulwarkintel, same reason as the data janitor: this writes a SQLite
+# database that app.py also writes, and root doing so leaves a root-owned journal
+# file that makes the service's next write fail.
+User=bulwarkintel
+Group=bulwarkintel
+Environment=BULWARK_INTEL_CONFIG=/etc/bulwark-intel/config.json
+ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-support-janitor.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The only writable path this needs: support.db and support_media both live here.
+# It never touches /opt/bulwark-intel, and the script itself refuses to run if its
+# database path resolves to the intel cache.db.
+ReadWritePaths=/var/lib/bulwark-intel
+TimeoutStartSec=600
+MemoryMax=256M

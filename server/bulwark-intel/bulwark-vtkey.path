@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for VT API key requests dropped by the dashboard
+
+[Path]
+# Fires the moment the dashboard writes a request, so adding a key from the web
+# UI feels immediate instead of waiting for a polling timer. DirectoryNotEmpty
+# (not PathModified) is the right trigger here: it re-fires as long as anything
+# is left in the spool, so a request that arrives while the service is already
+# running is still picked up on the next pass instead of being missed.
+DirectoryNotEmpty=/var/lib/bulwark-intel/vtkey-spool
+Unit=bulwark-vtkey.service
+
+[Install]
+WantedBy=multi-user.target

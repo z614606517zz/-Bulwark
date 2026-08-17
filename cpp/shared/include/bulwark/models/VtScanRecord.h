@@ -28,7 +28,14 @@ struct VtScanRecord {
     QString threatLabel;             // 可空
     QString message;                 // 可空:进度/结论/错误说明
     bool uploaded = false;
-    QString source;                  // 双击 / Dropper / 手动
+    QString source;                  // 触发来源:双击 / Dropper / 手动
+    // 结论【由谁给出】的展示名,与上面的 source(触发来源)是两件事:
+    //   "中央服务器·VirusTotal" / "中央服务器" / "VirusTotal" / "MalwareBazaar" / "本机缓存" …
+    // 云查毒刻意「先问中央服务器有没有收录、没收录才动本机密钥」,所以「这条结论到底是服务器
+    // 给的还是本机直连 VT 查的」是用户和排查都要看的一维。以前它只被拼进 message 文本里,
+    // 终态行与详情图都拿不到,详情图的中枢节点因此写死成 "VirusTotal" —— 服务器命中或
+    // MalwareBazaar 命中时那个标签是错的。
+    QString intelSource;
     QDateTime timestampUtc = nowUtc();
 
     bool isTerminal() const { return stage == VtScanStage::Completed || stage == VtScanStage::Error; }

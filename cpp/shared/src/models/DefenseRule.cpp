@@ -93,16 +93,41 @@ DefenseRule DefenseRule::createTrustDirectory(const QString& dirPath, const QStr
     return r;
 }
 
+namespace {
+
+// 大小写归一。ASCII 段用一条位运算,非 ASCII 才回落到 QChar::toUpper()。
+//
+// 为什么值得单独拎出来:wildcardMatch 是整个规则匹配的【最内层循环】—— 每条规则、每个字符
+// 各折叠两次,而一条事件要过一遍规则集(内置 588 条)。QChar::toUpper() 不是内联函数:它要查
+// Unicode 大小写表,且实现在 Qt6Core.dll 里,每次都是一次跨 DLL 调用。于是「比较两个字符」
+// 这件事的真实成本是两次不可内联的函数调用。
+//
+// 而这里参与匹配的东西是 Windows 路径、注册表键名、命令行和通配符 —— 压倒性地是 ASCII。
+// ASCII 段内 QChar::toUpper() 的结果与 'a'-'z' -> 'A'-'Z' 逐字符一致(QChar::toUpper 不受
+// 区域设置影响,不存在土耳其 i 那类特例),非字母字符映射到自身。故本函数与原先逐字符
+// 调用 QChar::toUpper() 的行为完全等价,只是把绝大多数字符的折叠变成一条 and/cmp。
+inline char16_t foldUpper(char16_t c)
+{
+    if (c < 0x80)
+        return (c >= u'a' && c <= u'z') ? static_cast<char16_t>(c - 0x20) : c;
+    return QChar(c).toUpper().unicode();
+}
+
+} // namespace
+
 bool DefenseRule::wildcardMatch(const QString& pattern, const QString& input) {
     if (pattern.isEmpty()) return true;
-    const int pl = pattern.size();
-    const int sl = input.size();
-    int p = 0, s = 0, star = -1, mark = 0;
+    const qsizetype pl = pattern.size();
+    const qsizetype sl = input.size();
+    // 直接取裸缓冲区:QString::operator[] 每次都要走一遍 size 断言与 QChar 构造,
+    // 在这个循环里被调用的次数是「规则数 x 路径长度」量级。
+    const char16_t* pd = reinterpret_cast<const char16_t*>(pattern.constData());
+    const char16_t* sd = reinterpret_cast<const char16_t*>(input.constData());
+    qsizetype p = 0, s = 0, star = -1, mark = 0;
     while (s < sl) {
-        if (p < pl && (pattern[p] == QLatin1Char('?') ||
-                       pattern[p].toUpper() == input[s].toUpper())) {
+        if (p < pl && (pd[p] == u'?' || foldUpper(pd[p]) == foldUpper(sd[s]))) {
             ++p; ++s;
-        } else if (p < pl && pattern[p] == QLatin1Char('*')) {
+        } else if (p < pl && pd[p] == u'*') {
             star = p++; mark = s;
         } else if (star != -1) {
             p = star + 1; s = ++mark;
@@ -110,7 +135,7 @@ bool DefenseRule::wildcardMatch(const QString& pattern, const QString& input) {
             return false;
         }
     }
-    while (p < pl && pattern[p] == QLatin1Char('*')) ++p;
+    while (p < pl && pd[p] == u'*') ++p;
     return p == pl;
 }
 

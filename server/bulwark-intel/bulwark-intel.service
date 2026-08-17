@@ -1,0 +1,33 @@
+[Unit]
+Description=Bulwark threat-intel aggregation/caching proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Type=simple
+User=bulwarkintel
+Group=bulwarkintel
+Environment=BULWARK_INTEL_CONFIG=/etc/bulwark-intel/config.json
+ExecStart=/usr/bin/python3 /opt/bulwark-intel/app.py
+Restart=on-failure
+RestartSec=3
+
+# --- hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bulwark-intel
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# --- small-box guard rails (new) ---
+MemoryMax=2G
+MemoryHigh=1500M
+
+[Install]
+WantedBy=multi-user.target

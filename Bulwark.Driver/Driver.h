@@ -13,6 +13,56 @@
 #define BLW_TAG 'dhSI'   // 'IShd' 池标记
 
 //
+// ==================== 池分配:唯一入口(Win10 兼容性硬约束)====================
+//
+// 【绝不要改回 ExAllocatePool2】
+//
+// 本工程用 WDK/SDK 10.0.26100(Win11 24H2)编译,而 ExAllocatePool2 / ExAllocatePool3
+// 是 ntoskrnl 从 **Windows 10 2004(build 19041)** 才开始导出的新 DDI。用它编译出的
+// Bulwark.sys 会在导入表里留下一条 ExAllocatePool2 —— 于是在 1703 / 1709 / 1803 /
+// 1809(含 LTSC 2019)/ 1903 / 1909 这些仍在服役的 Win10 上,加载器解析导入直接失败:
+//
+//     STATUS_PROCEDURE_NOT_FOUND (0xC0000139) -> 驱动【整个加载不起来】
+//
+// 后果不是「少一个功能」,而是全部内核防护(执行前拦截 / 文件反篡改 / 注册表硬拦 /
+// 自保护 / 网络阻断)一起消失,用户态服务降级成 WMI 观测模式 —— 表现就是「在 Win10 上
+// 时好时坏、拦不住东西」。而开发机是 Win11,这个问题在开发机上永远不会复现。
+//
+// 微软对此的官方指引(见 ExAllocatePool2 文档 "targeting versions of Windows prior to
+// Windows 10, version 2004")就是改用 ExAllocatePoolZero。但 26100 的头文件里,
+// ExAllocatePoolZero 的 down-level 零初始化分支要靠 POOL_ZERO_DOWN_LEVEL_SUPPORT 打开,
+// 而该宏又引用了这套头文件里【并不存在】的 SYSTEM_POOL_ZEROING_INFORMATION(实测:
+// 26100 全套 km/shared 头里搜不到该类型),一开就编不过。
+//
+// 所以这里自己包一层:底层只用 ExAllocatePoolWithTag —— 自 NT 起就有、每个在服役的
+// Windows 都导出 —— 再显式清零。语义与 ExAllocatePool2(POOL_FLAG_*) 完全一致
+// (同样返回全零内存),但导入表里不再有任何带版本门槛的符号。
+//
+// 顺带说明本驱动【当前】的真实最低版本:去掉 ExAllocatePool2 之后,导入表里剩下的最高
+// 门槛来自 WFP 的 FwpsCalloutRegister3(Win10 1703 / build 15063 起导出),因此实际底线
+// 是 1703。这条底线由构建后的导入表检查(Bulwark.Driver.vcxproj 里的 BlwVerifyImportFloor)
+// 把守 —— 那里也记录了「为什么不能用 NTDDI_VERSION 钉死」,别再走那条路。
+//
+// 池类型映射:POOL_FLAG_PAGED -> PagedPool;POOL_FLAG_NON_PAGED -> NonPagedPoolNx
+// (显式写 NonPagedPoolNx 而不是 NonPagedPool:后者在 POOL_NX_OPTIN 下是个变量,
+//  语义依赖 ExInitializeDriverRuntime 已经跑过;写死 NX 更直白,且 Win8 起即支持)。
+//
+FORCEINLINE PVOID
+BlwAllocPool(_In_ POOL_TYPE PoolType, _In_ SIZE_T NumberOfBytes, _In_ ULONG Tag)
+{
+    PVOID p;
+
+    // 4996/28751:ExAllocatePoolWithTag 被标记为 deprecated。这里是【刻意】使用它 ——
+    // 它是唯一在所有目标 Windows 版本上都存在的池分配导出,理由见上方大段说明。
+#pragma warning(suppress: 4996 28751)
+    p = ExAllocatePoolWithTag(PoolType, NumberOfBytes, Tag);
+    if (p != NULL) {
+        RtlZeroMemory(p, NumberOfBytes);
+    }
+    return p;
+}
+
+//
 // ============================ 架构总则:零同步 IPC ============================
 //
 // 历史教训:旧实现在注册表/文件回调里「同步 FltSendMessage 等用户态裁决(最长 1s)」。
@@ -31,6 +81,12 @@
 // 因此本头文件不再有任何「裁决超时」常量 —— 内核永不等待用户态。
 //
 #define BLW_MAX_PROTECTED 64   // 最多保护的路径条数
+
+// 卸载时注销 WFP callout 的退让重试:关引擎之后,在途 classify 排空需要一点时间,
+// 期间 FwpsCalloutUnregisterById 会返回 STATUS_DEVICE_BUSY。总等待上限 = 5 × 50ms = 250ms,
+// 足够覆盖排空,又不会把 fltmc unload 拖成"看起来卡住"。用尽仍失败则拒绝卸载(见 BlwFilterUnload)。
+#define BLW_WFP_UNREG_RETRIES  5
+#define BLW_WFP_UNREG_DELAY_MS 50
 
 // 内核本地「事后研判」:已知恶意 SHA-256 集合上限与待扫描 PID 队列容量。
 #define BLW_MAX_HASHES     1024  // 内置已知恶意哈希上限(32KB;线性匹配,off 热路径)
@@ -272,11 +328,20 @@ typedef struct _BLW_GLOBALS {
                                      // 若不互斥,摘除时的掩码重算可能擦掉刚加入 PID 的位(假否决)。
 
     // 网络防护(WFP)
-    HANDLE          WfpEngine;       // WFP 引擎句柄
+    //
+    // 状态机(全部在 WfpLock 下变更,见 NetMonitor.c):
+    //   WfpCalloutId != 0     内核 callout 已注册(在 netio 里,不随 BFE 消失)
+    //   WfpEngine    != NULL  引擎已开 + 管理层 callout/sublayer/filter 已加(随 BFE 消失)
+    //   WfpRegistered         上面两半都就绪 = 网络防护真正生效
+    // 这三者【必须分开看】:BFE 未就绪时可能出现"callout 有、引擎没有"的半就绪态,
+    // 只看 WfpRegistered 会在卸载时漏拆那个已注册的 callout —— 悬空指针。
+    HANDLE          WfpEngine;       // WFP 引擎句柄(动态会话:关闭即移除本驱动加的对象)
     UINT32          WfpCalloutId;    // 已注册 callout 的运行时 id
     UINT64          WfpFilterId;     // 已添加 filter 的 id
     BOOLEAN         WfpRegistered;
     PDEVICE_OBJECT  WfpDeviceObject; // 注册 callout 需要的设备对象
+    HANDLE          WfpBfeSubscription; // BFE 状态变更订阅句柄(延迟拉起 + BFE 重启后重建)
+    FAST_MUTEX      WfpLock;         // 串行化 WFP 拉起 / 拆除 / BFE 状态回调三方
     BLW_BLOCK_IP    BlockList[BLW_MAX_PROTECTED]; // 网络黑名单
     KSPIN_LOCK      NetLock;         // 保护 BlockList(WFP classify 可能在 DISPATCH_LEVEL,
                                      // 必须用自旋锁而非 FAST_MUTEX,否则会触发 IRQL_NOT_LESS_OR_EQUAL 蓝屏)
@@ -490,8 +555,13 @@ void     BlwRemoveBannedPid(_In_ ULONG Pid);
 BOOLEAN  BlwPidIsBanned(_In_ ULONG Pid);
 
 // NetMonitor.c
-NTSTATUS BlwRegisterWfp(_In_ PDEVICE_OBJECT DeviceObject);
-void     BlwUnregisterWfp(void);
+// 【武装】网络防护:BFE 已运行则当场拉起,未运行则订阅 BFE 状态、等它就绪后自动拉起。
+// 两种情况都返回成功 —— boot-start 时 BFE 必然还没起来,那不是失败,不要据此放弃网络防护。
+NTSTATUS BlwWfpStart(_In_ PDEVICE_OBJECT DeviceObject);
+// 返回值【必须检查】:失败(典型 STATUS_DEVICE_BUSY)表示 WFP 仍持有本驱动的 classifyFn,
+// 此时【绝不能】让镜像卸载,否则下一条外发连接就会跳进已释放内存。见 BlwFilterUnload。
+_Must_inspect_result_
+NTSTATUS BlwUnregisterWfp(void);
 void     BlwClearBlockList(void);
 void     BlwAddBlockIp(_In_ ULONG IpV4, _In_ USHORT Port);
 

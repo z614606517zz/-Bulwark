@@ -1,0 +1,20 @@
+[Unit]
+Description=Every-3-days Bulwark support desk wipe
+
+[Timer]
+# "Every 3 days" measured from the last run, not from a fixed calendar grid --
+# OnCalendar cannot express a 3-day period without drifting at month boundaries.
+# Same choice, same reason, as bulwark-janitor-data.timer.
+OnBootSec=20min
+OnUnitActiveSec=3d
+# Persistent so a box that was off over the window still runs the wipe on boot
+# instead of silently keeping conversations past the retention promise.
+Persistent=true
+# Deliberately small (the data janitor uses 30m): this one is cheap and the
+# retention window is the product promise, so drifting it by half an hour for
+# load-spreading buys nothing.
+RandomizedDelaySec=5m
+Unit=bulwark-support-janitor.service
+
+[Install]
+WantedBy=timers.target

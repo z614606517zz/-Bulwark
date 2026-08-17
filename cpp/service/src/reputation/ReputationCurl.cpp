@@ -130,6 +130,29 @@ std::pair<int, QString> ReputationCurl::postFile(const QString& url, const QStri
     return run(args, t);
 }
 
+std::pair<int, QString> ReputationCurl::download(const QString& url, const QString& destPath,
+                                                 const QStringList& headers, int timeoutSeconds) {
+    // 下载几 MB 的载荷,超时地板比 JSON 请求高得多。
+    const int t = std::max(30, timeoutSeconds);
+    QStringList args;
+    args << QStringLiteral("-sS") << QStringLiteral("-k") << QStringLiteral("-L")
+         << QStringLiteral("--max-redirs") << QStringLiteral("5")
+         << QStringLiteral("--max-time") << QString::number(t);
+    if (!proxyUrl.isEmpty())
+        args << QStringLiteral("--proxy") << proxyUrl;
+    for (const QString& h : headers)
+        args << QStringLiteral("-H") << h;
+    // 断点续传刻意【不用】(--continue-at):暂存目录里的半个文件可能来自上一次失败的、
+    // 甚至是另一个版本的下载,续传会把两段不同来源的字节拼成一个哈希对不上的文件,
+    // 而失败原因看起来会像「服务器发错了」。每次都重下,几 MB 的代价换一个确定的结论。
+    args << QStringLiteral("-o") << destPath;
+    args << QStringLiteral("-w") << QStringLiteral("\nHTTPSTATUS:%{http_code}");
+    args << url;
+    const auto res = run(args, t);
+    diag(QStringLiteral("download %1 -> HTTP %2").arg(QFileInfo(destPath).fileName()).arg(res.first));
+    return res;
+}
+
 void ReputationCurl::diag(const QString& line) {
     // 这里原来是「无锁 + 无上限」地往 rep_diag.log 追加:
     //   1) diag() 被多个线程调用(IP 情报消费线程、各信誉源、代理健康探测),各自 open/write/close

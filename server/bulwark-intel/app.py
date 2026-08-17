@@ -12,13 +12,16 @@ Responses are normalized to Bulwark's FileReputation / IpReputation shape so the
 C++ / .NET ReputationManager can map them 1:1.
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
 import sqlite3
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -39,6 +42,79 @@ VERDICT_RANK = {"unknown": 0, "clean": 1, "suspicious": 2, "malicious": 3}
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+
+# --- 反馈截图:允许的图片类型 ------------------------------------------------- #
+#
+# 【按魔术字节判定,不看扩展名也不信客户端给的 MIME】—— 提交口是公开无鉴权的,
+# 客户端说什么都不能当依据。
+#
+# 【SVG 被刻意排除】。SVG 是 XML,可以内嵌 <script>;而这些图片是给带着
+# bw_session 的管理员在同源下打开的,放行 SVG 等于把一条反馈变成管理页上的
+# XSS。PNG/JPEG/GIF/WebP 这四种是位图容器,浏览器不会当脚本执行。
+IMG_TYPES = (
+    (b"\x89PNG\r\n\x1a\n", "png", "image/png"),
+    (b"\xff\xd8\xff", "jpg", "image/jpeg"),
+    (b"GIF87a", "gif", "image/gif"),
+    (b"GIF89a", "gif", "image/gif"),
+)
+IMG_EXT_MIME = {"png": "image/png", "jpg": "image/jpeg",
+                "gif": "image/gif", "webp": "image/webp"}
+IMG_NAME_RE = re.compile(r"^fb\d+-\d-[0-9a-f]{16}\.(png|jpg|gif|webp)$")
+
+
+def sniff_image(data):
+    """返回 (ext, mime),识别不出就返回 (None, None)。"""
+    for magic, ext, mime in IMG_TYPES:
+        if data.startswith(magic):
+            return ext, mime
+    # WebP: 'RIFF' <4 字节长度> 'WEBP'
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None, None
+
+
+# --- 在线客服附件:图片 + 视频 ------------------------------------------------- #
+#
+# 判定规则与反馈截图那套【完全一致,而且是刻意复用同一条推理】:按魔术字节认容器,
+# 不看扩展名、不信客户端给的 Content-Type。客服的上传口和反馈一样是公开无鉴权的
+# (要让还没有账号的人能开口说话),客户端说什么都不能当依据。
+#
+# 视频只放行浏览器自己能播的三种容器。放行 MKV 之类的意义是负的:存进来占盘,
+# <video> 又播不了,用户只会以为功能坏了。
+#
+# 【SVG 依然排除】,理由同 IMG_TYPES 处:它是 XML,能内嵌 <script>,而这些附件会在
+# 同源下被客服(带着 bw_session)打开。
+SUP_EXT_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+    "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+}
+SUP_IMAGE_EXT = ("png", "jpg", "gif", "webp")
+SUP_VIDEO_EXT = ("mp4", "mov", "webm")
+# 文件名整个由服务端生成:sup-<会话媒体前缀 12 位>-<随机 16 位>.<ext>。
+# 用户输入一个字节都不参与拼接 —— 没有拼接就没有路径穿越。
+SUP_NAME_RE = re.compile(r"^sup-[0-9a-f]{12}-[0-9a-f]{16}\.(png|jpg|gif|webp|mp4|mov|webm)$")
+
+
+def sniff_media(head):
+    """按首部字节判定附件类型。返回 (ext, mime, kind),认不出返回 (None, None, None)。
+
+    kind 只有 "image" / "video" 两种 —— 前端要据此决定渲染 <img> 还是 <video>,
+    而这个判断必须由服务端做:让前端按扩展名猜,等于把类型判定权交回给上传者。
+    """
+    ext, mime = sniff_image(head)
+    if ext:
+        return ext, mime, "image"
+    # ISO BMFF (MP4 / MOV / M4V): 前 4 字节是 box 长度,紧跟 'ftyp'。
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand[:2] == b"qt":                      # 'qt  ' = QuickTime
+            return "mov", "video/quicktime", "video"
+        return "mp4", "video/mp4", "video"
+    # Matroska/WebM 都是 EBML 头。只认自称 webm 的那一支:MKV 浏览器不播。
+    if head[:4] == b"\x1a\x45\xdf\xa3" and b"webm" in head[:128]:
+        return "webm", "video/webm", "video"
+    return None, None, None
 
 
 def iso(dt):
@@ -115,6 +191,26 @@ def parse_iso(s):
         return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+# 展示层时区。存储与比较一律走 UTC(now_utc / iso / parse_iso 一个都没动),只在
+# 渲染给人看的那一刻换成北京时间 —— 把转换掺进比较逻辑会让窗口统计和「最近活跃」
+# 全体偏移 8 小时。
+#
+# 用固定 +08:00 而不是读服务器本地时区:这两台机器的 /etc/localtime 是 UTC,
+# 依赖系统设置意味着换台机器显示就变;中国也不用夏令时,固定偏移没有夏令时坑。
+CST = timezone(timedelta(hours=8))
+
+
+def cst_str(ts, fmt="%Y-%m-%d %H:%M"):
+    """UTC ISO 串(或 datetime)-> 北京时间显示串。解析不了就返回空串,不抛。"""
+    t = parse_iso(ts) if isinstance(ts, str) else ts
+    if not t:
+        return ""
+    try:
+        return t.astimezone(CST).strftime(fmt)
+    except Exception:
+        return ""
 
 
 def threat_category(attr, threat_label=""):
@@ -267,6 +363,26 @@ class Store:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 at TEXT, ip TEXT, path TEXT, agent TEXT)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_visitlog_at ON visit_log(at)")
+            # 用户问题反馈。ip 原样存,只在 HTTP 层做掩码(与 visitors 一致)。
+            # message/contact 是【用户可控文本】—— 展示时必须 html.escape,
+            # 否则一条反馈就能在管理页里存储型 XSS。
+            # images: 截图【文件名】的 JSON 数组,不是图片内容。图片落在
+            # feedback_images_dir 下,名字由服务端生成 —— 把二进制塞进 cache.db 会让
+            # 这个本来几十 MB 的库涨到几百 MB,而它每次同步、备份都要整份搬。
+            c.execute("""CREATE TABLE IF NOT EXISTS feedback(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT, ip TEXT, kind TEXT DEFAULT 'other', contact TEXT DEFAULT '',
+                message TEXT, agent TEXT DEFAULT '', page TEXT DEFAULT '',
+                status TEXT DEFAULT 'new', images TEXT DEFAULT '',
+                reply TEXT DEFAULT '', replied_at TEXT DEFAULT '')""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_at ON feedback(at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status)")
+            # 提交者按 IP 认领自己的反馈(没有账号体系),所以这一列要有索引。
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ip ON feedback(ip)")
+            fcols = [r[1] for r in c.execute("PRAGMA table_info(feedback)").fetchall()]
+            for col in ("images", "reply", "replied_at"):
+                if col not in fcols:
+                    c.execute("ALTER TABLE feedback ADD COLUMN %s TEXT DEFAULT ''" % col)
             # Permanent VT report store (NO TTL): full file report + behaviour summary.
             c.execute("""CREATE TABLE IF NOT EXISTS vt_reports(
                 sha256 TEXT PRIMARY KEY, md5 TEXT, sha1 TEXT, name TEXT,
@@ -373,6 +489,134 @@ class Store:
         with self.lock, self._conn() as c:
             c.execute("""INSERT INTO counters(name, value) VALUES (?,?)
                 ON CONFLICT(name) DO UPDATE SET value=value+?""", (name, n, n))
+
+    # ---- 用户反馈 ----------------------------------------------------------- #
+    # 提交口是公开的(要让没有 token 的普通用户能提),所以必须自带两道限:
+    #   · 字段长度上限 —— 否则一次 POST 就能往库里灌几十 MB
+    #   · 每 IP 每日条数上限 —— per-IP 滑窗只挡请求频率,挡不住「一天慢慢发一万条」
+    FEEDBACK_MAX_MSG = 4000
+    FEEDBACK_MAX_CONTACT = 200
+    FEEDBACK_PER_IP_PER_DAY = 20
+    # 截图:张数与单张大小。乘起来就是一条反馈最多能占的磁盘,再叠上每 IP 每日
+    # 20 条,单个 IP 一天最多写 20*3*2MB = 120MB —— 所以还需要目录总量闸门
+    # (见 FEEDBACK_IMG_DIR_MAX),否则几个 IP 就能把盘填满。
+    # 张数/大小的实际上限改由配置决定(见 HTTP 层的 _fb_limits),默认给得很宽,
+    # 正常使用碰不到。这里只留一个绝对兜底,防止配置写成天文数字。
+    FEEDBACK_IMG_HARD_CAP = 200
+
+    def add_feedback(self, ip, kind, contact, message, agent="", page="", images=None):
+        """写入一条反馈。返回 (id, error)。error 非空表示被拒。
+
+        images 是【文件名列表】,调用方负责先把字节落盘再把名字传进来 —— Store
+        不碰文件系统,配置与磁盘配额都归 HTTP 层。"""
+        message = (message or "").strip()[: self.FEEDBACK_MAX_MSG]
+        contact = (contact or "").strip()[: self.FEEDBACK_MAX_CONTACT]
+        kind = (kind or "other").strip()[:32] or "other"
+        names = [str(x) for x in (images or [])][: self.FEEDBACK_IMG_HARD_CAP]
+        # 一张截图往往比一句话说得清,所以【有图就不强制写文字】。
+        if not message and not names:
+            return (0, "请填写内容或附上截图")
+        day = now_utc().strftime("%Y-%m-%d")
+        with self.lock, self._conn() as c:
+            n = c.execute("SELECT COUNT(*) n FROM feedback WHERE ip=? AND substr(at,1,10)=?",
+                          (ip, day)).fetchone()["n"]
+            if n >= self.FEEDBACK_PER_IP_PER_DAY:
+                return (0, "今日提交次数已达上限,请明天再试")
+            cur = c.execute("""INSERT INTO feedback(at, ip, kind, contact, message, agent, page, images)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (iso(now_utc()), ip, kind, contact, message,
+                 (agent or "")[:120], (page or "")[:200],
+                 json.dumps(names, ensure_ascii=False) if names else ""))
+            return (cur.lastrowid, "")
+
+    def set_feedback_images(self, fid, names):
+        """回填真正落盘成功的截图文件名(插入时先占位,因为文件名要带记录 id)。"""
+        names = [str(x) for x in (names or [])][: self.FEEDBACK_IMG_HARD_CAP]
+        with self.lock, self._conn() as c:
+            c.execute("UPDATE feedback SET images=? WHERE id=?",
+                      (json.dumps(names, ensure_ascii=False) if names else "", int(fid)))
+
+    def feedback_images(self, fid):
+        with self.lock, self._conn() as c:
+            row = c.execute("SELECT images FROM feedback WHERE id=?", (int(fid),)).fetchone()
+        if not row or not row["images"]:
+            return []
+        try:
+            v = json.loads(row["images"])
+            return [str(x) for x in v] if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def feedback_stats(self):
+        with self.lock, self._conn() as c:
+            total = c.execute("SELECT COUNT(*) n FROM feedback").fetchone()["n"]
+            new = c.execute("SELECT COUNT(*) n FROM feedback WHERE status='new'").fetchone()["n"]
+        return {"total": total, "new": new}
+
+    def list_feedback(self, limit=300, status=""):
+        sql = "SELECT * FROM feedback"
+        args = []
+        if status:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, min(2000, int(limit))))
+        with self.lock, self._conn() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+    def list_feedback_by_ip(self, ip, limit=50):
+        """提交者自己的反馈。【刻意只返回能给本人看的字段】——
+        contact / ip / agent 全部不出现:这个接口是公开的,按 IP 认领,而 IP 会
+        被 NAT 共享。同一出口下的另一个人不该看到别人留的邮箱和 UA。
+        截图也不回传:处理完就删了,而且用户自己刚上传的图不需要再看一遍。"""
+        with self.lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT id, at, kind, message, status, reply, replied_at, images "
+                "FROM feedback WHERE ip=? ORDER BY id DESC LIMIT ?",
+                (ip, max(1, min(200, int(limit))))).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                imgs = json.loads(d.pop("images", "") or "[]")
+            except Exception:
+                imgs = []
+            d["image_count"] = len(imgs) if isinstance(imgs, list) else 0
+            out.append(d)
+        return out
+
+    def set_feedback_status(self, fid, status, reply=None):
+        """标记状态,顺带写处理结果。
+
+        返回 (ok, 需要删除的截图文件名)。标为 done 时截图【连同数据库里的引用
+        一起清掉】—— 截图的用途就是让问题被复现和定位,处理完它只剩占盘。这也是
+        取消大小/张数限制之后,磁盘不会单向增长的原因。"""
+        if status not in ("new", "done"):
+            return (False, [])
+        drop = self.feedback_images(fid) if status == "done" else []
+        with self.lock, self._conn() as c:
+            if reply is not None:
+                c.execute("UPDATE feedback SET reply=?, replied_at=? WHERE id=?",
+                          (str(reply)[: self.FEEDBACK_MAX_MSG], iso(now_utc()), int(fid)))
+            if drop:
+                c.execute("UPDATE feedback SET images='' WHERE id=?", (int(fid),))
+            cur = c.execute("UPDATE feedback SET status=? WHERE id=?", (status, int(fid)))
+            return (cur.rowcount > 0, drop)
+
+    def _set_feedback_status_legacy(self, fid, status):
+        if status not in ("new", "done"):
+            return False
+        with self.lock, self._conn() as c:
+            cur = c.execute("UPDATE feedback SET status=? WHERE id=?", (status, int(fid)))
+            return cur.rowcount > 0
+
+    def delete_feedback(self, fid):
+        """返回 (是否删掉, 该条曾挂的截图文件名)。文件名要交回给调用方去 unlink,
+        否则删掉记录后图片会永远留在盘上,再没有任何东西引用它。"""
+        names = self.feedback_images(fid)
+        with self.lock, self._conn() as c:
+            cur = c.execute("DELETE FROM feedback WHERE id=?", (int(fid),))
+            return (cur.rowcount > 0, names)
 
     def counters(self):
         with self.lock, self._conn() as c:
@@ -597,23 +841,40 @@ class Store:
     # (file/behaviour 两层),这样 engine_build.py 的 extract_markers 可以原样复用。
     BENIGN_DDL = ("CREATE TABLE IF NOT EXISTS benign_reports ("
                   "sha256 TEXT PRIMARY KEY, stored_at TEXT, type_tag TEXT, name TEXT, "
-                  "signed INTEGER DEFAULT 0, markers INTEGER DEFAULT 0, report TEXT)")
+                  "signed INTEGER DEFAULT 0, markers INTEGER DEFAULT 0, report TEXT, "
+                  "has_behaviour INTEGER DEFAULT 0)")
 
-    # 滚动窗口上限。语料是用来算出现率的,不需要无限留存;超出后按入库时间淘汰最旧的。
+    # 滚动窗口上限。语料是用来算出现率的,不需要无限留存;超出后淘汰。
+    #
+    # 【淘汰顺序不是单纯按时间】。留存策略放开成「干净就存」之后,没跑过沙箱的行会占
+    # 大多数(实测干净文件里约 97% 拿不到沙箱报告),而它们对区分度贡献为零 ——
+    # collect_benign 会直接跳过。若仍按 stored_at 单键淘汰,这批零价值的行会把真正
+    # 能用的、带沙箱行为的老行挤出去,语料越采越差。故排序键是 (has_behaviour, stored_at):
+    # 先清最旧的无行为行,只有无行为行全清完了才会碰到带行为的。
     BENIGN_MAX_ROWS = 20000
 
     @staticmethod
-    def slim_benign_report(sha256, attr, behaviour):
+    def slim_benign_report(sha256, attr, behaviour, has_behaviour=True):
         """把完整 VT 报告削成语料需要的最小形状。
 
         刻意保留 signature_info:后面要做「按签名状态给正常样本分层」时用得上,
         而重新去 VT 拉一遍代价远高于现在多存几百字节。
+
+        【type_description / type_extension / magic 是补上来的】。原先只留 type_tag,
+        而 VT 并不总给这个字段 —— 实测 63 份语料里 39 份(62%)的 type_tag 是空的,
+        于是挖掘侧按「type_tag 在 Windows 类型表里」过滤时把它们全判成非本平台,
+        可用语料从 63 掉到 13,低于 BENIGN_MIN_CORPUS(50),整个区分度环节因此空转。
+        要命的是这三个字段在存库那一刻【是有的】,是被这里削掉的 —— 那 39 行的平台
+        信息已经不可恢复,只能从现在起不再丢。每行多存不到一百字节。
         """
         sig = attr.get("signature_info") or {}
         return {
             "id": sha256,
             "file": {
                 "type_tag": attr.get("type_tag") or "",
+                "type_description": attr.get("type_description") or "",
+                "type_extension": attr.get("type_extension") or "",
+                "magic": (attr.get("magic") or "")[:160],
                 "meaningful_name": attr.get("meaningful_name") or "",
                 "last_analysis_stats": attr.get("last_analysis_stats") or {},
                 "popular_threat_classification": {},
@@ -623,36 +884,77 @@ class Store:
             },
             # sigma_analysis_results 是挖掘唯一消费的行为字段(见 engine_build.extract_markers)
             "behaviour": {"sigma_analysis_results":
-                          (behaviour.get("sigma_analysis_results") or [])},
-            "behaviour_available": True,
+                          ((behaviour or {}).get("sigma_analysis_results") or [])},
+            # 【必须如实反映,不能恒 True】。engine_build.collect_benign 正是靠这个字段
+            # 决定一行要不要计入语料:
+            #     if not rep.get("behaviour_available"): continue
+            # 现在留存策略放开成「干净就存」(见 vt_lookup),没跑过沙箱的行也会进表。
+            # 若这里继续写死 True,那些行就会伪装成有效语料进入 BenignCorpus,把
+            # 「这个行为在正常软件里的出现率」算低 —— 等于放过通用行为,比没有语料更糟。
+            # 恒 True 在旧策略下是安全的(那时只有 bst==200 才会走到这里),放开后就不是了。
+            "behaviour_available": bool(has_behaviour),
         }
 
-    def save_benign_report(self, sha256, attr, behaviour):
+    def save_benign_report(self, sha256, attr, behaviour, has_behaviour=True):
         """留存一个正常样本。返回 True 表示确实入库了。
 
         【没有 sigma 命中的样本也要存】。它不是"无用样本",而是分母的一部分 ——
         「这个行为在正常软件里并不普遍」的正面证据。只存有命中的会系统性高估出现率,
         那比没有语料更危险(会把真规则砍掉、把假规则留下)。
+
+        has_behaviour 区分的是【另一件事】,别和上面那条混起来:
+          * sigma 命中数为 0 = 跑过沙箱、什么可疑动作都没做 -> 有效分母,参与定级;
+          * has_behaviour=False = 【根本没跑过沙箱】-> 不知道它会做什么,不能计入分母。
+        两者都入库,但只有前者会被 collect_benign 取用(它按 behaviour_available 过滤)。
+        后者留着的理由是:①「这个哈希已经问过 VT 且是干净的」这个事实值得永久记住,
+        而 vt_lookup_cache 只有 7 天 TTL;② 以后若补到了沙箱行为,原地 upsert 即可升级
+        成有效语料,不必重新查一遍上游。
         """
-        slim = self.slim_benign_report(sha256, attr, behaviour)
+        slim = self.slim_benign_report(sha256, attr, behaviour, has_behaviour)
         sig = slim["file"]["signature_info"]
         n_marks = len(slim["behaviour"]["sigma_analysis_results"])
         with self.lock, self._conn() as c:
             c.execute(self.BENIGN_DDL)
+            # 幂等迁移:老库没有 has_behaviour 列。既有的 63 行都是在旧策略下入库的,
+            # 那时只有 bst==200 才走到这里 —— 所以它们全都确实跑过沙箱,回填 1 是准确的,
+            # 不是乐观猜测。
+            bcols = [r[1] for r in c.execute("PRAGMA table_info(benign_reports)").fetchall()]
+            if "has_behaviour" not in bcols:
+                c.execute("ALTER TABLE benign_reports ADD COLUMN has_behaviour INTEGER DEFAULT 0")
+                c.execute("UPDATE benign_reports SET has_behaviour=1")
             c.execute("INSERT INTO benign_reports(sha256, stored_at, type_tag, name, "
-                      "signed, markers, report) VALUES (?,?,?,?,?,?,?) "
+                      "signed, markers, report, has_behaviour) VALUES (?,?,?,?,?,?,?,?) "
                       "ON CONFLICT(sha256) DO UPDATE SET stored_at=excluded.stored_at, "
                       "type_tag=excluded.type_tag, name=excluded.name, "
-                      "signed=excluded.signed, markers=excluded.markers, "
-                      "report=excluded.report",
+                      "signed=excluded.signed, "
+                      # 【markers/report 只在「新的不比旧的差」时才覆盖】。
+                      # has_behaviour 用 MAX 保住了列,但 report 若无条件覆盖,一次偶发的
+                      # behaviour 取回失败(429/超时)就会把 behaviour_available=True 的报告
+                      # 换成 False 的 —— 而 collect_benign 读的是【报告里那个字段】,不是这
+                      # 一列。结果是列说「有效」、报告说「无效」,语料静默丢失且统计虚高。
+                      # 实测复现过:19:10:58 那次取到了行为,19:11:52 重查撞上 VT 4 次/分
+                      # 限流,列仍是 1 而报告已被换成无行为的那份。
+                      "markers=CASE WHEN excluded.has_behaviour=1 OR "
+                      "benign_reports.has_behaviour=0 THEN excluded.markers "
+                      "ELSE benign_reports.markers END, "
+                      "report=CASE WHEN excluded.has_behaviour=1 OR "
+                      "benign_reports.has_behaviour=0 THEN excluded.report "
+                      "ELSE benign_reports.report END, "
+                      # 只允许 0 -> 1,不允许 1 -> 0。同一个哈希若先在没有沙箱数据时入库、
+                      # 后来补到了行为,应当升级;而一次偶发的 behaviour 取回失败(超时/限流)
+                      # 绝不能把一份已经有效的语料降级成无效的。
+                      "has_behaviour=MAX(benign_reports.has_behaviour, excluded.has_behaviour)",
                       (sha256, iso(now_utc()), slim["file"]["type_tag"],
                        slim["file"]["meaningful_name"],
                        1 if str(sig.get("verified", "")).lower() == "signed" else 0,
-                       n_marks, json.dumps(slim, ensure_ascii=False)))
+                       n_marks, json.dumps(slim, ensure_ascii=False),
+                       1 if has_behaviour else 0))
             n = c.execute("SELECT COUNT(*) n FROM benign_reports").fetchone()["n"]
             if n > self.BENIGN_MAX_ROWS:
+                # 排序键见 BENIGN_MAX_ROWS 处说明:先淘汰无沙箱行为的最旧行。
                 c.execute("DELETE FROM benign_reports WHERE sha256 IN ("
-                          "SELECT sha256 FROM benign_reports ORDER BY stored_at ASC LIMIT ?)",
+                          "SELECT sha256 FROM benign_reports "
+                          "ORDER BY has_behaviour ASC, stored_at ASC LIMIT ?)",
                           (n - self.BENIGN_MAX_ROWS,))
         return True
 
@@ -660,13 +962,37 @@ class Store:
         """语料概况。网页与引擎页都要显示 —— 语料规模直接决定区分度能不能用。"""
         with self.lock, self._conn() as c:
             c.execute(self.BENIGN_DDL)
+            bcols = [r[1] for r in c.execute("PRAGMA table_info(benign_reports)").fetchall()]
+            # has_behaviour 可能还没迁移(本方法可能在任何一次 save 之前被调用)。
+            # 缺列时按旧语义算:那时能入库的行必定都跑过沙箱。
+            beh_expr = ("SUM(has_behaviour)" if "has_behaviour" in bcols else "COUNT(*)")
             r = c.execute("SELECT COUNT(*) n, "
                           "SUM(CASE WHEN markers>0 THEN 1 ELSE 0 END) with_marks, "
-                          "SUM(signed) signed, MIN(stored_at) oldest, MAX(stored_at) newest "
+                          "SUM(signed) signed, " + beh_expr + " with_beh, "
+                          "MIN(stored_at) oldest, MAX(stored_at) newest "
                           "FROM benign_reports").fetchone()
         return {"total": r["n"] or 0, "with_markers": r["with_marks"] or 0,
-                "signed": r["signed"] or 0, "oldest": r["oldest"] or "",
+                "signed": r["signed"] or 0,
+                # 这个数字才是「区分度能不能用」的真实分母(对齐 engine_build 的
+                # BENIGN_MIN_CORPUS 判据)。total 会被没跑过沙箱的行撑大,单看它会误判。
+                "with_behaviour": r["with_beh"] or 0,
+                "oldest": r["oldest"] or "",
                 "newest": r["newest"] or "", "cap": self.BENIGN_MAX_ROWS}
+
+    def list_benign_reports(self, limit=300):
+        """正常样本清单,喂给网页的「正常样本」区。形状与 list_vt_reports 对称:
+        只回列里就有的轻量字段(不解析 report JSON),300 行的列表零解析开销。
+        report 里的完整精简报告留给将来做详情页时按需拉取。"""
+        with self.lock, self._conn() as c:
+            c.execute(self.BENIGN_DDL)
+            # has_behaviour 可能还没迁移(见 benign_stats 的同款说明):缺列时用常量 1
+            # 顶替,语义等价于「旧库入库的行都跑过沙箱」。
+            bcols = [r[1] for r in c.execute("PRAGMA table_info(benign_reports)").fetchall()]
+            beh = "has_behaviour" if "has_behaviour" in bcols else "1 AS has_behaviour"
+            rows = c.execute(
+                "SELECT sha256, stored_at, type_tag, name, signed, markers, " + beh +
+                " FROM benign_reports ORDER BY stored_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     def save_vt_report(self, meta, report):
         with self.lock, self._conn() as c:
@@ -685,6 +1011,71 @@ class Store:
                        iso(now_utc()), json.dumps(report, ensure_ascii=False),
                        meta.get("threat_label", ""), meta.get("category", ""),
                        silverfox_family(report)))
+
+    # ---- lookup cache (答案缓存,不是归档) ----------------------------------- #
+    #
+    # 为什么必须是第三张表,不能复用现有两张:
+    #   1. vt_reports 是【威胁归档】。把干净文件放进去,归档计数、家族分布、分类统计
+    #      全部失真 —— 正是 BENIGN_DDL 那段注释里点名要避免的事。
+    #   2. benign_reports 存的是被 slim_benign_report 削过的语料行,而且有滚动淘汰
+    #      上限。拿它当缓存,后续查询就会拿到残缺报告,威胁分析台的展示随之退化。
+    #
+    # 所以单独一张表,只回答一件事:「这个哈希我们已经问过 VirusTotal,完整报告在此」。
+    # 一个标识符一行(sha256/md5/sha1 各存一行),因为 lookup 允许用任意一种哈希查。
+    #
+    # 修的是什么:vt_lookup 只在 vt_reports 里找缓存,而干净文件按留存策略永远不进
+    # vt_reports —— 于是干净哈希【结构性地无法被缓存】,每次重复查询都要再花两次上游
+    # 调用(/files 和 /files/behaviour_summary 各一次)。实测同一个已查过的干净文件
+    # 连查两次,配额 125->127->129,每次 +2。
+    LOOKUP_DDL = ("CREATE TABLE IF NOT EXISTS vt_lookup_cache ("
+                  "ident TEXT PRIMARY KEY, sha256 TEXT, stored_at TEXT, "
+                  "expires_at TEXT, report TEXT)")
+    # 有 TTL 就不需要永久留存;上限只是防止长期运行后无声长大。
+    LOOKUP_MAX_ROWS = 60000
+
+    def get_lookup_cache(self, ident):
+        key = ident.strip().lower()
+        with self.lock, self._conn() as c:
+            c.execute(self.LOOKUP_DDL)
+            row = c.execute("SELECT * FROM vt_lookup_cache WHERE ident=?", (key,)).fetchone()
+        if not row:
+            return None
+        exp = parse_iso(row["expires_at"] or "")
+        if exp and exp < now_utc():
+            return None                 # 过期 -> 当未命中,调用方会重新查
+        try:
+            rep = json.loads(row["report"]) if row["report"] else {}
+        except Exception:
+            return None
+        if not rep:
+            return None                 # 空报告不算命中,否则等于缓存了一个空壳
+        return {"sha256": row["sha256"] or key, "stored_at": row["stored_at"] or "",
+                "report": rep}
+
+    def save_lookup_cache(self, idents, sha256, report, ttl_seconds):
+        keys = []
+        for i in idents:
+            k = str(i or "").strip().lower()
+            if k and k not in keys:
+                keys.append(k)
+        if not keys or not report:
+            return
+        now = now_utc()
+        rows = [(k, sha256, iso(now),
+                 iso(now + timedelta(seconds=max(60, int(ttl_seconds)))),
+                 json.dumps(report, ensure_ascii=False)) for k in keys]
+        with self.lock, self._conn() as c:
+            c.execute(self.LOOKUP_DDL)
+            c.executemany("INSERT INTO vt_lookup_cache"
+                          "(ident, sha256, stored_at, expires_at, report) VALUES (?,?,?,?,?) "
+                          "ON CONFLICT(ident) DO UPDATE SET sha256=excluded.sha256, "
+                          "stored_at=excluded.stored_at, expires_at=excluded.expires_at, "
+                          "report=excluded.report", rows)
+            n = c.execute("SELECT COUNT(*) n FROM vt_lookup_cache").fetchone()["n"]
+            if n > self.LOOKUP_MAX_ROWS:
+                c.execute("DELETE FROM vt_lookup_cache WHERE ident IN ("
+                          "SELECT ident FROM vt_lookup_cache ORDER BY stored_at ASC LIMIT ?)",
+                          (n - self.LOOKUP_MAX_ROWS,))
 
     def get_vt_report(self, ident):
         key = ident.strip().lower()
@@ -752,6 +1143,323 @@ class Store:
 
 
 # --------------------------------------------------------------------------- #
+#  在线客服:会话 + 消息                                                        #
+# --------------------------------------------------------------------------- #
+class SupportStore:
+    """在线客服的会话与消息存储。
+
+    【刻意用独立的数据库文件,不放进 cache.db】。三条理由,每一条单独都足够:
+
+      1. cache.db 是 386MB 的威胁归档,vt_reports 有一份全量校验凭据要在每次部署
+         前后比对。对话是「每 3 天整体清空」的高频删除负载 —— 让它和那份归档共用
+         同一个文件,就是让删除作业和归档共用同一次备份、同一次同步、同一把锁。
+
+      2. 「每 3 天清空所有对话内容」这条承诺要能被审计。独立文件可以直接证明清理
+         一行都没碰到情报库;同库删除要证明这件事,成本高得多,而且没人会去证。
+
+      3. cache.db 会整份镜像到 245。客户的对话和上传的截图不该被复制到第二台机器。
+
+    连接与并发沿用 Store 的约定:每次访问新开连接 + 一把进程级锁。这个服务的对话
+    量是人打字的速度,没有必要引入连接池带来的新失败模式。
+    """
+
+    # 绝对兜底,防止配置写成天文数字。真实上限由配置决定(见 Handler._sup_cfg)。
+    MSG_HARD_CAP = 8000
+    MEDIA_HARD_CAP = 12
+
+    def __init__(self, path, media_dir):
+        self.path = path
+        self.media_dir = media_dir
+        self.lock = threading.Lock()
+        # 长轮询用:插入消息后广播,等待者立刻醒来重查。
+        self.cond = threading.Condition()
+        for d in (os.path.dirname(path), media_dir):
+            if d:
+                try:
+                    os.makedirs(d, exist_ok=True)
+                except OSError:
+                    pass
+        self._init()
+
+    def _conn(self):
+        c = sqlite3.connect(self.path, timeout=15)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def _init(self):
+        with self.lock, self._conn() as c:
+            # token 是访客的【能力凭证】:256 位随机,存在 HttpOnly cookie 里。
+            # 认领一次对话不需要账号 —— 客服系统不能要求用户先注册才能提问。
+            # mkey 与 token 分开:附件文件名里带 mkey,这样 URL 不泄露 token 的任何
+            # 一段。共用的话,媒体链接就等于把 48 位令牌写在了地址栏里。
+            c.execute("""CREATE TABLE IF NOT EXISTS conversations(
+                token TEXT PRIMARY KEY, mkey TEXT, created_at TEXT, last_at TEXT,
+                ip TEXT, agent TEXT DEFAULT '', page TEXT DEFAULT '',
+                status TEXT DEFAULT 'open', unread INTEGER DEFAULT 0,
+                msgs INTEGER DEFAULT 0)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_conv_last ON conversations(last_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_conv_mkey ON conversations(mkey)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_conv_ip ON conversations(ip)")
+            # who: visitor | agent | system。media 是【文件名】的 JSON 数组,不是字节 ——
+            # 一段 30MB 的视频塞进 SQLite,会让这个本该是几 MB 的库变成几 GB,而它每
+            # 3 天要被整体清空一次。
+            c.execute("""CREATE TABLE IF NOT EXISTS messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT, at TEXT, who TEXT, body TEXT DEFAULT '',
+                media TEXT DEFAULT '')""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(token, id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_msg_at ON messages(at)")
+            c.execute("""CREATE TABLE IF NOT EXISTS kv(
+                k TEXT PRIMARY KEY, v TEXT)""")
+
+    # ---- kv:客服在线状态 --------------------------------------------------- #
+    def kv_set(self, k, v):
+        with self.lock, self._conn() as c:
+            c.execute("INSERT INTO kv(k, v) VALUES (?,?) "
+                      "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+    def kv_get(self, k, default=""):
+        with self.lock, self._conn() as c:
+            row = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+        return row["v"] if row else default
+
+    # ---- 会话 --------------------------------------------------------------- #
+    def open_conversation(self, ip, agent, page, per_ip_per_day, greeting=""):
+        """新建一个会话。返回 (token, mkey, error)。
+
+        每 IP 每日建会话数要有上限:这个口是公开的,没有上限就等于允许任何人用
+        一个脚本把库刷满 —— per-IP 滑窗只挡请求频率,挡不住「一天慢慢开一万个」。
+        """
+        token = uuid.uuid4().hex + uuid.uuid4().hex     # 256 位
+        mkey = uuid.uuid4().hex[:12]
+        now = iso(now_utc())
+        day = now_utc().strftime("%Y-%m-%d")
+        with self.lock, self._conn() as c:
+            n = c.execute("SELECT COUNT(*) n FROM conversations "
+                          "WHERE ip=? AND substr(created_at,1,10)=?",
+                          (ip or "", day)).fetchone()["n"]
+            if per_ip_per_day and n >= per_ip_per_day:
+                return (None, None, "今日新建会话次数已达上限,请稍后再试")
+            c.execute("""INSERT INTO conversations
+                (token, mkey, created_at, last_at, ip, agent, page, status, unread, msgs)
+                VALUES (?,?,?,?,?,?,?,'open',0,0)""",
+                      (token, mkey, now, now, ip or "",
+                       (agent or "")[:40], (page or "")[:200]))
+            if greeting:
+                c.execute("INSERT INTO messages(token, at, who, body, media) "
+                          "VALUES (?,?,'system',?,'')", (token, now, greeting))
+                c.execute("UPDATE conversations SET msgs=1 WHERE token=?", (token,))
+        self._wake()
+        return (token, mkey, "")
+
+    def get_conversation(self, token, max_age_days=None):
+        """按 token 取会话。
+
+        max_age_days 不为 None 时做【读侧惰性过期】:超过留存期的对话一律当作不存在,
+        即便清理定时器坏了也读不出来。承诺是「3 天后没有」,不能只靠一个 timer 兑现。
+        """
+        t = (token or "").strip().lower()
+        if len(t) != 64 or not all(ch in "0123456789abcdef" for ch in t):
+            return None
+        with self.lock, self._conn() as c:
+            row = c.execute("SELECT * FROM conversations WHERE token=?", (t,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if max_age_days is not None:
+            last = parse_iso(d.get("last_at") or "")
+            if not last or last < now_utc() - timedelta(days=float(max_age_days)):
+                return None
+        return d
+
+    def conversation_by_mkey(self, mkey):
+        m = (mkey or "").strip().lower()
+        if len(m) != 12 or not all(ch in "0123456789abcdef" for ch in m):
+            return None
+        with self.lock, self._conn() as c:
+            row = c.execute("SELECT * FROM conversations WHERE mkey=?", (m,)).fetchone()
+        return dict(row) if row else None
+
+    def set_status(self, token, status):
+        if status not in ("open", "closed"):
+            return False
+        with self.lock, self._conn() as c:
+            cur = c.execute("UPDATE conversations SET status=? WHERE token=?", (status, token))
+            return cur.rowcount > 0
+
+    def mark_read(self, token):
+        with self.lock, self._conn() as c:
+            c.execute("UPDATE conversations SET unread=0 WHERE token=?", (token,))
+
+    def list_conversations(self, limit=200, include_closed=True):
+        sql = "SELECT * FROM conversations"
+        if not include_closed:
+            sql += " WHERE status='open'"
+        sql += " ORDER BY last_at DESC LIMIT ?"
+        with self.lock, self._conn() as c:
+            rows = c.execute(sql, (max(1, min(1000, int(limit))),)).fetchall()
+            last = {r["token"]: r["body"] for r in c.execute(
+                "SELECT token, body FROM messages WHERE id IN "
+                "(SELECT MAX(id) FROM messages GROUP BY token)").fetchall()}
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["preview"] = (last.get(d["token"], "") or "")[:60]
+            out.append(d)
+        return out
+
+    def stats(self, active_min=10):
+        cutoff = iso(now_utc() - timedelta(minutes=active_min))
+        with self.lock, self._conn() as c:
+            r = c.execute("SELECT COUNT(*) total, "
+                          "SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) open, "
+                          "SUM(CASE WHEN unread>0 THEN 1 ELSE 0 END) waiting, "
+                          "SUM(CASE WHEN last_at>=? THEN 1 ELSE 0 END) active "
+                          "FROM conversations", (cutoff,)).fetchone()
+            m = c.execute("SELECT COUNT(*) n FROM messages").fetchone()["n"]
+        return {"conversations": r["total"] or 0, "open": r["open"] or 0,
+                "waiting": r["waiting"] or 0, "active": r["active"] or 0,
+                "messages": m}
+
+    # ---- 消息 --------------------------------------------------------------- #
+    def add_message(self, token, who, body, media=None, per_day_cap=0, max_chars=2000):
+        """写一条消息。返回 (id, error)。
+
+        media 是【已经落盘成功】的文件名列表 —— 与 Store.add_feedback 一样,这一层
+        不碰文件系统:磁盘配额和类型判定归 HTTP 层,存储层只记引用。
+        """
+        body = (body or "").strip()[: min(int(max_chars), self.MSG_HARD_CAP)]
+        names = [str(x) for x in (media or []) if SUP_NAME_RE.match(str(x))][: self.MEDIA_HARD_CAP]
+        # 一张截图往往比一段描述更说明问题,所以【有附件就不强制写文字】。
+        if not body and not names:
+            return (0, "请输入内容或选择要发送的文件")
+        now = iso(now_utc())
+        day = now_utc().strftime("%Y-%m-%d")
+        with self.lock, self._conn() as c:
+            if not c.execute("SELECT 1 FROM conversations WHERE token=?", (token,)).fetchone():
+                return (0, "会话不存在或已过期")
+            if per_day_cap and who == "visitor":
+                n = c.execute("SELECT COUNT(*) n FROM messages WHERE token=? AND who='visitor' "
+                              "AND substr(at,1,10)=?", (token, day)).fetchone()["n"]
+                if n >= per_day_cap:
+                    return (0, "本次会话今日消息数已达上限")
+            cur = c.execute("INSERT INTO messages(token, at, who, body, media) VALUES (?,?,?,?,?)",
+                            (token, now, who, body,
+                             json.dumps(names, ensure_ascii=False) if names else ""))
+            # 访客发言 -> 未读 +1;客服发言 -> 清零(他显然已经看过了)。
+            if who == "visitor":
+                c.execute("UPDATE conversations SET last_at=?, msgs=msgs+1, unread=unread+1, "
+                          "status='open' WHERE token=?", (now, token))
+            else:
+                c.execute("UPDATE conversations SET last_at=?, msgs=msgs+1, unread=0 "
+                          "WHERE token=?", (now, token))
+        self._wake()
+        return (cur.lastrowid, "")
+
+    def messages(self, token, after_id=0, limit=400):
+        with self.lock, self._conn() as c:
+            rows = c.execute("SELECT id, at, who, body, media FROM messages "
+                             "WHERE token=? AND id>? ORDER BY id LIMIT ?",
+                             (token, int(after_id), max(1, min(1000, int(limit))))).fetchall()
+        out = []
+        for r in rows:
+            try:
+                names = json.loads(r["media"] or "[]")
+            except Exception:
+                names = []
+            files = []
+            for n in (names if isinstance(names, list) else []):
+                n = str(n)
+                if not SUP_NAME_RE.match(n):
+                    continue
+                ext = n.rsplit(".", 1)[-1]
+                files.append({"name": n,
+                              "kind": "video" if ext in SUP_VIDEO_EXT else "image"})
+            out.append({"id": r["id"], "at": r["at"], "who": r["who"],
+                        "body": r["body"] or "", "files": files})
+        return out
+
+    def media_names(self, token=None):
+        """库里现存的全部附件文件名。清理孤儿文件时要用它当白名单。"""
+        sql = "SELECT media FROM messages WHERE media<>''"
+        args = []
+        if token:
+            sql += " AND token=?"
+            args.append(token)
+        with self.lock, self._conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        names = []
+        for r in rows:
+            try:
+                v = json.loads(r["media"] or "[]")
+            except Exception:
+                continue
+            if isinstance(v, list):
+                names.extend(str(x) for x in v)
+        return names
+
+    def media_dir_bytes(self):
+        total = 0
+        try:
+            for n in os.listdir(self.media_dir):
+                try:
+                    total += os.path.getsize(os.path.join(self.media_dir, n))
+                except OSError:
+                    pass
+        except OSError:
+            return 0
+        return total
+
+    # ---- 长轮询 ------------------------------------------------------------- #
+    def _wake(self):
+        with self.cond:
+            self.cond.notify_all()
+
+    def wait_messages(self, token, after_id, timeout, admin=False):
+        """等到有新消息或超时。返回 (消息列表, 是否等过)。
+
+        为什么是长轮询而不是 WebSocket:这个服务是 stdlib 的 ThreadingHTTPServer,
+        没有任何现成的推送通道,手写 WebSocket 握手与帧解析是在一个公网端口上多开
+        一整片攻击面,只为省下一次 HTTP 往返。长轮询用现成的请求路径,首字节就是
+        新消息,实际延迟是毫秒级。
+
+        等待【切成 2 秒一片再重查】,不是一觉睡到超时:通知有可能落在「查完」和
+        「开始等」之间,分片重查让这种漏掉的通知最多只延迟 2 秒,而不需要为此引入
+        一套带序号的通知簿。
+        """
+        deadline = time.time() + max(0.0, float(timeout))
+        waited = False
+        while True:
+            rows = (self.admin_messages(after_id) if admin
+                    else self.messages(token, after_id))
+            if rows:
+                return rows, waited
+            left = deadline - time.time()
+            if left <= 0:
+                return [], waited
+            waited = True
+            with self.cond:
+                self.cond.wait(min(2.0, left))
+
+    def admin_messages(self, after_id=0, limit=400):
+        """跨全部会话的新消息(客服台用)。带上会话 token 才能归到对话里去。"""
+        with self.lock, self._conn() as c:
+            rows = c.execute("SELECT id, token, at, who, body, media FROM messages "
+                             "WHERE id>? ORDER BY id LIMIT ?",
+                             (int(after_id), max(1, min(1000, int(limit))))).fetchall()
+        out = []
+        for r in rows:
+            out.append({"id": r["id"], "token": r["token"], "at": r["at"],
+                        "who": r["who"], "body": r["body"] or ""})
+        return out
+
+    def max_message_id(self):
+        with self.lock, self._conn() as c:
+            row = c.execute("SELECT COALESCE(MAX(id),0) m FROM messages").fetchone()
+        return row["m"] or 0
+
+
+# --------------------------------------------------------------------------- #
 #  Per-source rate limiter: per-minute sliding window + per-day quota          #
 # --------------------------------------------------------------------------- #
 class RateLimiter:
@@ -800,6 +1508,22 @@ class IPThrottle:
                 self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] < 3600}
             return True, 0
 
+    def refund(self, ip):
+        """把刚记下的那一次还回去。
+
+        闸门必须在处理请求【之前】判,否则防滥用就是一句空话 —— 那时还不知道这次查询
+        会不会命中缓存。而命中缓存的查询既不花上游配额、也几乎不占 CPU,让它扣掉一个
+        名额是纯亏:实测计数器 hash_cache_hit 306 / miss 693,三成请求属于这一类,
+        而每 IP 每小时的名额本来就不多。
+
+        所以改成「先扣、命中缓存再退」。只弹最后一个时间戳:并发请求之间谁退谁的无关
+        紧要,总数才是限流依据。
+        """
+        with self.lock:
+            arr = self.hits.get(ip)
+            if arr:
+                arr.pop()
+
 
 # --------------------------------------------------------------------------- #
 #  Upstream clients                                                            #
@@ -837,20 +1561,64 @@ class VirusTotalClient:
         self._idx = 0
         self._cooldown = {}                               # key -> epoch until usable again
 
+        # ---- 按用途分配 key ---------------------------------------------------
+        # 每查一个新哈希要打【两次】VT，因为文件报告和沙箱行为在两个不同端点上，
+        # 拿不到一起（实测过 ?relationships=behaviours：只回 19 个 {type,id} 描述符，
+        # 没有属性，要拿真数据得按 id 再请求 19 次，比两次更贵）。
+        #
+        # 免费版是 4 次/分钟、500 次/天。两次调用共用一个 key，等于每分钟只能查
+        # 2 个新哈希，日上限 250 个。
+        #
+        # 把行为端点分给单独的 key 之后，两条路各有自己的配额和分钟速率：
+        # 文件报告走 self.keys，沙箱行为走 self.beh_keys，互不挤占。
+        # 没配 behaviour_api_key(s) 时 beh_keys 为空，自动回落到主 key —— 与旧行为一致。
+        braw = cfg.get("behaviour_api_keys")
+        if not braw:
+            single = cfg.get("behaviour_api_key", "")
+            braw = [single] if single else []
+        bseen, self.beh_keys = set(), []
+        for item in braw:
+            k = str(item).split(":")[0].strip()
+            if (len(k) == 64 and all(c in "0123456789abcdefABCDEF" for c in k)
+                    and k not in bseen):
+                bseen.add(k)
+                self.beh_keys.append(k)
+        self._beh_idx = 0
+
     def has_key(self):
         return len(self.keys) > 0
+
+    def beh_key_count(self):
+        return len(self.beh_keys)
 
     def key_count(self):
         return len(self.keys)
 
     def _next_key(self):
+        return self._next_from(self.keys, False)
+
+    def _next_from(self, pool, use_beh_idx):
+        """Hand out the next usable key from `pool`, honouring cooldowns.
+
+        Each pool keeps its own round-robin cursor so the behaviour pool rotating
+        does not skip entries in the file-report pool. The cooldown table is
+        shared on purpose: a 429 or a revoked key is a property of the key itself,
+        not of the endpoint it happened to be used for, so parking it must apply
+        everywhere it is used.
+        """
         now = time.time()
         chosen = None
         with self._lock:
-            n = len(self.keys)
+            n = len(pool)
+            if n == 0:
+                return None
             for _ in range(n):
-                k = self.keys[self._idx % n]
-                self._idx += 1
+                if use_beh_idx:
+                    k = pool[self._beh_idx % n]
+                    self._beh_idx += 1
+                else:
+                    k = pool[self._idx % n]
+                    self._idx += 1
                 if self._cooldown.get(k, 0) <= now:
                     chosen = k
                     break
@@ -918,33 +1686,77 @@ class VirusTotalClient:
         """GET an arbitrary VT v3 API path (e.g. '/files/<id>' or
         '/files/<id>/behaviour_summary'), rotating keys on 429/auth.
         Returns (http_status, text); status 0 => transport error / no key."""
-        if not self.keys:
-            return (0, "")
+        # 行为端点用单独的 key 池，和文件报告互不挤占配额（见 __init__ 里的说明）。
+        # 没配行为 key 时 beh_keys 为空，仍然走主池 —— 行为绝不能因为缺这个配置
+        # 而静默取不到：那会让攻击链引擎悄悄停止获得新标记。
+        is_beh = "/behaviour" in path
         url = "https://www.virustotal.com/api/v3" + path
         timeout = int(self.cfg.get("report_timeout_seconds",
                                    max(20, int(self.cfg.get("timeout_seconds", 10)))))
-        last = 0
-        for _ in range(min(6, len(self.keys))):
-            key = self._next_key()
-            if key is None:
-                return (429, "")
-            try:
-                status, body = http_get(url, {"x-apikey": key}, timeout)
-                text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
-                return (status, text)
-            except urllib.error.HTTPError as e:
-                self._note(key, e.code)
-                if e.code in (429, 401, 403):
-                    last = e.code
-                    continue  # rotate to another key
+
+        def attempt(pool, use_beh_idx):
+            last = 0
+            for _ in range(min(6, len(pool))):
+                key = self._next_from(pool, use_beh_idx)
+                if key is None:
+                    return (429, "")
                 try:
-                    return (e.code, e.read().decode("utf-8", "replace"))
+                    status, body = http_get(url, {"x-apikey": key}, timeout)
+                    text = (body.decode("utf-8", "replace")
+                            if isinstance(body, (bytes, bytearray)) else str(body))
+                    return (status, text)
+                except urllib.error.HTTPError as e:
+                    self._note(key, e.code)
+                    if e.code in (429, 401, 403):
+                        last = e.code
+                        continue  # rotate to another key
+                    try:
+                        return (e.code, e.read().decode("utf-8", "replace"))
+                    except Exception:
+                        return (e.code, "")
                 except Exception:
-                    return (e.code, "")
-            except Exception:
-                last = 0
-                continue
-        return (last, "")
+                    last = 0
+                    continue
+            return (last, "")
+
+        if is_beh and self.beh_keys:
+            st, text = attempt(self.beh_keys, True)
+            # 【行为专用池鉴权失败 -> 回退主池】。
+            #
+            # 上面那段注释的本意是「行为绝不能因为缺这个配置而静默取不到」，但它只覆盖了
+            # 「没配」，没覆盖【配了但那把 key 是死的】—— 而后者才是实际发生过的：
+            # behaviour_api_keys 里唯一一把 key 返回 401，池子只有 1 个成员，循环跑一轮
+            # 就退出并返回 401，从不回落主池。于是 vt_lookup 里 `bst == 200` 恒不成立，
+            # 干净样本一份都进不了 benign_reports —— 正常语料从 2026-08-07 起原地冻结在
+            # 63 份，攻击链引擎的区分度环节整整空转了九天，期间没有任何一行日志报错。
+            #
+            # 401/403 与 429 必须分开处理，不能一起回落：
+            #   * 401/403 是【配置错误】(key 被吊销/填错)。这种情况回落主池是对的 ——
+            #     实测主池那把 key 打 behaviour_summary 是 200，能力本来就在。
+            #   * 429 是【配额状态】。回落主池会去烧文件报告的配额，而把两个池分开的
+            #     全部目的就是不互相挤占。所以 429 保持原样返回，绝不回落。
+            if st in (401, 403) and self.keys:
+                self._warn_beh_fallback(st)
+                return attempt(self.keys, False)
+            return (st, text)
+        pool = self.keys
+        if not pool:
+            return (0, "")
+        return attempt(pool, False)
+
+    # 回退告警的最近一次打印时间。这条告警必须存在：上面那个故障之所以能潜伏九天，
+    # 就是因为它完全无声。但也不能每次请求都打 —— 补库作业一轮几百次调用会把 journal
+    # 刷满，于是按 key 状态设一个冷却窗口，够运维在 journalctl 里看见就行。
+    _beh_warn_at = 0.0
+
+    def _warn_beh_fallback(self, code):
+        now = time.time()
+        if now - self._beh_warn_at < 600:
+            return
+        self._beh_warn_at = now
+        print("[vt] behaviour key pool rejected (HTTP %d) -- falling back to the file-report "
+              "key pool. Fix or remove 'behaviour_api_keys' in config.json; until then the "
+              "two endpoints share one quota." % code, flush=True)
 
     def submit_file_path(self, path, filename, size):
         """Upload a spooled sample file to VirusTotal for analysis. The multipart
@@ -1070,10 +1882,20 @@ class ThreatBookClient:
         msg = str(data.get("verbose_msg", ""))
         if rc == 0:
             return {"querySucceeded": True, **self._parse_report(data), "source": self.NAME}
-        # endpoint works but ThreatBook has no record for this hash -> unknown, NOT a failure
-        if rc == -1 and "SAMPLE_NOT_FOUND" in msg.upper():
+        # 接口通、微步就是没这个哈希 -> unknown,【不算查询失败】。
+        #
+        # 原来只认 SAMPLE_NOT_FOUND,而线上实测微步回的是 verbose_msg="No Report Found"
+        # (rc=-1),于是一个权威的「我查了,我这儿没有」被记成「没问到」。后果不只是
+        # sources_ok 少算一个:reputation_hash 靠 succeeded 决定要不要落库,客户端靠
+        # serverHasRecord 决定要不要回退本地直连 —— 把「问过了」说成「没问到」,两边都
+        # 会做出相反的决定。
+        # 判据放宽到「消息里说了 not found / no report」:这类措辞只可能是「无记录」,
+        # 鉴权与配额问题在微步侧有各自的 rc 与文案,不会落进来。
+        up = msg.upper().replace("_", " ")
+        if rc != 0 and ("NOT FOUND" in up or "NO REPORT" in up or "NO RECORD" in up):
             return {"querySucceeded": True, "verdict": "unknown", "malicious": 0,
-                    "total_engines": 0, "threat_label": "", "source": self.NAME}
+                    "total_engines": 0, "threat_label": "", "source": self.NAME,
+                    "reason": msg}
         return {"querySucceeded": False, "reason": msg or ("rc=%s" % rc)}
 
     def query_ip(self, ip):
@@ -1496,13 +2318,29 @@ class IntelService:
             return now_utc() + timedelta(hours=int(t.get("suspicious_hours", 24)))
         return now_utc() + timedelta(hours=int(t.get("unknown_hours", 24)))
 
-    def reputation_hash(self, sha):
+    def reputation_hash(self, sha, lookup_only=False):
         sha = sha.lower()
         cached = self.store.get_hash(sha)
         if cached:
             self.store.counter_incr("hash_cache_hit")
             return self._hash_response(cached, cached=True)
         self.store.counter_incr("hash_cache_miss")
+
+        # 「只查收录」:客户端明确要求【不要动服务端的上游情报源】—— 它会用自己的本地密钥去查。
+        #
+        # 这个分支必须真的 return。客户端从一开始就在发 cacheOnly(配额耗尽时)并在注释里声称
+        # 「绝不动用付费上游」,但服务端此前【从未读过这个字段】,未命中一律往下走上游循环。
+        # 于是那层保护完全不存在:机队共享的付费配额照烧,而客户端还以为自己省下来了。
+        #
+        # 未收录时回 unknown + querySucceeded=true:对客户端语义是「我查了我的库,权威地告诉你
+        # 没有」(它据 serverHasRecord 判定无实据 -> 转本地直连),区别于「没问到」(HTTP 失败/
+        # 熔断/预算用尽)。两者混同的话,日志里就再也分不清这次到底走没走服务器。
+        if lookup_only:
+            self.store.counter_incr("lookup_only_miss")
+            return {"sha256": sha, "verdict": "unknown", "malicious": 0, "totalEngines": 0,
+                    "threatLabel": "", "source": "lookup-only", "querySucceeded": True,
+                    "cached": False, "recorded": False, "lookupOnly": True,
+                    "fetchedAt": iso(now_utc())}
 
         best = None
         succeeded = False
@@ -1619,13 +2457,21 @@ class IntelService:
         out.sort(key=lambda x: order.get(x["source"], 99))
         return out
 
-    def _degraded_lookup(self, ident, why):
+    def _degraded_lookup(self, ident, why, vt_unknown=False):
         """VT unavailable (no key / banned / rate-limited / error): still answer
         from the other configured sources instead of failing the whole query.
 
         Before this existed, any non-200 from VirusTotal returned an error and
         secondary_sources_hash() was never reached, so a single dead VT key took
         the entire file-lookup feature down with it.
+
+        vt_unknown=True means VirusTotal answered authoritatively "I have no record"
+        (HTTP 404), as opposed to not answering at all. It has to be recorded INSIDE
+        the report, because that distinction is load-bearing for harvest.py: it reads
+        `ok == False` plus "404" in the error to decide "VT has never seen this, upload
+        the sample". If a cached 404 answer came back as a plain ok=True hit, that
+        pipeline would silently stop uploading anything -- and harvest.py is frozen
+        byte-identical across nodes, so the compatibility has to be kept on this side.
         """
         srcs = self.secondary_sources_hash(ident)
         ok_srcs = [s for s in srcs if s.get("querySucceeded")]
@@ -1655,7 +2501,7 @@ class IntelService:
                 label = s["threat_label"]
                 break
         report = {"id": ident, "file": {}, "behaviour": {}, "behaviour_available": False,
-                  "degraded": True, "degraded_reason": why,
+                  "degraded": True, "degraded_reason": why, "vt_unknown": bool(vt_unknown),
                   "sources": ([{"source": "VirusTotal", "verdict": "unknown", "malicious": 0,
                                 "total_engines": 0, "threat_label": "",
                                 "querySucceeded": False, "reason": why}] + srcs)}
@@ -1665,6 +2511,28 @@ class IntelService:
         is_threat = verdict in ("malicious", "suspicious")
         if is_threat:
             self.store.save_vt_report(meta, report)
+        else:
+            # 非威胁的降级结论【也必须落缓存】。
+            #
+            # 以前这里什么都不存:威胁走 vt_reports 占位行(靠 degraded_retry_seconds
+            # 节流重试),而 clean/unknown 两手空空 —— 于是 VT 一旦持续 429,同一个哈希
+            # 每次查询都要把 5 个备用源重新问一遍。MetaDefender 100/天、
+            # HybridAnalysis 200/天,几轮批量就能把它们也打光,「VT 挂了还有备用源」
+            # 就变成「VT 挂了连备用源一起挂」。
+            #
+            # 线上实测正是这个形状:vt_lookup_cache 只有 30 行,而 vt_reports 里有
+            # 3301 行是 VirusTotal HTTP 429 留下的降级占位 —— 降级路径几乎没缓存过
+            # 任何东西。
+            #
+            # TTL 刻意远短于正常路径的 7 天(默认 30 分钟):这不是权威结论,VT 恢复后
+            # 应该尽快被真报告顶掉。它同时充当降级结论的重试窗口,与威胁侧的
+            # degraded_retry_seconds 是同一个意思、两条路径各自的实现。
+            try:
+                vtc = self.cfg.get("virustotal", {}) or {}
+                ttl = int(vtc.get("degraded_cache_ttl_seconds", 1800) or 1800)
+                self.store.save_lookup_cache([ident], ident, report, ttl)
+            except Exception:
+                pass        # 缓存写失败绝不能影响这次查询的返回
         return {"ok": True, "cached": False, "degraded": True, "stored": is_threat,
                 "stored_at": iso(now_utc()) if is_threat else "",
                 "verdict": verdict, "malicious": mal, "total_engines": tot,
@@ -1673,16 +2541,83 @@ class IntelService:
     # ---- full VT report (file report + sandbox behaviour), permanently stored --- #
     def vt_lookup(self, ident, refresh=False):
         ident = ident.strip().lower()
+        vtc = self.cfg.get("virustotal", {}) or {}
         if not refresh:
             stored = self.store.get_vt_report(ident)
             if stored:
-                return {"ok": True, "cached": True, "stored": True,
-                        "stored_at": stored["stored_at"], "report": stored["report"]}
+                rep = stored.get("report") or {}
+                if not rep.get("degraded"):
+                    return {"ok": True, "cached": True, "stored": True,
+                            "stored_at": stored["stored_at"], "report": stored["report"]}
+                # A DEGRADED row is a placeholder, not a report. _degraded_lookup
+                # archives with file={} and md5/sha1/name all empty, so serving it
+                # back hands the caller a "threat" with no engine data, no file name
+                # and no signature info -- and because the row exists, the real
+                # report would never be fetched again. That is how 486 of 3625 rows
+                # on the master ended up permanently contentless.
+                #
+                # Treating it as a miss makes them heal by themselves: save_vt_report
+                # is an upsert, so the next successful lookup overwrites the row in
+                # place with the full report. No data surgery needed.
+                #
+                # But not on EVERY query: a long VT outage (the master had one from
+                # 2026-07-26 to 08-05) would then re-run the whole secondary-source
+                # fan-out every single time and burn those providers' quotas instead.
+                # So a placeholder is still honoured while it is fresh, and only
+                # retried once it is older than this window.
+                retry_after = int(vtc.get("degraded_retry_seconds", 3600) or 3600)
+                age = (now_utc() - (parse_iso(stored.get("stored_at") or "") or now_utc()))
+                if age.total_seconds() < retry_after:
+                    return {"ok": True, "cached": True, "stored": True, "degraded": True,
+                            "degraded_reason": rep.get("degraded_reason", ""),
+                            "stored_at": stored["stored_at"], "report": stored["report"]}
+            # Clean / undetected files are deliberately never archived (vt_reports is
+            # the threat archive), which used to leave them with no cache at all.
+            hit = self.store.get_lookup_cache(ident)
+            if hit:
+                # degraded 必须往上层暴露。这张缓存现在也存降级结论(见 _degraded_lookup),
+                # 而一个「VT 没答话、靠备用源拼出来的 clean」和一个「VT 70 个引擎都说
+                # 干净」在页面与 /api 上必须能分开 —— 否则调用方会把前者当权威结论用。
+                hrep = hit["report"] or {}
+                out = {"ok": True, "cached": True, "stored": False,
+                       "stored_at": hit["stored_at"], "report": hrep}
+                if hrep.get("degraded"):
+                    out["degraded"] = True
+                    out["degraded_reason"] = hrep.get("degraded_reason", "")
+                if hrep.get("vt_unknown"):
+                    # 复现未缓存时的那一份响应形状。少了这三行,harvest.py 判「VT 从没
+                    # 见过它 -> 把样本传上去」的依据(ok=False 且 error 含 404)在命中
+                    # 缓存后就消失了,整条补库流水线会无声停摆。
+                    out["ok"] = False
+                    out["error"] = hrep.get("degraded_reason") or "VirusTotal 无此文件记录 (404)"
+                    out["vt_unknown"] = True
+                return out
         if not self.vt.has_key():
             return self._degraded_lookup(ident, "no VirusTotal key configured")
         st, body = self.vt.vt_api_get("/files/" + ident)
         if st == 404:
-            return {"ok": False, "error": "VirusTotal 无此文件记录 (404)"}
+            # VirusTotal genuinely has no record of this file. That is NOT a reason to
+            # stop asking the others: 微步 / OTX / HybridAnalysis routinely know samples
+            # VT has never seen, and returning a bare "not found" threw that away.
+            #
+            # 这里的响应形状是承重的,不能改。harvest.py 靠下面这段判断"VT 从没见过它,
+            # 把样本传上去":
+            #     if resp.get("ok"): return False
+            #     return "404" in err or "无此文件" in err
+            # 所以 ok 必须保持假值、error 必须继续含 404 字样。因为微步答了就把 ok 翻成
+            # True,会无声关掉整条补库流水线 —— 而 harvest.py 是跨节点字节冻结的,兼容
+            # 只能在这一侧维持。
+            #
+            # 备用云的结论因此挂在额外字段上:老调用方看不见,网页与 /api 现在会读。
+            if not bool(vtc.get("query_others_on_404", True)):
+                return {"ok": False, "error": "VirusTotal 无此文件记录 (404)",
+                        "vt_unknown": True}
+            out = self._degraded_lookup(ident, "VirusTotal 无此文件记录 (404)",
+                                        vt_unknown=True)
+            out["ok"] = False
+            out["error"] = "VirusTotal 无此文件记录 (404)"
+            out["vt_unknown"] = True
+            return out
         if st != 200:
             return self._degraded_lookup(ident, "VirusTotal HTTP %s" % st)
         try:
@@ -1722,8 +2657,8 @@ class IntelService:
         is_threat = verdict in ("malicious", "suspicious")
         if is_threat:
             self.store.save_vt_report(meta, report)
-        elif bst == 200:
-            # 干净【且真在沙箱里跑过】-> 留一份精简报告当正常语料。
+        else:
+            # 干净 -> 留一份精简报告当正常语料。
             #
             # 以前这里什么都不做,干净文件的沙箱行为抓到手就扔 —— 于是攻击链引擎只有
             # 恶意语料,只能算出「多少病毒有这个组合」,算不出「多少正常软件也有」,
@@ -1732,10 +2667,36 @@ class IntelService:
             #
             # 存入 benign_reports 而非 vt_reports:后者是威胁归档,混进干净文件会让
             # 归档计数与家族分布全部失真,而且会污染 lookup 缓存(见 BENIGN_DDL 处说明)。
+            #
+            # 【条件从 `elif bst == 200` 放宽成「干净就存」】。原判据要求这次必须成功拿到
+            # 沙箱行为,代价是:实测 94 份干净文件的完整报告里 91 份(97%)的
+            # behaviour_summary 是取不到的,于是绝大多数干净样本连「我们已经查过、它是
+            # 干净的」这个事实都没留下 —— 只进了 vt_lookup_cache,而那张表 7 天就过期。
+            # 语料因此只能以干净查询量的 3% 增长,九天一份没长。
+            #
+            # 放宽是安全的,因为有效性判据落在 has_behaviour 上而不是「在不在表里」:
+            # collect_benign 按 behaviour_available 过滤,BenignCorpus.n 只数跑过沙箱的,
+            # 所以没跑过沙箱的行不会把 BENIGN_MIN_CORPUS 那道门槛骗开。淘汰顺序也已经
+            # 改成优先丢这些行(见 BENIGN_MAX_ROWS)。
             try:
-                self.store.save_benign_report(sha256, attr, beh)
+                self.store.save_benign_report(sha256, attr, beh,
+                                              has_behaviour=(bst == 200))
             except Exception:
                 pass        # 语料是锦上添花,绝不能因为它失败而影响一次信誉查询
+        if not is_threat:
+            # 非威胁不进威胁归档 -> 必须有别的地方记住"已经问过了",否则每次重复查询
+            # 都要再花两次上游调用。TTL 默认 7 天:文件哈希是不变的,一个干净判定不会
+            # 天天翻转;真要强制重查,refresh=true 永远绕过这里。
+            #
+            # 存 ident 是为了让下次用同一种哈希查也能命中 —— VT 报告里可能没给 md5/
+            # sha1(降级或字段缺失),那时只靠 meta 的两个键会漏。
+            try:
+                ttl_h = int(vtc.get("lookup_cache_ttl_hours", 168) or 168)
+                self.store.save_lookup_cache(
+                    [sha256, meta.get("md5", ""), meta.get("sha1", ""), ident],
+                    sha256, report, ttl_h * 3600)
+            except Exception:
+                pass        # 缓存写失败绝不能影响这次查询的返回
         return {"ok": True, "cached": False, "stored": is_threat,
                 "stored_at": iso(now_utc()) if is_threat else "", "report": report}
 
@@ -1744,6 +2705,9 @@ class IntelService:
 
     def list_vt_reports(self):
         return self.store.list_vt_reports()
+
+    def list_benign_reports(self):
+        return self.store.list_benign_reports()
 
     def vt_submit_path(self, path, sha256, filename, size):
         """Given an already-hashed, spooled sample file: return the stored/known VT
@@ -1790,29 +2754,171 @@ class IntelService:
 SERVICE = None
 CONFIG = None
 THROTTLE = None
+SUPPORT = None          # SupportStore;建库失败时保持 None,客服路由如实回 503
+SUP_WAIT = None         # 长轮询并发闸门(BoundedSemaphore)
 WEBUI_PATH = os.environ.get("BULWARK_INTEL_WEBUI", "/opt/bulwark-intel/webui.html")
 
 API_DOCS_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Bulwark 威胁情报 API</title>
 <style>
-:root{--bg:#eef1f7;--card:#fff;--soft:#f6f8fc;--line:#e4e8f0;--ink:#1b2230;--muted:#6b7688;--brand:#6366f1;--mal:#e5484d;--clean:#0f9d58;--mono:"Cascadia Mono",Consolas,monospace;--sans:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+/* ===== 共享控制台外壳(注入 app.py 内嵌的各页面)=====================
+   这些页面各自有一套自己的 class 名和版式。这里不去逐页重写,而是统一
+   三件决定"是不是同一个产品"的东西:底子(白底+网格)、顶栏、以及标题/
+   表格/瓦片这几个到处都在用的组件。
+   放在每页样式块的最前面 —— 页面自己的规则在后面,仍可覆盖它。
+   ==================================================================== */
+:root{
+  /* 页面压暗、面板留纯白。原来两者都是 #ffffff，面板只能靠边框描出来，整页过亮。 */
+  --bwbg:#edf0f5; --bwpnl:#ffffff; --bwsoft:#f9fafb;
+  --bwln:#e4e7ec; --bwln2:#f2f4f7;
+  --bwink:#101828; --bwink2:#344054; --bwmut:#667085; --bwdim:#98a2b3;
+  --bwac:#2563eb; --bwvi:#7c3aed;
+  --bwmal:#d92d20; --bwsus:#b54708; --bwok:#067647;
+  --bwmono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace;
+  --bwsans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+}
+body{background:var(--bwbg);color:var(--bwink);font-family:var(--bwsans);
+  -webkit-font-smoothing:antialiased}
+/* 白底上的网格必须是深色低透明度,白线等于不存在 */
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;background:
+  repeating-linear-gradient(0deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px),
+  repeating-linear-gradient(90deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1200px 520px at 50% -12%,rgba(37,99,235,.07),transparent 70%)}
+
+/* ---- 顶栏:和 / 上完全一致,导航才不会每页一个样 ---- */
+.bwrail{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--bwln)}
+.bwrail .in{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:16px;
+  padding:10px 22px}
+.bwbrand{display:flex;align-items:center;gap:10px;text-decoration:none;flex:none}
+.bwbrand .mk{width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--bwac);color:#fff;font-size:15px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+.bwbrand b{display:block;font-size:13.5px;font-weight:800;letter-spacing:2.2px;
+  color:var(--bwink);line-height:1.1}
+.bwbrand s{display:block;text-decoration:none;font-size:9px;color:var(--bwmut);
+  letter-spacing:1.3px;margin-top:2px}
+.bwgrow{flex:1}
+.bwnav{display:flex;align-items:stretch;gap:2px;overflow-x:auto;
+  scrollbar-width:none;-ms-overflow-style:none}
+.bwnav::-webkit-scrollbar{display:none}
+.bwnav a{position:relative;display:inline-flex;align-items:center;gap:7px;
+  padding:9px 13px;font-size:12.5px;font-weight:600;letter-spacing:.5px;
+  color:var(--bwmut);text-decoration:none;white-space:nowrap}
+.bwnav a::after{content:"";position:absolute;left:11px;right:11px;bottom:-1px;height:2px;
+  background:var(--bwac);opacity:0;transition:opacity .16s}
+.bwnav a:hover{color:var(--bwink);text-decoration:none}
+.bwnav a:hover::after{opacity:.5}
+.bwnav a.on{color:var(--bwac)}
+.bwnav a.on::after{opacity:1}
+.bwnav a .i{font-size:13px;line-height:1}
+
+/* ---- 到处都在用的组件 ---- */
+h1{font-size:21px;font-weight:800;letter-spacing:-.2px;color:var(--bwink)}
+h2{font-size:12px!important;font-weight:800;letter-spacing:1.6px;color:var(--bwink);
+  display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--bwln2)!important;
+  padding-bottom:9px!important}
+h2::before{content:"";width:2px;height:13px;background:var(--bwac);flex:none}
+a{color:var(--bwac)}
+code{font-family:var(--bwmono);background:var(--bwsoft);border:1px solid var(--bwln);
+  border-radius:0;color:#1d4ed8}
+pre{border-radius:0!important;border:1px solid var(--bwln)}
+table th{color:var(--bwdim)!important;font-size:9.5px!important;font-weight:700;
+  text-transform:uppercase;letter-spacing:1.2px;background:var(--bwsoft)}
+table td{border-bottom:1px solid var(--bwln2)}
+table tbody tr:hover td{background:rgba(37,99,235,.04)}
+table tbody tr:hover td:first-child{box-shadow:inset 2px 0 0 var(--bwac)}
+/* 统计瓦片:顶部 2px 状态色 + 大号等宽数字,和 / 的 .hstat 同一个样式 */
+.bwstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,240px));justify-content:start;
+  gap:12px;margin:0 0 18px}
+.bwstat{background:var(--bwpnl);border:1px solid var(--bwln);border-top:2px solid var(--bwac);
+  padding:13px 15px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.bwstat .v{font-family:var(--bwmono);font-size:25px;font-weight:800;line-height:1.05;
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+/* background/padding/border-radius 是显式清零的，不是多余代码：这些页面各自留着
+   给旧标记用的 .k 药丸样式（圆角底色），而 .bwstat .k 只要不写这几个属性，页面级
+   的 .k 就会漏进来，标签变成一颗药丸。清零比去每个页面删旧规则安全 —— 那些旧
+   规则可能还有别处在用。 */
+.bwstat .k{font-size:10.5px;color:var(--bwmut);margin-top:4px;letter-spacing:1.1px;
+  background:none;padding:0;border-radius:0;display:block;width:auto}
+.bwstat.mal{border-top-color:var(--bwmal)}.bwstat.mal .v{color:var(--bwmal)}
+.bwstat.sus{border-top-color:var(--bwsus)}.bwstat.sus .v{color:var(--bwsus)}
+.bwstat.ok{border-top-color:var(--bwok)}.bwstat.ok .v{color:var(--bwok)}
+@media(max-width:640px){.bwrail .in{padding:9px 14px}.bwbrand s{display:none}}
+
+:root{--bg:#edf0f5;--card:#fff;--soft:#f9fafb;--line:#e4e7ec;--ink:#101828;--muted:#667085;--brand:#2563eb;--mal:#d92d20;--clean:#067647;--mono:"Cascadia Mono",Consolas,monospace;--sans:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.65 var(--sans)}
 .wrap{max-width:900px;margin:0 auto;padding:30px 20px 70px}
 h1{font-size:24px;margin:0 0 4px}.lead{color:var(--muted);margin:0 0 24px}
 h2{font-size:17px;margin:30px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
 code{font-family:var(--mono);background:var(--soft);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:12.5px}
-pre{background:#0f1424;color:#d6deec;border-radius:11px;padding:14px 16px;overflow:auto;font-family:var(--mono);font-size:12.5px;line-height:1.6}
-pre .k{color:#89b4fa}pre .s{color:#a6e3a1}
+/* 代码块转浅色。原来是 #101828 深底 + 亮色语法着色 —— 那是暗色主题时期留下的，
+   在灰底白卡的页面上，六七块近黑色的大方块是全页最重的元素，读起来像另一个网站
+   贴进来的。改成浅底 + 深字，语法色相不变（蓝=关键字、绿=字符串）但换成在白底上
+   够对比度的深色版本，亮蓝亮绿在浅底上会糊掉。 */
+pre{background:#f8fafc;color:#1f2937;border:1px solid var(--line);
+  border-radius:11px;padding:14px 16px;overflow:auto;
+  font-family:var(--mono);font-size:12.5px;line-height:1.6}
+pre .k{color:#1d4ed8;font-weight:700}pre .s{color:#046c4e}
 .ep{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:15px 17px;margin-bottom:13px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
 .ep .m{display:inline-block;font-weight:800;font-size:11.5px;padding:2px 9px;border-radius:6px;color:#fff;margin-right:9px;font-family:var(--mono)}
-.m.get{background:var(--clean)}.m.post{background:var(--brand)}
+/* GET 原来用 var(--clean)，也就是「安全」判定色。在一个满页都在讲恶意/可疑/安全的
+   系统里，用判定绿去表示 HTTP 动词是语义串台：绿色在这里必须只意味着「文件安全」。
+   GET 改中性石板色，POST（会改变状态、需要更留意）保留强调蓝。 */
+.m.get{background:#475467}.m.post{background:var(--brand)}
 .ep .p{font-family:var(--mono);font-weight:700;font-size:13.5px}
 .ep .d{color:var(--muted);font-size:13px;margin:7px 0 0}
 table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:11px;text-transform:uppercase}
 .tag{display:inline-block;background:var(--soft);border:1px solid var(--line);border-radius:20px;padding:2px 10px;font-size:12px;color:var(--muted);margin-right:6px}
-.note{background:#fff7e8;border:1px solid #fbe8c4;border-radius:11px;padding:12px 15px;font-size:13px;color:#7a5b16;margin:16px 0}
+/* 同理：原来的琥珀底 + 琥珀字是「可疑」判定色。这个框讲的是配额说明，属于中性提示，
+   不该长得像一条风险警告。改成强调蓝的淡色版本。 */
+.note{background:#f4f7fe;border:1px solid #dbe4f8;border-left:2px solid var(--brand);
+  border-radius:11px;padding:12px 15px;font-size:13px;color:var(--ink);margin:16px 0}
 a{color:var(--brand);text-decoration:none}
-</style></head><body><div class="wrap">
+</style></head><body>
+<div class="bwrail"><div class="in">
+<a class="bwbrand" href="/" title="返回控制台"><span class="mk">🛡️</span>
+<span><b>BULWARK</b><s>THREAT ANALYSIS CONSOLE</s></span></a>
+<div class="bwgrow"></div>
+<nav class="bwnav">
+<a href="/"><span class="i">🛡️</span>控制台</a>
+<a href="/engine" class=""><span class="i">🧬</span>攻击链引擎</a>
+<a href="/online" class=""><span class="i">📡</span>在线客户端</a>
+<a href="/support" class=""><span class="i">🎧</span>在线客服</a>
+<a href="/feedback" class=""><span class="i">💬</span>反馈</a>
+<a href="/api/docs" class="on"><span class="i">&#128268;</span>API 文档</a>
+<a href="/about" class=""><span class="i">📥</span>下载</a>
+</nav>
+<!-- 北京时间读数。这两台机器的系统时区是 UTC,而看页面的人在中国 —— 原来页面上
+     没有任何一处告诉你「现在几点」,读时间戳只能靠脑内加 8 小时。
+     样式写成内联:顶栏在 4 个页面里是 4 份字面量副本,内联能保证四份永远一致,
+     也不用去动那 4 份 CSS 副本、不改变 style 标签计数。 -->
+<div style="display:flex;flex-direction:column;align-items:flex-end;line-height:1.2;margin-left:16px">
+<b id="bwclk" style="font:600 13px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);font-variant-numeric:tabular-nums">--:--:--</b>
+<s id="bwclkd" style="text-decoration:none;font-size:10px;color:var(--mut)">北京时间</s>
+</div>
+</div></div>
+<script>
+(function(){
+  var b=document.getElementById("bwclk"),d=document.getElementById("bwclkd");
+  if(!b)return;
+  var DAYS=["\u65e5","\u4e00","\u4e8c","\u4e09","\u56db","\u4e94","\u516d"];
+  function p(n){return (n<10?"0":"")+n;}
+  function tick(){
+    /* Date.now() 是 UTC 毫秒;加 8 小时后再用 getUTC* 读出来,就是北京时间的墙上
+       钟面,与浏览器所在时区无关。用固定偏移而不是 toLocaleString("zh-CN") ——
+       后者受访问者系统时区影响,在国外打开会显示当地时间。中国无夏令时,
+       固定 +08:00 不会错。 */
+    var t=new Date(Date.now()+8*3600*1000);
+    b.textContent=p(t.getUTCHours())+":"+p(t.getUTCMinutes())+":"+p(t.getUTCSeconds());
+    if(d)d.textContent=t.getUTCFullYear()+"-"+p(t.getUTCMonth()+1)+"-"+p(t.getUTCDate())
+      +" \u5468"+DAYS[t.getUTCDay()]+" UTC+8";
+  }
+  tick();setInterval(tick,1000);
+})();
+</script>
+<div class="wrap">
 <h1>🛡️ Bulwark 威胁情报 API</h1>
 <p class="lead">基于 VirusTotal + 微步 + MalwareBazaar + MetaDefender + HybridAnalysis 的聚合威胁情报接口。</p>
 <h2>认证</h2>
@@ -1863,765 +2969,1282 @@ a{color:var(--brand);text-decoration:none}
 #   3. 【一行只留一个数字】。原来右侧挤 4 个元素(作证 21 / 正常软件 0 / 启用 / 换行的原因
 #      徽标),行高忽高忽低。现在只留右对齐的作证数,列名提到表头 —— 32 个一模一样的
 #      「正常软件 0」是纯噪音,只在真有命中时才出现。
-_ENGINE_PAGE = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+_ENGINE_PAGE = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>磐垒 · 攻击链组合引擎</title>
+<title>攻击链组合引擎 · 磐垒</title>
 <style>
-:root{--bg:#eef1f7;--card:#fff;--soft:#f7f9fc;--line:#e4e8f0;--line2:#eef1f6;
---ink:#1b2230;--ink2:#3b475c;--muted:#6b7688;--dim:#9aa4b2;
---brand:#6366f1;--brand2:#8b5cf6;--mal:#e5484d;--susp:#e08600;--clean:#0f9d58;
---mono:"Cascadia Mono",Consolas,ui-monospace,monospace;
---sans:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+:root{
+  --bg:#eef1f6; --pnl:#fff; --inset:#f5f7fa; --line:#e3e7ee; --line2:#eef1f6;
+  --ink:#0f1729; --ink2:#33405a; --mut:#5b6678; --dim:#8a93a3;
+  --acc:#4f46e5; --accbg:rgba(79,70,229,.07); --accln:rgba(79,70,229,.22);
+  --risk:#c2281c; --riskbg:rgba(194,40,28,.08);
+  --warn:#8a5209; --warnbg:rgba(138,82,9,.09);
+  --ok:#046239;
+  --mono:"Cascadia Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.6 var(--sans)}
-a{color:var(--brand)}
-b{font-weight:700}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink2);font:13px/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased}
+a{color:var(--acc);text-decoration:none}
 
 /* ---- 顶栏 ---- */
-.top{position:sticky;top:0;z-index:30;background:rgba(255,255,255,.94);
-backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
-.topin{max-width:1020px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:12px}
-.back{display:inline-flex;align-items:center;gap:7px;text-decoration:none;font-size:13.5px;
-font-weight:700;color:var(--ink2);background:var(--soft);border:1px solid var(--line);
-border-radius:9px;padding:7px 14px;transition:.15s;white-space:nowrap}
-.back:hover{background:#fff;border-color:var(--brand);color:var(--brand)}
-.tt{font-size:15px;font-weight:800}
-.ver{margin-left:auto;font-size:12px;font-weight:800;color:#fff;
-background:linear-gradient(135deg,var(--brand),var(--brand2));
-border-radius:20px;padding:4px 12px;white-space:nowrap}
+.top{background:rgba(255,255,255,.92);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
+.tin{max-width:1180px;margin:0 auto;padding:0 24px;height:50px;display:flex;
+  align-items:center;gap:16px}
+.bd{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:750;
+  color:var(--ink)}
+.top nav{display:flex;gap:2px}
+.top nav a{font-size:12.5px;font-weight:600;color:var(--mut);padding:6px 10px;
+  border-radius:7px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.top nav a:hover{background:var(--accbg);color:var(--acc)}
+.top nav a.on{background:var(--accbg);color:var(--acc)}
+.sp{flex:1}
+.ver{font:700 11.5px var(--mono);color:var(--acc);background:var(--accbg);
+  border:1px solid var(--accln);border-radius:20px;padding:3px 11px;white-space:nowrap}
 
-.wrap{max-width:1020px;margin:0 auto;padding:16px 20px 70px}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 24px 72px}
 
-/* ---- 状态行:全部诊断信息压在这一行,长解释收进展开 ---- */
-.st{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:11px 15px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:13.2px}
-.st b{font-size:15px}
-.dot{width:7px;height:7px;border-radius:50%;flex:none}
-.dot.ok{background:var(--clean)}.dot.warn{background:var(--susp)}.dot.bad{background:var(--mal)}
-.st .sep{color:var(--line);margin:0 3px}
-.st .why{margin-left:auto;font:600 12.5px var(--sans);color:var(--ink2);cursor:pointer;
-background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:5px 11px}
-.st .why:hover{border-color:var(--brand);color:var(--brand)}
-.notes{margin-top:9px;background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:14px 16px;font-size:12.8px;line-height:1.85;color:var(--muted)}
-.notes h4{margin:0 0 4px;font-size:13.2px;color:var(--ink)}
-.notes .n+.n{margin-top:13px;padding-top:13px;border-top:1px solid var(--line2)}
-.notes b{color:var(--ink2)}
+/* ---- 摘要卡 ----------------------------------------------------------------
+   刻意做成【一张卡两栏】,而不是四块独立瓦片:处置能力与流水线是同一件事的两个
+   侧面(能拦到什么强度 / 这些规则怎么筛出来的),分成两张卡会让人以为它们无关。 */
+.card{background:var(--pnl);border:1px solid var(--line);border-radius:14px;
+  padding:20px 22px;box-shadow:0 1px 2px rgba(15,23,41,.04)}
+.card h1{margin:0 0 4px;font-size:18px;font-weight:750;color:var(--ink);
+  letter-spacing:-.2px}
+.card .lead{margin:0 0 18px;font-size:12.5px;color:var(--mut);max-width:76ch}
+.split{display:grid;grid-template-columns:minmax(240px,1fr) 2fr;gap:28px}
+@media(max-width:820px){.split{grid-template-columns:1fr;gap:20px}}
+.blk{min-width:0}
+.blk h2{margin:0 0 10px;font-size:10.5px;font-weight:750;letter-spacing:1.1px;
+  color:var(--dim);text-transform:uppercase}
 
-/* ---- 页签 ---- */
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:18px 0 13px}
-.tabs button{appearance:none;background:none;border:none;border-bottom:2px solid transparent;
-cursor:pointer;font:600 14px/1 var(--sans);color:var(--muted);padding:10px 13px;transition:.15s}
-.tabs button:hover{color:var(--ink)}
-.tabs button.on{color:var(--brand);border-bottom-color:var(--brand);font-weight:800}
-.tabs .n{font-size:11.5px;font-weight:700;color:var(--dim);margin-left:5px}
-.tabs button.on .n{color:var(--brand)}
+/* 处置能力:三行,数字右对齐等宽,一眼看出「最强能到哪一档」。 */
+.caps{display:flex;flex-direction:column;gap:1px}
+.cap{display:flex;align-items:baseline;gap:10px;padding:6px 0;
+  border-bottom:1px solid var(--line2)}
+.cap:last-child{border-bottom:none}
+.cap b{font:800 20px/1 var(--mono);font-variant-numeric:tabular-nums;
+  min-width:2.4em;text-align:right;color:var(--ink)}
+.cap span{font-size:12.5px;color:var(--ink2)}
+.cap em{font-style:normal;font-size:11px;color:var(--dim);margin-left:auto;
+  text-align:right}
+.cap.z b{color:var(--dim)}
+.cap.hard b{color:var(--risk)}
+.cap.strong b{color:var(--warn)}
 
-/* ---- 工具条 ---- */
-.bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.bar input{flex:1;min-width:200px;font:14px var(--sans);padding:9px 13px;
-border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
-.bar input:focus{outline:none;border-color:var(--brand)}
-.chips{display:flex;gap:4px;flex-wrap:wrap}
-.chip{cursor:pointer;user-select:none;font-size:12.3px;font-weight:700;padding:6px 11px;
-border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink2);transition:.15s}
-.chip:hover{border-color:var(--brand);color:var(--brand)}
-.chip.on{background:var(--brand);border-color:var(--brand);color:#fff}
-select{font:13px var(--sans);padding:8px 10px;border:1px solid var(--line);
-border-radius:9px;background:var(--card);color:var(--ink);cursor:pointer}
+/* 流水线:横向阶梯 + 每段的损耗就地标注,不另起横带。 */
+.pipe{display:flex;align-items:stretch;flex-wrap:wrap;gap:0}
+.pst{padding:0 16px 0 0;margin-right:16px;border-right:1px solid var(--line);
+  min-width:104px}
+.pst:last-child{border-right:none;margin-right:0;padding-right:0}
+.pst b{display:block;font:800 19px/1.1 var(--mono);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.pst u{display:block;text-decoration:none;font-size:11px;color:var(--dim);
+  margin-top:3px;white-space:nowrap}
+.pst i{display:block;font-style:normal;font-size:10.5px;color:var(--warn);
+  margin-top:3px}
+.pst.fin b{color:var(--acc)}
 
-/* ---- 意图分组:给长列表提供可定位的锚点 ---- */
-.grp+.grp{margin-top:20px}
-.ghd{display:flex;align-items:baseline;gap:9px;padding:0 2px 8px;
-border-bottom:1px solid var(--line);margin-bottom:9px}
-.gnm{font-size:14px;font-weight:800}
-.gct{font:700 11.5px var(--mono);color:var(--brand);background:rgba(99,102,241,.1);
-border-radius:20px;padding:2px 9px}
-.gds{font-size:12px;color:var(--dim);margin-left:auto;text-align:right}
+/* 诚实提示。整页只有这一处横带,而且只在真有话要说时出现。 */
+.note{margin-top:16px;padding:10px 13px;border-radius:9px;font-size:12px;
+  border:1px solid var(--line);border-left:3px solid var(--acc);
+  background:var(--accbg);color:var(--ink2)}
+.note.warn{border-left-color:var(--warn);background:var(--warnbg)}
+.note b{color:var(--ink)}
 
-/* ---- 表头:把「作证」「强度」这类列名从每一行提到表头,行里只留值 ---- */
-.head{display:flex;align-items:center;gap:10px;padding:0 15px 6px;
-font-size:11.5px;font-weight:700;color:var(--dim)}
-.head .h-g{width:52px;flex:none}
-.head .h-c{flex:1}
-.head .h-n{width:64px;flex:none;text-align:right}
-.head .h-r{width:86px;flex:none;text-align:right}
-.head .h-u{width:76px;flex:none;text-align:right}
-.head .h-e{width:74px;flex:none;text-align:right}
-/* 两组筛选条件挨在一起会看成同一组,加一道竖线分开 */
-.divx{width:1px;height:20px;background:var(--line);margin:0 3px}
+/* ---- 区块 ---- */
+.sec{margin-top:18px;background:var(--pnl);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden}
+.sh{display:flex;align-items:center;gap:10px;padding:13px 20px;
+  border-bottom:1px solid var(--line)}
+.sh h2{margin:0;font-size:13px;font-weight:750;color:var(--ink)}
+.sh .n{font:700 11px var(--mono);color:var(--acc);background:var(--accbg);
+  border-radius:20px;padding:1px 9px}
+.sh .hint{margin-left:auto;font-size:11.5px;color:var(--dim);text-align:right}
+.sh input{margin-left:auto;width:200px;padding:5px 9px;border:1px solid var(--line);
+  border-radius:7px;font:12px var(--sans);color:var(--ink);background:var(--inset);
+  outline:none}
+.sh input:focus{border-color:var(--accln);background:#fff}
 
-/* ---- 列表:统一行高,左侧色条表强度 ---- */
-.list{display:flex;flex-direction:column;gap:6px}
-.r{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--line);
-border-radius:10px;overflow:hidden}
-.r.g-hard{border-left-color:var(--mal)}
-.r.g-strong{border-left-color:var(--susp)}
-.r.g-ask{border-left-color:var(--brand)}
-.r>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;
-padding:10px 15px;user-select:none}
-.r>summary::-webkit-details-marker{display:none}
-.r>summary:hover{background:var(--soft)}
-.chev{flex:none;width:7px;height:7px;border-right:2px solid var(--dim);
-border-bottom:2px solid var(--dim);transform:rotate(-45deg);transition:transform .15s}
-.r[open]>summary .chev{transform:rotate(45deg)}
-.gl{flex:none;width:52px;font-size:11.5px;font-weight:800;color:var(--muted)}
-.r.g-hard .gl{color:var(--mal)}.r.g-strong .gl{color:var(--susp)}.r.g-ask .gl{color:var(--brand)}
-.chain{flex:1;min-width:0;font-size:13.6px;font-weight:600;line-height:1.5}
-.plus{color:var(--dim);font-weight:400;margin:0 3px}
-.val{flex:none;width:64px;text-align:right;font:700 13px var(--mono);color:var(--ink2)}
-.rsn{flex:none;width:86px;text-align:right;font-size:11.5px;font-weight:700;color:var(--susp)}
-.ben{flex:none;font-size:11px;font-weight:800;color:var(--susp);
-background:#fff4e0;border-radius:6px;padding:2px 7px;white-space:nowrap}
+/* ---- 规则表 ---------------------------------------------------------------
+   列宽写死并与吸顶表头共用同一组值,是这一版的核心修复:原来每个意图分组下都重印
+   一遍列头,26 条规则出了 8 次表头 —— 那是「乱」的主要来源。现在整节只有一行表头,
+   吸顶跟随滚动,分组降级成一条细分隔线。 */
+.colh{position:sticky;top:50px;z-index:20;display:flex;align-items:center;
+  gap:12px;padding:8px 20px;background:var(--inset);
+  border-bottom:1px solid var(--line);font-size:10.5px;font-weight:750;
+  letter-spacing:.5px;color:var(--dim)}
+.cg{flex:none;width:52px}
+.cc{flex:1;min-width:0}
+.ce{flex:none;width:64px;text-align:right}
+.cs{flex:none;width:56px;text-align:right}
 
-/* ---- 展开体 ---- */
-.body{border-top:1px solid var(--line2);padding:2px 15px 12px}
-.why2{background:#fff8e6;border:1px solid #f0d896;border-radius:9px;padding:10px 12px;
-margin:11px 0 2px;font-size:12.3px;color:#6b5300;line-height:1.7}
-.why2 div+div{margin-top:6px}
-.why2 b{color:#8a5a00;margin-right:6px}
-ul.mk{margin:0;padding:0;list-style:none}
-ul.mk li{padding:9px 0;border-bottom:1px solid var(--line2);display:flex;align-items:flex-start;gap:10px}
-ul.mk li:last-child{border-bottom:none}
-.lv{flex:none;font-size:10.5px;font-weight:800;padding:2px 7px;border-radius:6px;
-min-width:28px;text-align:center;margin-top:2px}
-.lv.critical{background:var(--mal);color:#fff}
-.lv.high{background:#fde8e8;color:var(--mal)}
-.lv.medium{background:var(--soft);color:var(--muted);border:1px solid var(--line)}
-.mt{flex:1;min-width:0}
-.mt .cn{font-size:13.2px;font-weight:600}
-.mt .en{font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:2px;word-break:break-word}
-.cd{font-family:var(--mono);font-size:11.4px;color:var(--muted);margin-top:3px;word-break:break-all}
-.cd .dim{color:var(--dim);font-family:var(--sans)}
-.ev{flex:none;font-size:11px;font-weight:700;padding:2px 9px;border-radius:7px;
-background:rgba(99,102,241,.1);color:var(--brand);white-space:nowrap}
-.ev.no{background:#fdecec;color:var(--mal)}
-.fam{margin-top:9px;font-size:11.8px;color:var(--muted);font-family:var(--mono);
-background:var(--soft);border-radius:8px;padding:7px 10px;word-break:break-all}
-.fam b{font-family:var(--sans);color:var(--ink2);margin-right:7px}
+.grp{display:flex;align-items:baseline;gap:9px;padding:11px 20px 5px;
+  border-top:1px solid var(--line2)}
+.grp:first-of-type{border-top:none}
+.grp b{font-size:12px;font-weight:750;color:var(--ink)}
+.grp i{font-style:normal;font:700 10.5px var(--mono);color:var(--dim)}
+.grp s{text-decoration:none;font-size:11px;color:var(--dim);margin-left:auto}
 
-/* ---- 行为标记(不可展开,直接一行到底) ---- */
-.mrow{background:var(--card);border:1px solid var(--line);border-radius:10px;
-padding:9px 15px;display:flex;align-items:flex-start;gap:10px}
-.mrow.dead{background:#fffdf8;border-color:#ecd9b0}
-.muse{flex:none;width:76px;text-align:right;font-size:11.5px;font-weight:700;
-color:var(--ink2);white-space:nowrap}
-.muse .z{color:var(--dim);font-weight:600}
-.mnum{flex:none;width:64px;text-align:right;font:700 12.5px var(--mono);color:var(--ink2)}
-.mev{flex:none;width:74px;text-align:right}
+.rule{border-top:1px solid var(--line2)}
+.rule>summary{list-style:none;cursor:pointer;display:flex;align-items:center;
+  gap:12px;padding:9px 20px}
+.rule>summary::-webkit-details-marker{display:none}
+.rule>summary:hover{background:var(--accbg)}
+.rule[open]>summary{background:var(--accbg)}
+.rg{flex:none;width:52px;font:700 11px var(--sans);color:var(--mut)}
+.rg.hard{color:var(--risk)}
+.rg.strong{color:var(--warn)}
+/* ask 走的就是 .rg 的默认灰,但这条规则【必须写出来】:强度是 JS 拼上去的 class,
+   而本项目唯一能发现「某块掉了样式」的手段是「渲染后不存在无规则类」。留一个
+   只靠继承生效的类名,就等于在那个检查里永久留一条噪音,下次真掉样式时看不出来。 */
+.rg.ask{color:var(--mut)}
+.rchain{flex:1;min-width:0;font-size:13px;line-height:1.55;color:var(--ink2)}
+.rchain b{font-weight:750;color:var(--ink)}
+.rchain i{font-style:normal}
+.plus{color:var(--dim);margin:0 5px}
+/* 事件类型小标:让链条的「形状」(注册表→文件→进程)可以一眼扫出来,
+   而不必展开每一条。 */
+.ev{display:inline-block;font:600 9.5px var(--sans);color:var(--dim);
+  background:var(--inset);border:1px solid var(--line);border-radius:4px;
+  padding:0 4px;margin-right:4px;vertical-align:1px}
+/* 正常命中 > 0 是误报风险的直接证据,也是整页唯一该用红的地方。为 0 时【什么都不画】
+   —— 原来那一列 22 行全是 0。 */
+.ben{display:inline-block;margin-left:7px;font:700 10.5px var(--mono);
+  color:var(--risk);background:var(--riskbg);border-radius:4px;padding:0 5px}
+.re{flex:none;width:64px;text-align:right;font:12px var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.re.part{color:var(--warn);font-weight:700}
+.rs{flex:none;width:56px;text-align:right;font:12px var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
 
-/* ---- 构建详情 ---- */
-.funnel{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:14px 16px;display:flex;align-items:center;gap:11px;flex-wrap:wrap}
-.fs{display:flex;flex-direction:column;min-width:70px}
-.fv{font-size:22px;font-weight:800;line-height:1.1}
-.fs.hl .fv{color:var(--brand)}
-.fs.cut .fv{color:var(--mal)}
-.fk{color:var(--muted);font-size:11.5px;margin-top:2px;white-space:nowrap}
-.farr{color:var(--dim);font-size:16px}
-table.t{width:100%;border-collapse:collapse;font-size:13px;background:var(--card);
-border:1px solid var(--line);border-radius:12px;overflow:hidden}
-table.t td{padding:8px 15px;border-bottom:1px solid var(--line2)}
-table.t tr:last-child td{border-bottom:none}
-table.t td:first-child{color:var(--muted);width:52%}
-table.t td:last-child{font-family:var(--mono);font-weight:600}
-.sec{font-size:13.2px;font-weight:800;margin:19px 0 8px}
-.note{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:13px 16px;font-size:12.6px;color:var(--muted);line-height:1.85}
-.note b{color:var(--ink2)}
-.cnt{font-size:12px;color:var(--muted);margin:0 0 8px 2px}
-.cnt b{color:var(--ink)}
+.more{padding:2px 20px 14px 84px;font-size:12px}
+.mr{display:flex;gap:10px;padding:4px 0;border-top:1px solid var(--line2)}
+.mr:first-child{border-top:none}
+.mk{flex:none;width:74px;color:var(--dim);font-size:11px}
+.mv{flex:1;min-width:0;color:var(--ink2);word-break:break-word}
+code{font-family:var(--mono);font-size:11px;background:var(--inset);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+  margin:0 4px 3px 0;display:inline-block;color:var(--ink2)}
 
-/* ---- 原理页:编号步骤 + 反例框 ---- */
-.stp{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:15px 18px;margin-bottom:9px;display:flex;gap:14px;align-items:flex-start}
-.stn{flex:none;width:26px;height:26px;border-radius:8px;background:var(--brand);color:#fff;
-font:800 13px/26px var(--mono);text-align:center;margin-top:1px}
-.stb{flex:1;min-width:0}
-.stt{font-size:14.2px;font-weight:800;margin-bottom:5px}
-.stx{font-size:13px;line-height:1.9;color:var(--ink2)}
-.stx b{color:var(--ink)}
-.stx code{font-size:11.8px}
-.stx p{margin:9px 0 0}
-.stx ul{margin:8px 0 0;padding-left:20px}
-.stx li+li{margin-top:5px}
-/* 反例框:讲「不这么做会怎样」比讲「这么做很好」更能说明设计取舍 */
-.bad{background:#fdf3f3;border:1px solid #f0cfd0;border-radius:9px;
-padding:10px 13px;margin-top:10px;font-size:12.4px;line-height:1.8;color:#8a2b2e}
-.good{background:#f2f8f4;border:1px solid #cbe5d5;border-radius:9px;
-padding:10px 13px;margin-top:10px;font-size:12.4px;line-height:1.8;color:#155e35}
-.bad b{color:#a3272b}.good b{color:#0f7a3d}
-/* 只有【首个】 b 当标题成块。写成 `.bad b{display:block}` 会把句中的行内强调也拆成块,
-   于是「这类是<b>软信号</b>。」被切成三行 —— 已踩过一次。 */
-.bad>b:first-child,.good>b:first-child{display:block;margin-bottom:2px}
-/* 流水线示意:纯文本,不引任何图表库 */
-.flow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:11px;
-background:var(--soft);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
-.fbox{background:#fff;border:1px solid var(--line);border-radius:7px;padding:5px 10px;
-font-size:12.2px;font-weight:700;white-space:nowrap}
-.fbox.hl{border-color:var(--brand);color:var(--brand)}
-.fsep{color:var(--dim);font-size:14px}
-.empty{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:32px;text-align:center;color:var(--muted)}
-code{font-family:var(--mono);background:var(--soft);border:1px solid var(--line);
-border-radius:5px;padding:1px 6px;font-size:12px}
-.foot{color:var(--muted);font-size:12px;margin-top:22px}
-@media(max-width:720px){.head .h-n,.head .h-r{width:52px}.val{width:52px}.rsn{width:70px}}
-</style></head><body>
-<div class="top"><div class="topin">
-<a class="back" href="/">← 返回威胁分析台</a>
-<span class="tt">攻击链组合引擎</span>
-<span class="ver" id="ver"></span>
-</div></div>
-<div class="wrap">
-<div class="st" id="st"></div>
-<div class="notes" id="notes" hidden></div>
+/* ---- 标记表 ---- */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:8px 12px;border-top:1px solid var(--line2);
+  vertical-align:top}
+thead th{position:sticky;top:50px;z-index:15;background:var(--inset);
+  color:var(--dim);font-size:10.5px;font-weight:750;letter-spacing:.5px;
+  border-top:none;border-bottom:1px solid var(--line);white-space:nowrap}
+tbody tr:hover td{background:var(--accbg)}
+td.cn{font-weight:650;color:var(--ink)}
+td.cn s{display:block;text-decoration:none;font:10.5px var(--mono);
+  color:var(--dim);margin-top:2px;word-break:break-all}
+td.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;
+  white-space:nowrap;color:var(--ink)}
+td.n.z{color:var(--dim)}
+td.n.bad{color:var(--risk);font-weight:700}
+.sp2,.sp1,.sp0{display:inline-block;font:700 10px var(--sans);border-radius:5px;
+  padding:1px 6px;white-space:nowrap;border:1px solid var(--line)}
+.sp2{color:var(--ok);background:rgba(4,98,57,.07)}
+.sp1{color:var(--mut);background:var(--inset)}
+.sp0{color:var(--warn);background:var(--warnbg)}
+.lv{display:inline-block;font:700 10px var(--sans);border-radius:5px;
+  padding:1px 6px;border:1px solid var(--line);color:var(--mut);
+  background:var(--inset);white-space:nowrap}
+.lv.hi{color:var(--warn);background:var(--warnbg)}
+.dim{color:var(--dim)}
+.empty{padding:34px;text-align:center;color:var(--dim);font-size:12.5px}
 
-<div class="tabs" id="tabs">
-<button data-tab="live">生效规则<span class="n" id="n-live"></span></button>
-<button data-tab="cut">已剔除<span class="n" id="n-cut"></span></button>
-<button data-tab="mk">行为标记<span class="n" id="n-mk"></span></button>
-<button data-tab="build">构建详情</button>
-<button data-tab="how">原理</button>
-</div>
+/* ---- 未生效 / 折叠 ---- */
+.cut{display:flex;align-items:center;gap:12px;padding:8px 20px;
+  border-top:1px solid var(--line2);font-size:12.5px}
+.cutw{flex:none;width:120px;font-size:11px;color:var(--warn)}
+details.fold{margin-top:18px;background:var(--pnl);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden}
+details.fold>summary{cursor:pointer;padding:13px 20px;font-size:13px;
+  font-weight:750;color:var(--ink);list-style:none}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::before{content:"\25b8  ";color:var(--dim)}
+details.fold[open]>summary::before{content:"\25be  "}
+details.fold>summary em{font-style:normal;font-weight:500;font-size:12px;
+  color:var(--dim);margin-left:8px}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+  border-top:1px solid var(--line)}
+.kv div{display:flex;justify-content:space-between;gap:12px;padding:7px 20px;
+  border-bottom:1px solid var(--line2);font-size:12px}
+.kv u{text-decoration:none;color:var(--mut)}
+.kv b{font-family:var(--mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.ft{max-width:1180px;margin:0 auto;padding:0 24px 40px;font-size:11.5px;
+  color:var(--dim)}
+</style>
+</head>
+<body>
 
-<section id="tab-live">
-<div class="bar">
-<input type="search" id="q" placeholder="搜索动作名 / Sigma 规则原名 / 判定条件 / 家族">
-<div class="chips" id="gchips"></div>
-<select id="sort">
-<option value="sup">组内按作证样本数</option>
-<option value="n">组内按动作数</option>
-<option value="g">组内按强度</option>
-<option value="ben">组内按正常软件出现数</option>
-</select>
-</div>
-<div class="bar" id="tacbar"><div class="chips" id="tchips"></div></div>
-<div class="cnt" id="cnt1"></div>
-<div id="list1"></div>
-</section>
+<header class="top"><div class="tin">
+  <div class="bd">&#128737; Bulwark 威胁分析</div>
+  <nav>
+    <a href="/">&#128737; 控制台</a>
+    <a href="/engine" class="on">&#129516; 攻击链引擎</a>
+    <a href="/online">&#128225; 在线客户端</a>
+    <a href="/support">&#127911; 在线客服</a>
+    <a href="/feedback">&#128172; 反馈</a>
+    <a href="/api/docs">&#128268; API 文档</a>
+    <a href="/about">&#128229; 下载</a>
+  </nav>
+  <div class="sp"></div>
+  <div class="ver" id="ver"></div>
+</div></header>
 
-<section id="tab-cut" hidden>
-<div class="note" id="cutnote"></div>
-<div class="bar" style="margin-top:12px">
-<input type="search" id="q2" placeholder="搜索动作名 / Sigma 规则原名 / 判定条件">
-<div class="chips" id="rchips"></div>
-</div>
-<div class="cnt" id="cnt2"></div>
-<div class="head"><span class="chev" style="visibility:hidden"></span>
-<span class="h-g">强度</span><span class="h-c">动作链</span>
-<span class="h-r">剔除原因</span></div>
-<div class="list" id="list2"></div>
-</section>
+<main class="wrap">
 
-<section id="tab-mk" hidden>
-<div class="bar">
-<input type="search" id="mq" placeholder="搜索标记中文名 / Sigma 原名 / 判定条件 / 意图">
-<div class="chips" id="lchips"></div>
-<span class="divx"></span>
-<div class="chips" id="dchips"></div>
-</div>
-<div class="bar"><div class="chips" id="mtchips"></div></div>
-<div class="cnt" id="cnt3"></div>
-<div id="list3"></div>
-</section>
+  <section class="card">
+    <h1>攻击链组合引擎</h1>
+    <p class="lead" id="lead"></p>
+    <div class="split">
+      <div class="blk">
+        <h2>处置能力</h2>
+        <div class="caps" id="caps"></div>
+      </div>
+      <div class="blk">
+        <h2>规则是怎么筛出来的</h2>
+        <div class="pipe" id="pipe"></div>
+      </div>
+    </div>
+    <div id="notes"></div>
+  </section>
 
-<section id="tab-build" hidden>
-<div class="sec">压缩流程</div>
-<div class="funnel" id="funnel"></div>
-<div class="note" id="pipe" style="margin-top:9px"></div>
-<div class="sec">阈值（写死在 engine_build.py，不是学出来的参数）</div>
-<table class="t" id="thr"></table>
-<div class="sec">本轮构建统计</div>
-<table class="t" id="raw"></table>
-</section>
+  <section class="sec">
+    <div class="sh"><h2>生效规则</h2><span class="n" id="liveN"></span>
+      <span class="hint">按攻击意图分组 · 点开看匹配条件</span></div>
+    <div class="colh">
+      <span class="cg">强度</span>
+      <span class="cc">动作链（同一进程凑齐即命中）</span>
+      <span class="ce">真证据</span>
+      <span class="cs">作证</span>
+    </div>
+    <div id="rules"></div>
+  </section>
 
-<section id="tab-how" hidden><div id="how"></div></section>
+  <section class="sec">
+    <div class="sh"><h2>行为标记</h2><span class="n" id="mkN"></span>
+      <input id="mfilt" type="search" placeholder="过滤标记 / 事件 / 条件"></div>
+    <table>
+      <thead><tr>
+        <th>标记</th><th>事件</th><th>严重度</th><th>区分力</th><th>匹配条件</th>
+        <th style="text-align:right">恶意样本</th>
+        <th style="text-align:right">正常命中</th>
+        <th style="text-align:right">被引用</th>
+      </tr></thead>
+      <tbody id="mkbody"></tbody>
+    </table>
+  </section>
 
-<p class="foot" id="foot"></p>
-</div>
+  <section class="sec" id="cutSec">
+    <div class="sh"><h2>未生效</h2><span class="n" id="cutN"></span>
+      <span class="hint">服务器挖出来了,但客户端装载时会剔除</span></div>
+    <div id="cut"></div>
+  </section>
+
+  <details class="fold">
+    <summary>构建统计<em>展开备查</em></summary>
+    <div class="kv" id="stats"></div>
+  </details>
+
+  <details class="fold">
+    <summary>阈值与原理<em>写死在 engine_build.py,不是学出来的参数</em></summary>
+    <div class="note" id="how"></div>
+  </details>
+
+</main>
+<footer class="ft" id="foot"></footer>
+
 <script>
 const D = /*__DATA__*/null;
-const $ = s => document.querySelector(s);
-const esc = s => String(s==null?'':s).replace(/[&<>"]/g,
-  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-/* 强度用短标签 + 左侧色条。原来「阻断或强提示」六个字占掉一大块,还得配个彩色胶囊,
-   一行里就有两处抢注意力;短标签配色条同样能扫,完整含义放 title。 */
-const G = {hard:{s:'拦断', t:'可直接阻断：单独命中即可定性，客户端直接拦', c:'g-hard'},
-           strong:{s:'强提示', t:'阻断或给出强提示', c:'g-strong'},
-           ask:{s:'询问', t:'弹窗交给用户确认', c:'g-ask'}};
-const GORD = {hard:3, strong:2, ask:1};
-const RSN = {unobservable:'不可观测', actor:'主体冲突', redundant:'证据重复', single:'单动作'};
-const S = {q:'', grade:'', tac:'', sort:'sup', q2:'', rsn:'', mq:'', mlv:'', mdead:'', mtac:''};
+const $ = i => document.getElementById(i);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-const LIVE = () => D.patterns.filter(p => p.live);
-const CUT  = () => D.patterns.filter(p => !p.live);
-
-/* ---- 状态行 ---- */
-function status(){
-  const b = D.benign, cut = D.served - D.live;
-  const bits = [];
-  bits.push('<span class="dot ok"></span><b>' + D.live + '</b> 条规则生效');
-  bits.push('<span class="sep">|</span><span class="dot ' + (cut ? 'warn' : 'ok')
-    + '"></span><b>' + cut + '</b> 条被剔除');
-  if(!b.total)
-    bits.push('<span class="sep">|</span><span class="dot bad"></span>区分度未启用（无正常样本语料）');
-  else if(b.total < D.benign_min)
-    bits.push('<span class="sep">|</span><span class="dot warn"></span>区分度积累中（正常语料 '
-      + b.total + '/' + D.benign_min + '）');
-  else
-    bits.push('<span class="sep">|</span><span class="dot ok"></span>区分度已启用（正常语料 '
-      + b.total + '）');
-  bits.push('<button class="why" id="why">说明</button>');
-  $('#st').innerHTML = bits.join('');
-
-  const n = [];
-  if(!b.total){
-    n.push(['区分度未启用', '所有组合目前只由恶意样本证据定档 —— 能算出「多少病毒有这个组合」，'
-      + '算不出「多少正常软件也有」，而后者才是误报的直接预测量。'
-      + '信誉查询本来就为每个 hash 抓了沙箱行为，干净文件的留存已放开，语料会随客户端查询自动积累，'
-      + '不需要人工投喂样本。攒到 <b>' + D.benign_min + '</b> 个即自动参与定级。']);
-  } else if(b.total < D.benign_min){
-    n.push(['区分度积累中', '已有 <b>' + b.total + '</b> 个正常样本（' + b.with_markers
-      + ' 个有沙箱行为命中、' + b.signed + ' 个带有效签名），出现率已在统计并显示，'
-      + '但<b>不参与定级</b> —— 几个样本算出的比率噪声大于信号，拿它去砍规则会砍错真规则、留下假规则。'
-      + '门槛 <b>' + D.benign_min + '</b> 个。']);
-  } else {
-    let x = '正常语料 <b>' + b.total + '</b> 个作分母（' + b.with_markers + ' 个有沙箱行为命中、'
-          + b.signed + ' 个带有效签名）。';
-    if(D.benign_capped) x += '已有 <b>' + D.benign_capped + '</b> 条组合因在正常软件中出现而被降档。';
-    if(D.benign_dropped) x += '<b>' + D.benign_dropped + '</b> 条被整条丢弃。';
-    if(D.benign_generic) x += '另有 <b>' + D.benign_generic + '</b> 个标记因在正常软件里过于普遍而被剔除。';
-    if(!D.benign_capped && !D.benign_dropped) x += '尚无组合被正常语料降档。';
-    n.push(['区分度已启用', x]);
-  }
-  if(cut){
-    const parts = [];
-    for(const k in D.issues) parts.push((RSN[k]||k) + ' <b>' + D.issues[k] + '</b> 条');
-    n.push(['为什么有 ' + cut + ' 条被剔除',
-      '服务器挖的是「样本做了什么」，客户端装载时还要过一遍「本机能不能判、算不算互证」：'
-      + parts.join('、') + '。这些组合留着是死规则或伪互证，不会用于拦截。详见「已剔除」页签。']);
-  }
-  $('#notes').innerHTML = n.map(x =>
-    '<div class="n"><h4>' + x[0] + '</h4>' + x[1] + '</div>').join('');
-  $('#why').onclick = () => { $('#notes').hidden = !$('#notes').hidden; };
+/* 北京时间。固定 +08:00,不读访问者时区 —— 这是中国服务器的运营台。 */
+function cst(iso){
+  if(!iso) return "—";
+  const ms = Date.parse(iso);
+  if(!ms) return String(iso);
+  const t = new Date(ms + 8*3600*1000), p = n => (n<10?"0":"")+n;
+  return t.getUTCFullYear()+"-"+p(t.getUTCMonth()+1)+"-"+p(t.getUTCDate())
+    +" "+p(t.getUTCHours())+":"+p(t.getUTCMinutes());
 }
 
-/* ---- 组合行 ---- */
-const TAC = {};
-function hay(p){
-  let h = (p.fam || '').toLowerCase() + ' ' + (TAC[p.tac] || '');
-  for(const m of p.mk)
-    h += ' ' + m.cn.toLowerCase() + ' ' + m.en.toLowerCase() + ' ' + m.evcn
-       + ' ' + m.cond.join(' ').toLowerCase() + ' ' + (TAC[m.tac] || '');
-  return h;
-}
-function markerList(p){
-  return '<ul class="mk">' + p.mk.map(m =>
-    '<li><span class="lv ' + m.lv + '">' + m.lvcn + '</span><div class="mt">'
-    + '<div class="cn">' + esc(m.cn) + '</div>'
-    + (m.en ? '<div class="en">' + esc(m.en) + '</div>' : '')
-    + '<div class="cd">' + (m.cond.length
-        ? '判定条件：' + esc(m.cond.join(' · '))
-        : '<span class="dim">无具体条件（仅按事件类型）</span>') + '</div></div>'
-    + (m.obs && m.ev ? '<span class="ev">' + esc(m.evcn) + '</span>'
-                     : '<span class="ev no">不可观测</span>') + '</li>').join('') + '</ul>';
-}
-function row(p, cut){
-  const g = G[p.g] || {s:p.g, t:'', c:''};
-  const chain = p.mk.map(m => esc(m.cn)).join('<span class="plus">＋</span>');
-  /* 正常侧只在【真有命中】时出现。语料为 0 时每行都挂个「正常软件 0」等于 32 遍噪音,
-     而且「0」在没查过的情况下是个假结论。 */
-  const ben = (!cut && p.ben > 0)
-    ? '<span class="ben" title="这条组合在正常软件里也出现过，越高越可能误伤">正常 '
-      + p.ben + '/' + D.benign.total + '</span>' : '';
-  const right = cut
-    ? '<span class="rsn" title="客户端按固定顺序判定，撞上第一条即丢弃">'
-      + esc(RSN[(p.iss[0]||{}).k] || '—') + '</span>'
-    : '<span class="val" title="有多少个恶意样本同时具备这几个动作">' + p.sup + '</span>';
-  return '<details class="r ' + g.c + '"><summary><span class="chev"></span>'
-    + '<span class="gl" title="' + esc(g.t) + '">' + g.s + '</span>'
-    + '<span class="chain">' + chain + '</span>' + ben + right
-    + '</summary><div class="body">'
-    + (p.iss.length ? '<div class="why2">' + p.iss.map((i, ix) =>
-        '<div><b>' + esc(i.t) + (ix === 0 ? '（决定性）' : '') + '</b>' + esc(i.d)
-        + '</div>').join('') + '</div>' : '')
-    + markerList(p)
-    + (p.fam ? '<div class="fam"><b>常见家族</b>' + esc(p.fam) + '</div>' : '')
-    + '</div></details>';
-}
+const G = {hard:{s:"拦断", t:"单独命中即可定性,客户端直接拦"},
+           strong:{s:"强提示", t:"阻断或给出强提示"},
+           ask:{s:"询问", t:"弹窗交给用户确认"}};
+/* 一个标记算不算「一份真证据」:区分力 >= 2。判据正本在服务端,这里只做展示。 */
+const isEvidence = m => (m.spec == null ? 1 : m.spec) >= 2;
+const SPEC = {2:["sp2","可作证据"], 1:["sp1","信息量低"], 0:["sp0","不构成证据"]};
 
-function cmp(a, b){
-  return S.sort==='n'   ? (b.n - a.n) || (b.sup - a.sup)
-       : S.sort==='ben' ? (b.ben - a.ben) || (b.sup - a.sup)
-       : S.sort==='g'   ? ((GORD[b.g]||0) - (GORD[a.g]||0)) || (b.sup - a.sup)
-       :                  (b.sup - a.sup) || (b.n - a.n);
-}
+$("ver").textContent = "特征库 " + (D.label || ("v" + D.version));
 
-/* 分组渲染。扁平 28 行时每行长得都差不多、标记名反复出现,滚起来没有锚点;
-   按意图切成 2~9 条一组后,每屏都有标题可定位,也顺带答了「这套库在防什么」。
-   空组不渲染 —— 搜索/筛选后剩几组就只显示几组,不留一排「0 条」的空标题。 */
-function grouped(rows, host, emptyMsg, mkRow, headHtml){
-  const by = {};
-  rows.forEach(p => { (by[p.tac] = by[p.tac] || []).push(p); });
+const live = D.patterns.filter(p => p.live);
+const cut  = D.patterns.filter(p => !p.live);
+
+$("lead").textContent =
+  "从 " + D.samples + " 个有沙箱行为的恶意样本里数出「哪几个动作凑在一起就足以定性」,"
+  + "压缩去重后下发给端点。客户端按单个进程记账,凑齐即把它作为证据喂给裁决流水线 —— "
+  + "本引擎不自己下结论。";
+
+/* ---- 处置能力:整页第一件事 --------------------------------------------------
+   这是打开这一页最想知道的事,而旧版完全没有:这些规则最强能到哪一档?
+   非 hard 档在客户端会被硬钳在「高危阈值 - 1」,单凭自己到不了拦截。 */
+(function(){
+  const by = {hard:0, strong:0, ask:0};
+  live.forEach(p => { if(by[p.g] != null) by[p.g]++; });
+  const rows = [
+    ["hard",   by.hard,   "可直接阻断", "单独命中即拦"],
+    ["strong", by.strong, "阻断或强提示", "落在可疑档"],
+    ["ask",    by.ask,    "弹窗询问", "交用户确认"],
+  ];
+  $("caps").innerHTML = rows.map(r =>
+    '<div class="cap ' + (r[1] ? r[0] : "z") + '">'
+    + '<b>' + r[1] + '</b><span>' + r[2] + '</span><em>' + r[3] + '</em></div>').join("");
+})();
+
+/* ---- 流水线:每段的损耗就地标注,不另起横带 ---- */
+(function(){
+  const st = D.stats || {};
+  const dropObs = (D.issues && (D.issues.unobservable || 0)) || 0;
+  const steps = [
+    [D.mined, "挖出原始组合", ""],
+    [D.dedup, "去重后", D.mined > D.dedup ? ("-" + (D.mined - D.dedup) + " 冗余") : ""],
+    [D.served, "下发端点", D.dedup > D.served
+      ? ("-" + (D.dedup - D.served) + " 覆盖筛选/证据不足") : ""],
+    [D.live, "端点生效", D.served > D.live
+      ? ("-" + (D.served - D.live) + " 装载剔除") : "全部装载"],
+  ];
+  $("pipe").innerHTML = steps.map((s, i) =>
+    '<div class="pst' + (i === steps.length-1 ? " fin" : "") + '">'
+    + '<b>' + s[0] + '</b><u>' + s[1] + '</u>'
+    + (s[2] ? '<i>' + esc(s[2]) + '</i>' : '') + '</div>').join("");
+})();
+
+/* ---- 诚实提示。只在真有话要说时出现,最多两条。 ---- */
+(function(){
   const out = [];
-  for(const t of D.tactics){
-    const g = by[t.k];
-    if(!g || !g.length) continue;
-    g.sort(cmp);
-    // 列名只在第一组给一次。七个组各印一遍纯属重复 —— 列本身(短词/动作链/数字)
-    // 一眼就能认出来,而且各组列宽一致,对齐关系不会因为没有表头而丢。
-    out.push('<section class="grp"><div class="ghd">'
-      + '<span class="gnm">' + esc(t.t) + '</span>'
-      + '<span class="gct">' + g.length + ' 条</span>'
-      + '<span class="gds">' + esc(t.d) + '</span></div>'
-      + (out.length === 0 ? (headHtml || '') : '')
-      + '<div class="list">' + g.map(mkRow).join('') + '</div></section>');
+  const hard = live.filter(p => p.g === "hard").length;
+  if(!hard)
+    out.push(['warn', "当前没有任何「可直接阻断」档的组合。非 hard 档在端点上被钳在高危阈值"
+      + "之下,单凭攻击链命中只会弹窗询问,要到拦截必须有其它独立指标互证 —— "
+      + "这是现有语料能支撑的强度,不是配置问题。"]);
+  if(!D.benign_active)
+    out.push(['warn', "正常软件语料 <b>" + D.benign.total + "</b> 个,其中可用的不足 <b>"
+      + D.benign_min + "</b> 个门槛,区分度<b>未参与</b>定级。所以下面「正常命中」列的 0 "
+      + "是空分母,不是「不会误伤」的证据。"]);
+  $("notes").innerHTML = out.map(o =>
+    '<div class="note ' + o[0] + '">' + o[1] + '</div>').join("");
+})();
+
+/* ---- 生效规则 ---- */
+(function(){
+  const byTac = {};
+  live.forEach(p => { (byTac[p.tac] = byTac[p.tac] || []).push(p); });
+  $("liveN").textContent = live.length + " 条";
+
+  function chain(p){
+    return p.mk.map(m => {
+      const t = esc(m.cn);
+      const ev = m.evcn ? '<span class="ev">' + esc(m.evcn) + '</span>' : '';
+      return ev + (m.lv === "high" || m.lv === "critical" ? "<b>"+t+"</b>" : "<i>"+t+"</i>");
+    }).join('<span class="plus">+</span>');
   }
-  host.innerHTML = out.length ? out.join('') : '<div class="empty">' + emptyMsg + '</div>';
-}
 
-const HEAD1 = '<div class="head"><span class="chev" style="visibility:hidden"></span>'
-  + '<span class="h-g">强度</span><span class="h-c">动作链（凑齐即命中）</span>'
-  + '<span class="h-n">作证样本</span></div>';
+  function row(p){
+    const g = G[p.g] || {s:p.g, t:""};
+    const ev = p.mk.filter(isEvidence).length;
+    /* 真证据不足总数时标黄:说明这条组合里有标记只是「搭车」,不构成互证的一份。 */
+    const evCls = (ev < p.mk.length) ? "re part" : "re";
+    const ben = p.ben ? '<span class="ben">正常命中 ' + p.ben + '</span>' : '';
+    const conds = [].concat.apply([], p.mk.map(m => (m.cond||[]).map(c => [m.cn, c])));
+    let more = '<div class="mr"><span class="mk">事件</span><span class="mv">'
+      + esc(p.mk.map(m => m.evcn).filter((v,i,a) => a.indexOf(v)===i).join(" · "))
+      + '</span></div>';
+    more += '<div class="mr"><span class="mk">逐个动作</span><span class="mv">'
+      + p.mk.map(m => esc(m.cn) + ' <span class="' + SPEC[m.spec==null?1:m.spec][0]
+          + '">' + SPEC[m.spec==null?1:m.spec][1] + '</span>').join('<br>')
+      + '</span></div>';
+    if(conds.length)
+      more += '<div class="mr"><span class="mk">匹配条件</span><span class="mv">'
+        + conds.map(c => '<code>' + esc(c[1]) + '</code>').join("") + '</span></div>';
+    if(p.fam)
+      more += '<div class="mr"><span class="mk">作证家族</span><span class="mv dim">'
+        + esc(p.fam) + '</span></div>';
+    return '<details class="rule"><summary>'
+      + '<span class="rg ' + p.g + '" title="' + esc(g.t) + '">' + esc(g.s) + '</span>'
+      + '<span class="rchain">' + chain(p) + ben + '</span>'
+      + '<span class="' + evCls + '">' + ev + '/' + p.mk.length + '</span>'
+      + '<span class="rs">' + p.sup + '</span>'
+      + '</summary><div class="more">' + more + '</div></details>';
+  }
 
-function renderLive(){
-  const q = S.q.trim().toLowerCase();
-  const rows = LIVE().filter(p =>
-    (!S.grade || p.g === S.grade) && (!S.tac || p.tac === S.tac)
-    && (!q || hay(p).indexOf(q) >= 0));
-  $('#cnt1').innerHTML = '显示 <b>' + rows.length + '</b> / 生效 ' + D.live + ' 条'
-    + '　·　按攻击意图分组';
-  grouped(rows, $('#list1'), '没有符合条件的规则。', p => row(p, false), HEAD1);
-}
-
-function renderCut(){
-  const cut = CUT();
-  const parts = [];
-  for(const k in D.issues) parts.push((RSN[k]||k) + ' <b>' + D.issues[k] + '</b> 条');
-  $('#cutnote').innerHTML = '这些组合服务器挖出来了、也下发到客户端了，但客户端装载时会丢弃 —— '
-    + '它们要么本机没有可判条件（死规则），要么多个「动作」其实是同一个条件（伪互证）。'
-    + '判定顺序与 <code>AttackChainEngine::applyPayload</code> 一致，撞上第一条即丢弃。'
-    + (parts.length ? '<br>分布：' + parts.join('、') + '（一条可能有多个毛病，故之和可能大于 '
-        + cut.length + '）。' : '');
-  const q = S.q2.trim().toLowerCase();
-  const rows = cut.filter(p =>
-    (!S.rsn || (p.iss[0] && p.iss[0].k === S.rsn)) && (!q || hay(p).indexOf(q) >= 0));
-  rows.sort((a,b) => (b.sup - a.sup) || (b.n - a.n));
-  $('#cnt2').innerHTML = '显示 <b>' + rows.length + '</b> / 剔除 ' + cut.length + ' 条';
-  $('#list2').innerHTML = rows.length ? rows.map(p => row(p, true)).join('')
-    : '<div class="empty">没有符合条件的组合。</div>';
-}
+  const html = D.tactics.filter(t => byTac[t.k]).map(t => {
+    const rows = byTac[t.k].slice().sort((a,b) => b.sup - a.sup);
+    return '<div class="grp"><b>' + esc(t.t) + '</b><i>' + rows.length + '</i>'
+      + '<s>' + esc(t.d) + '</s></div>' + rows.map(row).join("");
+  }).join("");
+  $("rules").innerHTML = html || '<div class="empty">暂无生效规则</div>';
+})();
 
 /* ---- 行为标记 ---- */
-/* 正常侧那一列【只在真能说明问题时才出现】。语料还只有几个的时候它恒为 0,
-   摆出来就是把「32 个正常软件 0」的噪音换个位置又来一遍,而且 0 在没查过时是假结论。
-   判据:语料已达定级门槛,或者确实有标记命中过正常样本。 */
-const BENCOL = () => D.benign.total >= D.benign_min || D.mk.some(m => m.ben > 0);
-
-function renderMk(){
-  const q = S.mq.trim().toLowerCase();
-  const bc = BENCOL();
-  const rows = D.mk.filter(m => {
-    if(S.mlv && m.lv !== S.mlv) return false;
-    if(S.mtac && m.tac !== S.mtac) return false;
-    if(S.mdead === 'dead' && (m.obs && m.ev)) return false;
-    if(S.mdead === 'unused' && m.uselive > 0) return false;
-    if(q && (m.cn + ' ' + m.en + ' ' + m.cond.join(' ')
-             + ' ' + (TAC[m.tac] || '')).toLowerCase().indexOf(q) < 0) return false;
-    return true;
+(function(){
+  const mk = D.mk.slice().sort((a,b) => (b.spec||0)-(a.spec||0) || b.sam-a.sam);
+  $("mkN").textContent = mk.length + " 个";
+  function tr(m){
+    const sp = SPEC[m.spec == null ? 1 : m.spec];
+    const cond = (m.cond||[]).length
+      ? (m.cond||[]).map(c => '<code>' + esc(c) + '</code>').join("")
+      : '<span class="dim">无条件 —— 匹配该类型每一条事件</span>';
+    return '<tr><td class="cn">' + esc(m.cn) + '<s>' + esc(m.en) + '</s></td>'
+      + '<td>' + esc(m.evcn || "—") + '</td>'
+      + '<td><span class="lv' + (m.lv === "high" || m.lv === "critical" ? " hi" : "")
+        + '">' + esc(m.lvcn) + '</span></td>'
+      + '<td><span class="' + sp[0] + '">' + sp[1] + '</span></td>'
+      + '<td>' + cond + '</td>'
+      + '<td class="n">' + m.sam + '</td>'
+      + '<td class="n ' + (m.ben ? "bad" : "z") + '">' + m.ben + '</td>'
+      + '<td class="n ' + (m.uselive ? "" : "z") + '">' + m.uselive + " / " + m.use
+        + '</td></tr>';
+  }
+  const body = $("mkbody");
+  body.innerHTML = mk.map(tr).join("");
+  $("mfilt").addEventListener("input", e => {
+    const q = e.target.value.trim().toLowerCase();
+    const rows = mk.filter(m => !q
+      || (m.cn + " " + m.en + " " + (m.evcn||"") + " " + (m.cond||[]).join(" "))
+           .toLowerCase().indexOf(q) >= 0);
+    body.innerHTML = rows.length ? rows.map(tr).join("")
+      : '<tr><td colspan="8" class="empty">没有匹配的标记</td></tr>';
   });
-  $('#cnt3').innerHTML = '显示 <b>' + rows.length + '</b> / 下发给客户端 ' + D.mk.length
-    + ' 个（词表总量 ' + D.markers_total + '）　·　按攻击意图分组';
-  /* 表头随列数变化 —— 早先右侧两个裸数字没有列名,读者分不清哪个是恶意哪个是正常 */
-  const head = '<div class="head"><span class="h-g" style="width:36px">强度</span>'
-    + '<span class="h-c">行为标记</span><span class="h-u">用于规则</span>'
-    + '<span class="h-n">恶意样本</span>'
-    + (bc ? '<span class="h-n">正常样本</span>' : '')
-    + '<span class="h-e">事件</span></div>';
-  const mkRow = m => {
-    const dead = !(m.obs && m.ev);
-    return '<div class="mrow' + (dead ? ' dead' : '') + '">'
-      + '<span class="lv ' + m.lv + '">' + m.lvcn + '</span>'
-      + '<div class="mt"><div class="cn">' + esc(m.cn) + '</div>'
-      + (m.en ? '<div class="en">' + esc(m.en) + '</div>' : '')
-      + '<div class="cd">' + (m.cond.length
-          ? '判定条件：' + esc(m.cond.join(' · '))
-          : '<span class="dim">无具体条件（仅按事件类型）</span>') + '</div></div>'
-      + '<span class="muse" title="被多少条生效规则用到">'
-      + (m.uselive ? m.uselive + ' 条' : '<span class="z">未使用</span>') + '</span>'
-      + '<span class="mnum" title="出现该行为的恶意样本数">' + m.sam + '</span>'
-      + (bc ? '<span class="mnum" title="出现该行为的正常样本数">' + m.ben + '</span>' : '')
-      + '<span class="mev">' + (dead ? '<span class="ev no">不可观测</span>'
-              : '<span class="ev">' + esc(m.evcn) + '</span>') + '</span></div>';
+})();
+
+/* ---- 未生效 ---- */
+(function(){
+  const RSN = {redundant:"证据重复", actor:"主体冲突", unobservable:"无法观测",
+               single:"单动作"};
+  $("cutN").textContent = cut.length + " 条";
+  if(!cut.length){ $("cutSec").hidden = true; return; }
+  $("cut").innerHTML = cut.map(p => {
+    const why = (p.iss||[]).map(i => RSN[i.k] || i.k).join(" · ") || "未标注";
+    const ch = p.mk.map(m => m.lv === "high" || m.lv === "critical"
+      ? "<b>"+esc(m.cn)+"</b>" : esc(m.cn)).join('<span class="plus">+</span>');
+    return '<div class="cut"><span class="cutw">' + esc(why) + '</span>'
+      + '<span class="rchain">' + ch + '</span>'
+      + '<span class="rs">' + p.sup + '</span></div>';
+  }).join("");
+})();
+
+/* ---- 构建统计 ---- */
+(function(){
+  const LB = {
+    total_reports:"报告总数", skipped_other_platform:"跳过·非本平台",
+    skipped_not_threat:"跳过·非威胁", skipped_no_behaviour:"跳过·无沙箱行为",
+    usable_samples:"可用恶意样本", benign_reports:"正常软件报告",
+    benign_other_platform:"正常·非本平台", benign_usable:"正常·可用",
+    markers_observable:"可观测标记", generic_dropped:"丢弃·泛化",
+    benign_generic_dropped:"丢弃·正常泛化", benign_grading_active:"正常分级生效",
+    implications:"蕴含关系", markers_effective:"有效标记",
+    patterns_mined:"挖出组合", patterns_after_dedup:"去重后",
+    patterns_after_cover:"覆盖筛选后", markers_mapped:"已映射标记",
+    patterns_kept:"保留组合", benign_capped:"正常语料截断",
+    benign_dropped:"正常语料丢弃", stale_patterns_removed:"清理·过期组合",
+    stale_markers_removed:"清理·过期标记",
+    markers_with_context:"带命中上下文的标记", markers_derived:"推导出条件的标记",
+    markers_derived_new:"推导·手写表未覆盖", hand_rules_mismapped:"手写表·填错字段",
+    markers_spec_ok:"区分力·可作证据", markers_spec_weak:"区分力·信息量低",
+    markers_spec_none:"区分力·不构成证据",
+    patterns_dropped_no_evidence:"丢弃·真证据不足两份",
+    patterns_dropped_actor_conflict:"丢弃·主体冲突", patterns_dropped_redundant:"丢弃·证据重复",
+    patterns_dropped_unobservable:"丢弃·标记不可观测"
   };
-  /* 标记表同样分组:39 个平铺时同一主题的标记散落各处(四种计划任务、三种 Defender
-     排除项),分组后一眼能看出「这个意图下引擎认得几种手法」。
-     排序用「用于生效规则数」降序 —— 组内最要紧的是哪个标记真在干活。 */
-  const by = {};
-  rows.forEach(m => { (by[m.tac] = by[m.tac] || []).push(m); });
-  const out = [];
-  for(const t of D.tactics){
-    const g = by[t.k];
-    if(!g || !g.length) continue;
-    g.sort((a,b) => (b.uselive - a.uselive) || (b.sam - a.sam) || a.cn.localeCompare(b.cn));
-    out.push('<section class="grp"><div class="ghd"><span class="gnm">' + esc(t.t) + '</span>'
-      + '<span class="gct">' + g.length + ' 个</span>'
-      + '<span class="gds">' + esc(t.d) + '</span></div>'
-      + (out.length === 0 ? head : '')
-      + '<div class="list">' + g.map(mkRow).join('') + '</div></section>');
+  const s = D.stats || {};
+  $("stats").innerHTML = Object.keys(s).map(k =>
+    '<div><u>' + esc(LB[k] || k) + '</u><b>' + s[k] + '</b></div>').join("");
+})();
+
+$("how").innerHTML =
+  "组合的定性强度由三件事决定,三者都要够:<b>动作数</b>(链条多长) × <b>最高严重度</b>"
+  + " × <b>支持度</b>(多少真实样本作证)。"
+  + "另有一道<b>互证闸门</b>:一条组合至少要有两个「区分力可作证据」的标记才下发 —— "
+  + "只有一个真判据加一个恒真项(如「任意 svchost 启动」「未签名进程」)不算互证,"
+  + "而客户端会把命中登记为硬指标,那等于把软信号提拔成处置依据。"
+  + "正常软件语料至少需要 <b>" + D.benign_min + "</b> 个才启用反向校验,当前 <b>"
+  + D.benign.total + "</b> 个(带标记 " + D.benign.with_markers + " 个、有签名 "
+  + D.benign.signed + " 个)," + (D.benign_active ? "已启用。" : "尚未达到阈值。");
+
+$("foot").innerHTML =
+  "特征库 " + esc(D.label || D.version) + " · 构建于 " + cst(D.built_at) + " 北京时间"
+  + " · 下发接口 /v1/engine/manifest 与 /v1/engine/patterns"
+  + " · 本页只读,不触发任何构建";
+</script>
+</body>
+</html>
+'''
+
+
+# ---- /support 访客页 --------------------------------------------------------- #
+#
+# 版式只守三条,和 /engine 那一版是同一套取舍:
+#   1. 【一列,一条时间线】。客服对话天然是线性的,任何分栏都只会把注意力从"对方
+#      说了什么"上引开。
+#   2. 【不给每条信息配一条自己的横带】。系统提示是居中的小灰字,不是一条带底色的
+#      通告条 —— 上一轮两次被说"乱",共同原因就是横带太多。
+#   3. 【只有一处会用红】:发送失败。附件大小、类型这些说明是灰字,它们是常识不是
+#      警告。
+#
+# 配置由服务端注入 /*__CFG__*/null 处(上限、客服名),前端据此提示,而不是把上限
+# 写死在两个地方 —— 那样改了配置页面还在说旧数字。
+_SUPPORT_PAGE = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>在线客服 · 磐垒</title>
+<style>
+:root{
+  --bwbg:#edf0f5; --bwpnl:#ffffff; --bwsoft:#f9fafb;
+  --bwln:#e4e7ec; --bwln2:#f2f4f7;
+  --bwink:#101828; --bwink2:#344054; --bwmut:#667085; --bwdim:#98a2b3;
+  --bwac:#2563eb; --bwmal:#d92d20; --bwok:#067647;
+  --bwmono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace;
+  --bwsans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bwbg);color:var(--bwink);font:14px/1.65 var(--bwsans);
+  -webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;background:
+  repeating-linear-gradient(0deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px),
+  repeating-linear-gradient(90deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1200px 520px at 50% -12%,rgba(37,99,235,.07),transparent 70%)}
+a{color:var(--bwac);text-decoration:none}
+
+.bwrail{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--bwln)}
+.bwrail .in{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:16px;
+  padding:10px 22px}
+.bwbrand{display:flex;align-items:center;gap:10px;text-decoration:none;flex:none}
+.bwbrand .mk{width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--bwac);color:#fff;font-size:15px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+.bwbrand b{display:block;font-size:13.5px;font-weight:800;letter-spacing:2.2px;
+  color:var(--bwink);line-height:1.1}
+.bwbrand s{display:block;text-decoration:none;font-size:9px;color:var(--bwmut);
+  letter-spacing:1.3px;margin-top:2px}
+.bwgrow{flex:1}
+.bwnav{display:flex;align-items:stretch;gap:2px;overflow-x:auto;
+  scrollbar-width:none;-ms-overflow-style:none}
+.bwnav::-webkit-scrollbar{display:none}
+.bwnav a{position:relative;display:inline-flex;align-items:center;gap:7px;
+  padding:9px 13px;font-size:12.5px;font-weight:600;letter-spacing:.5px;
+  color:var(--bwmut);white-space:nowrap}
+.bwnav a::after{content:"";position:absolute;left:11px;right:11px;bottom:-1px;height:2px;
+  background:var(--bwac);opacity:0;transition:opacity .16s}
+.bwnav a:hover{color:var(--bwink)}
+.bwnav a:hover::after{opacity:.5}
+.bwnav a.on{color:var(--bwac)}
+.bwnav a.on::after{opacity:1}
+.bwnav a .i{font-size:13px;line-height:1}
+@media(max-width:640px){.bwrail .in{padding:9px 14px}.bwbrand s{display:none}}
+
+/* ---- 对话壳 ---- */
+.wrap{max-width:780px;margin:0 auto;padding:22px 20px 28px;
+  display:flex;flex-direction:column;min-height:calc(100vh - 52px)}
+.hd{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+.hd h1{margin:0;font-size:19px;font-weight:800;letter-spacing:-.2px}
+.hd .st{font-size:11.5px;color:var(--bwmut);margin-left:auto;display:flex;
+  align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--bwdim);display:inline-block}
+.dot.on{background:var(--bwok);box-shadow:0 0 0 3px rgba(6,118,71,.15)}
+.lead{margin:0 0 14px;font-size:12.5px;color:var(--bwmut)}
+
+.thread{flex:1;background:var(--bwpnl);border:1px solid var(--bwln);
+  padding:16px 18px;overflow-y:auto;max-height:60vh;min-height:260px}
+.m{display:flex;flex-direction:column;margin-bottom:14px;max-width:76%}
+.m:last-child{margin-bottom:2px}
+.m.me{margin-left:auto;align-items:flex-end}
+.m .bd{padding:9px 12px;font-size:13.5px;line-height:1.6;white-space:pre-wrap;
+  word-break:break-word;background:var(--bwsoft);border:1px solid var(--bwln)}
+.m.me .bd{background:var(--bwac);border-color:var(--bwac);color:#fff}
+.m .ts{font:10.5px var(--bwmono);color:var(--bwdim);margin-top:4px}
+.m .who{font-size:10.5px;font-weight:700;color:var(--bwmut);margin-bottom:4px;
+  letter-spacing:.6px}
+/* 系统提示不给横带:居中小灰字。它每条对话都会出现,做成通告条就是一整页噪音。 */
+.m.sys{max-width:100%;align-items:center;margin:10px 0 16px}
+.m.sys .bd{background:none;border:none;color:var(--bwdim);font-size:12px;
+  text-align:center;padding:0}
+/* 附件。缩略图固定高度裁切,否则一张竖屏手机截图能把整条消息顶到几百像素高。 */
+.fx{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px}
+.fx a{display:block;line-height:0;border:1px solid var(--bwln);overflow:hidden}
+.fx img{width:132px;height:92px;object-fit:cover;display:block;background:var(--bwln2)}
+.fx video{width:240px;max-height:180px;display:block;background:#000}
+.empty{color:var(--bwdim);font-size:12.5px;text-align:center;padding:40px 0}
+
+/* ---- 输入区 ---- */
+.comp{background:var(--bwpnl);border:1px solid var(--bwln);border-top:none;
+  padding:11px 12px}
+.q{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.q span{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;
+  background:var(--bwsoft);border:1px solid var(--bwln);padding:3px 8px;
+  color:var(--bwink2)}
+.q span i{font-style:normal;color:var(--bwdim);font-family:var(--bwmono)}
+.q span b{cursor:pointer;color:var(--bwdim);font-weight:700}
+.q span b:hover{color:var(--bwmal)}
+.rw{display:flex;align-items:flex-end;gap:8px}
+.clip{flex:none;width:38px;height:38px;display:grid;place-items:center;cursor:pointer;
+  border:1px solid var(--bwln);background:var(--bwsoft);font-size:16px;user-select:none}
+.clip:hover{border-color:var(--bwac)}
+textarea{flex:1;resize:none;min-height:38px;max-height:140px;padding:9px 11px;
+  border:1px solid var(--bwln);background:var(--bwbg);color:var(--bwink);
+  font:14px/1.5 var(--bwsans);outline:none}
+textarea:focus{border-color:var(--bwac);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+button{flex:none;padding:0 18px;height:38px;background:var(--bwac);color:#fff;
+  border:none;font:700 13px/1 var(--bwsans);letter-spacing:1px;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+button:disabled{background:var(--bwdim);cursor:default;filter:none}
+.hint{margin-top:8px;font-size:11.5px;color:var(--bwdim)}
+.hint.bad{color:var(--bwmal)}
+.ft{margin:12px 0 0;font-size:11.5px;color:var(--bwdim)}
+</style>
+</head>
+<body>
+<div class="bwrail"><div class="in">
+<a class="bwbrand" href="/" title="返回控制台"><span class="mk">&#128737;</span>
+<span><b>BULWARK</b><s>THREAT ANALYSIS CONSOLE</s></span></a>
+<div class="bwgrow"></div>
+<nav class="bwnav">
+<a href="/"><span class="i">&#128737;</span>控制台</a>
+<a href="/engine"><span class="i">&#129516;</span>攻击链引擎</a>
+<a href="/online"><span class="i">&#128225;</span>在线客户端</a>
+<a href="/support" class="on"><span class="i">&#127911;</span>在线客服</a>
+<a href="/feedback"><span class="i">&#128172;</span>反馈</a>
+<a href="/api/docs"><span class="i">&#128268;</span>API 文档</a>
+<a href="/about"><span class="i">&#128229;</span>下载</a>
+</nav>
+</div></div>
+
+<div class="wrap">
+  <div class="hd">
+    <h1>在线客服</h1>
+    <div class="st"><span class="dot" id="dot"></span><span id="stx">连接中</span></div>
+  </div>
+  <p class="lead" id="lead"></p>
+  <div class="thread" id="thread"><div class="empty">正在载入对话…</div></div>
+  <div class="comp">
+    <div class="q" id="q"></div>
+    <div class="rw">
+      <label class="clip" for="f" title="发送图片或视频">&#128206;</label>
+      <input type="file" id="f" multiple hidden
+        accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/quicktime,video/webm">
+      <textarea id="box" rows="1" placeholder="描述你遇到的问题，回车发送"></textarea>
+      <button id="send">发送</button>
+    </div>
+    <div class="hint" id="hint"></div>
+  </div>
+  <!-- 客服台入口。放一行小灰字而不是一个按钮:对访客它是噪音,对值守的人它省掉
+       记一个 URL。这条链接本身不泄露任何东西 —— /support/admin 需要口令,没配
+       口令时它连页面都不出。 -->
+  <p class="ft">值守人员入口：<a href="/support/admin">客服台</a></p>
+</div>
+
+<script>
+const CFG = /*__CFG__*/null;
+const $ = id => document.getElementById(id);
+let lastId = 0, pending = [], sending = false, polling = false;
+
+/* 北京时间。固定 +08:00,不读访问者时区 —— 服务器时区是 UTC,而用它的人在中国。 */
+function hhmm(iso){
+  const ms = Date.parse(iso);
+  if(!ms) return "";
+  const t = new Date(ms + 8*3600*1000), p = n => (n<10?"0":"")+n;
+  return p(t.getUTCHours())+":"+p(t.getUTCMinutes());
+}
+function mb(n){ return (n/1048576).toFixed(n >= 10485760 ? 0 : 1) + " MB"; }
+
+$("lead").textContent = "发送文字、截图或录屏都可以。图片单个上限 "
+  + CFG.image_mb + " MB，视频 " + CFG.video_mb + " MB，一次最多 "
+  + CFG.max_files + " 个。对话内容与附件会在 " + CFG.retention_days
+  + " 天后自动删除。"
+  + (CFG.staffed ? "" : "当前客服台尚未配置值守口令，留言会先保存下来。");
+
+/* 三种状态,措辞各自对应一个事实,不含糊:
+     有凭证 + 心跳新鲜 -> 客服在线
+     有凭证 + 无心跳    -> 留言后会尽快回复
+     没有凭证          -> 留言模式（没人能回，就不说会回） */
+function statusText(online){
+  if(!CFG.staffed) return "留言模式";
+  return online ? "客服在线" : "留言后客服会尽快回复";
+}
+
+function status(on, text){
+  $("dot").className = "dot" + (on ? " on" : "");
+  $("stx").textContent = text;
+}
+function hint(text, bad){
+  $("hint").textContent = text || "";
+  $("hint").className = "hint" + (bad ? " bad" : "");
+}
+
+/* 消息一律用 textContent 落地,不拼 innerHTML。正文是用户和客服两边都能写的自由
+   文本,任何一次 innerHTML 拼接都是一条存储型 XSS 的入口。 */
+function render(rows){
+  const th = $("thread");
+  if(th.querySelector(".empty")) th.textContent = "";
+  rows.forEach(m => {
+    const d = document.createElement("div");
+    d.className = "m " + (m.who === "visitor" ? "me" : (m.who === "system" ? "sys" : ""));
+    if(m.who === "agent"){
+      const w = document.createElement("div");
+      w.className = "who"; w.textContent = CFG.agent_name;
+      d.appendChild(w);
+    }
+    if(m.body){
+      const b = document.createElement("div");
+      b.className = "bd"; b.textContent = m.body;
+      d.appendChild(b);
+    }
+    if(m.files && m.files.length){
+      const fx = document.createElement("div");
+      fx.className = "fx";
+      m.files.forEach(f => {
+        const url = "/support/media/" + encodeURIComponent(f.name);
+        if(f.kind === "video"){
+          const v = document.createElement("video");
+          v.src = url; v.controls = true; v.preload = "metadata";
+          fx.appendChild(v);
+        } else {
+          const a = document.createElement("a");
+          a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+          const i = document.createElement("img");
+          i.src = url; i.loading = "lazy"; i.alt = "附件";
+          a.appendChild(i); fx.appendChild(a);
+        }
+      });
+      d.appendChild(fx);
+    }
+    if(m.who !== "system"){
+      const t = document.createElement("div");
+      t.className = "ts"; t.textContent = hhmm(m.at);
+      d.appendChild(t);
+    }
+    th.appendChild(d);
+    if(m.id > lastId) lastId = m.id;
+  });
+  th.scrollTop = th.scrollHeight;
+}
+
+function drawQueue(){
+  const q = $("q"); q.textContent = "";
+  pending.forEach((p, i) => {
+    const s = document.createElement("span");
+    s.appendChild(document.createTextNode(p.label));
+    const it = document.createElement("i"); it.textContent = mb(p.size);
+    const x = document.createElement("b"); x.textContent = "\u00d7";
+    x.onclick = () => { pending.splice(i,1); drawQueue(); };
+    s.appendChild(it); s.appendChild(x); q.appendChild(s);
+  });
+}
+
+async function boot(){
+  try{
+    const r = await fetch("/support/api/session", {credentials:"same-origin"});
+    const d = await r.json();
+    if(!d.ok){ status(false, "暂不可用"); hint(d.error || "服务未启用", true); return; }
+    $("thread").textContent = "";
+    if(d.messages && d.messages.length) render(d.messages);
+    else {
+      render([{id:0, at:"", who:"system", body:CFG.greeting, files:[]}]);
+      lastId = 0;
+    }
+    status(!!d.agent_online, statusText(!!d.agent_online));
+    poll();
+  }catch(e){ status(false, "连接失败"); hint("网络异常，请刷新重试", true); }
+}
+
+/* 长轮询。服务端最多挂 CFG.poll_wait 秒;没有新消息就空手回来,立刻再挂上去。
+   出错时退避 3 秒再试,避免服务重启期间前端把自己变成压测工具。 */
+async function poll(){
+  if(polling) return;
+  polling = true;
+  for(;;){
+    try{
+      const r = await fetch("/support/api/poll?after=" + lastId, {credentials:"same-origin"});
+      if(r.status === 409){ polling = false; return boot(); }   /* 会话已过期 */
+      const d = await r.json();
+      if(d.ok && d.messages && d.messages.length) render(d.messages);
+      if(d.ok) status(!!d.agent_online, statusText(!!d.agent_online));
+    }catch(e){
+      status(false, "重连中");
+      await new Promise(s => setTimeout(s, 3000));
+    }
   }
-  $('#list3').innerHTML = out.length ? out.join('')
-    : '<div class="empty">没有符合条件的标记。</div>';
 }
 
-/* ---- 构建详情 ---- */
-function renderBuild(){
-  const cut = D.served - D.live;
-  $('#funnel').innerHTML =
-    '<div class="fs"><span class="fv">' + D.mined + '</span><span class="fk">挖出原始组合</span></div>'
-  + '<span class="farr">→</span>'
-  + '<div class="fs"><span class="fv">' + D.dedup + '</span><span class="fk">去冗余后</span></div>'
-  + '<span class="farr">→</span>'
-  + '<div class="fs"><span class="fv">' + D.served + '</span><span class="fk">下发客户端</span></div>'
-  + '<span class="farr">→</span>'
-  + '<div class="fs hl"><span class="fv">' + D.live + '</span><span class="fk">实际生效</span></div>'
-  + (cut ? '<div class="fs cut"><span class="fv">-' + cut + '</span><span class="fk">装载时剔除</span></div>' : '');
-  $('#pipe').innerHTML = '恶意作证样本 <b>' + D.samples + '</b> 个 · 行为标记 <b>' + D.mk.length
-    + '</b> 个 · 正常语料 <b>' + D.benign.total + '</b> 个（上限 ' + (D.benign.cap||0) + '）。'
-    + '<br>去冗余是折叠掉「子集且支持度接近」的组合，再由贪心集合覆盖挑出能解释最多样本的最小子集。'
-    + (D.benign.total >= D.benign_min
-        ? '<br>区分度<b>已参与</b>定级。'
-        : '<br>区分度<b>未参与</b>定级：语料 ' + D.benign.total + ' 个，门槛 ' + D.benign_min + ' 个。');
-  const thr = [
-    ['一条组合最少要多少样本作证', 'MIN_SUPPORT = 5'],
-    ['组合最多几个动作', 'MAX_ITEMSET = 4'],
-    ['判「拦断」所需样本数', 'SUPPORT_FOR_HARD = 10'],
-    ['判「强提示」所需样本数', 'SUPPORT_FOR_STRONG = 8'],
-    ['判「询问」所需样本数', 'SUPPORT_FOR_ASK = 5'],
-    ['恶意样本内出现率超此值视为通用行为', 'GENERIC_DF_RATIO = 0.45'],
-    ['正常样本内出现率超此值即剔除该标记', 'BENIGN_GENERIC_RATIO = 0.30'],
-    ['组合在正常软件出现率超此值 → 只能询问', 'BENIGN_ASK_RATIO = 0.02'],
-    ['组合在正常软件出现率超此值 → 整条丢弃', 'BENIGN_DROP_RATIO = 0.10'],
-    ['正常语料少于此数则不参与定级', 'BENIGN_MIN_CORPUS = ' + D.benign_min],
-  ];
-  $('#thr').innerHTML = thr.map(r =>
-    '<tr><td>' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>').join('');
-  const keys = Object.keys(D.stats).sort();
-  $('#raw').innerHTML = keys.length
-    ? keys.map(k => '<tr><td>' + esc(k) + '</td><td>' + esc(D.stats[k]) + '</td></tr>').join('')
-    : '<tr><td>（本轮没有统计数据）</td><td>—</td></tr>';
+async function upload(file){
+  const q = "?name=" + encodeURIComponent(file.name || "file");
+  const r = await fetch("/support/api/upload" + q, {
+    method:"POST", credentials:"same-origin", body:file,
+    headers:{"Content-Type":"application/octet-stream"}});
+  const d = await r.json();
+  if(!d.ok) throw new Error(d.error || "上传失败");
+  return d.name;
 }
 
-/* ---- 原理 ---- */
-/* 这一页刻意多用「反例」:讲「不这么做会怎样」比讲「这么做很好」更能说明设计取舍,
-   而且这些反例全是实测撞出来的,不是假想。数字用当前库的真实值,免得文档和现实脱节。 */
-function renderHow(){
-  const S1 = [];
-  const step = (t, x) => S1.push('<div class="stp"><div class="stn">' + (S1.length + 1)
-    + '</div><div class="stb"><div class="stt">' + t + '</div><div class="stx">' + x
-    + '</div></div></div>');
-
-  step('为什么非要「几个动作凑齐」',
-    '单个动作说明不了问题 —— 正常安装程序也写开机自启动项、也往磁盘落 exe、也建计划任务。'
-    + '但<b>若干动作凑在一起</b>就足以定性：一个程序既给 Defender 加排除项、又从 Temp 跑脚本、'
-    + '又往 lsass 里塞未签名模块，这个组合正常软件不会有。'
-    + '<p>所以本引擎的输出不是「哪个动作可疑」，而是「哪几个动作凑在一起就是病毒」。'
-    + '一条组合至少要 <b>2</b> 个动作，最多 <b>4</b> 个。</p>'
-    + '<div class="bad"><b>单动作为什么不行</b>'
-    + '「未签名」「从可疑路径运行」「本机首见」这类是<b>软信号</b>。'
-    + '本产品的底线是：软信号单独出现绝不触发拦截或弹窗，必须由硬指标互证。'
-    + '一条只靠软信号的规则，等于把软信号提拔成了处置依据。</div>');
-
-  step('语料从哪来：真实样本的沙箱记录',
-    '归档里每份 VirusTotal 报告都自带沙箱行为记录 —— 该样本在虚拟机里跑起来后做过什么。'
-    + '当前有 <b>' + D.samples + '</b> 个带行为记录的 Windows 恶意样本作证。'
-    + '<p>只取 <code>sigma_analysis_results</code>（社区 Sigma 规则命中，自带严重度），'
-    + '<b>不用</b> <code>processes_created</code> / <code>files_written</code> / '
-    + '<code>registry_keys_set</code> 这些原始字段。</p>'
-    + '<div class="bad"><b>用原始字段会怎样（实测）</b>'
-    + '沙箱记录里<b>环境噪音压倒性多数</b>。按频次排序，冠军是 services.exe、svchost.exe、'
-    + 'lsass.exe、/bin/gzip、/var/log/*.gz —— 全是虚拟机自己的正常活动，跟样本无关。'
-    + '所以判断交给社区 Sigma 规则做，不自己从噪音里猜。</div>');
-
-  step('另外两个实测踩到的坑',
-    '<ul><li><b>归档里 42% 是 Linux/ELF 样本</b>（mirai 家族霸榜），对 Windows 端点无用，'
-    + '先按文件类型剔除。本轮剔掉 <b>' + (D.stats.skipped_other_platform || 0) + '</b> 份。</li>'
-    + '<li><b>同义标记与蕴含标记</b>会让组合虚高。'
-    + '「Powershell Defender Exclusion」与「Windows Defender Exclusions Added - PowerShell」'
-    + '实测共现 44 次，本是同一个动作，算成两个等于凭一个动作就凑够一组；'
-    + '「New RUN Key Pointing to Suspicious Folder」必然同时命中'
-    + '「CurrentVersion Autorun Keys Modification」（前者是后者的特例），两者同现不构成互证。</li></ul>'
-    + '<p>同义靠人工表归一；<b>蕴含靠数据自动识别</b> —— 条件概率 P(B|A) &gt; 0.90 即判定 A 蕴含 B '
-    + '并折叠掉 B，这样新出现的蕴含关系不必等人去发现。本轮自动识别出 <b>'
-    + (D.stats.implications || 0) + '</b> 条蕴含关系。</p>');
-
-  step('怎么把组合数出来（纯计数，没有模型）',
-    '<div class="flow"><span class="fbox">Apriori 频繁项集</span><span class="fsep">→</span>'
-    + '<span class="fbox">折叠冗余组合</span><span class="fsep">→</span>'
-    + '<span class="fbox">贪心集合覆盖</span><span class="fsep">→</span>'
-    + '<span class="fbox hl">' + D.served + ' 条下发</span></div>'
-    + '<p><b>Apriori</b>：只扩展已达支持度的项集，避免组合爆炸。本轮挖出 <b>'
-    + D.mined + '</b> 条原始组合。</p>'
-    + '<p><b>折叠冗余</b>：若某组合是另一个组合的子集、且支持度接近（比值 ≥ 0.80），'
-    + '说明命中前者的样本几乎都把超集里的动作全做了，单独留它只会让规则库变大、'
-    + '而且更容易误伤（要求的动作更少）。剩 <b>' + D.dedup + '</b> 条。</p>'
-    + '<p><b>集合覆盖</b>：去冗余后仍彼此高度重叠 —— 一个命中 8 个标记的样本能派生出 56 个三元组。'
-    + '于是每轮挑「能新覆盖最多样本」的那条，直到没有组合还能新增覆盖。最终 <b>'
-    + D.served + '</b> 条，覆盖率没变，说明删掉的确实是冗余。</p>'
-    + '<div class="good"><b>为什么强调「纯计数」</b>'
-    + '全流程没有任何模型、没有训练、没有学出来的权重。所有阈值都写死在 '
-    + '<code>engine_build.py</code> 里（见「构建详情」页签）。'
-    + '样本越多组合越准，每天增量重算即可，不需要重新训练。</div>');
-
-  step('怎么定强度：三个维度都要够',
-    '强度决定「能不能不问就拦」，宁保守勿激进。动作数（链条多长）× 最高严重度 × '
-    + '支持度（多少真实样本作证），三者都要够：'
-    + '<ul><li><b>拦断</b>：≥3 动作 + 含高/严重 + ≥10 个样本作证</li>'
-    + '<li><b>强提示</b>：≥3 动作 + ≥8 个样本</li>'
-    + '<li><b>询问</b>：≥2 动作 + 含高/严重 + ≥5 个样本</li>'
-    + '<li>其余一律丢弃</li></ul>'
-    + '<div class="bad"><b>只按动作数分级会怎样（实测）</b>'
-    + '1729 条仅 5~13 个样本支撑的组合全被判成「可直接拦」。证据这么薄就敢直接阻断即是过拟合，'
-    + '所以越是要「不问就拦」，越要更多样本作证。<br>'
-    + '另外：两个「中」级动作绝不下判断 —— 实测正常安装程序确实会「写 Run 键 + 落 exe」，'
-    + '凭这个就拦必然误伤。</div>');
-
-  step('区分度：为什么必须有正常样本语料',
-    '上面所有阈值都只看恶意样本，答的是「<b>多少病毒</b>有这个组合」。'
-    + '真正决定误报的是另一个问题：「<b>多少正常软件</b>也有」。缺了后者，'
-    + '一条组合是真特征还是普遍现象根本区分不出来。'
-    + '<p>正常语料来自信誉查询本身 —— 每次查 hash 时顺带抓到的沙箱行为，'
-    + '干净文件的那份留下来当分母。当前 <b>' + D.benign.total + '</b> 个，门槛 <b>'
-    + D.benign_min + '</b> 个'
-    + (D.benign.total >= D.benign_min ? '（<b>已参与</b>定级）。' : '（<b>未参与</b>定级）。') + '</p>'
-    + '<p>参与定级时<b>只降不升</b>：恶意侧证据再多，也不能抵消「正常软件也这么干」这个事实。'
-    + '命中过正常样本就不许「不问就拦」；出现率 &gt; 2% 只能询问；&gt; 10% 整条丢弃。'
-    + '标记层面，正常软件里出现率 &gt; 30% 的直接剔除。</p>'
-    + '<div class="bad"><b>没有区分度会怎样（实测）</b>'
-    + '曾有一条组合，两个标记的判定条件都退化成「未签名的进程创建」，支持度 13、严重度「高」，'
-    + '顺利进档。实际命中的是 ripgrep 和<b>本产品自己的界面程序</b>。'
-    + '<br>另一个陷阱：恶意样本内部的出现率（<code>GENERIC_DF_RATIO</code>）答不了这个问题 —— '
-    + '一个标记完全可以只出现在 5% 的病毒里、却出现在 90% 的正常软件里，照样过门槛。</div>');
-
-  step('客户端拿到规则后怎么用',
-    '服务器只下发「哪几个动作凑一起是病毒」，客户端还得知道「这个动作在我这儿长什么样」。'
-    + '所以每个标记都带一份匹配条件（主体 / 目标 / 命令行 / 父进程 / 未签名），'
-    + '字段名与本产品的防御规则完全一致 —— 客户端<b>直接复用现成的规则匹配实现</b>，'
-    + '不为本引擎另写一套。'
-    + '<p>装载时还要过一遍「本机能不能判、算不算互证」，四条判据按顺序走，撞上第一条即丢弃：'
-    + '本轮 ' + D.served + ' 条里丢掉了 ' + (D.served - D.live) + ' 条，实际生效 <b>'
-    + D.live + '</b> 条。详见「已剔除」页签。</p>'
-    + '<div class="good"><b>命中之后并不直接等于拦截</b>'
-    + '命中只是决策流水线上的一步。流水线前面还有几道无条件放行：本产品自身组件、'
-    + '用户信任的文件与目录、已安装的第三方安全软件。'
-    + '也就是说 —— 写一条拦截规则并不能越过那几道放行。</div>');
-
-  $('#how').innerHTML = S1.join('');
-}
-
-/* ---- 筛选 chip ---- */
-function chips(host, items, cur, cb){
-  host.innerHTML = items.map(it =>
-    '<span class="chip' + (it[0]===cur ? ' on' : '') + '" data-v="' + it[0] + '">'
-    + esc(it[1]) + '</span>').join('');
-  host.onclick = e => { const c = e.target.closest('.chip'); if(c) cb(c.dataset.v); };
-}
-function gradeChips(){
-  const n = {hard:0, strong:0, ask:0}, live = LIVE();
-  live.forEach(p => { if(n[p.g] !== undefined) n[p.g]++; });
-  chips($('#gchips'), [['','全部 ' + live.length], ['hard','拦断 ' + n.hard],
-                       ['strong','强提示 ' + n.strong], ['ask','询问 ' + n.ask]],
-        S.grade, v => { S.grade = v; gradeChips(); renderLive(); });
-}
-/* 意图既是分组依据、也做筛选:组多的时候「只看这一类」比滚到那个标题更快 */
-function tacChips(){
-  const n = {};
-  LIVE().forEach(p => { n[p.tac] = (n[p.tac] || 0) + 1; });
-  const items = [['', '全部意图']];
-  for(const t of D.tactics) if(n[t.k]) items.push([t.k, t.t + ' ' + n[t.k]]);
-  chips($('#tchips'), items, S.tac, v => { S.tac = v; tacChips(); renderLive(); });
-}
-function mtacChips(){
-  const n = {};
-  D.mk.forEach(m => { n[m.tac] = (n[m.tac] || 0) + 1; });
-  const items = [['', '全部意图']];
-  for(const t of D.tactics) if(n[t.k]) items.push([t.k, t.t + ' ' + n[t.k]]);
-  chips($('#mtchips'), items, S.mtac, v => { S.mtac = v; mtacChips(); renderMk(); });
-}
-function rsnChips(){
-  const items = [['','全部 ' + CUT().length]];
-  for(const k of ['unobservable','actor','redundant','single'])
-    if(D.issues[k]) items.push([k, RSN[k] + ' ' + D.issues[k]]);
-  chips($('#rchips'), items, S.rsn, v => { S.rsn = v; rsnChips(); renderCut(); });
-}
-function lvChips(){
-  const n = {critical:0, high:0, medium:0};
-  D.mk.forEach(m => { if(n[m.lv] !== undefined) n[m.lv]++; });
-  chips($('#lchips'), [['','全部 ' + D.mk.length], ['critical','严重 ' + n.critical],
-                       ['high','高 ' + n.high], ['medium','中 ' + n.medium]],
-        S.mlv, v => { S.mlv = v; lvChips(); renderMk(); });
-}
-function deadChips(){
-  const dead = D.mk.filter(m => !(m.obs && m.ev)).length;
-  const unused = D.mk.filter(m => !m.uselive).length;
-  const items = [['','状态不限']];
-  if(dead) items.push(['dead','不可观测 ' + dead]);
-  if(unused) items.push(['unused','未被使用 ' + unused]);
-  chips($('#dchips'), items, S.mdead, v => { S.mdead = v; deadChips(); renderMk(); });
-}
-
-/* ---- 装配 ---- */
-const TABS = ['live','cut','mk','build','how'];
-function setTab(t){
-  if(!TABS.includes(t)) t = 'live';
-  document.querySelectorAll('#tabs button').forEach(
-    x => x.classList.toggle('on', x.dataset.tab === t));
-  TABS.forEach(x => { $('#tab-' + x).hidden = (x !== t); });
-}
-function init(){
-  if(!D || !D.version){
-    $('#st').innerHTML = '特征库还没有构建过。在服务器上执行 '
-      + '<code>python3 /opt/bulwark-intel/engine_build.py</code> 即可生成。';
-    $('#tabs').hidden = true;
-    document.querySelectorAll('section').forEach(s => s.hidden = true);
-    return;
+$("f").onchange = async ev => {
+  const files = Array.from(ev.target.files || []);
+  ev.target.value = "";
+  for(const f of files){
+    if(pending.length >= CFG.max_files){ hint("一次最多 " + CFG.max_files + " 个附件", true); break; }
+    const isVid = /^video\//.test(f.type || "");
+    const cap = (isVid ? CFG.video_mb : CFG.image_mb) * 1048576;
+    if(f.size > cap){ hint(f.name + " 超过 " + (isVid?CFG.video_mb:CFG.image_mb) + " MB", true); continue; }
+    const slot = {label:f.name.slice(0,28), size:f.size, name:null};
+    pending.push(slot); drawQueue(); hint("正在上传 " + slot.label + " …");
+    try{
+      slot.name = await upload(f);
+      hint("");
+    }catch(e){
+      pending.splice(pending.indexOf(slot), 1); drawQueue();
+      hint(e.message, true);
+    }
   }
-  // 优先显示给人看的版本号(0.1 起 +0.1);老库没有 label 时回退到内部整数版本号。
-  $('#ver').textContent = D.label ? ('特征库 ' + D.label) : ('特征库 v' + D.version);
-  $('#ver').title = '内部版本号 v' + D.version + '（客户端据此判断是否需要重新下载）';
-  $('#n-live').textContent = D.live;
-  $('#n-cut').textContent = D.served - D.live;
-  $('#n-mk').textContent = D.mk.length;
-  // 没有正常语料时「按正常软件出现数」排序是个死控件,直接去掉,不留下来让人点了没反应
-  if(!BENCOL()){
-    const o = document.querySelector('#sort option[value="ben"]');
-    if(o) o.remove();
-  }
-  $('#foot').innerHTML = '构建于 ' + esc(D.built_at || '—')
-    + ' · 下载接口 <code>/v1/engine/manifest</code>、<code>/v1/engine/patterns</code>'
-    + ' · <a href="/online">连接与访问</a> · <a href="/">返回威胁分析台</a>';
-  D.tactics.forEach(t => { TAC[t.k] = t.t; });
-  status(); gradeChips(); tacChips(); rsnChips(); lvChips(); deadChips(); mtacChips();
-  renderLive(); renderCut(); renderMk(); renderBuild(); renderHow();
+  drawQueue();
+};
 
-  // 页签支持 #cut / #mk / #build 锚点 —— 排查时要能把「就是这条」的链接直接发给人。
-  $('#tabs').onclick = e => {
-    const b = e.target.closest('button');
-    if(!b) return;
-    setTab(b.dataset.tab);
-    history.replaceState(null, '', '#' + b.dataset.tab);
-  };
-  setTab((location.hash || '#live').slice(1));
-  addEventListener('hashchange', () => setTab((location.hash || '#live').slice(1)));
-
-  $('#q').oninput   = e => { S.q = e.target.value; renderLive(); };
-  $('#sort').onchange = e => { S.sort = e.target.value; renderLive(); };
-  $('#q2').oninput  = e => { S.q2 = e.target.value; renderCut(); };
-  $('#mq').oninput  = e => { S.mq = e.target.value; renderMk(); };
+async function send(){
+  if(sending) return;
+  const box = $("box");
+  const body = box.value.trim();
+  const files = pending.filter(p => p.name).map(p => p.name);
+  if(!body && !files.length){ hint("请输入内容或选择要发送的文件", true); return; }
+  if(body.length > CFG.max_chars){ hint("内容超过 " + CFG.max_chars + " 字", true); return; }
+  sending = true; $("send").disabled = true; hint("");
+  try{
+    const r = await fetch("/support/api/send", {
+      method:"POST", credentials:"same-origin",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({body:body, files:files})});
+    const d = await r.json();
+    if(!d.ok){ hint(d.error || "发送失败", true); }
+    else{
+      box.value = ""; pending = []; drawQueue();
+      if(d.messages) render(d.messages);
+    }
+  }catch(e){ hint("发送失败：" + e.message, true); }
+  sending = false; $("send").disabled = false; box.focus();
 }
-init();
-</script></body></html>'''
+
+$("send").onclick = send;
+$("box").addEventListener("keydown", e => {
+  if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$("box").addEventListener("input", e => {
+  e.target.style.height = "auto";
+  e.target.style.height = Math.min(140, e.target.scrollHeight) + "px";
+});
+boot();
+</script>
+</body>
+</html>
+'''
+
+
+# ---- /support/admin 客服台 ---------------------------------------------------- #
+#
+# 两栏:左边会话列表(带未读数),右边一条时间线。和访客页共用同一套气泡样式 ——
+# 同一种东西在同一个产品里不该有两种排法。
+_SUPPORT_ADMIN_PAGE = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>客服台 · 磐垒</title>
+<style>
+:root{
+  --bwbg:#edf0f5; --bwpnl:#ffffff; --bwsoft:#f9fafb;
+  --bwln:#e4e7ec; --bwln2:#f2f4f7;
+  --bwink:#101828; --bwink2:#344054; --bwmut:#667085; --bwdim:#98a2b3;
+  --bwac:#2563eb; --bwmal:#d92d20; --bwsus:#b54708; --bwok:#067647;
+  --bwmono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace;
+  --bwsans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bwbg);color:var(--bwink);font:14px/1.65 var(--bwsans);
+  -webkit-font-smoothing:antialiased}
+a{color:var(--bwac);text-decoration:none}
+
+.bwrail{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--bwln)}
+.bwrail .in{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:16px;
+  padding:10px 22px}
+.bwbrand{display:flex;align-items:center;gap:10px;flex:none}
+.bwbrand .mk{width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--bwac);color:#fff;font-size:15px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+.bwbrand b{display:block;font-size:13.5px;font-weight:800;letter-spacing:2.2px;
+  color:var(--bwink);line-height:1.1}
+.bwbrand s{display:block;text-decoration:none;font-size:9px;color:var(--bwmut);
+  letter-spacing:1.3px;margin-top:2px}
+.bwgrow{flex:1}
+.bwnav{display:flex;gap:2px}
+.bwnav a{display:inline-flex;align-items:center;gap:7px;padding:9px 13px;
+  font-size:12.5px;font-weight:600;color:var(--bwmut);white-space:nowrap}
+.bwnav a.on{color:var(--bwac);box-shadow:inset 0 -2px 0 var(--bwac)}
+.bwnav a:hover{color:var(--bwink)}
+/* 导航图标。缺这一条不会报错也不会渲染失败 —— emoji 只是跟着正文字号走,比其余
+   页面的顶栏略小一点,是那种没人会去查的差异。「无规则类」检查就是为这种东西存在的。 */
+.bwnav a .i{font-size:13px;line-height:1}
+
+.wrap{max-width:1440px;margin:0 auto;padding:16px 22px 24px}
+.bwstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,200px));
+  justify-content:start;gap:12px;margin:0 0 16px}
+.bwstat{background:var(--bwpnl);border:1px solid var(--bwln);
+  border-top:2px solid var(--bwac);padding:11px 14px}
+.bwstat .v{font-family:var(--bwmono);font-size:23px;font-weight:800;line-height:1.05;
+  font-variant-numeric:tabular-nums}
+.bwstat .k{font-size:10.5px;color:var(--bwmut);margin-top:3px;letter-spacing:1px}
+.bwstat.sus{border-top-color:var(--bwsus)}.bwstat.sus .v{color:var(--bwsus)}
+.bwstat.ok{border-top-color:var(--bwok)}.bwstat.ok .v{color:var(--bwok)}
+
+.cols{display:grid;grid-template-columns:320px 1fr;gap:14px;align-items:start}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.list{background:var(--bwpnl);border:1px solid var(--bwln);max-height:74vh;
+  overflow-y:auto}
+.cv{display:block;width:100%;text-align:left;background:none;border:none;
+  border-bottom:1px solid var(--bwln2);padding:11px 13px;cursor:pointer;font:inherit}
+.cv:hover{background:rgba(37,99,235,.04)}
+.cv.on{background:rgba(37,99,235,.08);box-shadow:inset 2px 0 0 var(--bwac)}
+.cv .t{display:flex;align-items:baseline;gap:8px}
+.cv .t b{font-size:12.5px;font-weight:700;color:var(--bwink);font-family:var(--bwmono)}
+.cv .t i{font-style:normal;font:10.5px var(--bwmono);color:var(--bwdim);margin-left:auto}
+.cv .p{font-size:12px;color:var(--bwmut);margin-top:3px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.cv .n{display:inline-block;min-width:17px;text-align:center;background:var(--bwmal);
+  color:#fff;font:700 10px var(--bwmono);padding:1px 5px;border-radius:9px}
+.cv.done .t b{color:var(--bwdim)}
+.pane{background:var(--bwpnl);border:1px solid var(--bwln);display:flex;
+  flex-direction:column;min-height:420px}
+.pane .ph{display:flex;align-items:center;gap:10px;padding:11px 15px;
+  border-bottom:1px solid var(--bwln)}
+.pane .ph b{font:700 12.5px var(--bwmono);color:var(--bwink)}
+.pane .ph span{font-size:11.5px;color:var(--bwmut)}
+.pane .ph .sp{flex:1}
+.pane .ph button{background:none;border:1px solid var(--bwln);color:var(--bwink2);
+  padding:5px 11px;font:600 12px var(--bwsans);cursor:pointer}
+.pane .ph button:hover{border-color:var(--bwac);color:var(--bwac)}
+.thread{flex:1;padding:15px 18px;overflow-y:auto;max-height:56vh;min-height:200px}
+.m{display:flex;flex-direction:column;margin-bottom:14px;max-width:76%}
+.m.me{margin-left:auto;align-items:flex-end}
+.m .bd{padding:9px 12px;font-size:13.5px;line-height:1.6;white-space:pre-wrap;
+  word-break:break-word;background:var(--bwsoft);border:1px solid var(--bwln)}
+.m.me .bd{background:var(--bwac);border-color:var(--bwac);color:#fff}
+.m .ts{font:10.5px var(--bwmono);color:var(--bwdim);margin-top:4px}
+.m.sys{max-width:100%;align-items:center;margin:10px 0 16px}
+.m.sys .bd{background:none;border:none;color:var(--bwdim);font-size:12px;padding:0}
+.fx{display:flex;flex-wrap:wrap;gap:7px;margin-top:7px}
+.fx a{display:block;line-height:0;border:1px solid var(--bwln);overflow:hidden}
+.fx img{width:132px;height:92px;object-fit:cover;display:block;background:var(--bwln2)}
+.fx video{width:240px;max-height:180px;display:block;background:#000}
+.empty{color:var(--bwdim);font-size:12.5px;text-align:center;padding:52px 0}
+.comp{border-top:1px solid var(--bwln);padding:11px 12px}
+.q{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.q span{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;
+  background:var(--bwsoft);border:1px solid var(--bwln);padding:3px 8px}
+.q span b{cursor:pointer;color:var(--bwdim);font-weight:700}
+.rw{display:flex;align-items:flex-end;gap:8px}
+.clip{flex:none;width:38px;height:38px;display:grid;place-items:center;cursor:pointer;
+  border:1px solid var(--bwln);background:var(--bwsoft);font-size:16px}
+.clip:hover{border-color:var(--bwac)}
+textarea{flex:1;resize:none;min-height:38px;max-height:140px;padding:9px 11px;
+  border:1px solid var(--bwln);background:var(--bwbg);color:var(--bwink);
+  font:14px/1.5 var(--bwsans);outline:none}
+textarea:focus{border-color:var(--bwac);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+button.snd{flex:none;padding:0 18px;height:38px;background:var(--bwac);color:#fff;
+  border:none;font:700 13px/1 var(--bwsans);letter-spacing:1px;cursor:pointer}
+button.snd:disabled{background:var(--bwdim);cursor:default}
+.hint{margin-top:8px;font-size:11.5px;color:var(--bwdim)}
+.hint.bad{color:var(--bwmal)}
+.note{margin:0 0 14px;font-size:12px;color:var(--bwmut)}
+</style>
+</head>
+<body>
+<div class="bwrail"><div class="in">
+<a class="bwbrand" href="/"><span class="mk">&#128737;</span>
+<span><b>BULWARK</b><s>THREAT ANALYSIS CONSOLE</s></span></a>
+<div class="bwgrow"></div>
+<nav class="bwnav">
+<a href="/"><span class="i">&#128737;</span>控制台</a>
+<a href="/support/admin" class="on"><span class="i">&#127911;</span>客服台</a>
+<a href="/feedback"><span class="i">&#128172;</span>反馈</a>
+<a href="/online"><span class="i">&#128225;</span>在线客户端</a>
+</nav>
+</div></div>
+
+<div class="wrap">
+  <div class="bwstats" id="stats"></div>
+  <p class="note" id="note"></p>
+  <div class="cols">
+    <div class="list" id="list"></div>
+    <div class="pane">
+      <div class="ph">
+        <b id="pt">未选择会话</b><span id="pm"></span><div class="sp"></div>
+        <button id="close" hidden>结束会话</button>
+      </div>
+      <div class="thread" id="thread"><div class="empty">从左侧选择一条会话</div></div>
+      <div class="comp">
+        <div class="q" id="q"></div>
+        <div class="rw">
+          <label class="clip" for="f" title="发送图片或视频">&#128206;</label>
+          <input type="file" id="f" multiple hidden
+            accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/quicktime,video/webm">
+          <textarea id="box" rows="1" placeholder="回复访客，回车发送"></textarea>
+          <button class="snd" id="send" disabled>发送</button>
+        </div>
+        <div class="hint" id="hint"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const CFG = /*__CFG__*/null;
+const $ = id => document.getElementById(id);
+let cur = null, lastId = 0, cursor = 0, pending = [], convs = [];
+
+function hhmm(iso){
+  const ms = Date.parse(iso);
+  if(!ms) return "";
+  const t = new Date(ms + 8*3600*1000), p = n => (n<10?"0":"")+n;
+  return p(t.getUTCHours())+":"+p(t.getUTCMinutes());
+}
+function rel(iso){
+  const ms = Date.parse(iso);
+  if(!ms) return "";
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if(s < 60) return "刚刚";
+  if(s < 3600) return Math.floor(s/60) + " 分钟前";
+  if(s < 86400) return Math.floor(s/3600) + " 小时前";
+  return Math.floor(s/86400) + " 天前";
+}
+function hint(t, bad){ $("hint").textContent = t || "";
+  $("hint").className = "hint" + (bad ? " bad" : ""); }
+
+function drawStats(s){
+  const cells = [["待回复", s.waiting, s.waiting ? "sus" : ""],
+                 ["进行中", s.open, "ok"], ["会话总数", s.conversations, ""],
+                 ["消息总数", s.messages, ""]];
+  const box = $("stats"); box.textContent = "";
+  cells.forEach(c => {
+    const d = document.createElement("div"); d.className = "bwstat " + c[2];
+    const v = document.createElement("div"); v.className = "v"; v.textContent = c[1];
+    const k = document.createElement("div"); k.className = "k"; k.textContent = c[0];
+    d.appendChild(v); d.appendChild(k); box.appendChild(d);
+  });
+  $("note").textContent = "对话与附件在 " + CFG.retention_days
+    + " 天后由定时任务整体删除，包括访客上传的图片和视频。附件目录已用 "
+    + s.media_mb + " MB。";
+}
+
+function drawList(){
+  const box = $("list"); box.textContent = "";
+  if(!convs.length){
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "还没有访客发起会话"; box.appendChild(e); return;
+  }
+  convs.forEach(c => {
+    const b = document.createElement("button");
+    b.className = "cv" + (c.token === cur ? " on" : "")
+      + (c.status === "closed" ? " done" : "");
+    const t = document.createElement("div"); t.className = "t";
+    const nm = document.createElement("b"); nm.textContent = c.ip;
+    t.appendChild(nm);
+    if(c.unread > 0){
+      const n = document.createElement("span"); n.className = "n";
+      n.textContent = c.unread; t.appendChild(n);
+    }
+    const ago = document.createElement("i"); ago.textContent = rel(c.last_at);
+    t.appendChild(ago);
+    const p = document.createElement("div"); p.className = "p";
+    p.textContent = c.preview || "（仅附件）";
+    b.appendChild(t); b.appendChild(p);
+    b.onclick = () => open(c.token);
+    box.appendChild(b);
+  });
+}
+
+function render(rows, reset){
+  const th = $("thread");
+  if(reset){ th.textContent = ""; lastId = 0; }
+  if(th.querySelector(".empty")) th.textContent = "";
+  rows.forEach(m => {
+    const d = document.createElement("div");
+    d.className = "m " + (m.who === "agent" ? "me" : (m.who === "system" ? "sys" : ""));
+    if(m.body){
+      const b = document.createElement("div");
+      b.className = "bd"; b.textContent = m.body; d.appendChild(b);
+    }
+    if(m.files && m.files.length){
+      const fx = document.createElement("div"); fx.className = "fx";
+      m.files.forEach(f => {
+        const url = "/support/media/" + encodeURIComponent(f.name);
+        if(f.kind === "video"){
+          const v = document.createElement("video");
+          v.src = url; v.controls = true; v.preload = "metadata"; fx.appendChild(v);
+        } else {
+          const a = document.createElement("a");
+          a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+          const i = document.createElement("img");
+          i.src = url; i.loading = "lazy"; i.alt = "附件";
+          a.appendChild(i); fx.appendChild(a);
+        }
+      });
+      d.appendChild(fx);
+    }
+    if(m.who !== "system"){
+      const t = document.createElement("div");
+      t.className = "ts"; t.textContent = hhmm(m.at); d.appendChild(t);
+    }
+    th.appendChild(d);
+    if(m.id > lastId) lastId = m.id;
+  });
+  th.scrollTop = th.scrollHeight;
+}
+
+async function open(token){
+  cur = token; pending = []; drawQueue(); hint("");
+  const c = convs.filter(x => x.token === token)[0] || {};
+  $("pt").textContent = c.ip || "会话";
+  $("pm").textContent = (c.agent || "") + " · " + (c.page || "") + " · " + (c.msgs || 0) + " 条";
+  $("close").hidden = false;
+  $("close").textContent = c.status === "closed" ? "重新打开" : "结束会话";
+  $("send").disabled = false;
+  drawList();
+  const r = await fetch("/support/admin/api/thread?token=" + encodeURIComponent(token),
+                        {credentials:"same-origin"});
+  const d = await r.json();
+  if(d.ok) render(d.messages, true);
+  refresh();
+}
+
+function drawQueue(){
+  const q = $("q"); q.textContent = "";
+  pending.forEach((p, i) => {
+    const s = document.createElement("span");
+    s.appendChild(document.createTextNode(p.label));
+    const x = document.createElement("b"); x.textContent = "\u00d7";
+    x.onclick = () => { pending.splice(i,1); drawQueue(); };
+    s.appendChild(x); q.appendChild(s);
+  });
+}
+
+async function refresh(){
+  const r = await fetch("/support/admin/api/list", {credentials:"same-origin"});
+  const d = await r.json();
+  if(!d.ok) return;
+  convs = d.conversations; drawStats(d.stats); drawList();
+}
+
+/* 客服台的长轮询挂在「全部会话的最大消息 id」上:任何会话来了新消息都会醒。
+   醒来后只刷新列表,当前会话的消息再单独取一次 —— 这样列表的未读数和红点是活的,
+   不必为每条会话各挂一个连接。 */
+async function poll(){
+  for(;;){
+    try{
+      const r = await fetch("/support/admin/api/poll?after=" + cursor,
+                            {credentials:"same-origin"});
+      const d = await r.json();
+      if(d.ok){
+        cursor = d.cursor;
+        if(d.hit){
+          await refresh();
+          if(cur){
+            const t = await fetch("/support/admin/api/thread?token="
+              + encodeURIComponent(cur) + "&after=" + lastId, {credentials:"same-origin"});
+            const td = await t.json();
+            if(td.ok && td.messages.length) render(td.messages, false);
+          }
+        }
+      }
+    }catch(e){ await new Promise(s => setTimeout(s, 3000)); }
+  }
+}
+
+async function upload(file){
+  const q = "?name=" + encodeURIComponent(file.name || "file")
+          + "&token=" + encodeURIComponent(cur);
+  const r = await fetch("/support/admin/api/upload" + q, {
+    method:"POST", credentials:"same-origin", body:file,
+    headers:{"Content-Type":"application/octet-stream"}});
+  const d = await r.json();
+  if(!d.ok) throw new Error(d.error || "上传失败");
+  return d.name;
+}
+
+$("f").onchange = async ev => {
+  const files = Array.from(ev.target.files || []); ev.target.value = "";
+  if(!cur){ hint("先选择一条会话", true); return; }
+  for(const f of files){
+    if(pending.length >= CFG.max_files){ hint("一次最多 " + CFG.max_files + " 个", true); break; }
+    const slot = {label:f.name.slice(0,28), name:null};
+    pending.push(slot); drawQueue(); hint("正在上传 " + slot.label + " …");
+    try{ slot.name = await upload(f); hint(""); }
+    catch(e){ pending.splice(pending.indexOf(slot),1); drawQueue(); hint(e.message, true); }
+  }
+  drawQueue();
+};
+
+async function send(){
+  if(!cur) return;
+  const box = $("box"), body = box.value.trim();
+  const files = pending.filter(p => p.name).map(p => p.name);
+  if(!body && !files.length){ hint("请输入内容或选择文件", true); return; }
+  $("send").disabled = true;
+  try{
+    const r = await fetch("/support/admin/api/reply", {
+      method:"POST", credentials:"same-origin",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({token:cur, body:body, files:files})});
+    const d = await r.json();
+    if(!d.ok) hint(d.error || "发送失败", true);
+    else{ box.value = ""; pending = []; drawQueue(); hint("");
+          if(d.messages) render(d.messages, false); refresh(); }
+  }catch(e){ hint("发送失败：" + e.message, true); }
+  $("send").disabled = false; box.focus();
+}
+
+$("send").onclick = send;
+$("box").addEventListener("keydown", e => {
+  if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+});
+$("close").onclick = async () => {
+  if(!cur) return;
+  const c = convs.filter(x => x.token === cur)[0] || {};
+  const want = c.status === "closed" ? "open" : "closed";
+  await fetch("/support/admin/api/status", {method:"POST", credentials:"same-origin",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({token:cur, status:want})});
+  await refresh();
+  const c2 = convs.filter(x => x.token === cur)[0] || {};
+  $("close").textContent = c2.status === "closed" ? "重新打开" : "结束会话";
+};
+
+(async () => { await refresh(); cursor = CFG.cursor; poll(); })();
+</script>
+</body>
+</html>
+'''
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2662,25 +4285,66 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _serve_login_page(self, error=""):
-        err_html = '<p style="color:red">' + error + '</p>' if error else ''
+        # 错误提示用状态色而不是字面 red:后者比页面上任何一个红都更刺眼,
+        # 和其余页面的「恶意」红也不是同一个色。
+        err_html = ('<p class="err">' + error + '</p>') if error else ''
         html = '''<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bulwark - Login</title>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磐垒 · 登录</title>
 <style>
-body{font-family:system-ui;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0d1117;color:#c9d1d9}
-.box{background:#161b22;padding:40px;border-radius:12px;border:1px solid #30363d;width:320px;text-align:center}
-h2{margin:0 0 20px;color:#58a6ff}
-input[type=password]{width:100%;padding:12px;margin:8px 0;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#c9d1d9;font-size:15px;box-sizing:border-box}
-button{width:100%;padding:12px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer;margin-top:8px}
-button:hover{background:#2ea043}
+/* 与其余页面同一套配色:白底、单一强调蓝、加深后的状态色。 */
+:root{--bg:#edf0f5;--pnl:#ffffff;--ln:#e4e7ec;--ink:#101828;--mut:#667085;
+  --dim:#98a2b3;--acc:#2563eb;--mal:#d92d20;
+  --sans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+  --mono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace}
+*{box-sizing:border-box}
+body{font:14px/1.6 var(--sans);display:flex;justify-content:center;align-items:center;
+  min-height:100vh;margin:0;background:var(--bg);color:var(--ink)}
+/* 极淡的网格 + 顶部冷光,和控制台是同一个底子 */
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:
+  repeating-linear-gradient(0deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px),
+  repeating-linear-gradient(90deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1000px 460px at 50% -14%,rgba(37,99,235,.08),transparent 70%)}
+.box{background:var(--pnl);padding:34px 32px;border:1px solid var(--ln);width:352px;
+  box-shadow:0 1px 2px rgba(16,24,40,.05),0 12px 32px rgba(16,24,40,.08)}
+.mk{width:36px;height:36px;display:grid;place-items:center;background:var(--acc);
+  color:#fff;font-size:18px;margin-bottom:16px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+h2{margin:0;font-size:16px;font-weight:800;letter-spacing:1.6px}
+.sub{margin:5px 0 22px;color:var(--mut);font-size:11.5px;letter-spacing:.9px;
+  font-family:var(--mono)}
+label{display:block;font-size:10.5px;font-weight:700;color:var(--mut);
+  letter-spacing:1.1px;margin-bottom:7px}
+input[type=password]{width:100%;padding:12px 13px;border:1px solid var(--ln);
+  border-left:2px solid var(--acc);background:var(--bg);color:var(--ink);
+  font:14px var(--mono);letter-spacing:1px;outline:none;transition:.15s}
+input[type=password]:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+input[type=password]::placeholder{color:var(--dim);letter-spacing:normal;
+  font-family:var(--sans)}
+button{width:100%;padding:12px;background:var(--acc);color:#fff;border:none;
+  font:700 13px/1 var(--sans);letter-spacing:1.2px;cursor:pointer;margin-top:14px;
+  transition:.13s;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),
+  calc(100% - 8px) 100%,0 100%,0 8px)}
+button:hover{filter:brightness(1.1)}
+button:active{transform:translateY(1px)}
+.err{margin:0 0 14px;padding:9px 12px;font-size:12.5px;color:var(--mal);
+  background:rgba(217,45,32,.07);border-left:2px solid var(--mal)}
+.foot{margin-top:18px;font-size:10.5px;color:var(--dim);font-family:var(--mono);
+  letter-spacing:.5px}
 </style></head><body>
 <div class="box">
-<h2>Bulwark VT</h2>
+<div class="mk">&#128737;</div>
+<h2>BULWARK</h2>
+<div class="sub">THREAT ANALYSIS CONSOLE</div>
 ''' + err_html + '''
 <form method="POST" action="/login">
-<input type="password" name="password" placeholder="请输入密码" autofocus>
+<label for="pw">访问口令</label>
+<input id="pw" type="password" name="password" placeholder="请输入密码" autofocus>
 <button type="submit">登录</button>
 </form>
+<div class="foot">仅授权人员访问</div>
 </div></body></html>'''
         self._send_bytes(200, html.encode("utf-8"), "text/html; charset=utf-8")
 
@@ -2736,6 +4400,322 @@ button:hover{background:#2ea043}
                 "identified": st.get("identified", 0), "window_min": st["window_min"],
                 "clients": clients}
 
+    def _serve_feedback(self):
+        """管理页:查看用户提交的问题反馈。走网页口令,不对外公开。
+
+        所有用户可控文本(内容/联系方式/UA/页面)都必须转义后再插进 HTML ——
+        提交口是公开的,不转义的话一条反馈就是一次存储型 XSS,而看这个页面的
+        恰恰是带着 bw_session 的管理员。
+        """
+        if not self._check_webui_cookie():
+            return self._serve_login_page()
+
+        def esc(s):
+            return (str(s if s is not None else "").replace("&", "&amp;")
+                    .replace("<", "&lt;").replace(">", "&gt;")
+                    .replace('"', "&quot;").replace("'", "&#39;"))
+
+        def rel(ts):
+            t = parse_iso(ts)
+            if not t:
+                return ts or "—"
+            secs = int((now_utc() - t).total_seconds())
+            if secs < 60:
+                return "刚刚"
+            if secs < 3600:
+                return "%d 分钟前" % (secs // 60)
+            if secs < 86400:
+                return "%d 小时前" % (secs // 3600)
+            # 过一天就给北京时间的绝对时刻。「37 天前」对排查没有用,而看这两页的人
+            # 通常是要拿这个时间去跟客户端日志对时的。
+            return cst_str(ts, "%m-%d %H:%M")
+
+        KIND = {"bug": "功能异常", "fp": "误报", "fn": "漏报",
+                "feature": "功能建议", "other": "其它"}
+        items = SERVICE.store.list_feedback(limit=500)
+        st = SERVICE.store.feedback_stats()
+        img_gated = not self._webui_password()
+
+        rows = []
+        for f in items:
+            done = f.get("status") == "done"
+            kind = KIND.get(f.get("kind", "other"), f.get("kind", "other"))
+            contact = f.get("contact") or ""
+            # 截图。文件名过一遍白名单正则才拼进 HTML —— 库里的值理论上都是服务端
+            # 生成的,但这是给管理员看的页面,不值得为"理论上"省这一道。
+            try:
+                names = json.loads(f.get("images") or "[]")
+            except Exception:
+                names = []
+            names = [str(n) for n in (names if isinstance(names, list) else [])
+                     if IMG_NAME_RE.match(str(n))]
+            if names and img_gated:
+                # 截图取回口 fail closed(见 _serve_feedback_image)。这里说清楚
+                # 图还在、为什么看不到、怎么才能看到 —— 直接放 <img> 只会得到
+                # 一排碎图标,没人知道发生了什么。
+                shots_html = ('<div class="shots"><span class="dim">已收到 %d 张截图,'
+                              '但本服务未设置 webui_password。为避免公网无鉴权读取'
+                              '用户上传的内容,截图暂不显示 —— 配置 webui_password '
+                              '并重启后即可查看。</span></div>' % len(names))
+            elif names:
+                shots_html = '<div class="shots">%s</div>' % "".join(
+                    '<a class="shot" href="/feedback/img/%s" target="_blank" '
+                    'rel="noopener noreferrer"><img src="/feedback/img/%s" '
+                    'alt="用户截图" loading="lazy"></a>' % (esc(n), esc(n)) for n in names)
+            else:
+                shots_html = ""
+            msg_html = esc(f.get("message", "")).replace("\n", "<br>")
+            if not msg_html and shots_html:
+                msg_html = '<span class="dim">(只有截图,没有文字)</span>'
+            if f.get("reply"):
+                msg_html += ('<div class="rpshow"><b>处理结果</b>%s<span class="dim">%s</span></div>'
+                             % (esc(f.get("reply", "")).replace("\n", "<br>"),
+                                esc(rel(f.get("replied_at")))))
+            if done and not names:
+                msg_html += '<div class="dim" style="margin-top:6px">截图已随处理完成自动删除</div>'
+            rows.append(
+                '<tr class="%s" data-id="%d">'
+                '<td class="num">#%d</td>'
+                '<td><span class="k">%s</span></td>'
+                '<td class="msg">%s</td>'
+                '<td class="meta">%s</td>'
+                '<td class="meta">%s<br><span class="dim">%s · %s</span></td>'
+                '<td class="act">'
+                '<input class="rp" placeholder="处理结果(提交者可见)" value="%s">'
+                '<button class="b" data-act="%s">%s</button>'
+                '<button class="b d" data-act="delete">删除</button>'
+                '</td></tr>'
+                % ("done" if done else "",
+                   int(f["id"]), int(f["id"]), esc(kind),
+                   msg_html + shots_html,
+                   esc(contact) if contact else '<span class="dim">未留</span>',
+                   esc(rel(f.get("at"))), esc(mask_ip(f.get("ip", ""))),
+                   esc(f.get("agent", "") or "—"),
+                   esc(f.get("reply", "") or ""),
+                   "new" if done else "done",
+                   "标为未读" if done else "标记已处理"))
+        rows_html = "\n".join(rows) if rows else (
+            '<tr><td colspan="6" class="empty">还没有收到反馈</td></tr>')
+
+        html = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>磐垒 · 问题反馈</title>
+<style>
+/* ===== 共享控制台外壳(注入 app.py 内嵌的各页面)=====================
+   这些页面各自有一套自己的 class 名和版式。这里不去逐页重写,而是统一
+   三件决定"是不是同一个产品"的东西:底子(白底+网格)、顶栏、以及标题/
+   表格/瓦片这几个到处都在用的组件。
+   放在每页样式块的最前面 —— 页面自己的规则在后面,仍可覆盖它。
+   ==================================================================== */
+:root{
+  /* 页面压暗、面板留纯白。原来两者都是 #ffffff，面板只能靠边框描出来，整页过亮。 */
+  --bwbg:#edf0f5; --bwpnl:#ffffff; --bwsoft:#f9fafb;
+  --bwln:#e4e7ec; --bwln2:#f2f4f7;
+  --bwink:#101828; --bwink2:#344054; --bwmut:#667085; --bwdim:#98a2b3;
+  --bwac:#2563eb; --bwvi:#7c3aed;
+  --bwmal:#d92d20; --bwsus:#b54708; --bwok:#067647;
+  --bwmono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace;
+  --bwsans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+}
+body{background:var(--bwbg);color:var(--bwink);font-family:var(--bwsans);
+  -webkit-font-smoothing:antialiased}
+/* 白底上的网格必须是深色低透明度,白线等于不存在 */
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;background:
+  repeating-linear-gradient(0deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px),
+  repeating-linear-gradient(90deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1200px 520px at 50% -12%,rgba(37,99,235,.07),transparent 70%)}
+
+/* ---- 顶栏:和 / 上完全一致,导航才不会每页一个样 ---- */
+.bwrail{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--bwln)}
+.bwrail .in{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:16px;
+  padding:10px 22px}
+.bwbrand{display:flex;align-items:center;gap:10px;text-decoration:none;flex:none}
+.bwbrand .mk{width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--bwac);color:#fff;font-size:15px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+.bwbrand b{display:block;font-size:13.5px;font-weight:800;letter-spacing:2.2px;
+  color:var(--bwink);line-height:1.1}
+.bwbrand s{display:block;text-decoration:none;font-size:9px;color:var(--bwmut);
+  letter-spacing:1.3px;margin-top:2px}
+.bwgrow{flex:1}
+.bwnav{display:flex;align-items:stretch;gap:2px;overflow-x:auto;
+  scrollbar-width:none;-ms-overflow-style:none}
+.bwnav::-webkit-scrollbar{display:none}
+.bwnav a{position:relative;display:inline-flex;align-items:center;gap:7px;
+  padding:9px 13px;font-size:12.5px;font-weight:600;letter-spacing:.5px;
+  color:var(--bwmut);text-decoration:none;white-space:nowrap}
+.bwnav a::after{content:"";position:absolute;left:11px;right:11px;bottom:-1px;height:2px;
+  background:var(--bwac);opacity:0;transition:opacity .16s}
+.bwnav a:hover{color:var(--bwink);text-decoration:none}
+.bwnav a:hover::after{opacity:.5}
+.bwnav a.on{color:var(--bwac)}
+.bwnav a.on::after{opacity:1}
+.bwnav a .i{font-size:13px;line-height:1}
+
+/* ---- 到处都在用的组件 ---- */
+h1{font-size:21px;font-weight:800;letter-spacing:-.2px;color:var(--bwink)}
+h2{font-size:12px!important;font-weight:800;letter-spacing:1.6px;color:var(--bwink);
+  display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--bwln2)!important;
+  padding-bottom:9px!important}
+h2::before{content:"";width:2px;height:13px;background:var(--bwac);flex:none}
+a{color:var(--bwac)}
+code{font-family:var(--bwmono);background:var(--bwsoft);border:1px solid var(--bwln);
+  border-radius:0;color:#1d4ed8}
+pre{border-radius:0!important;border:1px solid var(--bwln)}
+table th{color:var(--bwdim)!important;font-size:9.5px!important;font-weight:700;
+  text-transform:uppercase;letter-spacing:1.2px;background:var(--bwsoft)}
+table td{border-bottom:1px solid var(--bwln2)}
+table tbody tr:hover td{background:rgba(37,99,235,.04)}
+table tbody tr:hover td:first-child{box-shadow:inset 2px 0 0 var(--bwac)}
+/* 统计瓦片:顶部 2px 状态色 + 大号等宽数字,和 / 的 .hstat 同一个样式 */
+.bwstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,240px));justify-content:start;
+  gap:12px;margin:0 0 18px}
+.bwstat{background:var(--bwpnl);border:1px solid var(--bwln);border-top:2px solid var(--bwac);
+  padding:13px 15px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.bwstat .v{font-family:var(--bwmono);font-size:25px;font-weight:800;line-height:1.05;
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+/* background/padding/border-radius 是显式清零的，不是多余代码：这些页面各自留着
+   给旧标记用的 .k 药丸样式（圆角底色），而 .bwstat .k 只要不写这几个属性，页面级
+   的 .k 就会漏进来，标签变成一颗药丸。清零比去每个页面删旧规则安全 —— 那些旧
+   规则可能还有别处在用。 */
+.bwstat .k{font-size:10.5px;color:var(--bwmut);margin-top:4px;letter-spacing:1.1px;
+  background:none;padding:0;border-radius:0;display:block;width:auto}
+.bwstat.mal{border-top-color:var(--bwmal)}.bwstat.mal .v{color:var(--bwmal)}
+.bwstat.sus{border-top-color:var(--bwsus)}.bwstat.sus .v{color:var(--bwsus)}
+.bwstat.ok{border-top-color:var(--bwok)}.bwstat.ok .v{color:var(--bwok)}
+@media(max-width:640px){.bwrail .in{padding:9px 14px}.bwbrand s{display:none}}
+
+:root{--bg:#edf0f5;--card:#fff;--soft:#f9fafb;--line:#e4e7ec;--ink:#101828;--muted:#667085;
+--dim:#98a2b3;--acc:#2563eb;--ok:#067647;--warn:#b54708}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,"Segoe UI",
+"Microsoft YaHei",sans-serif;padding:24px}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+.sub a{color:var(--acc);text-decoration:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th,td{padding:11px 13px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--soft);font-weight:600;font-size:12px;color:var(--muted);
+text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr.done{background:#fafbfd;color:var(--muted)}
+tr.done .msg{text-decoration:line-through;text-decoration-color:var(--dim)}
+.num{font-variant-numeric:tabular-nums;color:var(--muted);white-space:nowrap}
+.k{display:inline-block;padding:2px 9px;border-radius:99px;background:#eaf0ff;
+color:var(--acc);font-size:12px;white-space:nowrap}
+.msg{max-width:560px;word-break:break-word;white-space:normal}
+/* 用户截图。缩略图固定高度、cover 裁切,否则一张竖屏手机截图会把整行撑到
+   几百像素高,一页就只剩两条反馈能看。点开是原图(新标签页)。 */
+.shots{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+.shot{display:block;line-height:0;border:1px solid var(--line);border-radius:8px;
+overflow:hidden;transition:.14s}
+.shot:hover{border-color:var(--acc);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.1)}
+.shot img{width:110px;height:76px;object-fit:cover;display:block;background:#f2f4f8}
+.rp{display:block;width:190px;margin-bottom:6px;padding:5px 8px;border:1px solid var(--line);
+border-radius:7px;font:inherit;font-size:12.5px}
+.rp:focus{outline:none;border-color:var(--acc)}
+.rpshow{margin-top:8px;padding:8px 10px;border-left:3px solid var(--acc);background:#f6f8fd;
+border-radius:0 7px 7px 0;font-size:13px}
+.rpshow b{display:block;font-size:11.5px;color:var(--acc);margin-bottom:3px}
+.meta{font-size:12.5px;color:var(--muted);white-space:nowrap}
+.dim{color:var(--dim);font-size:11.5px}
+.empty{text-align:center;color:var(--dim);padding:34px}
+.act{white-space:nowrap}
+.b{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:7px;
+padding:5px 10px;font-size:12px;cursor:pointer;margin-right:5px}
+.b:hover{border-color:var(--acc);color:var(--acc)}
+.b.d:hover{border-color:#dc2626;color:#dc2626}
+.pill{display:inline-block;padding:3px 11px;border-radius:99px;font-size:12px;margin-right:8px}
+.p1{background:#fff5e6;color:var(--warn)}
+.p2{background:#e9f8ef;color:var(--ok)}
+</style></head><body>
+<div class="bwrail"><div class="in">
+<a class="bwbrand" href="/" title="返回控制台"><span class="mk">🛡️</span>
+<span><b>BULWARK</b><s>THREAT ANALYSIS CONSOLE</s></span></a>
+<div class="bwgrow"></div>
+<nav class="bwnav">
+<a href="/"><span class="i">🛡️</span>控制台</a>
+<a href="/engine" class=""><span class="i">🧬</span>攻击链引擎</a>
+<a href="/online" class=""><span class="i">📡</span>在线客户端</a>
+<a href="/support" class=""><span class="i">🎧</span>在线客服</a>
+<a href="/feedback" class="on"><span class="i">💬</span>反馈</a>
+<a href="/api/docs" class=""><span class="i">&#128268;</span>API 文档</a>
+<a href="/about" class=""><span class="i">📥</span>下载</a>
+</nav>
+<!-- 北京时间读数。这两台机器的系统时区是 UTC,而看页面的人在中国 —— 原来页面上
+     没有任何一处告诉你「现在几点」,读时间戳只能靠脑内加 8 小时。
+     样式写成内联:顶栏在 4 个页面里是 4 份字面量副本,内联能保证四份永远一致,
+     也不用去动那 4 份 CSS 副本、不改变 style 标签计数。 -->
+<div style="display:flex;flex-direction:column;align-items:flex-end;line-height:1.2;margin-left:16px">
+<b id="bwclk" style="font:600 13px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);font-variant-numeric:tabular-nums">--:--:--</b>
+<s id="bwclkd" style="text-decoration:none;font-size:10px;color:var(--mut)">北京时间</s>
+</div>
+</div></div>
+<script>
+(function(){
+  var b=document.getElementById("bwclk"),d=document.getElementById("bwclkd");
+  if(!b)return;
+  var DAYS=["\u65e5","\u4e00","\u4e8c","\u4e09","\u56db","\u4e94","\u516d"];
+  function p(n){return (n<10?"0":"")+n;}
+  function tick(){
+    /* Date.now() 是 UTC 毫秒;加 8 小时后再用 getUTC* 读出来,就是北京时间的墙上
+       钟面,与浏览器所在时区无关。用固定偏移而不是 toLocaleString("zh-CN") ——
+       后者受访问者系统时区影响,在国外打开会显示当地时间。中国无夏令时,
+       固定 +08:00 不会错。 */
+    var t=new Date(Date.now()+8*3600*1000);
+    b.textContent=p(t.getUTCHours())+":"+p(t.getUTCMinutes())+":"+p(t.getUTCSeconds());
+    if(d)d.textContent=t.getUTCFullYear()+"-"+p(t.getUTCMonth()+1)+"-"+p(t.getUTCDate())
+      +" \u5468"+DAYS[t.getUTCDay()]+" UTC+8";
+  }
+  tick();setInterval(tick,1000);
+})();
+</script>
+<div class="wrap">
+<h1>问题反馈</h1>
+<!-- 「未处理」是待办不是统计，所以用可疑色单独立成一块瓦片；返回链接删了 ——
+     顶栏已经有全站导航，页内再放一遍只是重复。 -->
+<div class="bwstats">
+<div class="bwstat sus"><div class="v">__NEW__</div><div class="k">待处理</div></div>
+<div class="bwstat"><div class="v">__TOTAL__</div><div class="k">累计提交</div></div>
+</div>
+<div class="card"><table>
+<thead><tr><th>#</th><th>类型</th><th>内容</th><th>联系方式</th><th>时间 / 来源</th><th>处理</th></tr></thead>
+<tbody id="tb">
+__ROWS__
+</tbody></table></div>
+</div>
+<script>
+document.getElementById('tb').addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const tr = b.closest('tr');
+  const id = +tr.dataset.id, act = b.dataset.act;
+  if (act === 'delete' && !confirm('删除这条反馈?')) return;
+  b.disabled = true;
+  try {
+    // 处理结果跟状态一起提交,省掉一次单独的"保存"动作。留空就不覆盖已有回复
+    // (reply 不传 = 不动),否则一次误点就会把之前写好的结论清空。
+    const rp = tr.querySelector('input.rp');
+    const payload = {id: id, action: act};
+    if (rp && rp.value.trim()) payload.reply = rp.value.trim();
+    const r = await fetch('/feedback/status', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)});
+    const d = await r.json();
+    if (!d.ok) { alert('操作失败'); b.disabled = false; return; }
+    location.reload();
+  } catch (err) { alert('操作失败: ' + err.message); b.disabled = false; }
+});
+</script></body></html>"""
+        html = (html.replace("__ROWS__", rows_html)
+                    .replace("__NEW__", str(st["new"]))
+                    .replace("__TOTAL__", str(st["total"])))
+        self._send_bytes(200, html.encode("utf-8"), "text/html; charset=utf-8")
+
     def _serve_online(self):
         """Public page: how many local clients are connected, with masked IPs."""
         if not self._check_webui_cookie():
@@ -2752,7 +4732,9 @@ button:hover{background:#2ea043}
                 return "%d 分钟前" % (secs // 60)
             if secs < 86400:
                 return "%d 小时前" % (secs // 3600)
-            return "%d 天前" % (secs // 86400)
+            # 过一天就给北京时间的绝对时刻。「37 天前」对排查没有用,而看这两页的人
+            # 通常是要拿这个时间去跟客户端日志对时的。
+            return cst_str(ts, "%m-%d %H:%M")
 
         st = SERVICE.store.clients_stats(window_min=15)
         rows = []
@@ -2799,11 +4781,99 @@ button:hover{background:#2ea043}
 <meta http-equiv="refresh" content="15">
 <title>磐垒 · 在线客户端</title>
 <style>
-:root{--bg:#eef1f7;--card:#fff;--soft:#f6f8fc;--line:#e4e8f0;--ink:#1b2230;--muted:#6b7688;
---brand:#6366f1;--brand2:#8b5cf6;--on:#0f9d58;--off:#c2c8d2;--mono:"Cascadia Mono",Consolas,monospace;
+/* ===== 共享控制台外壳(注入 app.py 内嵌的各页面)=====================
+   这些页面各自有一套自己的 class 名和版式。这里不去逐页重写,而是统一
+   三件决定"是不是同一个产品"的东西:底子(白底+网格)、顶栏、以及标题/
+   表格/瓦片这几个到处都在用的组件。
+   放在每页样式块的最前面 —— 页面自己的规则在后面,仍可覆盖它。
+   ==================================================================== */
+:root{
+  /* 页面压暗、面板留纯白。原来两者都是 #ffffff，面板只能靠边框描出来，整页过亮。 */
+  --bwbg:#edf0f5; --bwpnl:#ffffff; --bwsoft:#f9fafb;
+  --bwln:#e4e7ec; --bwln2:#f2f4f7;
+  --bwink:#101828; --bwink2:#344054; --bwmut:#667085; --bwdim:#98a2b3;
+  --bwac:#2563eb; --bwvi:#7c3aed;
+  --bwmal:#d92d20; --bwsus:#b54708; --bwok:#067647;
+  --bwmono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace;
+  --bwsans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+}
+body{background:var(--bwbg);color:var(--bwink);font-family:var(--bwsans);
+  -webkit-font-smoothing:antialiased}
+/* 白底上的网格必须是深色低透明度,白线等于不存在 */
+body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;background:
+  repeating-linear-gradient(0deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px),
+  repeating-linear-gradient(90deg,transparent 0 47px,rgba(16,24,40,.03) 47px 48px)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(1200px 520px at 50% -12%,rgba(37,99,235,.07),transparent 70%)}
+
+/* ---- 顶栏:和 / 上完全一致,导航才不会每页一个样 ---- */
+.bwrail{position:sticky;top:0;z-index:60;background:rgba(255,255,255,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--bwln)}
+.bwrail .in{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:16px;
+  padding:10px 22px}
+.bwbrand{display:flex;align-items:center;gap:10px;text-decoration:none;flex:none}
+.bwbrand .mk{width:30px;height:30px;flex:none;display:grid;place-items:center;
+  background:var(--bwac);color:#fff;font-size:15px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+.bwbrand b{display:block;font-size:13.5px;font-weight:800;letter-spacing:2.2px;
+  color:var(--bwink);line-height:1.1}
+.bwbrand s{display:block;text-decoration:none;font-size:9px;color:var(--bwmut);
+  letter-spacing:1.3px;margin-top:2px}
+.bwgrow{flex:1}
+.bwnav{display:flex;align-items:stretch;gap:2px;overflow-x:auto;
+  scrollbar-width:none;-ms-overflow-style:none}
+.bwnav::-webkit-scrollbar{display:none}
+.bwnav a{position:relative;display:inline-flex;align-items:center;gap:7px;
+  padding:9px 13px;font-size:12.5px;font-weight:600;letter-spacing:.5px;
+  color:var(--bwmut);text-decoration:none;white-space:nowrap}
+.bwnav a::after{content:"";position:absolute;left:11px;right:11px;bottom:-1px;height:2px;
+  background:var(--bwac);opacity:0;transition:opacity .16s}
+.bwnav a:hover{color:var(--bwink);text-decoration:none}
+.bwnav a:hover::after{opacity:.5}
+.bwnav a.on{color:var(--bwac)}
+.bwnav a.on::after{opacity:1}
+.bwnav a .i{font-size:13px;line-height:1}
+
+/* ---- 到处都在用的组件 ---- */
+h1{font-size:21px;font-weight:800;letter-spacing:-.2px;color:var(--bwink)}
+h2{font-size:12px!important;font-weight:800;letter-spacing:1.6px;color:var(--bwink);
+  display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--bwln2)!important;
+  padding-bottom:9px!important}
+h2::before{content:"";width:2px;height:13px;background:var(--bwac);flex:none}
+a{color:var(--bwac)}
+code{font-family:var(--bwmono);background:var(--bwsoft);border:1px solid var(--bwln);
+  border-radius:0;color:#1d4ed8}
+pre{border-radius:0!important;border:1px solid var(--bwln)}
+table th{color:var(--bwdim)!important;font-size:9.5px!important;font-weight:700;
+  text-transform:uppercase;letter-spacing:1.2px;background:var(--bwsoft)}
+table td{border-bottom:1px solid var(--bwln2)}
+table tbody tr:hover td{background:rgba(37,99,235,.04)}
+table tbody tr:hover td:first-child{box-shadow:inset 2px 0 0 var(--bwac)}
+/* 统计瓦片:顶部 2px 状态色 + 大号等宽数字,和 / 的 .hstat 同一个样式 */
+.bwstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,240px));justify-content:start;
+  gap:12px;margin:0 0 18px}
+.bwstat{background:var(--bwpnl);border:1px solid var(--bwln);border-top:2px solid var(--bwac);
+  padding:13px 15px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.bwstat .v{font-family:var(--bwmono);font-size:25px;font-weight:800;line-height:1.05;
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+/* background/padding/border-radius 是显式清零的，不是多余代码：这些页面各自留着
+   给旧标记用的 .k 药丸样式（圆角底色），而 .bwstat .k 只要不写这几个属性，页面级
+   的 .k 就会漏进来，标签变成一颗药丸。清零比去每个页面删旧规则安全 —— 那些旧
+   规则可能还有别处在用。 */
+.bwstat .k{font-size:10.5px;color:var(--bwmut);margin-top:4px;letter-spacing:1.1px;
+  background:none;padding:0;border-radius:0;display:block;width:auto}
+.bwstat.mal{border-top-color:var(--bwmal)}.bwstat.mal .v{color:var(--bwmal)}
+.bwstat.sus{border-top-color:var(--bwsus)}.bwstat.sus .v{color:var(--bwsus)}
+.bwstat.ok{border-top-color:var(--bwok)}.bwstat.ok .v{color:var(--bwok)}
+@media(max-width:640px){.bwrail .in{padding:9px 14px}.bwbrand s{display:none}}
+
+:root{--bg:#edf0f5;--card:#fff;--soft:#f9fafb;--line:#e4e7ec;--ink:#101828;--muted:#667085;
+--brand:#2563eb;--brand2:#7c3aed;--on:#067647;--off:#c2c8d2;--mono:"Cascadia Mono",Consolas,monospace;
 --sans:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.6 var(--sans)}
-.wrap{max-width:760px;margin:0 auto;padding:34px 20px 70px}
+/* 760 → 1080：这页有三张 5~6 列的表，760px 下表格被压在页面中间一条窄带里，
+   而顶栏是 1440px，视觉上像没对齐。1080 与 /engine(1020)、/feedback(1180) 同量级。 */
+.wrap{max-width:1080px;margin:0 auto;padding:34px 20px 70px}
 h1{font-size:22px;margin:0 0 4px;display:flex;align-items:center;gap:9px}
 .lead{color:var(--muted);margin:0 0 22px;font-size:13px}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:22px}
@@ -2817,10 +4887,10 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04
 tr:last-child td{border-bottom:none}
 td.ip{font-family:var(--mono)}td.num{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
 .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;line-height:1.5}
-.tag.m{background:rgba(99,102,241,.12);color:var(--brand)}.tag.i{background:var(--soft);color:var(--muted)}
+.tag.m{background:rgba(37,99,235,.12);color:var(--brand)}.tag.i{background:var(--soft);color:var(--muted)}
 td.empty{text-align:center;color:var(--muted);padding:26px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
-.dot.on{background:var(--on);box-shadow:0 0 0 3px rgba(15,157,88,.15)}.dot.off{background:var(--off)}
+.dot.on{background:var(--on);box-shadow:0 0 0 3px rgba(6,118,71,.15)}.dot.off{background:var(--off)}
 h2{font-size:17px;margin:34px 0 4px;display:flex;align-items:center;gap:8px}
 h2:first-of-type{margin-top:6px}
 h3{font-size:14px;margin:24px 0 10px;color:var(--muted);font-weight:700}
@@ -2829,15 +4899,70 @@ table{margin-bottom:4px}
 td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
 .foot{color:var(--muted);font-size:12px;margin-top:16px}
 .foot a{color:var(--brand);text-decoration:none}
-</style></head><body><div class="wrap">
+</style></head><body>
+<div class="bwrail"><div class="in">
+<a class="bwbrand" href="/" title="返回控制台"><span class="mk">🛡️</span>
+<span><b>BULWARK</b><s>THREAT ANALYSIS CONSOLE</s></span></a>
+<div class="bwgrow"></div>
+<nav class="bwnav">
+<a href="/"><span class="i">🛡️</span>控制台</a>
+<a href="/engine" class=""><span class="i">🧬</span>攻击链引擎</a>
+<a href="/online" class="on"><span class="i">📡</span>在线客户端</a>
+<a href="/support" class=""><span class="i">🎧</span>在线客服</a>
+<a href="/feedback" class=""><span class="i">💬</span>反馈</a>
+<a href="/api/docs" class=""><span class="i">&#128268;</span>API 文档</a>
+<a href="/about" class=""><span class="i">📥</span>下载</a>
+</nav>
+<!-- 北京时间读数。这两台机器的系统时区是 UTC,而看页面的人在中国 —— 原来页面上
+     没有任何一处告诉你「现在几点」,读时间戳只能靠脑内加 8 小时。
+     样式写成内联:顶栏在 4 个页面里是 4 份字面量副本,内联能保证四份永远一致,
+     也不用去动那 4 份 CSS 副本、不改变 style 标签计数。 -->
+<div style="display:flex;flex-direction:column;align-items:flex-end;line-height:1.2;margin-left:16px">
+<b id="bwclk" style="font:600 13px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ink);font-variant-numeric:tabular-nums">--:--:--</b>
+<s id="bwclkd" style="text-decoration:none;font-size:10px;color:var(--mut)">北京时间</s>
+</div>
+</div></div>
+<script>
+(function(){
+  var b=document.getElementById("bwclk"),d=document.getElementById("bwclkd");
+  if(!b)return;
+  var DAYS=["\u65e5","\u4e00","\u4e8c","\u4e09","\u56db","\u4e94","\u516d"];
+  function p(n){return (n<10?"0":"")+n;}
+  function tick(){
+    /* Date.now() 是 UTC 毫秒;加 8 小时后再用 getUTC* 读出来,就是北京时间的墙上
+       钟面,与浏览器所在时区无关。用固定偏移而不是 toLocaleString("zh-CN") ——
+       后者受访问者系统时区影响,在国外打开会显示当地时间。中国无夏令时,
+       固定 +08:00 不会错。 */
+    var t=new Date(Date.now()+8*3600*1000);
+    b.textContent=p(t.getUTCHours())+":"+p(t.getUTCMinutes())+":"+p(t.getUTCSeconds());
+    if(d)d.textContent=t.getUTCFullYear()+"-"+p(t.getUTCMonth()+1)+"-"+p(t.getUTCDate())
+      +" \u5468"+DAYS[t.getUTCDay()]+" UTC+8";
+  }
+  tick();setInterval(tick,1000);
+})();
+</script>
+<div class="wrap">
 <h1>🛡️ 连接与访问</h1>
 <p class="lead">上半部分是正在使用磐垒、连接到本情报服务器的本地客户端；下半部分是浏览器访客记录。为保护隐私，所有来源 IP 均已打码（仅保留前两段）。</p>
 <h2>📡 本地客户端</h2>
 <p class="lead2">支持匿名机器 ID 的客户端按机器去重，其余按来源 IP 去重。</p>
-<div class="cards">
-<div class="card"><div class="v">""" + str(st["online"]) + """</div><div class="k">当前在线（近 """ + str(st["window_min"]) + """ 分钟活跃）</div></div>
-<div class="card plain"><div class="v">""" + str(st["total"]) + """</div><div class="k">累计客户端（去重，其中 """ + str(st.get("identified", 0)) + """ 台按机器识别）</div></div>
-<div class="card plain"><div class="v">""" + str(st["total_hits"]) + """</div><div class="k">累计情报查询次数</div></div>
+<!-- 统计瓦片改用共享的 .bwstat：和控制台首页的 KPI 是同一个样式。
+     「当前在线」用安全色 + 复用本页已有的 .dot 在线灯，一眼能看出这个数是活的；
+     另外两个是累计量，保持中性色，避免三块都在抢注意力。
+
+     注意 .dot 那个 span 是整段拼好再插进来的，属性值一律不许跨模板拼接边界。
+     曾经把 class 的值拆在拼接两侧、漏了收尾引号，结果右尖括号和 span 的闭合标签
+     全被吞进属性值：span 不闭合 → .bwstats 一直开着 → 表格和下面整节都变成它的
+     grid 子项，整页挤成几条窄柱。py_compile 和标签计数都发现不了（计数是平衡的，
+     闭合标签确实存在，只是被属性值吃了），只有 HTML 解析器能看出来。
+
+     这段注释本身也不要再抄那个坏写法的字面量：它位于 Python 三引号模板内部，
+     写进去会提前闭合字符串、把示例里的变量名变成真代码。 -->
+<div class="bwstats">
+<div class="bwstat ok"><div class="v">""" + str(st["online"]) + """</div>
+  <div class="k">""" + ('<span class="dot %s"></span>' % ("on" if st["online"] else "off")) + """ 当前在线（近 """ + str(st["window_min"]) + """ 分钟活跃）</div></div>
+<div class="bwstat"><div class="v">""" + str(st["total"]) + """</div><div class="k">累计客户端（去重，其中 """ + str(st.get("identified", 0)) + """ 台按机器识别）</div></div>
+<div class="bwstat"><div class="v">""" + str(st["total_hits"]) + """</div><div class="k">累计情报查询次数</div></div>
 </div>
 <table><thead><tr><th>状态</th><th>来源 IP（打码）</th><th>识别方式</th><th>最近活跃</th><th>查询次数</th></tr></thead>
 <tbody>
@@ -2846,10 +4971,11 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
 
 <h2>🌐 网页访客</h2>
 <p class="lead2">浏览器访问本站页面的记录（威胁分析台 / 关于 / API 文档 / 下载）。自动刷新与后台轮询不计入。</p>
-<div class="cards">
-<div class="card"><div class="v">""" + str(vst["active"]) + """</div><div class="k">当前活跃访客（近 """ + str(vst["window_min"]) + """ 分钟）</div></div>
-<div class="card plain"><div class="v">""" + str(vst["unique"]) + """</div><div class="k">独立访客（按来源 IP 去重）</div></div>
-<div class="card plain"><div class="v">""" + str(vst["today_views"]) + """</div><div class="k">今日访问 / 累计 """ + str(vst["views"]) + """</div></div>
+<div class="bwstats">
+<div class="bwstat ok"><div class="v">""" + str(vst["active"]) + """</div>
+  <div class="k">""" + ('<span class="dot %s"></span>' % ("on" if vst["active"] else "off")) + """ 当前活跃访客（近 """ + str(vst["window_min"]) + """ 分钟）</div></div>
+<div class="bwstat"><div class="v">""" + str(vst["unique"]) + """</div><div class="k">独立访客（按来源 IP 去重）</div></div>
+<div class="bwstat"><div class="v">""" + str(vst["today_views"]) + """</div><div class="k">今日访问 / 累计 """ + str(vst["views"]) + """</div></div>
 </div>
 <table><thead><tr><th>状态</th><th>来源 IP（打码）</th><th>最近页面</th><th>浏览器</th><th>最近访问</th><th>次数</th></tr></thead>
 <tbody>
@@ -2913,7 +5039,76 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         "cmstp_execution_registry_event": "cmstp.exe 执行留下的注册表痕迹",
         "process_creation_using_sysnative_folder": "借 Sysnative 路径别名启动进程",
         "wow6432node_currentversion_autorun_keys_modification": "改 32 位视图的开机自启动项",
+        # v20 这一轮带出来的 11 个。补名之前,22 条生效规则里有 10 条的动作链是中英混排,
+        # 且这 11 个全部落进「其他」—— 页面看着乱的头号原因是这个,不是配色或间距。
+        # 「看得见不会被静默吞掉」这条设计确实成立了,但看得见 ≠ 可以放着不管。
+        "base64_encoded_powershell_command_detected": "PowerShell 命令用 Base64 编码",
+        # 特征库 1.2 这一轮新挖出来的两个。名字按【实际判据】起,不照抄 Sigma 规则名:
+        # 前者的条件就是命令行含 bypass(covers -ep/-exec 等缩写写法),后者是
+        # -EncodedCommand。写成「参数缩写异常」之类会让人对不上页面上显示的那行条件。
+        "suspicious_powershell_parameter_substring": "PowerShell 命令行带 bypass 参数",
+        "suspicious_encoded_powershell_command_line": "PowerShell 用 -EncodedCommand 传参",
+        # 特征库 1.3。补齐任务把旧的降级占位行换成完整报告后语料变多,挖掘随之带出新标记
+        # —— 这张表要跟着走,不然它们会一起掉进「其他」并显示英文原名。
+        "suspicious_powershell_parent_process": "PowerShell 被异常父进程拉起",
+        # ⚠ 这一个的判据是「命令行含 truncated」。那不是攻击特征,是 VirusTotal 报告里
+        # 命令行过长时留下的截断占位词被当成了字面量。留着中文名只为让页面别显示英文原名,
+        # 真正该修的是 engine_build 的条件推导:它应当把报告自身的产物(truncated / …)
+        # 列入字面量黑名单。见交接说明。
+        "suspicious_mshta_child_process": "mshta 拉起子进程",
+        "currentversion_nt_autorun_keys_modification": "改 Windows NT 键下的自启动项",
+        "disable_internal_tools_or_feature_in_registry": "改注册表关掉系统功能",
+        "path_to_screensaver_binary_modified": "改屏保程序路径",
+        "registry_persistence_via_service_in_safe_mode": "让服务连安全模式也启动",
+        "remote_access_tool_screenconnect_execution": "跑起远控工具 ScreenConnect",
+        "service_startuptype_change_via_sc_exe": "用 sc.exe 改服务启动方式",
+        "silenttrinity_stager_msbuild_activity": "SilentTrinity 借 msbuild 外联",
+        "suspicious_dns_query_for_ip_lookup_service_apis": "解析查公网 IP 的接口域名",
+        "suspicious_msbuild_execution_by_uncommon_parent_process": "msbuild 被异常父进程拉起",
+        "suspicious_powershell_in_registry_run_keys": "自启动项里写 PowerShell 命令",
     }
+
+    # ---- 标记的区分力 -------------------------------------------------------- #
+    #
+    # 【判据的正本在 engine_build.condition_specificity,这里是给页面用的副本】。
+    # 为什么容忍这份重复:这一页的用途就是「让人看出客户端到底会怎么判」,而区分力决定
+    # 一个标记算不算互证的一份 —— 页面不显示它,就无法回答「这条规则靠得住吗」,而那
+    # 恰恰是看这页的人唯一真正想知道的事。app.py 不 import 挖掘器(那是独立的定时任务,
+    # 不该成为 HTTP 服务的依赖),故照抄判据并在两处都留下指针。
+    # 两边如果跑偏,表现是页面上的区分力与下发表实际生效的不一致 —— 故任何一侧改动
+    # 判据时,另一侧必须同步。
+    _SPEC_COMMON_BIN = (
+        "svchost.exe", "services.exe", "lsass.exe", "explorer.exe", "cmd.exe",
+        "conhost.exe", "rundll32.exe", "regsvr32.exe", "msiexec.exe", "dllhost.exe",
+        "taskhostw.exe", "wmiprvse.exe", "schtasks.exe", "reg.exe", "sc.exe",
+        "powershell.exe", "powershell", "wscript.exe", "cscript.exe", "csc.exe",
+        "curl.exe", "mshta.exe", "certutil.exe", "bitsadmin.exe",
+    )
+
+    @classmethod
+    def _cond_spec(cls, cond):
+        """0 = 不构成证据(恒真/只有软信号) 1 = 信息量极低 2 = 可算一份证据。"""
+        if not isinstance(cond, dict):
+            return 0
+        slots = {k: str(cond.get(k) or "").strip()
+                 for k in ("actor", "target", "cmdline", "parent",
+                           "cmdline_absent", "target_absent", "parent_absent")}
+        if not any(slots.values()):
+            return 0                      # 无条件,或只有 unsigned -> 软信号
+        def lits(p, n=4):
+            return [s for s in p.replace("?", "*").split("*") if len(s) >= n]
+        sub = 0
+        for k in ("target", "cmdline", "parent"):
+            if slots[k] and lits(slots[k]):
+                sub += 1
+        for k in ("cmdline_absent", "target_absent", "parent_absent"):
+            if slots[k] and lits(slots[k], 2):
+                sub += 1                  # 「不含」条件正是把恒真项变成真判据的那一半
+        if slots["actor"]:
+            low = slots["actor"].lower()
+            if not any(b in low for b in cls._SPEC_COMMON_BIN) and lits(slots["actor"]):
+                sub += 1
+        return 2 if sub >= 1 else 1
 
     # ---- 攻击意图分组 -------------------------------------------------------- #
     #
@@ -2932,7 +5127,10 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         ("masq",    "伪装",           "冒充系统程序名或系统所在位置"),
         ("cred",    "注入与凭据窃取", "把模块塞进别人的进程，或读取凭据"),
         ("tamper",  "信任面篡改",     "改证书、服务、注册表等系统信任配置"),
-        ("net",     "外联下载",       "联网取回载荷或回传"),
+        # 「外联下载」原来只说取载荷/回传,装不下远控工具落地与 C2 stager 这两类。
+        # 与其为它们单开一个只有两三个标记的分组(分组一多,这一页又回到「乱」),
+        # 不如把这一格如实写成「联网这件事的全部去向」。
+        ("net",     "外联与远控",     "联网取回载荷、回传,或把机器交给外部控制"),
         ("other",   "其他",           "尚未归类的行为"),
     ]
 
@@ -2943,9 +5141,18 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         "suspicious_windows_defender_folder_exclusion_added_via_reg_exe": "evade",
         "change_powershell_policies_to_an_insecure_level": "evade",
         "potential_powershell_command_line_obfuscation": "evade",
+        "base64_encoded_powershell_command_detected": "evade",
+        "disable_internal_tools_or_feature_in_registry": "evade",
+        "suspicious_powershell_parameter_substring": "evade",
+        "suspicious_encoded_powershell_command_line": "evade",
+        "suspicious_powershell_parent_process": "evade",
         # 开机留驻
         "currentversion_autorun_keys_modification": "persist",
+        "currentversion_nt_autorun_keys_modification": "persist",
         "new_run_key_pointing_to_suspicious_folder": "persist",
+        "suspicious_powershell_in_registry_run_keys": "persist",
+        "path_to_screensaver_binary_modified": "persist",
+        "registry_persistence_via_service_in_safe_mode": "persist",
         "startup_folder_file_write": "persist",
         "suspicious_startup_folder_persistence": "persist",
         "schedule_system_process": "persist",
@@ -2964,6 +5171,8 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         "suspicious_binaries_and_scripts_in_public_folder": "exec",
         "windows_shell_scripting_application_file_write_to_suspicious_folder": "exec",
         "file_with_uncommon_extension_created_by_an_office_application": "exec",
+        "suspicious_msbuild_execution_by_uncommon_parent_process": "exec",
+        "suspicious_mshta_child_process": "exec",
         # 伪装
         "files_with_system_process_name_in_unsuspected_locations": "masq",
         "system_file_execution_location_anomaly": "masq",
@@ -2982,10 +5191,14 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         "suspicious_windows_service_tampering": "tamper",
         "bypass_uac_via_cmstp": "tamper",
         "cmstp_execution_registry_event": "tamper",
-        # 外联下载
+        "service_startuptype_change_via_sc_exe": "tamper",
+        # 外联与远控
         "suspicious_curl_exe_download": "net",
         "suspicious_network_connection_to_ip_lookup_service_apis": "net",
+        "suspicious_dns_query_for_ip_lookup_service_apis": "net",
         "office_application_initiated_network_connection_to_non_local_ip": "net",
+        "silenttrinity_stager_msbuild_activity": "net",
+        "remote_access_tool_screenconnect_execution": "net",
     }
 
     def _serve_engine(self):
@@ -3137,6 +5350,8 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                         "evcn": EV_CN.get(markers.get(s, {}).get("event") or "",
                                           markers.get(s, {}).get("event") or ""),
                         "obs": bool(markers.get(s, {}).get("observable")),
+                        # 区分力:决定这个标记算不算互证的一份(见 _cond_spec)。
+                        "spec": self._cond_spec(cond_of(s)),
                         "cond": cond_bits(s)} for s in slugs],
             })
 
@@ -3151,6 +5366,7 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                 "ev": md.get("event") or "",
                 "evcn": EV_CN.get(md.get("event") or "", md.get("event") or ""),
                 "obs": bool(md.get("observable")),
+                "spec": self._cond_spec(cond_of(s)),
                 "cond": cond_bits(s),
                 "sam": md.get("samples") or 0,
                 "ben": md.get("benign_samples") or 0,
@@ -3186,6 +5402,648 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
 
         html = _ENGINE_PAGE.replace("/*__DATA__*/null", blob)
         self._send_bytes(200, html.encode("utf-8"), "text/html; charset=utf-8")
+
+    # ======================================================================= #
+    #  在线客服                                                                #
+    # ======================================================================= #
+    #
+    # 访客侧【必须无鉴权】—— 这是客服的前提,要求用户先登录才能提问就等于没有客服。
+    # 代价是这几条路由对公网完全敞开,所以防滥用不是可选项,而且必须是多层的:
+    #   · 每 IP 请求滑窗          _throttle_ok()(与反馈提交共用同一套)
+    #   · 每 IP 每日新建会话上限  new_conv_per_ip_per_day
+    #   · 每会话每日消息上限      messages_per_conv_per_day
+    #   · 正文长度上限            max_message_chars
+    #   · 附件:张数 / 单个大小 / 类型白名单 / 目录总量闸门
+    #   · 长轮询并发上限          max_waiters(见 SUP_WAIT)
+    # 少任何一层,单个 IP 都能把磁盘或线程池吃干。
+
+    def _cookie(self, name):
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) == 2 and kv[0].strip() == name:
+                return kv[1].strip()
+        return ""
+
+    @staticmethod
+    def _sup_cfg():
+        """客服配置。全部有默认值 —— 上线这个功能不需要动 config.json,
+        而那个文件是 600 且装着所有 API key,能不碰就不碰。"""
+        s = CONFIG.get("support", {}) or {}
+
+        def num(k, d, lo, hi):
+            try:
+                v = int(s.get(k, d))
+            except (TypeError, ValueError):
+                v = d
+            return max(lo, min(hi, v))
+
+        return {
+            "enabled": bool(s.get("enabled", True)),
+            "agent_name": (str(s.get("agent_name", "") or "磐垒客服"))[:24],
+            "greeting": (str(s.get("greeting", "") or
+                             "你好，这里是磐垒在线客服。说明你遇到的问题，"
+                             "可以直接发送截图或录屏。"))[:400],
+            "retention_days": num("retention_days", 3, 1, 30),
+            "max_chars": num("max_message_chars", 2000, 100, SupportStore.MSG_HARD_CAP),
+            "max_files": num("max_attachments", 6, 1, SupportStore.MEDIA_HARD_CAP),
+            "image_mb": num("max_image_mb", 16, 1, 64),
+            "video_mb": num("max_video_mb", 128, 1, 512),
+            "dir_max_mb": num("dir_max_mb", 4096, 64, 262144),
+            "per_conv_per_day": num("messages_per_conv_per_day", 300, 10, 5000),
+            "per_ip_per_day": num("new_conv_per_ip_per_day", 10, 1, 200),
+            # 上限 28 秒是【被 socket 超时限住的】,不是随手取的:BulwarkHTTPServer
+            # 给每个连接设了 30 秒 conn_timeout,挂得比它久,客户端会先看到连接断开。
+            "poll_wait": num("poll_wait_seconds", 25, 1, 28),
+            "max_waiters": num("max_waiters", 64, 4, 512),
+        }
+
+    def _sup_ready(self, cfg):
+        """功能是否可用。SUPPORT 为 None 表示建库失败(磁盘只读等),此时如实说
+        不可用,而不是让每个请求各自抛一次 500。"""
+        if SUPPORT is None or not cfg["enabled"]:
+            self._send(503, {"ok": False, "error": "在线客服未启用"})
+            return False
+        return True
+
+    def _sup_send(self, code, obj, set_token=None):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if set_token:
+            # Path=/support:这个 cookie 只对客服的几条路由有意义,不必跟着每一次
+            # 情报查询一起上路。HttpOnly:前端根本不需要读它 —— 令牌由浏览器自动
+            # 带上,页面脚本拿不到,一次 XSS 也偷不走会话。
+            self.send_header("Set-Cookie",
+                             "bw_chat=%s; Path=/support; Max-Age=%d; HttpOnly; SameSite=Lax"
+                             % (set_token, 30 * 86400))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _sup_conv(self, cfg):
+        """当前访客的会话(带读侧惰性过期)。没有就返回 None。"""
+        tok = self._cookie("bw_chat")
+        if not tok:
+            return None
+        return SUPPORT.get_conversation(tok, max_age_days=cfg["retention_days"])
+
+    def _sup_open(self, cfg):
+        """按需新建会话。返回 (conv, error)。
+
+        刻意【不在打开页面时就建】:那样每个路过的爬虫都会留下一条空会话,既污染
+        客服台的列表,也让「每 IP 每日上限」在真正有人要说话之前就用完了。
+        第一次发消息或上传附件时才建。
+        """
+        ip = self.client_address[0] if self.client_address else ""
+        token, mkey, err = SUPPORT.open_conversation(
+            ip, ua_short(self.headers.get("User-Agent", "")),
+            self.headers.get("Referer", ""), cfg["per_ip_per_day"],
+            greeting=cfg["greeting"])
+        if err:
+            return None, err
+        print("[support] new conversation from %s" % mask_ip(ip), flush=True)
+        return SUPPORT.get_conversation(token), ""
+
+    def _sup_agent_online(self):
+        """客服台在 90 秒内有过心跳就算在线。访客页据此决定说「客服在线」还是
+        「留言后会尽快回复」—— 显示一个假的「在线」比不显示更糟。"""
+        try:
+            seen = parse_iso(SUPPORT.kv_get("agent_seen_at", ""))
+        except Exception:
+            seen = None
+        return bool(seen and seen > now_utc() - timedelta(seconds=90))
+
+    def _serve_support_page(self):
+        cfg = self._sup_cfg()
+        if SUPPORT is None or not cfg["enabled"]:
+            return self._send_bytes(503, "<!doctype html><meta charset=utf-8>"
+                                    "<p>在线客服未启用。", "text/html; charset=utf-8")
+        blob = json.dumps({
+            "agent_name": cfg["agent_name"], "greeting": cfg["greeting"],
+            "retention_days": cfg["retention_days"], "max_chars": cfg["max_chars"],
+            "max_files": cfg["max_files"], "image_mb": cfg["image_mb"],
+            "video_mb": cfg["video_mb"], "poll_wait": cfg["poll_wait"],
+            # 没有任何客服凭证时,页面必须说实话:留言会存下来,但现在没人能回。
+            # 显示一个假的「客服会尽快回复」比什么都不说更糟。
+            "staffed": self._sup_staffed(),
+        }, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e") \
+            .replace("&", "\\u0026")
+        self._log_visit("/support")
+        self._send_bytes(200, _SUPPORT_PAGE.replace("/*__CFG__*/null", blob)
+                         .encode("utf-8"), "text/html; charset=utf-8")
+
+    # ---- 客服身份 ----------------------------------------------------------- #
+    #
+    # 为什么客服台【不能只认 webui_password】:这台机器上根本没配 webui_password,
+    # 整个控制台目前是公开可读的。如果客服台只认它,那么要让客服能回话就必须给
+    # webui_password 赋值,而那会顺带把 / /engine /online /feedback 全部关到登录
+    # 后面 —— 一个「上线客服」的需求不该顺手改掉其余五个页面的访问方式。
+    #
+    # 所以客服台自己有一把口令 support.agent_password,与 webui_password 并列:
+    # 两者任一有效即放行。两者都没配则 fail closed —— 访客对话和访客上传的图片
+    # 视频绝不能在公网无鉴权可读,这一点与 _serve_feedback_image 同一条推理。
+    @staticmethod
+    def _sup_agent_pw():
+        return str((CONFIG.get("support", {}) or {}).get("agent_password", "") or "")
+
+    @staticmethod
+    def _sup_agent_digest(pw):
+        # 与 webui 的推导刻意用不同前缀,这样两把口令即使设成同一个字符串,
+        # 两个 cookie 也不通用 —— 一把口令泄露不会顺带成为另一处的凭证。
+        return hashlib.sha256(("bwa_" + pw).encode()).hexdigest()[:32]
+
+    def _sup_is_agent(self):
+        """当前请求是不是客服。两条凭证任一成立即可。"""
+        pw = self._webui_password()
+        if pw and self._check_webui_cookie():
+            return True
+        apw = self._sup_agent_pw()
+        if apw:
+            got = self._cookie("bw_agent")
+            if got and hmac.compare_digest(got, self._sup_agent_digest(apw)):
+                return True
+        return False
+
+    def _sup_staffed(self):
+        """客服台是否有可用凭证。没有就等于没人能回话 —— 访客页要据此说实话,
+        而不是继续显示「客服会尽快回复」。"""
+        return bool(self._webui_password() or self._sup_agent_pw())
+
+    def _serve_support_login(self, error=""):
+        err = ('<p class="err">' + error + '</p>') if error else ''
+        html = ('''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>客服台 · 登录</title>
+<style>
+:root{--bg:#edf0f5;--pnl:#fff;--ln:#e4e7ec;--ink:#101828;--mut:#667085;
+  --dim:#98a2b3;--acc:#2563eb;--mal:#d92d20;
+  --sans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+  --mono:"SFMono-Regular","Cascadia Mono",Consolas,Menlo,monospace}
+*{box-sizing:border-box}
+body{font:14px/1.6 var(--sans);display:flex;justify-content:center;
+  align-items:center;min-height:100vh;margin:0;background:var(--bg);color:var(--ink)}
+.box{background:var(--pnl);padding:34px 32px;border:1px solid var(--ln);width:352px;
+  box-shadow:0 1px 2px rgba(16,24,40,.05),0 12px 32px rgba(16,24,40,.08)}
+.mk{width:36px;height:36px;display:grid;place-items:center;background:var(--acc);
+  color:#fff;font-size:18px;margin-bottom:16px;
+  clip-path:polygon(22% 0,100% 0,100% 78%,78% 100%,0 100%,0 22%)}
+h2{margin:0;font-size:16px;font-weight:800;letter-spacing:1.6px}
+.sub{margin:5px 0 22px;color:var(--mut);font-size:11.5px;letter-spacing:.9px;
+  font-family:var(--mono)}
+label{display:block;font-size:10.5px;font-weight:700;color:var(--mut);
+  letter-spacing:1.1px;margin-bottom:7px}
+input[type=password]{width:100%;padding:12px 13px;border:1px solid var(--ln);
+  border-left:2px solid var(--acc);background:var(--bg);color:var(--ink);
+  font:14px var(--mono);letter-spacing:1px;outline:none}
+input[type=password]:focus{border-color:var(--acc);
+  box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+button{width:100%;padding:12px;background:var(--acc);color:#fff;border:none;
+  font:700 13px/1 var(--sans);letter-spacing:1.2px;cursor:pointer;margin-top:14px}
+button:hover{filter:brightness(1.1)}
+.err{margin:0 0 14px;padding:9px 12px;font-size:12.5px;color:var(--mal);
+  background:rgba(217,45,32,.07);border-left:2px solid var(--mal)}
+.foot{margin-top:18px;font-size:10.5px;color:var(--dim);font-family:var(--mono)}
+</style></head><body>
+<div class="box">
+<div class="mk">&#127911;</div>
+<h2>BULWARK</h2>
+<div class="sub">SUPPORT DESK</div>
+''' + err + '''
+<form method="POST" action="/support/admin/login">
+<label for="pw">客服口令</label>
+<input id="pw" type="password" name="password" placeholder="请输入口令" autofocus>
+<button type="submit">进入客服台</button>
+</form>
+<div class="foot">仅授权人员访问</div>
+</div></body></html>''')
+        self._send_bytes(200, html.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _sup_admin_login(self):
+        """客服台登录。口令是公开可提交的,所以走 per-IP 滑窗限流 —— 否则这就是
+        一个不限速的在线爆破入口。"""
+        if not self._throttle_ok():
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > 4096:
+            self.close_connection = True
+            return self._send(413, {"ok": False, "error": "too large"})
+        raw = self.rfile.read(length) if length else b""
+        form_pw = ""
+        for part in raw.decode("utf-8", "replace").split("&"):
+            kv = part.split("=", 1)
+            if len(kv) == 2 and kv[0] == "password":
+                form_pw = urllib.parse.unquote_plus(kv[1])
+        apw = self._sup_agent_pw()
+        wpw = self._webui_password()
+        if apw and hmac.compare_digest(form_pw, apw):
+            digest = self._sup_agent_digest(apw)
+            self.send_response(302)
+            self.send_header("Set-Cookie",
+                             "bw_agent=%s; Path=/support; Max-Age=%d; HttpOnly; SameSite=Lax"
+                             % (digest, 12 * 3600))
+            self.send_header("Location", "/support/admin")
+            self.end_headers()
+            print("[support] agent signed in from %s" % mask_ip(
+                self.client_address[0] if self.client_address else ""), flush=True)
+            return
+        if wpw and hmac.compare_digest(form_pw, wpw):
+            # 也接受网页总口令,这样已经用它登录控制台的人不必再记第二个。
+            self.send_response(302)
+            self.send_header("Set-Cookie",
+                             "bw_session=%s; Path=/; HttpOnly; SameSite=Strict"
+                             % hashlib.sha256(("bw_" + wpw).encode()).hexdigest()[:32])
+            self.send_header("Location", "/support/admin")
+            self.end_headers()
+            return
+        return self._serve_support_login(error="口令错误")
+
+    def _sup_admin_ok(self, as_json=True):
+        """客服台的闸门,【必须 fail closed】。
+
+        _check_webui_cookie() 在没配 webui_password 时一律放行 —— 那对「服务端自己
+        生成的页面」是可接受的取舍,对「客户对话和客户上传的图片视频」不是同一件事。
+        8787 是公网口,提交口又是公开的,两头一敞开,任何人都能翻别人的对话。
+        """
+        if not self._sup_staffed():
+            msg = ("客服台未配置口令。请在 /etc/bulwark-intel/config.json 的 "
+                   "support 段设置 agent_password（只影响客服台），"
+                   "或设置顶层 webui_password（会同时给整个控制台加登录）。"
+                   "在此之前，为避免公网无鉴权读取访客对话，客服台不予提供")
+            if as_json:
+                self._send(403, {"ok": False, "error": msg})
+            else:
+                self._send_bytes(403, "<!doctype html><meta charset=utf-8>"
+                                 "<p>" + msg + "。", "text/html; charset=utf-8")
+            return False
+        if not self._sup_is_agent():
+            if as_json:
+                self._send(401, {"ok": False, "error": "unauthorized"})
+            else:
+                self._serve_support_login()
+            return False
+        return True
+
+    def _serve_support_admin(self):
+        cfg = self._sup_cfg()
+        if not self._sup_admin_ok(as_json=False):
+            return
+        if SUPPORT is None or not cfg["enabled"]:
+            return self._send_bytes(503, "<!doctype html><meta charset=utf-8>"
+                                    "<p>在线客服未启用。", "text/html; charset=utf-8")
+        SUPPORT.kv_set("agent_seen_at", iso(now_utc()))
+        blob = json.dumps({
+            "retention_days": cfg["retention_days"], "max_files": cfg["max_files"],
+            "max_chars": cfg["max_chars"], "poll_wait": cfg["poll_wait"],
+            "cursor": SUPPORT.max_message_id(),
+        }, ensure_ascii=False)
+        self._send_bytes(200, _SUPPORT_ADMIN_PAGE.replace("/*__CFG__*/null", blob)
+                         .encode("utf-8"), "text/html; charset=utf-8")
+
+    # ---- 附件 --------------------------------------------------------------- #
+    def _sup_take_upload(self, conv, cfg):
+        """把请求体流式写进附件目录。返回 (name, kind, error)。
+
+        【不走 base64-in-JSON】,这一点与反馈截图刻意不同:一段 128MB 的视频,
+        base64 后是 170MB,整份读进内存再解码,峰值 300MB 出头,而这个 unit 的
+        MemoryMax 是 2G —— 几个人同时发就能把服务打成 OOM,而且谁都能发。
+        改走 _read_upload 那条已经在样本上传上验证过的流式写盘路径,一次 1MiB,
+        内存占用与文件大小无关。
+
+        类型判定只看首部魔术字节。扩展名和 Content-Type 都是上传者说的话,
+        在一个公开的口子上不能当依据。
+        """
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return None, None, "空请求体"
+        hard = max(cfg["image_mb"], cfg["video_mb"]) * 1024 * 1024
+        if length > hard:
+            # 【不读就拒】的时候必须让连接关掉:剩下的请求体还在管道里,复用这个
+            # 连接会把视频字节当成下一个请求的起始行。
+            self.close_connection = True
+            return None, None, "文件过大（上限 %d MB）" % (hard // (1024 * 1024))
+        budget = cfg["dir_max_mb"] * 1024 * 1024 - SUPPORT.media_dir_bytes()
+        if length > budget:
+            self.close_connection = True
+            return None, None, "附件空间已满，请稍后再试"
+        d = SUPPORT.media_dir
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        tmp = os.path.join(d, ".up-%s.part" % uuid.uuid4().hex)
+        head, got = b"", 0
+        try:
+            with open(tmp, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    if len(head) < 160:
+                        head += chunk[:160 - len(head)]
+                    f.write(chunk)
+                    remaining -= len(chunk)
+                    got += len(chunk)
+            if got != length:
+                return None, None, "上传中断（收到 %d/%d 字节）" % (got, length)
+            ext, _mime, kind = sniff_media(head)
+            if not ext:
+                return None, None, ("只支持图片（PNG/JPEG/GIF/WebP）"
+                                    "与视频（MP4/MOV/WebM）")
+            cap = (cfg["video_mb"] if kind == "video" else cfg["image_mb"]) * 1024 * 1024
+            if got > cap:
+                return None, None, ("%s超过 %d MB"
+                                    % ("视频" if kind == "video" else "图片",
+                                       cap // (1024 * 1024)))
+            name = "sup-%s-%s.%s" % (conv["mkey"], uuid.uuid4().hex[:16], ext)
+            dest = os.path.join(d, name)
+            os.replace(tmp, dest)
+            try:
+                os.chmod(dest, 0o640)
+            except OSError:
+                pass
+            return name, kind, ""
+        except OSError as e:
+            print("[support] upload write failed: %s" % e, flush=True)
+            return None, None, "服务端写入失败"
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    def _serve_support_media(self, u):
+        """附件取回。【以会话令牌为能力凭证】。
+
+        这里不能照搬 /feedback/img 的「只给 bw_session」:访客要能看见自己和客服
+        刚刚交换的图片和视频,而访客手上永远不会有管理员 cookie。所以放行两种身份:
+          · 带着本会话 bw_chat 令牌的访客(256 位随机,只能看自己那条对话)
+          · 带着 bw_session 的客服
+
+        文件名里带的是 mkey,不是 token 的任何一段 —— 否则每条媒体链接都等于把
+        令牌的前 48 位写在地址栏里。
+        """
+        cfg = self._sup_cfg()
+        if SUPPORT is None or not cfg["enabled"]:
+            return self._send(404, {"ok": False, "error": "not found"})
+        name = urllib.parse.unquote(u.path.rsplit("/", 1)[-1])
+        # 白名单正则同时挡掉 .. 和 /:名字必须完全长成我们自己生成的样子。
+        if not SUP_NAME_RE.match(name):
+            return self._send(404, {"ok": False, "error": "not found"})
+        conv = SUPPORT.conversation_by_mkey(name[4:16])
+        if not conv:
+            return self._send(404, {"ok": False, "error": "not found"})
+        # 过期的对话连附件也不给看 —— 承诺是「3 天后没有」,清理任务万一没跑,
+        # 读侧也要守住。
+        last = parse_iso(conv.get("last_at") or "")
+        if not last or last < now_utc() - timedelta(days=cfg["retention_days"]):
+            return self._send(404, {"ok": False, "error": "not found"})
+        if not (self._sup_is_agent() or self._cookie("bw_chat") == conv["token"]):
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        path = os.path.join(SUPPORT.media_dir, name)
+        try:
+            size = os.path.getsize(path)
+            fh = open(path, "rb")
+        except OSError:
+            return self._send(404, {"ok": False, "error": "not found"})
+        mime = SUP_EXT_MIME.get(name.rsplit(".", 1)[-1], "application/octet-stream")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(size))
+            # nosniff + sandbox:即便有人设法存进了别的东西,浏览器也不准改主意
+            # 按 HTML 解释它。与 /feedback/img 同一套头。
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Disposition", 'inline; filename="%s"' % name)
+            self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.send_header("Cache-Control", "private, max-age=600")
+            self.end_headers()
+            shutil.copyfileobj(fh, self.wfile, 256 * 1024)
+        except OSError:
+            pass
+        finally:
+            fh.close()
+
+    # ---- 访客侧 API --------------------------------------------------------- #
+    def _sup_get(self, u):
+        cfg = self._sup_cfg()
+        if not self._sup_ready(cfg):
+            return
+        rest = u.path[len("/support/api/"):]
+        if rest == "session":
+            conv = self._sup_conv(cfg)
+            msgs = SUPPORT.messages(conv["token"]) if conv else []
+            return self._sup_send(200, {"ok": True, "has": bool(conv),
+                                        "agent_online": self._sup_agent_online(),
+                                        "messages": msgs})
+        if rest == "poll":
+            conv = self._sup_conv(cfg)
+            if not conv:
+                # 409 而不是 404:前端据此重新初始化(会话过期或被清理了),
+                # 而 404 会被当成「这个接口不存在」。
+                return self._send(409, {"ok": False, "error": "no session"})
+            try:
+                after = int((urllib.parse.parse_qs(u.query).get("after") or ["0"])[0])
+            except ValueError:
+                after = 0
+            rows, _ = self._sup_wait(conv["token"], after, cfg, admin=False)
+            return self._sup_send(200, {"ok": True, "messages": rows,
+                                        "agent_online": self._sup_agent_online()})
+        return self._send(404, {"ok": False, "error": "unknown endpoint"})
+
+    def _sup_wait(self, token, after, cfg, admin=False):
+        """长轮询的公共入口,带并发闸门。
+
+        ThreadingHTTPServer 一个连接一个线程,没有任何上限;若不限制同时挂着的
+        轮询数,几百个连接就能把这台机器的线程和内存吃光 —— 而它还要同时扛信誉
+        查询。超出闸门就立刻空手返回,前端会退化成短轮询,功能不坏,只是慢一点。
+        """
+        if SUP_WAIT is None or not SUP_WAIT.acquire(blocking=False):
+            rows = (SUPPORT.admin_messages(after) if admin
+                    else SUPPORT.messages(token, after))
+            return rows, False
+        try:
+            return SUPPORT.wait_messages(token, after, cfg["poll_wait"], admin=admin)
+        finally:
+            SUP_WAIT.release()
+
+    def _sup_post(self, u):
+        cfg = self._sup_cfg()
+        if not self._sup_ready(cfg):
+            return
+        if not self._throttle_ok():
+            return
+        rest = u.path[len("/support/api/"):]
+
+        if rest == "upload":
+            conv = self._sup_conv(cfg)
+            new_token = None
+            if not conv:
+                conv, err = self._sup_open(cfg)
+                if err:
+                    self.close_connection = True
+                    return self._send(429, {"ok": False, "error": err})
+                new_token = conv["token"]
+            name, kind, err = self._sup_take_upload(conv, cfg)
+            if err:
+                return self._sup_send(400, {"ok": False, "error": err}, new_token)
+            print("[support] attachment %s (%s) from %s" % (
+                name, kind, mask_ip(self.client_address[0] if self.client_address else "")),
+                flush=True)
+            return self._sup_send(200, {"ok": True, "name": name, "kind": kind},
+                                  new_token)
+
+        if rest == "send":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > 64 * 1024:      # 正文而已,附件是另一条路
+                self.close_connection = True
+                return self._send(413, {"ok": False, "error": "内容过长"})
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+            except Exception:
+                return self._send(400, {"ok": False, "error": "请求体不是合法 JSON"})
+            if not isinstance(body, dict):
+                return self._send(400, {"ok": False, "error": "请求体格式不对"})
+            conv = self._sup_conv(cfg)
+            new_token = None
+            if not conv:
+                conv, err = self._sup_open(cfg)
+                if err:
+                    return self._send(429, {"ok": False, "error": err})
+                new_token = conv["token"]
+            files = body.get("files") or []
+            if not isinstance(files, list):
+                files = []
+            # 只接受【本会话】自己上传出来的文件名。mkey 前缀一核对,别人会话的
+            # 附件就没法被引用进这条对话 —— 否则拿到一个文件名就能把它转贴到
+            # 任意会话里。
+            files = [str(x) for x in files
+                     if SUP_NAME_RE.match(str(x)) and str(x)[4:16] == conv["mkey"]]
+            mid, err = SUPPORT.add_message(
+                conv["token"], "visitor", str(body.get("body", "")),
+                media=files[: cfg["max_files"]],
+                per_day_cap=cfg["per_conv_per_day"], max_chars=cfg["max_chars"])
+            if err:
+                return self._sup_send(400, {"ok": False, "error": err}, new_token)
+            rows = SUPPORT.messages(conv["token"], mid - 1)
+            return self._sup_send(200, {"ok": True, "id": mid, "messages": rows},
+                                  new_token)
+
+        return self._send(404, {"ok": False, "error": "unknown endpoint"})
+
+    # ---- 客服侧 API --------------------------------------------------------- #
+    def _sup_admin_get(self, u):
+        cfg = self._sup_cfg()
+        if not self._sup_admin_ok():
+            return
+        if not self._sup_ready(cfg):
+            return
+        SUPPORT.kv_set("agent_seen_at", iso(now_utc()))
+        rest = u.path[len("/support/admin/api/"):]
+        qs = urllib.parse.parse_qs(u.query)
+
+        if rest == "list":
+            convs = []
+            for c in SUPPORT.list_conversations(limit=200):
+                convs.append({"token": c["token"], "ip": mask_ip(c["ip"]),
+                              "agent": c.get("agent", ""), "page": c.get("page", ""),
+                              "created_at": c["created_at"], "last_at": c["last_at"],
+                              "status": c["status"], "unread": c["unread"],
+                              "msgs": c["msgs"], "preview": c["preview"]})
+            st = SUPPORT.stats()
+            st["media_mb"] = round(SUPPORT.media_dir_bytes() / 1048576.0, 1)
+            return self._send(200, {"ok": True, "conversations": convs, "stats": st})
+
+        if rest == "thread":
+            token = (qs.get("token") or [""])[0]
+            conv = SUPPORT.get_conversation(token)
+            if not conv:
+                return self._send(404, {"ok": False, "error": "会话不存在"})
+            try:
+                after = int((qs.get("after") or ["0"])[0])
+            except ValueError:
+                after = 0
+            if not after:
+                SUPPORT.mark_read(token)
+            return self._send(200, {"ok": True, "messages":
+                                    SUPPORT.messages(token, after)})
+
+        if rest == "poll":
+            try:
+                after = int((qs.get("after") or ["0"])[0])
+            except ValueError:
+                after = 0
+            rows, _ = self._sup_wait(None, after, cfg, admin=True)
+            cursor = max([r["id"] for r in rows] + [after])
+            return self._send(200, {"ok": True, "hit": bool(rows), "cursor": cursor})
+
+        return self._send(404, {"ok": False, "error": "unknown endpoint"})
+
+    def _sup_admin_post(self, u):
+        cfg = self._sup_cfg()
+        if not self._sup_admin_ok():
+            return
+        if not self._sup_ready(cfg):
+            return
+        SUPPORT.kv_set("agent_seen_at", iso(now_utc()))
+        rest = u.path[len("/support/admin/api/"):]
+
+        if rest == "upload":
+            token = (urllib.parse.parse_qs(u.query).get("token") or [""])[0]
+            conv = SUPPORT.get_conversation(token)
+            if not conv:
+                self.close_connection = True
+                return self._send(404, {"ok": False, "error": "会话不存在"})
+            name, kind, err = self._sup_take_upload(conv, cfg)
+            if err:
+                return self._send(400, {"ok": False, "error": err})
+            return self._send(200, {"ok": True, "name": name, "kind": kind})
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > 64 * 1024:
+            self.close_connection = True
+            return self._send(413, {"ok": False, "error": "内容过长"})
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except Exception:
+            return self._send(400, {"ok": False, "error": "bad json"})
+        if not isinstance(body, dict):
+            return self._send(400, {"ok": False, "error": "bad json"})
+        token = str(body.get("token", ""))
+        conv = SUPPORT.get_conversation(token)
+        if not conv:
+            return self._send(404, {"ok": False, "error": "会话不存在"})
+
+        if rest == "reply":
+            files = body.get("files") or []
+            if not isinstance(files, list):
+                files = []
+            files = [str(x) for x in files
+                     if SUP_NAME_RE.match(str(x)) and str(x)[4:16] == conv["mkey"]]
+            mid, err = SUPPORT.add_message(token, "agent", str(body.get("body", "")),
+                                           media=files[: cfg["max_files"]],
+                                           per_day_cap=0, max_chars=cfg["max_chars"])
+            if err:
+                return self._send(400, {"ok": False, "error": err})
+            return self._send(200, {"ok": True, "id": mid,
+                                    "messages": SUPPORT.messages(token, mid - 1)})
+
+        if rest == "status":
+            want = str(body.get("status", ""))
+            ok = SUPPORT.set_status(token, want)
+            if ok and want == "closed":
+                SUPPORT.add_message(token, "system", "客服已结束本次会话",
+                                    per_day_cap=0, max_chars=cfg["max_chars"])
+            return self._send(200, {"ok": ok})
+
+        return self._send(404, {"ok": False, "error": "unknown endpoint"})
+
     def _authed(self):
         token = CONFIG.get("auth_token", "")
         if not token:
@@ -3193,10 +6051,52 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
         auth = self.headers.get("Authorization", "")
         return auth == "Bearer " + token
 
+    def _client_ip(self):
+        return self.client_address[0] if self.client_address else ""
+
+    @staticmethod
+    def _in_whitelist(ip, wl):
+        """精确匹配,外加【显式的】前缀写法。
+
+        原来只有 `ip in wl`。家宽出口地址一变,白名单就静默失效 —— 线上实测正是这样:
+        白名单里有一条 123.154.x,而实际吃到 429 的是同段的另一个地址。
+        前缀必须以 '.' 或 '*' 结尾才算前缀,不做隐式判断:否则写 "1.2.3.4" 会把
+        "1.2.3.40" 也放进来,那是把防滥用悄悄放宽,比不支持前缀更糟。
+        """
+        for e in wl:
+            s = str(e or "").strip()
+            if not s:
+                continue
+            if s.endswith("*"):
+                if ip.startswith(s[:-1]):
+                    return True
+            elif s.endswith("."):
+                if ip.startswith(s):
+                    return True
+            elif ip == s:
+                return True
+        return False
+
+    def _refund_if_cached(self, res):
+        """命中缓存的查询不该扣每 IP 名额 —— 它没花任何上游配额。
+
+        为什么是「退」而不是「查完再判」:闸门必须在处理之前拦,否则一个 IP 就能靠
+        海量请求把服务器本身拖垮,限流形同虚设。而请求处理完才知道是否命中缓存,所以
+        只能先扣后退。
+
+        这条修的是一个具体症状:批量查 35 个文件,前 20 个成功、第 21 个起被锁一小时
+        (per_hour=20),而其中相当一部分本来是缓存命中、根本没碰 VT。
+        """
+        if THROTTLE is None or not isinstance(res, dict) or not res.get("cached"):
+            return
+        ip = self._client_ip()
+        if ip and ip not in ("127.0.0.1", "::1"):
+            THROTTLE.refund(ip)
+
     def _throttle_ok(self):
-        ip = self.client_address[0] if self.client_address else ""
+        ip = self._client_ip()
         _wl = (CONFIG.get("public_rate_limit", {}) or {}).get("whitelist", []) or []
-        if THROTTLE is None or ip in ("127.0.0.1", "::1") or ip in _wl:
+        if THROTTLE is None or ip in ("127.0.0.1", "::1") or self._in_whitelist(ip, _wl):
             return True
         ok, retry = THROTTLE.allow(ip)
         if not ok:
@@ -3319,6 +6219,173 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
             except OSError:
                 pass
 
+    # ---- 反馈截图 ---------------------------------------------------------- #
+    @staticmethod
+    def _fb_img_dir():
+        return CONFIG.get("feedback_images_dir", "/var/lib/bulwark-intel/feedback_img")
+
+    @staticmethod
+    def _fb_limits():
+        """截图上限,全部可配。默认给到正常使用碰不到的程度。
+
+        为什么不做成字面上的"无限":这个提交口是【公网 + 无鉴权】的,而请求体是
+        整份读进内存再 base64 解码的,峰值内存约等于请求体的两倍。真去掉上限,
+        一条请求就能把服务打成 OOM,而且谁都能发。
+        所以给的是"宽到不碍事"而不是"没有":要更大就改这几个键。
+          feedback.max_images     单条反馈的张数上限
+          feedback.max_image_mb   单张上限
+          feedback.max_body_mb    整个请求体上限(要容得下 base64 的 4/3 膨胀)
+          feedback.dir_max_mb     截图目录总量闸门
+        """
+        fb = CONFIG.get("feedback", {}) or {}
+        return {
+            "count": max(1, min(int(fb.get("max_images", 20) or 20),
+                                SERVICE.store.FEEDBACK_IMG_HARD_CAP)),
+            "each": max(1, int(fb.get("max_image_mb", 32) or 32)) * 1024 * 1024,
+            "body": max(1, int(fb.get("max_body_mb", 640) or 640)) * 1024 * 1024,
+            "dir": max(1, int(fb.get("dir_max_mb", 4096) or 4096)) * 1024 * 1024,
+        }
+
+    def _drop_fb_images(self, names):
+        """删掉一批截图文件。名字必须先过白名单正则 —— 这是唯一会 unlink 的地方。"""
+        gone = 0
+        for n in (names or []):
+            if not IMG_NAME_RE.match(str(n)):
+                continue
+            try:
+                os.remove(os.path.join(self._fb_img_dir(), str(n)))
+                gone += 1
+            except OSError:
+                pass
+        return gone
+
+    @classmethod
+    def _fb_dir_bytes(cls):
+        d = cls._fb_img_dir()
+        total = 0
+        try:
+            for n in os.listdir(d):
+                try:
+                    total += os.path.getsize(os.path.join(d, n))
+                except OSError:
+                    pass
+        except OSError:
+            return 0
+        return total
+
+    def _store_feedback_images(self, fid, items):
+        """把 data-URL / 裸 base64 的截图落盘,返回真正写成功的文件名。
+
+        每一步都是在替客户端说的话找反证:
+          · 类型按魔术字节判,不看它给的 MIME,也不看扩展名
+          · 文件名整个由服务端生成,用户输入一个字节都不参与 —— 没有拼接就没有
+            路径穿越
+          · 目录总量到顶就直接不收,不然公开提交口等于一个免费网盘
+        """
+        out = []
+        d = self._fb_img_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            print("[feedback] cannot create image dir %s: %s" % (d, e), flush=True)
+            return out
+        lim = self._fb_limits()
+        budget = lim["dir"] - self._fb_dir_bytes()
+        for i, raw in enumerate(items[: lim["count"]]):
+            s = str(raw or "")
+            if s.startswith("data:"):
+                comma = s.find(",")
+                if comma < 0:
+                    continue
+                s = s[comma + 1:]
+            s = re.sub(r"\s+", "", s)
+            try:
+                data = base64.b64decode(s, validate=True)
+            except Exception:
+                continue
+            if not data or len(data) > lim["each"]:
+                continue
+            if len(data) > budget:
+                print("[feedback] image dir at capacity -> dropping attachment", flush=True)
+                break
+            ext, _mime = sniff_image(data)
+            if not ext:
+                continue          # 不是我们认得的位图容器 -> 丢掉,不落盘
+            name = "fb%d-%d-%s.%s" % (int(fid), min(i, 9), uuid.uuid4().hex[:16], ext)
+            try:
+                with open(os.path.join(d, name), "wb") as f:
+                    f.write(data)
+                os.chmod(os.path.join(d, name), 0o640)
+            except OSError as e:
+                print("[feedback] image write failed: %s" % e, flush=True)
+                continue
+            budget -= len(data)
+            out.append(name)
+        return out
+
+    def _serve_feedback_image(self, u):
+        """截图只给带 bw_session 的管理员看。
+
+        这一点是这个功能的主要遏制手段:上传口是公开的,但取回口不是,所以谁也
+        不能拿这台服务器当图床来托管任意内容。"""
+        # 【这一条必须 fail closed,不能沿用管理页的约定】。
+        # _check_webui_cookie() 在没配 webui_password 时一律放行 —— 那对"服务端
+        # 自己生成的 HTML"是可以接受的取舍,但对"任意用户上传的二进制"不是同一
+        # 件事:8787 是公网口,上传又是公开无鉴权的,两头一敞开,这台机器就成了
+        # 谁都能写、谁都能读的图床,而内容完全不受我们控制。
+        # 实测过:不加这一段时,无 cookie 直接 GET 截图返回 200。
+        if not self._webui_password():
+            return self._send(403, {"ok": False, "error":
+                                    "未设置 webui_password;为避免公网无鉴权读取"
+                                    "用户上传内容,截图不予提供"})
+        if not self._check_webui_cookie():
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        name = urllib.parse.unquote(u.path.rsplit("/", 1)[-1])
+        # 白名单正则同时挡掉 .. 和 /:名字必须完全长成我们自己生成的样子。
+        if not IMG_NAME_RE.match(name):
+            return self._send(404, {"ok": False, "error": "not found"})
+        path = os.path.join(self._fb_img_dir(), name)
+        if not os.path.isfile(path):
+            return self._send(404, {"ok": False, "error": "not found"})
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, {"ok": False, "error": "not found"})
+        mime = IMG_EXT_MIME.get(name.rsplit(".", 1)[-1], "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        # nosniff:即便有人设法存进了别的东西,浏览器也不准改主意按 HTML 解释它。
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Disposition", 'inline; filename="%s"' % name)
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.send_header("Cache-Control", "private, max-age=600")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _secondary_only_payload(h, r):
+        """VT has no record but other clouds do. Returns a 200 payload, or None so
+        the caller falls through to its normal 404.
+
+        vt_lookup has to keep ok=False on a VT 404 (harvest.py's upload trigger keys
+        on it), so without this the API would answer "not found" while holding a
+        perfectly good 微步/OTX verdict in its hand."""
+        if not r.get("vt_unknown") or int(r.get("sources_ok") or 0) <= 0:
+            return None
+        rep = r.get("report") or {}
+        return {"ok": True, "hash": h, "vt_unknown": True, "degraded": True,
+                "verdict": r.get("verdict", "unknown"),
+                "malicious": r.get("malicious", 0),
+                "total_engines": r.get("total_engines", 0),
+                "sources_ok": int(r.get("sources_ok") or 0),
+                "sources": rep.get("sources", []),
+                "note": "VirusTotal 无此文件记录;结论来自其他威胁情报云"}
+
     def _api_get(self, u, info):
         rest = u.path[len("/api/v1/"):]
         if rest.startswith("hash/"):
@@ -3327,6 +6394,9 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                 return self._send(400, {"ok": False, "error": "invalid hash (md5/sha1/sha256)"})
             r = SERVICE.vt_lookup(h, False)
             if not r.get("ok"):
+                alt = self._secondary_only_payload(h, r)
+                if alt:
+                    return self._send(200, alt)
                 return self._send(404, {"ok": False, "error": r.get("error", "not found")})
             return self._send(200, self._api_hash_summary(r))
         if rest.startswith("file/"):
@@ -3335,6 +6405,9 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                 return self._send(400, {"ok": False, "error": "invalid hash"})
             r = SERVICE.vt_lookup(h, False)
             if not r.get("ok"):
+                alt = self._secondary_only_payload(h, r)
+                if alt:
+                    return self._send(200, alt)
                 return self._send(404, {"ok": False, "error": r.get("error", "not found")})
             return self._send(200, {"ok": True, "cached": bool(r.get("cached")),
                                     "stored_at": r.get("stored_at", ""), "report": r.get("report", {})})
@@ -3379,9 +6452,176 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                 return self._send(400, {"ok": False, "error": "invalid hash"})
             r = SERVICE.vt_lookup(h, bool(payload.get("refresh", False)))
             if not r.get("ok"):
+                alt = self._secondary_only_payload(h, r)
+                if alt:
+                    return self._send(200, alt)
                 return self._send(404, {"ok": False, "error": r.get("error", "not found")})
             return self._send(200, self._api_hash_summary(r))
         return self._send(404, {"ok": False, "error": "unknown endpoint; see /api/docs"})
+
+    # --------------------------------------------------- 在线更新(公开接口) #
+    # 客户端「软件内更新」用的两个接口。两者都刻意放在 _authed() 闸门【之前】:
+    # 发布包里 ReputationProxy.BearerToken 是空的,放到闸门之后等于「只有持令牌的
+    # 人能检查更新」,而那恰恰是唯一一批不需要这个功能的人。
+    #
+    # 服务器侧的目录约定(文件由 scripts/make-update-package.ps1 生成后手工投放,
+    # 本进程只读不写):
+    #     <app 目录>/update/<channel>/manifest.json
+    #     <app 目录>/update/<channel>/<载荷文件>
+    #
+    # 这里【不做签名】,也不需要:签名在文件自身(Authenticode),由客户端按编译期
+    # 钉死的证书指纹校验(见 cpp/shared/include/bulwark/UpdateTrust.h)。服务器只是
+    # 分发点 —— 这正是「服务器被拿下也决定不了客户端装什么」的原因。清单里的哈希由
+    # 服务器现算(带 mtime 缓存),这样「清单说 X、文件是 Y」这一类陈旧不一致压根
+    # 不可能出现;它不是安全边界,安全边界是客户端那道指纹校验。
+    _UPDATE_CHANNELS = ("stable", "beta")
+    _UPDATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    _update_hash_cache = {}   # path -> (size, mtime_ns, sha256)
+
+    def _update_dir(self, channel):
+        if channel not in self._UPDATE_CHANNELS:
+            return None
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "update", channel)
+
+    def _update_file_sha256(self, path, st):
+        """SHA-256,按 (size, mtime) 缓存。投放新文件时 mtime 变化即自动失效。"""
+        key = path
+        cached = self._update_hash_cache.get(key)
+        if cached and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+            return cached[2]
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(1024 * 1024)
+                if not b:
+                    break
+                h.update(b)
+        digest = h.hexdigest()
+        self._update_hash_cache[key] = (st.st_size, st.st_mtime_ns, digest)
+        return digest
+
+    def _update_manifest_obj(self, channel):
+        """读 manifest.json 并用磁盘真实状态收敛 files[]。返回 (obj, error)。"""
+        d = self._update_dir(channel)
+        if not d:
+            return None, "unknown channel"
+        try:
+            with open(os.path.join(d, "manifest.json"), "rb") as f:
+                man = json.loads(f.read().decode("utf-8"))
+        except OSError:
+            return None, "no release published"
+        except (ValueError, UnicodeDecodeError) as e:
+            return None, "manifest unreadable: %s" % e
+        if not isinstance(man, dict):
+            return None, "manifest is not an object"
+
+        files = []
+        missing = []
+        for item in (man.get("files") or []):
+            name = str((item or {}).get("name", "")).strip()
+            # 清单是人工投放的文本,这里当不可信输入处理:名字不合规就丢掉,
+            # 绝不拼进路径。否则一个 "../../etc/passwd" 就能把任意文件读出去。
+            if not self._UPDATE_NAME_RE.match(name):
+                continue
+            p = os.path.join(d, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                missing.append(name)
+                continue
+            if not os.path.isfile(p):
+                missing.append(name)
+                continue
+            files.append({"name": name, "size": st.st_size,
+                          "sha256": self._update_file_sha256(p, st),
+                          "url": "/v1/update/file/%s/%s" % (channel, name)})
+        # 少一个文件就不算一次可用的更新:半套载荷装上去,机器上就是一个新 exe
+        # 配旧驱动的组合 —— 那种状态比不更新危险得多。宁可整份不发布。
+        if missing:
+            return None, "incomplete release (missing: %s)" % ",".join(sorted(missing))
+        if not files:
+            return None, "release lists no usable files"
+
+        out = {
+            "ok": True,
+            "available": True,
+            "channel": channel,
+            "version": str(man.get("version", "")).strip(),
+            "label": str(man.get("label", "")).strip(),
+            "published": str(man.get("published", "")).strip(),
+            "notes": str(man.get("notes", "")),
+            "files": files,
+            "totalBytes": sum(f["size"] for f in files),
+        }
+        if not out["version"]:
+            return None, "manifest has no version"
+        return out, None
+
+    def _serve_update_manifest(self, u):
+        qs = urllib.parse.parse_qs(u.query or "")
+        channel = (qs.get("channel") or ["stable"])[0].strip().lower()
+        man, err = self._update_manifest_obj(channel)
+        if err:
+            # 三种情况必须回三种码,否则客户端只能笼统地说「检查更新失败」:
+            #   200 还没发布任何版本 —— 这是正常状态,不是错误。用 404/5xx 表达它,
+            #       会与「网络不通 / 端点配错」在客户端侧混成同一个现象。
+            #   400 channel 传错 —— 客户端的错。回 5xx 会让它显示成「服务器不可用」,
+            #       于是有人去查服务器,而问题在请求里。
+            #   503 发布内容自身有问题(清单缺文件/版本号为空)—— 确实是服务端的事,
+            #       且是【暂时】的:补齐文件即恢复,所以 503 而不是 500。
+            if err == "no release published":
+                return self._send(200, {"ok": True, "available": False,
+                                        "channel": channel, "reason": err})
+            code = 400 if err == "unknown channel" else 503
+            return self._send(code, {"ok": False, "available": False,
+                                     "channel": channel, "reason": err})
+        return self._send(200, man)
+
+    def _serve_update_file(self, u):
+        # /v1/update/file/<channel>/<name>
+        rest = u.path[len("/v1/update/file/"):]
+        parts = [p for p in rest.split("/") if p != ""]
+        if len(parts) != 2:
+            return self._send(400, {"ok": False, "error": "need /v1/update/file/<channel>/<name>"})
+        channel, name = parts[0].strip().lower(), urllib.parse.unquote(parts[1]).strip()
+        if channel not in self._UPDATE_CHANNELS or not self._UPDATE_NAME_RE.match(name):
+            return self._send(400, {"ok": False, "error": "bad channel or name"})
+        # 只允许下载【当前清单里列出的】文件。比单纯的文件名正则更强:即便有人往
+        # update/ 目录里放了别的东西,也不会因为这个接口而变成可下载的。
+        man, err = self._update_manifest_obj(channel)
+        if err:
+            return self._send(404, {"ok": False, "error": err})
+        entry = next((f for f in man["files"] if f["name"].lower() == name.lower()), None)
+        if not entry:
+            return self._send(404, {"ok": False, "error": "not part of the published release"})
+        path = os.path.join(self._update_dir(channel), entry["name"])
+        # realpath 兜底:即使上面的校验被绕过,也不允许把 update/ 之外的文件送出去。
+        root = os.path.realpath(self._update_dir(channel))
+        real = os.path.realpath(path)
+        if not (real == root or real.startswith(root + os.sep)):
+            return self._send(400, {"ok": False, "error": "path escapes the update directory"})
+        try:
+            f = open(real, "rb")
+        except OSError:
+            return self._send(404, {"ok": False, "error": "file unavailable"})
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(entry["size"]))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % entry["name"])
+            # 客户端会自己按清单里的 sha256 校验,缓存只会带来「更新了却拿到旧文件」
+            # 这种最难查的故障,直接禁掉。
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Bulwark-Sha256", entry["sha256"])
+            self.end_headers()
+            shutil.copyfileobj(f, self.wfile)
+        except OSError:
+            pass
+        finally:
+            f.close()
+        return None
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -3420,8 +6660,37 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
             except OSError:
                 pass
             return
+        # ---- 在线客服 -----------------------------------------------------
+        # 顺序是承重的:更长的前缀必须先判,否则 /support/admin/api/* 会被
+        # /support/admin 吃掉、/support/media/* 会被 /support 吃掉。
+        # 整组都放在 _authed() 闸门【之前】—— 访客侧不可能带 Bearer token,
+        # 放在闸门之后等于这个功能只有管理员能用,那就不叫客服了。
+        if u.path.startswith("/support/media/"):
+            return self._serve_support_media(u)
+        if u.path.startswith("/support/admin/api/"):
+            return self._sup_admin_get(u)
+        if u.path in ("/support/admin", "/support/admin/"):
+            return self._serve_support_admin()
+        if u.path.startswith("/support/api/"):
+            return self._sup_get(u)
+        if u.path in ("/support", "/support/", "/kefu"):
+            return self._serve_support_page()
         if u.path in ("/online", "/online/", "/clients"):
             return self._serve_online()
+        if u.path in ("/feedback/mine", "/feedback/mine/"):
+            # 提交者查看自己提交过什么、处理到哪一步了。公开可访问,但只按调用方
+            # 的 IP 返回,且不含 contact/ip/agent —— 详见 list_feedback_by_ip。
+            ip_now = self.client_address[0] if self.client_address else ""
+            return self._send(200, {"ok": True, "ip": mask_ip(ip_now),
+                                    "items": SERVICE.store.list_feedback_by_ip(ip_now)})
+        if u.path.startswith("/feedback/img/"):
+            # 反馈截图。同样要网页口令 —— 上传公开,取回不公开。
+            # 放在 /feedback 判断【之前】,否则会被上面的前缀匹配吃掉。
+            return self._serve_feedback_image(u)
+        if u.path in ("/feedback", "/feedback/"):
+            # 与 /online 同级:页面本身要网页口令,而 POST /feedback(提交)是公开的。
+            self._log_visit("/feedback")
+            return self._serve_feedback()
         if u.path in ("/engine", "/engine/"):
             self._log_visit("/engine")
             return self._serve_engine()
@@ -3469,6 +6738,11 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
             finally:
                 _f.close()
             return
+        # ---- 在线更新(公开:发布包不带令牌,见 _serve_update_manifest 的说明)----
+        if u.path in ("/v1/update/manifest", "/v1/update/manifest/"):
+            return self._serve_update_manifest(u)
+        if u.path.startswith("/v1/update/file/"):
+            return self._serve_update_file(u)
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         if u.path == "/stats":
@@ -3488,6 +6762,7 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                                     "engine": {k: v for k, v in
                                                SERVICE.store.engine_manifest().items()
                                                if k != "stats"},
+                                    "feedback": SERVICE.store.feedback_stats(),
                                     "quota_today": {
                                         "VirusTotal": SERVICE.store.quota_used("VirusTotal"),
                                         "ThreatBook": SERVICE.store.quota_used("ThreatBook")}})
@@ -3496,6 +6771,14 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
                                     "reports": SERVICE.list_vt_reports(),
                                     "stats": SERVICE.store.archive_stats(),
                                     "silverfox": SERVICE.store.list_silverfox()})
+        if u.path == "/benign/reports":
+            # 正常样本区。与 /vt/reports 对称,同样坐在 _authed() 闸门之后。
+            # 干净文件刻意不进 vt_reports(否则威胁计数/家族分布全失真,见 LOOKUP_DDL
+            # 处说明),而是单独存在 benign_reports,这里单独出一份清单给网页展示。
+            bstats = SERVICE.store.benign_stats()
+            return self._send(200, {"count": bstats.get("total", 0),
+                                    "reports": SERVICE.list_benign_reports(),
+                                    "stats": bstats})
         if u.path.startswith("/ha/behaviour/"):
             ident = urllib.parse.unquote(u.path[len("/ha/behaviour/"):]).strip().lower()
             if not re.match(r"^[0-9a-f]{64}$", ident):
@@ -3568,15 +6851,106 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
             if info is None:
                 return
             return self._api_post(u, info)
+        # ---- 在线客服 --------------------------------------------------------
+        # 同样刻意放在 _authed() 之前,理由与下面的反馈提交一样。
+        if u.path == "/support/admin/login":
+            return self._sup_admin_login()
+        if u.path.startswith("/support/admin/api/"):
+            return self._sup_admin_post(u)
+        if u.path.startswith("/support/api/"):
+            return self._sup_post(u)
+        # ---- 用户反馈提交 ----------------------------------------------------
+        # 刻意放在 _authed() 之前:提交反馈的是普通用户,浏览器 fetch 不带 Bearer
+        # token,放在闸门之后等于这个功能只有管理员能用,反馈就永远收不到。
+        # 代价是它对外完全开放,所以 per-IP 滑窗限流 + Store 里的每日条数上限
+        # 与长度上限一起构成防滥用,三者缺一不可。
+        if u.path in ("/feedback", "/api/feedback"):
+            if not self._throttle_ok():
+                return
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            # 截图走 JSON 里的 base64,所以这个上限必须容得下 3 张 2MB 的图再乘
+            # base64 的 4/3 膨胀,留点余量 = 9MB。刻意不改成 multipart:多写一个
+            # 解析器就是在公开无鉴权的口子上多开一片攻击面,而 base64 的解码路径
+            # 是标准库里久经考验的那一条。
+            lim = self._fb_limits()
+            if length > lim["body"]:
+                return self._send(413, {"ok": False, "error":
+                                        "内容过长(整份提交上限 %d MB,可调 feedback.max_body_mb)"
+                                        % (lim["body"] // (1024 * 1024))})
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+            except Exception:
+                return self._send(400, {"ok": False, "error": "请求体不是合法 JSON"})
+            if not isinstance(body, dict):
+                return self._send(400, {"ok": False, "error": "请求体格式不对"})
+            imgs_in = body.get("images") or []
+            if not isinstance(imgs_in, list):
+                imgs_in = []
+            ip_now = self.client_address[0] if self.client_address else ""
+            # 先建记录拿到 id(文件名要带 id 才能一眼看出属于谁),再落盘,最后把
+            # 文件名回填。顺序反过来的话,一条被每日上限拒掉的提交仍然已经把图
+            # 写进了盘,而且没有任何记录引用它 —— 那就是永久垃圾。
+            fid, err = SERVICE.store.add_feedback(
+                ip_now,
+                str(body.get("kind", "other")),
+                str(body.get("contact", "")),
+                str(body.get("message", "")),
+                ua_short(self.headers.get("User-Agent", "")),
+                str(body.get("page", "")),
+                images=["pending"] * min(len(imgs_in), lim["count"]))
+            if err:
+                return self._send(400, {"ok": False, "error": err})
+            names = self._store_feedback_images(fid, imgs_in) if imgs_in else []
+            SERVICE.store.set_feedback_images(fid, names)
+            SERVICE.store.counter_incr("feedback_received")
+            if names:
+                SERVICE.store.counter_incr("feedback_images", len(names))
+            print("[feedback] #%d from %s (%d img): %s" % (
+                fid, mask_ip(ip_now), len(names),
+                str(body.get("message", ""))[:80].replace("\n", " ")), flush=True)
+            return self._send(200, {"ok": True, "id": fid, "images": len(names),
+                                    "images_rejected": max(0, len(imgs_in) - len(names))})
+        if u.path == "/feedback/status":
+            # 管理动作(标记已处理 / 删除)。走网页口令而不是 Bearer token ——
+            # 管理员是在浏览器里点的,身上只有 bw_session cookie。
+            if not self._check_webui_cookie():
+                return self._send(401, {"ok": False, "error": "unauthorized"})
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                body = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+            except Exception:
+                return self._send(400, {"ok": False, "error": "bad json"})
+            fid = int(body.get("id", 0) or 0)
+            act = str(body.get("action", ""))
+            if act == "delete":
+                ok, imgs = SERVICE.store.delete_feedback(fid)
+                return self._send(200, {"ok": ok, "images_removed": self._drop_fb_images(imgs)})
+            if act in ("new", "done"):
+                reply = body.get("reply")
+                ok, drop = SERVICE.store.set_feedback_status(
+                    fid, act, None if reply is None else str(reply))
+                # 标为已处理 -> 截图使命结束,立即删盘。数据库里的引用已在 Store
+                # 里清空,所以不会留下指向不存在文件的记录。
+                return self._send(200, {"ok": ok, "images_removed": self._drop_fb_images(drop)})
+            return self._send(400, {"ok": False, "error": "unknown action"})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
-        if u.path in ("/vt/upload", "/vt/lookup", "/v1/reputation/hash") and not self._throttle_ok():
+        # 会真的花掉共享上游配额的两条路照旧先过 per-IP 滑窗。
+        # /v1/reputation/hash 【不在这里判】—— 它的闸门推迟到读出 lookupOnly 之后(见下),
+        # 因为「只查收录」的查询不限次数。
+        if u.path in ("/vt/upload", "/vt/lookup") and not self._throttle_ok():
             return
         length = int(self.headers.get("Content-Length", 0) or 0)
         # Binary sample upload -> read raw bytes (no JSON). Filename via ?name=<urlencoded>.
         if u.path == "/vt/upload":
             st, obj = self._read_upload(u)
             return self._send(st, obj)
+        # JSON 体一律限长。这条以前靠「读之前先限流」间接兜着,现在只读收录的查询不再限次数,
+        # 就得自己挡住「一个请求声明 4GB 体长」这种最省事的打法。这些 JSON 体最大也就几百字节。
+        if length > 64 * 1024:
+            return self._send(413, {"error": "payload too large"})
         raw = self.rfile.read(length) if length else b""
         try:
             payload = json.loads(raw or b"{}")
@@ -3586,14 +6960,42 @@ td.pt{font-family:var(--mono);font-size:12.5px;color:var(--brand)}
             sha = str(payload.get("sha256", "")).strip()
             if not SHA256_RE.match(sha):
                 return self._send(400, {"error": "invalid sha256"})
+            # 只查收录、不要动服务端上游。三种写法任一成立即生效:
+            #   lookupOnly(新客户端的常态模式)/ cacheOnly(老客户端配额耗尽时就在发)/
+            #   X-Cache-Only 头(纯 header 型调用方)。
+            # 认 cacheOnly 是刻意的:那个字段本来就承诺「绝不动用付费上游」,此前服务端不读它
+            # 才让承诺落空;现在一并兑现,老客户端无需升级即可停止烧共享配额。
+            lookup_only = (bool(payload.get("lookupOnly", False))
+                           or bool(payload.get("cacheOnly", False))
+                           or str(self.headers.get("X-Cache-Only", "")).strip() == "1")
+            # 【只查收录 = 不限次数】。
+            #
+            # per-IP 滑窗存在的理由只有一个:别让一个 IP 把机队共用的付费上游配额烧光。
+            # 而 lookup_only 的请求根本不碰上游 —— 它就是一次 sha256 主键的 SQLite 查询,
+            # 命中就答、不命中就回 recorded=false。对这种请求限次数是在拿唯一一条【免费】通路
+            # 去省【付费】通路的钱,方向是反的:每挡掉一次「服务器收录了吗」,换来的都是客户端
+            # 多烧一次自己的 VirusTotal 免费额度(4/min、500/天),而超限的代价更离谱 ——
+            # 回 429 且 retry_after_seconds=3600,整整一小时里云查全部退回纯本地。
+            #
+            # 仍然守住的部分:会触达上游的查询(lookup_only 为假)、/vt/lookup、/vt/upload
+            # 照旧限流,JSON 体限长在上面。
+            if not lookup_only and not self._throttle_ok():
+                return
             SERVICE.store.touch_client(self.client_address[0] if self.client_address else "",
                                        self._client_id())
-            return self._send(200, SERVICE.reputation_hash(sha))
+            res = SERVICE.reputation_hash(sha, lookup_only)
+            if not lookup_only:
+                # 只有真的扣过名额才谈退还。lookup_only 压根没扣,这里若照退,弹掉的是【别的
+                # 并发请求】刚记下的那个时间戳 —— 等于凭一串只读查询把限流额度洗掉。
+                self._refund_if_cached(res)
+            return self._send(200, res)
         if u.path == "/vt/lookup":
             h = str(payload.get("hash", "")).strip().lower()
             if not re.match(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", h):
                 return self._send(400, {"ok": False, "error": "invalid hash (need md5/sha1/sha256)"})
-            return self._send(200, SERVICE.vt_lookup(h, bool(payload.get("refresh", False))))
+            res = SERVICE.vt_lookup(h, bool(payload.get("refresh", False)))
+            self._refund_if_cached(res)
+            return self._send(200, res)
         return self._send(404, {"error": "not found"})
 
 
@@ -3626,13 +7028,57 @@ class BulwarkHTTPServer(ThreadingHTTPServer):
                 return  # incomplete / invalid TLS (scanner or probe) -> drop quietly
         self.RequestHandlerClass(request, client_address, self)
 
+    # 对端提前挂断不是错误,不该印 20 行 traceback。
+    #
+    # 实测:一个扫描器 GET / 之后在服务端还在写那 131 KB 控制台页时就断开,sendall 抛
+    # ConnectionReset,socketserver 默认把整段调用栈打进 journal。一次访问三条 traceback。
+    #
+    # 这件事本身无害(死的只是那一个线程,服务照常),但它会毁掉一个判据:部署守卫用
+    # 「重启以来 traceback 数为 0」当健康门,而这条门此后随时会被一个路过的扫描器按下 ——
+    # 那正是本项目最不想要的「假失败」。所以把断连这一类收敛成一行,其余异常【原样保留】
+    # 完整调用栈:真的 bug 绝不能被这个开关顺手藏掉。
+    _QUIET_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                     TimeoutError, ssl.SSLEOFError, ssl.SSLZeroReturnError)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self._QUIET_ERRORS):
+            print("%s - client went away mid-response (%s)"
+                  % (client_address[0] if client_address else "?",
+                     type(exc).__name__), flush=True)
+            return
+        super().handle_error(request, client_address)
+
 
 def main():
-    global SERVICE, CONFIG, THROTTLE
+    global SERVICE, CONFIG, THROTTLE, SUPPORT, SUP_WAIT
     CONFIG = load_config()
     SERVICE = IntelService(CONFIG)
     _prl = CONFIG.get("public_rate_limit", {}) or {}
     THROTTLE = IPThrottle(int(_prl.get("per_minute", 60)), int(_prl.get("per_hour", 600)))
+
+    # ---- 在线客服 ---------------------------------------------------------- #
+    # 独立的数据库文件,默认放在 db_path 旁边(那是这个 unit 唯一可写的目录:
+    # ProtectSystem=strict + ReadWritePaths=/var/lib/bulwark-intel)。
+    # 建库失败【不能让整个服务起不来】—— 情报查询是主业,客服是附加功能,
+    # 后者的磁盘问题不该把前者一起拖下线。
+    _sup = CONFIG.get("support", {}) or {}
+    if _sup.get("enabled", True):
+        _state = os.path.dirname(CONFIG["db_path"]) or "/var/lib/bulwark-intel"
+        try:
+            SUPPORT = SupportStore(
+                _sup.get("db_path") or os.path.join(_state, "support.db"),
+                _sup.get("media_dir") or os.path.join(_state, "support_media"))
+            try:
+                _mw = max(4, min(512, int(_sup.get("max_waiters", 64))))
+            except (TypeError, ValueError):
+                _mw = 64
+            SUP_WAIT = threading.BoundedSemaphore(_mw)
+            print("support desk ready (db=%s, media=%s, waiters=%d)"
+                  % (SUPPORT.path, SUPPORT.media_dir, _mw), flush=True)
+        except Exception as e:
+            SUPPORT, SUP_WAIT = None, None
+            print("support desk DISABLED: %s: %s" % (type(e).__name__, e), flush=True)
     host = CONFIG.get("listen_host", "0.0.0.0")
     port = int(CONFIG.get("listen_port", 8787))
     httpd = BulwarkHTTPServer((host, port), Handler)

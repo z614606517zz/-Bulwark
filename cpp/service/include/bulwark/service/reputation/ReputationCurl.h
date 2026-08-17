@@ -35,6 +35,17 @@ public:
     static std::pair<int, QString> postFile(const QString& url, const QString& filePath,
                                              const QStringList& headers, int timeoutSeconds);
 
+    // GET straight to a file (curl -o). Returns (http status, curl stderr on failure).
+    //
+    // 为什么不能用上面的 get():那四个方法都把响应体收进 QString 再返回。更新载荷是几 MB 的
+    // PE,走内存要经「curl -> QProcess 管道 -> QByteArray -> QString(UTF-16,体积翻倍)」,
+    // 而且二进制过一遍 QString 转换本身就是错的。-o 让 curl 直接落盘,内存里只留状态码。
+    //
+    // 注意:HTTP 非 200 时 curl 仍会把错误响应体写进目标文件(没用 -f),故调用方必须在
+    // code != 200 时删掉它 —— 否则会留下一个「长度不对的 exe」在暂存目录里。
+    static std::pair<int, QString> download(const QString& url, const QString& destPath,
+                                            const QStringList& headers, int timeoutSeconds);
+
     // Append a diagnostic line to %ProgramData%\Bulwark\rep_diag.log (ReputationHttp.DiagLog).
     static void diag(const QString& line);
 

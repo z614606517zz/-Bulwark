@@ -5,14 +5,17 @@
 #include "dialogs/RemediationReportDialog.h"
 #include "dialogs/ScanProgressWindow.h"
 #include "dialogs/ToastNotifier.h"
+#include "dialogs/UpdateDialog.h"
 #include "ipc/IpcClient.h"
 #include "pages/CardPages.h"
+#include "pages/CleanupPage.h"
 #include "pages/DashboardPage.h"
 #include "pages/TablePages.h"
 #include "widgets/AppIcon.h"
 #include "widgets/NavButton.h"
 #include "widgets/Ui.h"
 
+#include "bulwark/Version.h"
 #include "bulwark/ipc/Payloads.h"
 #include "bulwark/models/Enums.h"
 #include "bulwark/models/SecurityEvent.h"
@@ -83,6 +86,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     addPage("trust", u("信任名单"), u("信任名单"), u("受信任的程序与目录"), pages::trust(m_ipc));
     addPage("lock", u("隔离区"), u("隔离区"), u("已隔离的威胁文件"), pages::quarantine(m_ipc));
     addPage("power", u("自启动项"), u("自启动项"), u("开机持久化审计"), pages::persistence(m_ipc));
+    addPage("trash", u("垃圾清理"), u("垃圾清理"), u("按类别扫描 · 勾选后清理"), new CleanupPage(m_ipc));
     addPage("cloud", u("云信誉"), u("云信誉"), u("多引擎哈希信誉查询"), pages::reputation(m_ipc));
     addPage("link", u("攻击链"), u("攻击链"), u("动作组合定性 · 命中记录"), pages::attackChain(m_ipc));
     addPage("sparkles", u("AI 研判"), u("AI 研判"), u("大模型行为研判"), pages::aiScan(m_ipc));
@@ -141,6 +145,28 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                 if (m_tray && QSystemTrayIcon::isSystemTrayAvailable())
                     m_tray->showMessage(QString::fromUtf8("重试隔离"), r.message,
                                         r.success ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 4000);
+            });
+
+    // 「启动后自动检查」的结果落在这里。刻意只弹一次托盘气泡,不自动打开弹窗、更不自动下载:
+    // 更新会替换内核驱动,那必须由用户按下按钮才发生。
+    //
+    // 三道抑制,针对的都是「变成骚扰」这一个失败形态:
+    //   查失败 / 没有新版本 -> 什么都不说。用户没主动问,就不该被告知「检查失败了」。
+    //   弹窗正开着          -> 那是用户自己点的检查,结论已经写在弹窗里,再弹气泡是噪音。
+    //   本会话已经弹过      -> 服务端每个生命周期只自动查一次,但界面可能重连,不设闸门
+    //                          就会每次重连都弹一遍。
+    connect(m_ipc, &IpcClient::updateCheckReceived, this,
+            [this](const bulwark::ipc::UpdateCheckResponsePayload& p) {
+                if (!p.ok || !p.available) return;
+                if (UpdateDialog::isAnyOpen()) return;
+                if (m_updateBalloonShown) return;
+                if (!m_tray || !QSystemTrayIcon::isSystemTrayAvailable()) return;
+                m_updateBalloonShown = true;
+                m_tray->showMessage(
+                    QString::fromUtf8("有新版本 ") + p.version,
+                    QString::fromUtf8("当前 ") + p.currentVersion
+                        + QString::fromUtf8("。在「设置 > 关于与更新」里查看更新说明并安装。"),
+                    QSystemTrayIcon::Information, 6000);
             });
 
     // 中央信誉服务在线状态灯:连接后 + 每 30s 探测一次(source=ReputationProxy 定向探测代理
@@ -234,7 +260,9 @@ QWidget* MainWindow::buildSidebar()
         "中央信誉服务(云端共享缓存 + 多引擎)连接状态。离线时本地直连情报源自动兜底,实时防护不受影响。"));
     v->addWidget(m_repPill, 0, Qt::AlignLeft);
     v->addSpacing(8);
-    v->addWidget(ui::label(QString::fromUtf8("v1.0.0 · Qt Edition"), "muted"));
+    // 版本串来自 bulwark/Version.h —— 与 exe 的 VERSIONINFO、更新清单比较用的是
+    // 同一个数字。以前这里是硬编字面量,是全产品唯一的版本来源。
+    v->addWidget(ui::label(bulwark::version::displayString(), "muted"));
 
     m_navGroup = new QButtonGroup(this);
     m_navGroup->setExclusive(true);

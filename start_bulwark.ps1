@@ -1,4 +1,4 @@
-# Bulwark 启动脚本
+﻿# Bulwark 启动脚本
 # 需要以管理员权限运行
 
 Write-Host "正在启动 Bulwark..." -ForegroundColor Green

@@ -288,6 +288,89 @@ void IpcServer::handleLine(QLocalSocket* /*sock*/, const QString& line) {
                 break;
             }
 
+            // ---- 在线更新:异步 —— 宿主后台走网络,算完经 sendUpdateCheck / 进度 / 结果回推 ----
+            // 未绑定回调时【立刻】回一条 ok=false 的结论,而不是什么都不发:后者会让弹窗
+            // 一直停在「正在检查…」,用户无从判断是服务没这个功能还是网络卡住了。
+            case IpcMessageType::UpdateCheckRequest: {
+                if (updateCheckRequested) {
+                    updateCheckRequested();
+                } else {
+                    UpdateCheckResponsePayload res;
+                    res.ok = false;
+                    res.error = QString::fromUtf8("本服务未启用在线更新功能。");
+                    sendUpdateCheck(res);
+                }
+                break;
+            }
+            case IpcMessageType::UpdateDownloadRequest: {
+                if (updateDownloadRequested) {
+                    updateDownloadRequested();
+                } else {
+                    UpdateDownloadResponsePayload res;
+                    res.ok = false;
+                    res.error = QString::fromUtf8("本服务未启用在线更新功能。");
+                    sendUpdateDownloadResult(res);
+                }
+                break;
+            }
+            case IpcMessageType::UpdateApplyRequest: {
+                if (updateApplyRequested) {
+                    updateApplyRequested();
+                } else {
+                    // 未绑定时【立刻】回一条失败结论,不能什么都不发 —— 后者会让界面
+                    // 一直停在「正在安装」,而用户无从判断是没这功能还是卡住了。
+                    UpdateApplyResponsePayload res;
+                    res.ok = false;
+                    res.needsRestart = false;
+                    res.error = QString::fromUtf8("本服务未启用在线更新功能。");
+                    sendUpdateApplyResult(res);
+                }
+                break;
+            }
+
+            // ---- 磁盘垃圾清理:异步 —— 宿主后台遍历,算完经 sendJunkScan / sendJunkClean 回推。
+            //      未绑定回调时【立刻】回一条 enabled=false / success=false 的结论,而不是什么都
+            //      不发 —— 后者会让界面一直停在「正在扫描…」,用户无从判断是没这功能还是卡住了。
+            case IpcMessageType::JunkScanRequest: {
+                const auto req = JunkScanRequestPayload::fromJson(msg->payloadObject());
+                if (junkScanRequested) {
+                    junkScanRequested(req);
+                } else {
+                    JunkScanResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.enabled = false;
+                    res.message = QString::fromUtf8("本服务未启用磁盘垃圾清理。");
+                    sendJunkScan(res);
+                }
+                break;
+            }
+            case IpcMessageType::JunkCleanRequest: {
+                const auto req = JunkCleanRequestPayload::fromJson(msg->payloadObject());
+                if (junkCleanRequested) {
+                    junkCleanRequested(req);
+                } else {
+                    JunkCleanResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.success = false;
+                    res.message = QString::fromUtf8("本服务未启用磁盘垃圾清理。");
+                    sendJunkClean(res);
+                }
+                break;
+            }
+            case IpcMessageType::LargeFileScanRequest: {
+                const auto req = LargeFileScanRequestPayload::fromJson(msg->payloadObject());
+                if (largeFileScanRequested) {
+                    largeFileScanRequested(req);
+                } else {
+                    LargeFileScanResponsePayload res;
+                    res.requestId = req.requestId;
+                    res.enabled = false;
+                    res.message = QString::fromUtf8("本服务未启用大文件查找。");
+                    sendLargeFileScan(res);
+                }
+                break;
+            }
+
             // ---- 事件时间线(取证回溯):异步 —— 宿主后台扫历史,算完经 sendTimeline 回推 ----
             case IpcMessageType::EventTimelineRequest: {
                 const auto req = TimelineRequestPayload::fromJson(msg->payloadObject());
@@ -464,6 +547,38 @@ void IpcServer::sendQuarantineList() {
     const QuarantineListResponsePayload payload =
         quarantineListRequested ? quarantineListRequested() : QuarantineListResponsePayload{};
     broadcast(IpcMessage::from(IpcMessageType::QuarantineListResponse, payload));
+}
+
+void IpcServer::sendUpdateCheck(const UpdateCheckResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::UpdateCheckResponse, payload));
+}
+
+void IpcServer::sendUpdateProgress(const UpdateProgressPayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::UpdateProgressNotification, payload));
+}
+
+void IpcServer::sendUpdateDownloadResult(const UpdateDownloadResponsePayload& p) {
+    broadcast(IpcMessage::from(IpcMessageType::UpdateDownloadResponse, p));
+}
+
+void IpcServer::sendUpdateApplyResult(const UpdateApplyResponsePayload& p) {
+    broadcast(IpcMessage::from(IpcMessageType::UpdateApplyResponse, p));
+}
+
+void IpcServer::sendJunkScan(const JunkScanResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::JunkScanResponse, payload));
+}
+
+void IpcServer::sendJunkClean(const JunkCleanResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::JunkCleanResponse, payload));
+}
+
+void IpcServer::sendJunkProgress(const JunkProgressPayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::JunkProgressNotification, payload));
+}
+
+void IpcServer::sendLargeFileScan(const LargeFileScanResponsePayload& payload) {
+    broadcast(IpcMessage::from(IpcMessageType::LargeFileScanResponse, payload));
 }
 
 // 未绑定回调时回一个 enabled=false 的空负载 —— UI 据此显示「引擎未启用」而不是空白页。

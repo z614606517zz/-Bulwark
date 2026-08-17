@@ -62,6 +62,7 @@ QJsonObject RuntimeSettings::toJson() const {
     o["eventSource"] = eventSource;
     o["kernelConnected"] = kernelConnected;
     o["kernelStatus"] = kernelStatus;
+    o["cloudServerOnly"] = cloudServerOnly; // 只读状态位(服务 -> UI),见 RuntimeSettings.h
 
     o["quarantineOnBlock"] = quarantineOnBlock;
     return o;
@@ -128,6 +129,7 @@ RuntimeSettings RuntimeSettings::fromJson(const QJsonObject& o) {
     if (o.contains(QLatin1String("eventSource"))) s.eventSource = getStr(o, "eventSource");
     s.kernelConnected = getBool(o, "kernelConnected", s.kernelConnected);
     if (o.contains(QLatin1String("kernelStatus"))) s.kernelStatus = getStr(o, "kernelStatus");
+    s.cloudServerOnly = getBool(o, "cloudServerOnly", s.cloudServerOnly);
 
     s.quarantineOnBlock = getBool(o, "quarantineOnBlock", s.quarantineOnBlock);
     return s;

@@ -155,24 +155,41 @@ ProxyReputationService::ProxyReputationService(const BulwarkOptions& options,
     if (options.ReputationProxy.QueryTimeoutSeconds > 0)
         timeoutSecs_ = options.ReputationProxy.QueryTimeoutSeconds;
     syncResults_ = options.ReputationProxy.SyncResultsToServer;
+    lookupOnly_ = options.ReputationProxy.LookupOnly;
+    serverOnly_ = options.ReputationProxy.ServerOnly;
     enabled_.store(options.ReputationProxy.Enabled && !baseUrl_.isEmpty());
     // Optional per-day cap on fresh (non-cached) server-intel lookups (portable builds).
-    const int dailyFresh = options.ReputationProxy.FreshQueriesPerDay;
+    // 「只查收录」模式下这个预算没有意义(压根不会有新鲜的上游查询),不要建 —— 建了反而会
+    // 让日志里出现一个永远用不掉的配额数字,读的人会以为还有别的路径在花它。
+    const int dailyFresh = lookupOnly_ ? 0 : options.ReputationProxy.FreshQueriesPerDay;
     if (dailyFresh > 0)
         freshBudget_ = std::make_unique<DailyQuota>(dailyFresh);
     // 请求数预算,压在服务端 per-IP 滑窗之下(它超限就是一小时 429)。注意这与 freshBudget_
     // 是两回事:后者只管「服务端有没有真去问付费上游」,命中服务端共享缓存的查询不计数,
     // 却照样占掉一个 IP 名额 —— 所以光靠 freshBudget_ 挡不住请求数被打光。
+    //
+    // 但【只查收录】模式下这两个桶默认不武装(即不限次数):那类请求只让服务端读自己的库,
+    // 不花机队任何上游配额,却是本机 VT 密钥(免费档 4/min、500/天)的唯一替代品 —— 为省一次
+    // 免费的服务器查询而多烧一次稀缺的本机配额,方向是反的。桶照建,等服务端真的回 429
+    // (说明对面仍对只读查询限流)再由 noteOutcome 武装,收敛到配置值之内。
     const int perMin = options.ReputationProxy.RequestsPerMinute;
     const int perHour = options.ReputationProxy.RequestsPerHour;
     if (perMin > 0)
         minuteBudget_ = std::make_unique<TokenBucket>(perMin, 60LL * 1000);
     if (perHour > 0)
         hourBudget_ = std::make_unique<TokenBucket>(perHour, 3600LL * 1000);
-    ReputationCurl::diag(QStringLiteral("RepProxy init: enabled=%1 base=%2 token=%3 freshCap=%4 rate=%5/min %6/h")
+    if (!lookupOnly_)
+        health_->budgetsArmed.store(true); // 会触达服务端上游的模式:一开始就守住预算
+    if (serverOnly_)
+        ReputationCurl::diag(QStringLiteral(
+            "RepProxy 本机不动用任何第三方情报源(ServerOnly):云端只问中央服务器「是否已收录」;"
+            "不用本机密钥查各情报源、不拉行为画像、不上传文件。未收录即无云端结论。"));
+    ReputationCurl::diag(QStringLiteral("RepProxy init: enabled=%1 base=%2 token=%3 lookupOnly=%4 freshCap=%5 rate=%6/min %7/h")
                              .arg(enabled_.load() ? QStringLiteral("1") : QStringLiteral("0"),
                                   maskedUrl_,
                                   token_.isEmpty() ? QStringLiteral("(none)") : QStringLiteral("set"),
+                                  lookupOnly_ ? QStringLiteral("1(只查收录,未收录转本地密钥)")
+                                              : QStringLiteral("0"),
                                   dailyFresh > 0 ? QString::number(dailyFresh) : QStringLiteral("off"),
                                   perMin > 0 ? QString::number(perMin) : QStringLiteral("∞"),
                                   perHour > 0 ? QString::number(perHour) : QStringLiteral("∞")));
@@ -180,6 +197,9 @@ ProxyReputationService::ProxyReputationService(const BulwarkOptions& options,
 
 bool ProxyReputationService::isEnabled() const {
     // Enabled if the proxy is usable OR the fallback aggregate has any active source.
+    // ServerOnly:本地那条腿不存在,可用性就只等于「中央服务器这一跳可用」。
+    if (serverOnly_)
+        return enabled_.load();
     return enabled_.load() || (fallback_ && fallback_->isEnabled());
 }
 
@@ -221,7 +241,12 @@ bulwark::FileReputation ProxyReputationService::queryServerOnly(const QString& s
     // 预算耗尽:改发 cacheOnly=true,只接受服务端缓存命中(仍不限),未命中则由调用方回退本地。
     bool reserved = false;
     bool cacheOnly = false;
-    if (freshBudget_) {
+    if (lookupOnly_) {
+        // 【只查收录】常态模式:一律只问「你收录了吗」,永不请求服务端触达它的上游付费情报源。
+        // 这不是预算耗尽后的降级 —— 未收录时由 query() 的回退分支改用本机密钥直连各情报源。
+        // 也因此不碰 freshBudget_:这个模式下不存在「新鲜的上游查询」可供计费。
+        cacheOnly = true;
+    } else if (freshBudget_) {
         reserved = freshBudget_->tryConsume(priority);
         cacheOnly = !reserved; // 预算耗尽 -> 只查服务端已保存的缓存
     }
@@ -238,7 +263,13 @@ bulwark::FileReputation ProxyReputationService::queryServerOnly(const QString& s
 
     // cacheOnly 模式下只信任服务端缓存命中:若服务端仍回了新鲜结果(忽略了 cacheOnly),
     // 不越过预算采用它,转而让调用方回退本地——严格贯彻「配额用尽后仅用服务端缓存」。
-    if (ok && rep.querySucceeded && (!cacheOnly || wasCached)) {
+    //
+    // 【只查收录】模式是例外,必须放行:服务端此时答的「未收录」本身就是权威结论(它查过自己
+    // 的库了),而这种回复的 cached 必然是 false。若还要求 wasCached,每一次权威的「未收录」
+    // 都会被记成「没问到」——回退行为不变,但日志与云扫描卡片会永远分不清「服务器说没有」和
+    // 「这次没问到服务器」,而「云查是否真的服务器优先」恰恰只能从这个区分看出来。
+    const bool trustAnswer = lookupOnly_ || !cacheOnly || wasCached;
+    if (ok && rep.querySucceeded && trustAnswer) {
         if (answered)  *answered  = true;
         if (hasRecord) *hasRecord = serverHasRecord(rep);
     }
@@ -265,6 +296,20 @@ bulwark::FileReputation ProxyReputationService::query(const QString& sha256, boo
     // 【策略 1】服务器确实收录了该哈希 -> 就用它,不再动本地情报源配额。
     if (hasRecord)
         return serverMiss;
+
+    // 【策略 0】ServerOnly:到此为止,本机一个第三方情报源都不碰(见 ReputationProxyOptions)。
+    // 服务器权威答过「没有收录」时把它降级成 Unknown 返回 —— 保留 querySucceeded=true 才能进
+    // 本地负缓存(24h),否则同一个哈希每来一个事件都要再问服务器一遍;而必须降级成 Unknown,
+    // 是因为老服务端会把「谁都没数据」讲成 verdict=clean/0 引擎,原样返回会被缓存按 7 天当成
+    // 「此文件干净」—— 那正是 serverHasRecord / downgradeToUnknown 一直在堵的漏。
+    if (serverOnly_) {
+        if (haveServerMiss) {
+            ReputationCurl::diag(QStringLiteral("RepProxy %1 => 服务器未收录;本机不动用第三方情报源,无云端结论")
+                                     .arg(sha256.left(12)));
+            return downgradeToUnknown(serverMiss);
+        }
+        return unknown; // 连问都没问到(未启用/熔断/失败):同样不回退本地
+    }
     // 【策略 2】服务器没有该哈希的任何实据(0 引擎的 clean / unknown)-> 不当作最终
     // 结论,继续查本地。服务端目前只聚合 VirusTotal + ThreatBook,本地直连还有
     // MalwareBazaar / OTX / MetaDefender / HybridAnalysis;服务器没有不等于这几家没有。
@@ -381,6 +426,14 @@ bool ProxyReputationService::proxyLikelyUp() {
 }
 
 bool ProxyReputationService::tryConsumeRequestBudget(bool priority) {
+    // 预算未武装 -> 不限次数,直接放行。
+    //
+    // 这是【只查收录】模式的常态:请求只让服务端查它自己的库,不触达任何付费上游,所以
+    // 「省着用」省下来的不是钱,而是把查询推回本机 VT 密钥去烧 —— 那是真稀缺的一档
+    // (免费档 4/min、500/天)。武装条件只有一个:服务端真的回过 429(见 noteOutcome)。
+    if (!health_->budgetsArmed.load())
+        return true;
+
     // 两个桶都要过:分钟桶挡突发(后台队列会连着排空),小时桶挡长时间稳态超配。
     // 先问分钟桶:若小时桶没过,损失的是一枚分钟令牌(几秒就补回来),而反过来损失的是
     // 一枚小时令牌(要十几秒才补一枚,且小时预算才是被服务端封禁的那条线)。TokenBucket
@@ -431,8 +484,14 @@ void ProxyReputationService::noteOutcome(const std::shared_ptr<HealthCache>& hea
         waitMs = std::max<qint64>(1000, std::min<qint64>(waitMs, kThrottleMaxCooldownMs));
         health->throttledUntilMs.store(now + waitMs);
         health->state.store(2);
-        ReputationCurl::diag(QStringLiteral("RepProxy 被服务端限流(429),冷却 %1s 后再试;期间走本地直连")
-                                 .arg(waitMs / 1000));
+        // 收到过 429 => 这台服务端确实对我们按次数限流(新版服务端对「只查收录」请求不限次数,
+        // 见 app.py 的 IPThrottle 旁路)。武装客户端预算桶,后续收敛到 RequestsPerMinute/PerHour
+        // 之内 —— 否则「不限次数」会周期性地把服务器这一跳整段打没,反而更差。只升不降。
+        const bool firstClamp = !health->budgetsArmed.exchange(true);
+        ReputationCurl::diag(QStringLiteral("RepProxy 被服务端限流(429),冷却 %1s 后再试;期间走本地直连%2")
+                                 .arg(waitMs / 1000)
+                                 .arg(firstClamp ? QStringLiteral(";已启用客户端请求预算(该服务端对只读查询也限次数)")
+                                                 : QString()));
         return;
     }
 
@@ -452,9 +511,14 @@ bulwark::FileReputation ProxyReputationService::queryProxy(const QString& sha256
     const QString url = baseUrl_ + QStringLiteral("/v1/reputation/hash");
     // cacheOnly 让配合的服务端仅从共享缓存作答、绝不动用付费上游;不认识该字段的服务端会忽略它
     // (无害),客户端侧仍据回包的 cached 标记独立记账/回退,故限额不依赖服务端配合也成立。
+    // lookupOnly 与 cacheOnly 都发:前者是本客户端的常态模式(「只查收录,永不动服务端上游」),
+    // 后者是老字段(服务端读任一即可)。不认这两个字段的服务端会忽略它们 —— 无害,但那意味着
+    // 它仍会去问上游,所以下面据回包的 lookupOnly 标记告警一次。
     const QString body = QStringLiteral("{\"sha256\":\"") + jsonEscape(sha256) +
                          QStringLiteral("\",\"cacheOnly\":") +
                          (cacheOnly ? QStringLiteral("true") : QStringLiteral("false")) +
+                         QStringLiteral(",\"lookupOnly\":") +
+                         (lookupOnly_ ? QStringLiteral("true") : QStringLiteral("false")) +
                          QStringLiteral("}");
     QStringList headers{ QStringLiteral("Content-Type: application/json") };
     headers << (QStringLiteral("X-Bulwark-Client: ") + clientId()); // 匿名机器 ID,供服务器按机器去重
@@ -493,6 +557,17 @@ bulwark::FileReputation ProxyReputationService::queryProxy(const QString& sha256
     const bool cached = o.value(QLatin1String("cached")).toBool();
     if (wasCached) *wasCached = cached;
 
+    // 服务端是否真的按「只查收录」作答。开关开着但回包没有这个标记 => 对面是旧版,它照样
+    // 去问了自己的上游付费情报源。这一条必须说出来:否则「已经不烧服务器配额了」是个假象,
+    // 而这正是 cacheOnly 白发了很久都没人察觉的老毛病 —— 只警一次,不刷屏。
+    if (lookupOnly_ && !o.value(QLatin1String("lookupOnly")).toBool()) {
+        bool expected = false;
+        if (health_->lookupOnlyUnsupportedWarned.compare_exchange_strong(expected, true))
+            ReputationCurl::diag(QStringLiteral(
+                "RepProxy 警告:已开启「只查收录」(LookupOnly),但服务端回包无 lookupOnly 标记 —— "
+                "对面版本较旧、仍会查询它自己的上游情报源,共享配额并未省下。请更新服务端 app.py。"));
+    }
+
     if (ok) *ok = true;
     ReputationCurl::diag(QStringLiteral("RepProxy %1 => v%2 (%3/%4) src=%5 cacheOnly=%6 cached=%7 ok=%8")
                              .arg(sha256.left(12))
@@ -507,7 +582,9 @@ bulwark::FileReputation ProxyReputationService::queryProxy(const QString& sha256
 
 std::pair<bool, QString> ProxyReputationService::testConnection() {
     if (!enabled_.load()) {
-        if (fallback_) return fallback_->testConnection();
+        // ServerOnly 下不拿本地聚合器的连通性顶替:那会对第三方情报源真发一次请求,正是这个
+        // 模式要禁的事;而且「中央服务器没启用」就该如实这么讲。
+        if (fallback_ && !serverOnly_) return fallback_->testConnection();
         return { false, QString::fromUtf8("信誉代理未启用") };
     }
     const auto res = ReputationCurl::get(baseUrl_ + QStringLiteral("/health"), {}, timeoutSecs_);
@@ -522,7 +599,7 @@ std::pair<bool, QString> ProxyReputationService::healthCheckNonBlocking() {
     // No central proxy configured -> report the direct aggregate's connectivity
     // instead (there is nothing to be "offline"); keeps the UI pill meaningful.
     if (!enabled_.load()) {
-        if (fallback_) return fallback_->testConnection();
+        if (fallback_ && !serverOnly_) return fallback_->testConnection(); // 理由同 testConnection()
         return { false, QString::fromUtf8("信誉代理未启用") };
     }
 
@@ -601,6 +678,10 @@ bulwark::ReputationUsage ProxyReputationService::getUsage() {
 }
 
 bulwark::ThreatBehaviorProfile ProxyReputationService::fetchBehaviorProfile(const QString& sha256) {
+    // 行为画像只有第三方情报源(VT / HybridAnalysis 的沙箱记录)能给,服务端未代理该能力。
+    // ServerOnly 下就当作「拿不到」——绝不为了补一张详情图而绕过「本机不动用第三方情报源」。
+    if (serverOnly_)
+        return {};
     if (fallback_)
         return fallback_->fetchBehaviorProfile(sha256);
     return {};
