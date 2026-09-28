@@ -52,6 +52,11 @@ public:
     static int ruleTier(const DefenseRule& r);
     static int rulePriority(VerdictAction a);
 
+    // 这条 Allow 规则是否「既不限定位置、也不限定签名」——即等价于放行任何位置的同名程序。
+    // loadRules / addRule 用它做准入校验;公开出来是为了让规则集的单元测试能直接断言。
+    // 判据与理由见 RuleEngine.cpp 里该函数上方的长注释。
+    static bool isUnsafeAllowRule(const DefenseRule& r, QString* whyOut = nullptr);
+
     // 规则集管理(线程安全;读取时跳过已到期规则)。
     void loadRules(const QVector<DefenseRule>& rules);
     QVector<DefenseRule> getRules() const;

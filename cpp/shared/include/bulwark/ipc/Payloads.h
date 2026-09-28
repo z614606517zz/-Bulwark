@@ -16,7 +16,6 @@
 #include "bulwark/models/VtScanRecord.h"
 #include "bulwark/models/AttackGraph.h"
 #include "bulwark/models/ProcessEntry.h"
-#include "bulwark/models/JunkEntry.h"
 
 // IPC payload DTOs. Phase-0 seeds the handshake + verdict payloads to exercise
 // the envelope end-to-end; the remaining ~30 payloads are ported in the
@@ -554,113 +553,6 @@ struct AttackChainResponsePayload {
     QList<AttackChainHitPayload> hits;   // 最新在前
     QJsonObject toJson() const;
     static AttackChainResponsePayload fromJson(const QJsonObject& o);
-};
-
-// ---- 磁盘垃圾清理 ----------------------------------------------------------- #
-//
-// 【请求里绝不出现路径】每个类别在服务端对应一组编译期固定的根目录,UI 能表达的只有
-// 「清理哪几类」。理由见 bulwark/models/JunkEntry.h 顶部:接受调用方给的路径就等于把
-// 一个任意文件删除原语暴露在管道上。
-//
-// 扫描与清理都是异步的(要遍历数万文件),响应经 JunkScanResponse / JunkCleanResponse 回推,
-// 中途用 JunkProgressNotification 报进度 —— 没有进度的话,一次十几秒的扫描在界面上和卡死
-// 没有区别。
-
-// UI -> 服务:扫描。categories 为空 = 扫描全部已知类别(首次进入页面的默认动作)。
-struct JunkScanRequestPayload {
-    QUuid requestId = QUuid::createUuid();
-    QList<int> categories;                 // junk::Category 序号;空 = 全部
-    // 只统计「最后修改时间早于 N 小时」的文件。正在被安装程序使用的临时文件通常刚写下,
-    // 这个阈值就是为了不把它们算进来(更不会去删)。<=0 表示用服务端配置的默认值。
-    int minAgeHours = 0;
-    QJsonObject toJson() const;
-    static JunkScanRequestPayload fromJson(const QJsonObject& o);
-};
-
-// 服务 -> UI:扫描结果。
-struct JunkScanResponsePayload {
-    QUuid requestId;
-    QDateTime scannedUtc = QDateTime::currentDateTimeUtc();
-    bool enabled = true;                   // 服务端是否启用了垃圾清理
-    QList<bulwark::JunkCategoryResult> categories;
-    qint64 totalBytes = 0;
-    int totalFiles = 0;
-    int minAgeHours = 0;                   // 本次实际生效的保留时长(UI 如实展示)
-    bool truncated = false;                // 命中扫描上限,结果为下限估计
-    int unreadable = 0;                    // 全程读不进去的子目录总数(权限不足)
-    qint64 elapsedMs = 0;                  // 扫描总耗时。界面把它显示出来,「怎么这么快」
-                                           // 就变成一个可核对的数字,而不是一个可疑现象
-    QString message;
-    QJsonObject toJson() const;
-    static JunkScanResponsePayload fromJson(const QJsonObject& o);
-};
-
-// UI -> 服务:清理。categories 【必须】非空 —— 不提供「清理全部」的隐式语义:
-// 删除动作只能来自用户对具体类别的显式勾选,空列表一律按「什么都不做」处理。
-struct JunkCleanRequestPayload {
-    QUuid requestId = QUuid::createUuid();
-    QList<int> categories;                 // junk::Category 序号;空 = 不做任何事
-    int minAgeHours = 0;                   // <=0 用服务端默认值
-    QJsonObject toJson() const;
-    static JunkCleanRequestPayload fromJson(const QJsonObject& o);
-};
-
-// 服务 -> UI:清理结果(逐类别)。
-struct JunkCleanResponsePayload {
-    QUuid requestId;
-    QDateTime finishedUtc = QDateTime::currentDateTimeUtc();
-    bool success = false;                  // 是否至少有一个类别清理成功
-    QList<bulwark::JunkCleanOutcome> outcomes;
-    qint64 freedBytes = 0;
-    int deletedFiles = 0;
-    int skipped = 0;
-    QString message;
-    QJsonObject toJson() const;
-    static JunkCleanResponsePayload fromJson(const QJsonObject& o);
-};
-
-// UI -> 服务:大文件查找。
-//
-// 与垃圾清理一致,请求里【没有路径】—— 扫描范围固定为本机的固定磁盘(排除网络盘与可移动
-// 介质)。这里不接受路径不是为了防删除(本功能压根不删),而是为了不让一个管道消息能驱使
-// 服务去遍历任意位置(比如一个巨大的网络共享)。
-struct LargeFileScanRequestPayload {
-    QUuid requestId = QUuid::createUuid();
-    qint64 minBytes = 0;                   // 体积下限;<=0 用服务端默认(100 MB)
-    int limit = 0;                         // 返回条数上限;<=0 用服务端默认(200)
-    QJsonObject toJson() const;
-    static LargeFileScanRequestPayload fromJson(const QJsonObject& o);
-};
-
-// 服务 -> UI:大文件清单(按体积降序)。
-struct LargeFileScanResponsePayload {
-    QUuid requestId;
-    QDateTime scannedUtc = QDateTime::currentDateTimeUtc();
-    bool enabled = true;
-    QList<bulwark::LargeFileEntry> files;
-    qint64 minBytes = 0;                   // 本次实际生效的阈值
-    qint64 totalBytes = 0;                 // 列出的这些文件合计占用
-    int scannedFiles = 0;                  // 实际检视过多少个文件(让耗时可解释)
-    int unreadable = 0;                    // 读不进去的目录数
-    bool truncated = false;                // 命中时间 / 条数上限
-    qint64 elapsedMs = 0;
-    QString message;
-    QJsonObject toJson() const;
-    static LargeFileScanResponsePayload fromJson(const QJsonObject& o);
-};
-
-// 服务 -> UI:扫描 / 清理进度。
-struct JunkProgressPayload {
-    QUuid requestId;
-    bool cleaning = false;                 // false=扫描阶段,true=清理阶段
-    int categoryIndex = 0;                 // 第几个类别(1 起)
-    int categoryTotal = 0;                 // 共几个类别
-    QString categoryTitle;
-    QString currentPath;                   // 当前正在处理的位置(展示用)
-    qint64 bytesSoFar = 0;
-    int filesSoFar = 0;
-    QJsonObject toJson() const;
-    static JunkProgressPayload fromJson(const QJsonObject& o);
 };
 
 } // namespace bulwark::ipc

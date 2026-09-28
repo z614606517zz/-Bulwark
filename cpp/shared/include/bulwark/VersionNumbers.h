@@ -21,8 +21,8 @@
 
 #define BULWARK_VERSION_MAJOR 1
 #define BULWARK_VERSION_MINOR 0
-#define BULWARK_VERSION_PATCH 0
-#define BULWARK_VERSION_STRING "1.0.0"
+#define BULWARK_VERSION_PATCH 3
+#define BULWARK_VERSION_STRING "1.0.3"
 
 /* Display suffix only; never part of any comparison. */
 #define BULWARK_VERSION_SUFFIX "Qt Edition"

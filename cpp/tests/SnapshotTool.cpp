@@ -57,7 +57,6 @@
 #include "bulwark/ipc/Payloads.h"
 #include "bulwark/ipc/PipeNames.h"
 #include "bulwark/models/AttackGraph.h"
-#include "bulwark/models/JunkEntry.h"
 #include "bulwark/models/PersistenceEntry.h"
 #include "bulwark/models/ProcessEntry.h"
 
@@ -824,6 +823,10 @@ int compare(const QJsonObject &golden, const QVector<CaseResult> &results)
 // DefaultRules::build() 末尾按规则内容派生 UUIDv5(见那里的注释),以换取跨重启稳定的
 // 规则身份;代价就是引入了撞 id 的可能。这条检查把代价钉住:一旦有人新增内置规则时
 // 复用了已有备注 / 匹配条件组合,构建立刻失败,而不是等到线上少了一条防护才发现。
+//
+// 【当前状态:本检查是空跑】内置规则集已被整体清空,build() 返回空集,于是这里必然
+// 「0 条规则 / 0 组撞 id / OK」。它【现在不保护任何东西】,绿灯不代表有覆盖。保留它是因为
+// 一旦将来重新引入内置规则(连同那段 UUIDv5 id 派生),这道护栏立刻重新生效。
 int checkRuleset()
 {
     const QVector<DefenseRule> rules = DefaultRules::build();
@@ -853,11 +856,14 @@ int checkRuleset()
 
 // 把内置规则集原样导出为 JSON。
 //
-// 用途:588 条内置规则的离线审阅与跨版本 diff。规则表在源码 diff 里是一片 fw(...) / proc(...)
+// 用途:内置规则的离线审阅与跨版本 diff。规则表在源码 diff 里是一片 fw(...) / proc(...)
 // 调用,漏掉一个 hardOverride、写错一个通配符看不出来;导出成结构化字段之后,这类
 // 【静默的检测缺口】(不报错、只表现为某类攻击不再被拦)才有被看出来的可能。
 //
 // 顺序即 build() 的顺序,不排序、不去重 —— 顺序本身要能被回比。
+//
+// 注意:内置规则集当前已被整体清空(DefaultRules::build() 返回空集),故本模式现在导出的是
+// { "count": 0, "rules": [] }。它仍然有用 —— 正是「规则集为空」这件事的可回比证据。
 int dumpRules(const QString &path)
 {
     const QVector<DefenseRule> rules = DefaultRules::build();
@@ -1707,170 +1713,6 @@ int dumpIpc(const QString &path)
         ar.message = QString::fromUtf8("已计算");
         ar.sha256 = e.sha256;
         p[QStringLiteral("processActionResultWithHash")] = ar.toJson();
-    }
-
-    // ---- 磁盘垃圾清理 ----
-    //
-    // 两条钉住的要点(它们各自都曾是别处出过问题的形态):
-    //   · 扫描请求的 categories 为空时【键不出现】(空 = 全部,靠键缺失表达即可);
-    //   · 清理请求的 categories 为空时【键仍要出现】—— 空数组在那里有明确含义(什么都不清理),
-    //     靠键缺失表达会让解析侧分不清「用户没选」和「旧版本没这个字段」。
-    {
-        JunkScanRequestPayload sq;
-        sq.requestId = QUuid{};
-        p[QStringLiteral("junkScanRequestDefaults")] = sq.toJson();
-        sq.requestId = stableId(QStringLiteral("ipc-junk-scan-req"));
-        sq.categories << static_cast<int>(bulwark::junk::Category::WindowsTemp)
-                      << static_cast<int>(bulwark::junk::Category::BrowserCache);
-        sq.minAgeHours = 48;
-        p[QStringLiteral("junkScanRequestFilled")] = sq.toJson();
-
-        bulwark::JunkLocation loc;
-        loc.path = QStringLiteral("C:\\Windows\\Temp");
-        loc.note = QString::fromUtf8("仅统计 24 小时前的文件");
-        loc.bytes = 5368709120LL;   // > 2^32,确认大数走 double 仍能原样往返
-        loc.fileCount = 18342;
-        loc.skipped = 27;
-        loc.unreadable = 4;         // 「有子目录读不进去」这一状态必须能过线
-        p[QStringLiteral("junkLocationFilled")] = loc.toJson();
-        p[QStringLiteral("junkLocationDefaults")] = bulwark::JunkLocation{}.toJson();
-
-        bulwark::JunkCategoryResult cat;
-        cat.category = bulwark::junk::Category::WindowsTemp;
-        cat.risk = bulwark::junk::Risk::Safe;
-        cat.title = QString::fromUtf8("系统与用户临时文件");
-        cat.description = QString::fromUtf8("程序运行时留下的中间文件。");
-        cat.recommended = true;
-        cat.available = true;
-        cat.cleanable = true;
-        cat.bytes = loc.bytes;
-        cat.fileCount = loc.fileCount;
-        cat.skipped = loc.skipped;
-        cat.unreadable = loc.unreadable;
-        cat.elapsedMs = 1234;
-        cat.locations << loc;
-        p[QStringLiteral("junkCategoryFilled")] = cat.toJson();
-        // 全默认:categoryKey 仍要出现(它由 category 派生,不是可选字段)。
-        p[QStringLiteral("junkCategoryDefaults")] = bulwark::JunkCategoryResult{}.toJson();
-
-        // 「只统计不清理」那一类的形态:available 为真但 cleanable 为假。
-        bulwark::JunkCategoryResult scanOnly;
-        scanOnly.category = bulwark::junk::Category::WindowsOld;
-        scanOnly.risk = bulwark::junk::Risk::Caution;
-        scanOnly.title = QString::fromUtf8("旧版 Windows 升级残留");
-        scanOnly.description = QString::fromUtf8("只报告体积,不代为删除。");
-        scanOnly.available = true;
-        scanOnly.cleanable = false;
-        scanOnly.bytes = 21474836480LL;
-        scanOnly.message = QString::fromUtf8("仅统计体积,本产品不代为删除。");
-        p[QStringLiteral("junkCategoryScanOnly")] = scanOnly.toJson();
-
-        JunkScanResponsePayload sr;
-        sr.requestId = sq.requestId;
-        sr.scannedUtc = t0;   // 默认是 currentDateTimeUtc(),必须显式给
-        sr.enabled = true;
-        sr.categories << cat << scanOnly;
-        sr.totalBytes = cat.bytes;
-        sr.totalFiles = cat.fileCount;
-        sr.minAgeHours = 24;
-        sr.truncated = true;
-        sr.unreadable = 4;
-        sr.elapsedMs = 4210;
-        sr.message = QString::fromUtf8("扫描达到上限,结果为下限估计。");
-        p[QStringLiteral("junkScanResponseFilled")] = sr.toJson();
-        {
-            JunkScanResponsePayload empty;
-            empty.scannedUtc = t0;
-            p[QStringLiteral("junkScanResponseEmpty")] = empty.toJson();
-        }
-
-        JunkCleanRequestPayload cq;
-        cq.requestId = QUuid{};
-        p[QStringLiteral("junkCleanRequestEmptySelection")] = cq.toJson();
-        cq.requestId = stableId(QStringLiteral("ipc-junk-clean-req"));
-        cq.categories << static_cast<int>(bulwark::junk::Category::WindowsTemp)
-                      << static_cast<int>(bulwark::junk::Category::RecycleBin);
-        cq.minAgeHours = 12;
-        p[QStringLiteral("junkCleanRequestFilled")] = cq.toJson();
-
-        bulwark::JunkCleanOutcome ok;
-        ok.category = bulwark::junk::Category::WindowsTemp;
-        ok.title = cat.title;
-        ok.success = true;
-        ok.freedBytes = 4294967296LL;
-        ok.deletedFiles = 17900;
-        ok.deletedDirs = 812;
-        ok.skipped = 442;
-        ok.message = QString::fromUtf8("已删除 17900 个文件,跳过 442 个。");
-        p[QStringLiteral("junkOutcomeFilled")] = ok.toJson();
-        p[QStringLiteral("junkOutcomeDefaults")] = bulwark::JunkCleanOutcome{}.toJson();
-
-        bulwark::JunkCleanOutcome failed;
-        failed.category = bulwark::junk::Category::WindowsOld;
-        failed.title = scanOnly.title;
-        failed.success = false;
-        failed.message = QString::fromUtf8("本产品不代为删除该类内容。");
-
-        JunkCleanResponsePayload cr;
-        cr.requestId = cq.requestId;
-        cr.finishedUtc = t0;  // 默认是 currentDateTimeUtc(),必须显式给
-        cr.success = true;
-        cr.outcomes << ok << failed;
-        cr.freedBytes = ok.freedBytes;
-        cr.deletedFiles = ok.deletedFiles;
-        cr.skipped = ok.skipped;
-        cr.message = QString::fromUtf8("清理完成。");
-        p[QStringLiteral("junkCleanResponseFilled")] = cr.toJson();
-
-        // 大文件查找。注意这一对【没有】对应的删除请求 —— 本功能纯只读,详见
-        // bulwark/models/JunkEntry.h 里 LargeFileEntry 的说明。
-        LargeFileScanRequestPayload lq;
-        lq.requestId = QUuid{};
-        p[QStringLiteral("largeFileRequestDefaults")] = lq.toJson();
-        lq.requestId = stableId(QStringLiteral("ipc-largefile-req"));
-        lq.minBytes = 209715200LL;   // 200 MB
-        lq.limit = 30;
-        p[QStringLiteral("largeFileRequestFilled")] = lq.toJson();
-
-        bulwark::LargeFileEntry lf;
-        lf.path = QStringLiteral("C:\\hiberfil.sys");
-        lf.bytes = 13647200256LL;    // > 2^32,确认大数走 double 仍原样往返
-        lf.lastModifiedUtc = t0.addSecs(-3600);
-        lf.suffix = QStringLiteral("sys");
-        p[QStringLiteral("largeFileEntryFilled")] = lf.toJson();
-        p[QStringLiteral("largeFileEntryDefaults")] = bulwark::LargeFileEntry{}.toJson();
-
-        LargeFileScanResponsePayload lr;
-        lr.requestId = lq.requestId;
-        lr.scannedUtc = t0;          // 默认是 currentDateTimeUtc(),必须显式给
-        lr.enabled = true;
-        lr.files << lf;
-        lr.minBytes = lq.minBytes;
-        lr.totalBytes = lf.bytes;
-        lr.scannedFiles = 557486;
-        lr.unreadable = 55;
-        lr.truncated = false;
-        lr.elapsedMs = 44392;
-        lr.message = QString::fromUtf8("检视 557486 个文件,列出最大的 1 个。");
-        p[QStringLiteral("largeFileResponseFilled")] = lr.toJson();
-        {
-            LargeFileScanResponsePayload empty;
-            empty.scannedUtc = t0;
-            p[QStringLiteral("largeFileResponseEmpty")] = empty.toJson();
-        }
-
-        JunkProgressPayload pg;
-        pg.requestId = QUuid{};
-        p[QStringLiteral("junkProgressDefaults")] = pg.toJson();
-        pg.requestId = sq.requestId;
-        pg.cleaning = true;
-        pg.categoryIndex = 2;
-        pg.categoryTotal = 5;
-        pg.categoryTitle = QString::fromUtf8("浏览器缓存");
-        pg.currentPath = QStringLiteral("C:\\Users\\u\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache");
-        pg.bytesSoFar = 1073741824LL;
-        pg.filesSoFar = 9312;
-        p[QStringLiteral("junkProgressFilled")] = pg.toJson();
     }
 
     root[QStringLiteral("payloads")] = p;

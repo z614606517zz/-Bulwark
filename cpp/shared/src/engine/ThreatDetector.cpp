@@ -107,7 +107,19 @@ const QVector<Sig>& commandLineSignals() {
         { "start-bitstransfer", 30, "BITS 后台下载(PowerShell,T1197)" },
         { "reflection.assembly", 30, "内存加载程序集(无文件,T1027)" },
         { "[reflection.assembly]", 30, "内存加载程序集(无文件,T1027)" },
-        { "vssadmin delete", 45, "删除卷影副本(勒索前置,T1490)" },
+        //
+        // 判别词是 "delete shadows",不是 "vssadmin delete"。
+        //
+        // 本表是【子串】匹配,而真实命令行是 `vssadmin.exe delete shadows /all /quiet` ——
+        // "vssadmin" 与 "delete" 之间隔着 ".exe",所以旧判别词【一次都没命中过】。后果不是
+        // 少 45 分那么简单:没有硬指标,事件就一路走到步骤 7 的 isStronglyTrusted(vssadmin
+        // 是微软签名 + 位于 System32)被【放行】—— 也就是勒索最标准的前置动作在默认配置下
+        // 畅通无阻。裁决快照语料里那条用例的备注写的是「一瞬间完成故必须硬拦」,而黄金结果
+        // 记的却是 Allow,正是这处失配被固化下来的样子。
+        //
+        // 换成 "delete shadows" 后两种写法(带不带 .exe)都命中,且没有任何正常命令行会包含它。
+        //
+        { "delete shadows", 45, "删除卷影副本(勒索前置,T1490)" },
         { "wmic shadowcopy delete", 45, "删除卷影副本(勒索前置,T1490)" },
         { "wbadmin delete", 40, "删除系统备份(勒索前置,T1490)" },
         { "bcdedit", 25, "修改引导配置(勒索常用,T1490)" },
@@ -338,15 +350,88 @@ bool hasDoubleExtension(const QString& name) {
 }
 
 // 路径是否指向 NTFS 备用数据流(ADS),如 C:\path\file.txt:payload.exe。
+//
+// 【这里曾是一处稳定的误报源】原实现只在冒号【正好位于下标 1】时才跳过盘符:
+//     const int start = (path.size() > 1 && path.at(1) == ':') ? 2 : 0;
+// 而内核事件源交上来的路径本产品自己就明确期待 NT 命名空间形态(\??\C:\...,见
+// Worker 里对该前缀的处理)。那种路径下标 1 是 '?',于是 start=0,接着就把 "C:" 的
+// 那个冒号当成了流分隔符 —— 命中「从 NTFS 备用数据流(ADS)执行」并加 40 分【硬指标】。
+// 硬指标会让静默模式把 >=50 分直接升级为拦截,也就是普通程序被误杀。
+// 修法:先剥掉 NT / Win32 设备命名空间前缀,再按「盘符冒号之后是否还有冒号」判定。
 bool isAlternateDataStreamPath(const QString& path) {
     if (path.isEmpty()) return false;
-    const int start = (path.size() > 1 && path.at(1) == QLatin1Char(':')) ? 2 : 0;
-    return path.indexOf(QLatin1Char(':'), start) >= 0;
+    QString p = path;
+    p.replace(QLatin1Char('/'), QLatin1Char('\\'));
+
+    // \??\  \\?\  \\.\ 三种前缀都要剥,否则前缀里的字符会把盘符位置算错。
+    static const char* kPrefixes[] = { "\\??\\", "\\\\?\\", "\\\\.\\" };
+    for (const char* pre : kPrefixes) {
+        const QString s = QLatin1String(pre);
+        if (p.startsWith(s, Qt::CaseInsensitive)) {
+            p = p.mid(s.size());
+            break;
+        }
+    }
+
+    int start = 0;
+    if (p.size() > 1 && p.at(1) == QLatin1Char(':') && p.at(0).isLetter())
+        start = 2;                                  // 跳过盘符 "X:"
+    const int colon = p.indexOf(QLatin1Char(':'), start);
+    if (colon < 0) return false;
+    return colon + 1 < p.size();                    // 流名必须非空("C:" 结尾不算流)
+}
+
+// PowerShell 的执行策略探测:每次启动 PowerShell 都会往临时目录写一个
+// __PSScriptPolicyTest_<随机>.ps1,是常态噪音,确实该放过。
+//
+// 【原判据可被攻击者直接利用】原实现是
+//     if (e.target.toLower().contains("__psscriptpolicytest")) return;
+// —— 只要目标路径里出现这个字样,本函数【全部】分析(注入、双扩展名、LOLBin、
+// 凭据访问、防御规避……)一次都不跑。而 target 是攻击者可控的:把释放物命名成
+// __psscriptpolicytest_x.exe,或往那个名字的目录里落盘,就能整体关掉单事件威胁检测。
+// 这里收紧成完整签名,四个条件缺一不可。
+bool isPowerShellPolicyProbe(const SecurityEvent& e) {
+    if (e.type != EventType::FileWrite && e.type != EventType::FileDelete)
+        return false;
+
+    const QString actorName = fileNameLower(e.actorPath);
+    if (actorName != QLatin1String("powershell.exe") && actorName != QLatin1String("pwsh.exe"))
+        return false;
+
+    QString actorLower = e.actorPath.toLower();
+    actorLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    QString sysRoot = qEnvironmentVariable("SystemRoot", QStringLiteral("C:\\Windows")).toLower();
+    sysRoot.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    if (!sysRoot.endsWith(QLatin1Char('\\'))) sysRoot += QLatin1Char('\\');
+    if (!actorLower.contains(sysRoot)) return false;   // contains:兼容 \??\ 前缀
+
+    QString targetLower = e.target.toLower();
+    targetLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    const int slash = targetLower.lastIndexOf(QLatin1Char('\\'));
+    const QString targetName = (slash >= 0) ? targetLower.mid(slash + 1) : targetLower;
+    // 文件名必须以该前缀【开头】,且扩展名必须是 .ps1(不能是可执行体)。
+    if (!targetName.startsWith(QLatin1String("__psscriptpolicytest"))
+        || !targetName.endsWith(QLatin1String(".ps1")))
+        return false;
+
+    return targetLower.contains(QLatin1String("\\temp\\"))
+           || targetLower.contains(QLatin1String("\\appdata\\local\\temp\\"));
 }
 
 } // anonymous namespace
 
 void ThreatDetector::analyze(SecurityEvent& e) {
+    // 良性系统行为白名单。必须放在【任何状态改写之前】:原实现把这个判断放在函数中段,
+    // 已经复位了 hasThreatIndicator、也已经把 e.chainScore 累进局部 score 之后才 return,
+    // 于是攻击链组合引擎的跨事件结论被无声丢掉(riskScore 也停在旧值上从不更新)。
+    // 这里返回前显式把组合引擎的结论落到事件上 —— 那是跨事件记账的产物,与「本事件是
+    // 不是 PowerShell 策略探测」无关,不该被这条白名单顺带抹掉。
+    if (isPowerShellPolicyProbe(e)) {
+        e.riskScore = e.chainScore;
+        e.hasThreatIndicator = e.chainHardIndicator;
+        return;
+    }
+
     int score = 0;
     e.hasThreatIndicator = false;
 
@@ -373,10 +458,8 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     const QString cmd = e.commandLine.toLower();
     const QString pathLower = e.actorPath.toLower();
 
-    // 白名单:PowerShell 临时策略测试文件为正常系统行为,直接跳过。
+    // (PowerShell 策略探测的白名单已上移到函数开头,见那里的说明。)
     const QString targetLower = e.target.toLower();
-    if (targetLower.contains(QLatin1String("__psscriptpolicytest")))
-        return;
 
     const bool inHighSuspiciousDir = anyContains(highSuspiciousDirs(), pathLower);
     const bool inMediumSuspiciousDir = anyContains(mediumSuspiciousDirs(), pathLower);

@@ -95,19 +95,16 @@ enum class IpcMessageType {
     UpdateProgressNotification, // 65 服务->UI:下载/校验进度(第几个文件、当前阶段)
     UpdateDownloadResponse,     // 66 服务->UI:下载结果 + 通过校验的暂存目录
 
-    // ---- 磁盘垃圾清理 ----
-    // 扫描与清理都是【异步】的:要遍历 %TEMP%、浏览器缓存这类动辄数万文件的目录,秒级到
-    // 十几秒。同步做会把 IPC 线程连同它服务的弹窗与拦截通知一起堵住 —— 与取证查询、进程
-    // 列表、在线更新同一约定。
-    //
-    // 请求里【只有类别序号,没有任何路径】:每个类别在服务端对应一组编译期固定的根目录。
-    // 详见 bulwark/models/JunkEntry.h 顶部的说明 —— 一个能删文件的接口若接受调用方给的
-    // 路径,它就成了任意文件删除原语,哪怕管道那头已通过认证也不该这么设计。
-    JunkScanRequest,            // 67 UI->服务:扫描可清理的垃圾(按类别)
-    JunkScanResponse,           // 68 服务->UI:各类别的大小 / 文件数 / 位置明细
-    JunkCleanRequest,           // 69 UI->服务:清理选中的类别(用户显式勾选并二次确认)
-    JunkCleanResponse,          // 70 服务->UI:逐类别的清理结果(释放空间 / 跳过原因)
-    JunkProgressNotification,   // 71 服务->UI:扫描/清理进度(当前类别与位置)
+    // ---- 已废弃占位:磁盘垃圾清理(功能已移除;保序,勿复用)----
+    // 删功能时只删处理代码、【不删枚举项】:类型按整数上线(IpcMessage::serialize),
+    // 抽掉这 5 项会让下面的 UpdateApply* 从 72/73 滑到 67/68。已发布的 1.0.2 两端仍按
+    // 旧号收发,新旧混跑(在线更新替换后旧界面还没重启)时,旧界面的 JunkScanRequest(67)
+    // 会被新服务当成 UpdateApplyRequest 执行。两端收到这些号都走 default 静默忽略。
+    ReservedJunkScanRequest,          // 67
+    ReservedJunkScanResponse,         // 68
+    ReservedJunkCleanRequest,         // 69
+    ReservedJunkCleanResponse,        // 70
+    ReservedJunkProgressNotification, // 71
 
     // ---- 在线更新的应用 ----
     // 替换动作【由服务自己做】,不再由 UI 拉起提权脚本。原因不是嫌脚本麻烦,是那条路
@@ -120,15 +117,22 @@ enum class IpcMessageType {
     UpdateApplyRequest,         // 72 UI->服务:就地应用已下载并校验通过的更新
     UpdateApplyResponse,        // 73 服务->UI:应用结果(已替换几个 / 是否已回退 / 是否需重启)
 
-    // ---- 大文件查找 ----
-    // 【只有这一对,没有「删除大文件」的消息 —— 这是刻意的】本功能报的是任意路径上的任意
-    // 文件,再配一个删除接口就等于在管道上放了一个任意文件删除原语,与上面垃圾清理那边
-    // 「只收类别序号、绝不收路径」的整套设计直接对立。界面只提供「在资源管理器中打开所在
-    // 位置」,由用户自己处置。详见 bulwark/models/JunkEntry.h 里 LargeFileEntry 的说明。
-    //
-    // 同样是异步:要遍历整块磁盘,秒级到几十秒。
-    LargeFileScanRequest,       // 74 UI->服务:按体积阈值找出最大的若干文件(纯只读)
-    LargeFileScanResponse,      // 75 服务->UI:大文件清单(按体积降序)
+    // ---- 已废弃占位:大文件查找(功能已移除;保序,勿复用)----
+    ReservedLargeFileScanRequest,     // 74
+    ReservedLargeFileScanResponse,    // 75
 };
+
+// 序号钉桩:删改枚举项导致序号漂移时在编译期失败,而不是等到两端混跑才串号。
+// 新消息一律追加在末尾,并在这里补一条。
+static_assert(static_cast<int>(IpcMessageType::ReservedBehaviorSessionStart) == 23);
+static_assert(static_cast<int>(IpcMessageType::AiScanRequest) == 28);
+static_assert(static_cast<int>(IpcMessageType::VtScanUpdate) == 36);
+static_assert(static_cast<int>(IpcMessageType::EventTimelineRequest) == 50);
+static_assert(static_cast<int>(IpcMessageType::ProcessActionResponse) == 57);
+static_assert(static_cast<int>(IpcMessageType::AttackChainHitNotification) == 61);
+static_assert(static_cast<int>(IpcMessageType::UpdateDownloadResponse) == 66);
+static_assert(static_cast<int>(IpcMessageType::UpdateApplyRequest) == 72);
+static_assert(static_cast<int>(IpcMessageType::UpdateApplyResponse) == 73);
+static_assert(static_cast<int>(IpcMessageType::ReservedLargeFileScanResponse) == 75);
 
 } // namespace bulwark::ipc

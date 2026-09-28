@@ -15,8 +15,7 @@ add_library(bulwark_shared STATIC
     src/models/PersistenceEntry.cpp
     src/models/AttackGraph.cpp
     src/models/ProcessEntry.cpp
-    # 磁盘垃圾清理的契约模型(类别 / 风险档 / 位置聚合 / 清理结果)
-    src/models/JunkEntry.cpp
+
     src/ipc/IpcMessage.cpp
     src/ipc/Payloads.cpp
 
@@ -46,6 +45,19 @@ add_library(bulwark_shared STATIC
     src/engine/EcsAlertFormatter.cpp
     src/engine/PersistenceAnalyzer.cpp
     src/engine/AiDecisionPolicy.cpp
+
+    # 内置防护规则库,按攻击阶段分 8 段(公共名单在 RulesCommon.cpp)。
+    # DefaultRules::build() 直接调用这 8 个 add*Rules 函数 —— 少加一个文件就是一个链接错误,
+    # 所以这里的清单必须与 rules/RuleDsl.h 末尾的声明一一对应。
+    src/engine/rules/RulesCommon.cpp
+    src/engine/rules/Rules01_SystemMaintenance.cpp
+    src/engine/rules/Rules02_Persistence.cpp
+    src/engine/rules/Rules03_DefenseEvasion.cpp
+    src/engine/rules/Rules04_CredentialAccess.cpp
+    src/engine/rules/Rules05_Impact.cpp
+    src/engine/rules/Rules06_Execution.cpp
+    src/engine/rules/Rules07_Injection.cpp
+    src/engine/rules/Rules08_LateralC2.cpp
 )
 
 target_include_directories(bulwark_shared

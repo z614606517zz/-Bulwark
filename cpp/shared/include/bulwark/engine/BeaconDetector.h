@@ -20,6 +20,10 @@ public:
     explicit BeaconDetector(int minSamples = 6, int maxSeries = 1024, qint64 retentionSecs = 0);
 
     ScoreResult observe(const SecurityEvent& e);
+    // 无调用点:本项目没有「进程已退出」事件可依赖,状态只按 retentionSecs_ + 容量淘汰。
+    // 完整理由见 ProcessChainTracker.h 里同名方法的注释(那里写全了为什么没有这个信号)。
+    // 对本检测器的具体影响:PID 复用时新进程可能继承旧进程的外联时间序列,进而影响 CV。
+    // 由于低抖动档才置硬指标、且序列要凑满 minSamples_ 才起作用,误升格的概率低但非零。
     void forget(int pid);
     int trackedSeriesCount();
 

@@ -67,7 +67,7 @@
                 "action": "Allow",
                 "evidence": [
                     {
-                        "description": "已安装的知名安全软件(hipsdaemon.exe),共存放行",
+                        "description": "已安装的知名安全软件(hipsdaemon.exe)·签名健康,共存放行",
                         "kind": "Trust",
                         "scoreDelta": 0,
                         "source": "TrustPolicy"
@@ -109,7 +109,7 @@
                         "source": "ThreatDetector"
                     },
                     {
-                        "description": "命中规则:[内置] 写入开机启动项（HKLM/HKCU Run）",
+                        "description": "命中规则:[内置] 持久化 · 未签名程序写入 Run 开机自启动项(T1547.001)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
@@ -122,7 +122,7 @@
                     }
                 ],
                 "hasThreatIndicator": false,
-                "matchedRuleNote": "[内置] 写入开机启动项（HKLM/HKCU Run）",
+                "matchedRuleNote": "[内置] 持久化 · 未签名程序写入 Run 开机自启动项(T1547.001)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "无可信数字签名",
@@ -131,6 +131,7 @@
                 "riskScore": 40,
                 "source": "Rule",
                 "techniques": [
+                    "T1547.001 注册表 Run 键/启动文件夹"
                 ],
                 "userTrusted": false
             }
@@ -168,28 +169,29 @@
         {
             "label": "step3-vendor-app-imageload-NOT-exempt",
             "snapshot": {
-                "action": "Ask",
+                "action": "Allow",
                 "evidence": [
                     {
-                        "description": "命中规则:[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
-                        "kind": "Rule",
+                        "description": "有效数字签名:Tencent Technology (Shenzhen) Company Limited(健康),直接放行",
+                        "kind": "Trust",
                         "scoreDelta": 0,
-                        "source": "RuleEngine"
+                        "source": "TrustPolicy"
                     },
                     {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 0)",
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": false,
-                "matchedRuleNote": "[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                "matchedRuleNote": "",
                 "memoryInjection": false,
                 "riskReasons": [
+                    "有效数字签名:Tencent Technology (Shenzhen) Company Limited(健康),直接放行"
                 ],
                 "riskScore": 0,
-                "source": "Rule",
+                "source": "TrustedSigner",
                 "techniques": [
                 ],
                 "userTrusted": false
@@ -198,7 +200,7 @@
         {
             "label": "step4-lolbin-certutil-urlcache",
             "snapshot": {
-                "action": "Ask",
+                "action": "Block",
                 "evidence": [
                     {
                         "description": "certutil 远程下载(-urlcache,T1105)",
@@ -231,20 +233,20 @@
                         "source": "CommandObfuscationAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] certutil 远程下载并分割(-urlcache -split)",
+                        "description": "命中规则:[内置] 执行与 LOLBin · 外壳层调用 certutil 远程下载(cmd/powershell 包裹,T1105)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     },
                     {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] certutil 远程下载并分割(-urlcache -split)",
+                "matchedRuleNote": "[内置] 执行与 LOLBin · 外壳层调用 certutil 远程下载(cmd/powershell 包裹,T1105)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "certutil 远程下载(-urlcache,T1105)",
@@ -291,7 +293,7 @@
                         "source": "CommandObfuscationAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] regsvr32 远程脚本执行(Squiblydoo)",
+                        "description": "命中规则:[内置] 执行与 LOLBin · regsvr32 经 scrobj 加载远程 scriptlet(Squiblydoo,T1218.010)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
@@ -304,7 +306,7 @@
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] regsvr32 远程脚本执行(Squiblydoo)",
+                "matchedRuleNote": "[内置] 执行与 LOLBin · regsvr32 经 scrobj 加载远程 scriptlet(Squiblydoo,T1218.010)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "命令行内含明文 URL",
@@ -338,7 +340,7 @@
                         "source": "LolbinAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] mshta 执行远程脚本",
+                        "description": "命中规则:[内置] 执行与 LOLBin · mshta 执行远程 HTA(T1218.005)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
@@ -351,7 +353,7 @@
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] mshta 执行远程脚本",
+                "matchedRuleNote": "[内置] 执行与 LOLBin · mshta 执行远程 HTA(T1218.005)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "命令行内含明文 URL",
@@ -401,14 +403,20 @@
                         "source": "CommandObfuscationAnalyzer"
                     },
                     {
-                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "description": "命中规则:[内置] 凭据窃取 · 经 comsvcs.dll 转储 LSASS 内存(rundll32 MiniDump,T1003.001)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "",
+                "matchedRuleNote": "[内置] 凭据窃取 · 经 comsvcs.dll 转储 LSASS 内存(rundll32 MiniDump,T1003.001)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "comsvcs 转储 LSASS 内存(凭据窃取,T1003.001)",
@@ -418,7 +426,7 @@
                     "命令行信息熵偏高(4.7,疑似混淆)"
                 ],
                 "riskScore": 100,
-                "source": "Heuristic",
+                "source": "Rule",
                 "techniques": [
                     "T1003.001 LSASS 内存转储"
                 ],
@@ -431,26 +439,34 @@
                 "action": "Block",
                 "evidence": [
                     {
-                        "description": "命中规则:[内置] 删除卷影副本(vssadmin,勒索特征)",
+                        "description": "删除卷影副本(勒索前置,T1490)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "命中规则:[内置] 勒索与破坏 · 删除卷影副本(vssadmin delete shadows,毁掉本地恢复点,T1490)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     },
                     {
-                        "description": "最终裁决:阻止(依据:命中规则;风险分 0)",
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 45)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
-                "hasThreatIndicator": false,
-                "matchedRuleNote": "[内置] 删除卷影副本(vssadmin,勒索特征)",
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 勒索与破坏 · 删除卷影副本(vssadmin delete shadows,毁掉本地恢复点,T1490)",
                 "memoryInjection": false,
                 "riskReasons": [
+                    "删除卷影副本(勒索前置,T1490)"
                 ],
-                "riskScore": 0,
+                "riskScore": 45,
                 "source": "Rule",
                 "techniques": [
+                    "T1490 抑制系统恢复(删卷影/备份)"
                 ],
                 "userTrusted": false
             }
@@ -458,7 +474,7 @@
         {
             "label": "step4-powershell-encoded-download",
             "snapshot": {
-                "action": "Ask",
+                "action": "Block",
                 "evidence": [
                     {
                         "description": "PowerShell 编码命令(-EncodedCommand,T1027)",
@@ -491,20 +507,20 @@
                         "source": "CommandObfuscationAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] 隐藏窗口+编码命令组合(-w 简写,高可疑)",
+                        "description": "命中规则:[内置] 执行与 LOLBin · PowerShell 下载执行组合:隐藏窗口 + 编码命令(T1059.001/T1105)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     },
                     {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] 隐藏窗口+编码命令组合(-w 简写,高可疑)",
+                "matchedRuleNote": "[内置] 执行与 LOLBin · PowerShell 下载执行组合:隐藏窗口 + 编码命令(T1059.001/T1105)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "PowerShell 编码命令(-EncodedCommand,T1027)",
@@ -516,7 +532,8 @@
                 "riskScore": 100,
                 "source": "Rule",
                 "techniques": [
-                    "T1027 混淆文件或信息"
+                    "T1027 混淆文件或信息",
+                    "T1059.001 PowerShell"
                 ],
                 "userTrusted": false
             }
@@ -524,7 +541,7 @@
         {
             "label": "step4-masquerade-svchost-outside-system32",
             "snapshot": {
-                "action": "Ask",
+                "action": "Block",
                 "evidence": [
                     {
                         "description": "无可信数字签名",
@@ -545,20 +562,14 @@
                         "source": "ThreatDetector"
                     },
                     {
-                        "description": "命中规则:[内置] 从 Public 目录执行未签名程序",
-                        "kind": "Rule",
-                        "scoreDelta": 0,
-                        "source": "RuleEngine"
-                    },
-                    {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 80)",
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 80)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] 从 Public 目录执行未签名程序",
+                "matchedRuleNote": "",
                 "memoryInjection": false,
                 "riskReasons": [
                     "无可信数字签名",
@@ -566,7 +577,7 @@
                     "疑似进程伪装:svchost.exe 不在合法目录(T1036.005)"
                 ],
                 "riskScore": 80,
-                "source": "Rule",
+                "source": "Heuristic",
                 "techniques": [
                     "T1036.005 伪装为合法名称/位置"
                 ],
@@ -615,7 +626,7 @@
         {
             "label": "step4-double-extension",
             "snapshot": {
-                "action": "Block",
+                "action": "Ask",
                 "evidence": [
                     {
                         "description": "无可信数字签名",
@@ -636,20 +647,14 @@
                         "source": "ThreatDetector"
                     },
                     {
-                        "description": "命中规则:[内置] 双重扩展名伪装(.pdf.exe)",
-                        "kind": "Rule",
-                        "scoreDelta": 0,
-                        "source": "RuleEngine"
-                    },
-                    {
-                        "description": "最终裁决:阻止(依据:命中规则;风险分 70)",
+                        "description": "最终裁决:询问用户(依据:行为研判;风险分 70)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] 双重扩展名伪装(.pdf.exe)",
+                "matchedRuleNote": "",
                 "memoryInjection": false,
                 "riskReasons": [
                     "无可信数字签名",
@@ -657,7 +662,7 @@
                     "可疑双重扩展名(伪装文档,T1036.007)"
                 ],
                 "riskScore": 70,
-                "source": "Rule",
+                "source": "Heuristic",
                 "techniques": [
                     "T1036.007 双重文件扩展名"
                 ],
@@ -667,7 +672,7 @@
         {
             "label": "step4-office-spawns-lolbin",
             "snapshot": {
-                "action": "Ask",
+                "action": "Block",
                 "evidence": [
                     {
                         "description": "异常进程链:winword.exe 派生 powershell.exe(疑似宏病毒/钓鱼)",
@@ -694,20 +699,20 @@
                         "source": "CommandObfuscationAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] 绕过 PowerShell 执行策略",
+                        "description": "命中规则:[内置] 执行与 LOLBin · Office 组件 winword.exe 派生脚本宿主 powershell.exe(宏文档执行载荷,T1566.001/T1204.002)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     },
                     {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 100)",
+                        "description": "最终裁决:阻止(依据:命中规则;风险分 100)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] 绕过 PowerShell 执行策略",
+                "matchedRuleNote": "[内置] 执行与 LOLBin · Office 组件 winword.exe 派生脚本宿主 powershell.exe(宏文档执行载荷,T1566.001/T1204.002)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "异常进程链:winword.exe 派生 powershell.exe(疑似宏病毒/钓鱼)",
@@ -718,6 +723,7 @@
                 "riskScore": 100,
                 "source": "Rule",
                 "techniques": [
+                    "T1566.001"
                 ],
                 "userTrusted": false
             }
@@ -764,7 +770,7 @@
                         "source": "InjectionAnalyzer"
                     },
                     {
-                        "description": "命中规则:[内置] 银狐:Temp 未签名进程注入远程线程(shellcode 注入,高危)",
+                        "description": "命中规则:[内置] 注入与侧载 · 可写投递目录 \\appdata\\local\\temp\\ 内的程序发起远程线程注入(T1055)",
                         "kind": "Rule",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
@@ -777,7 +783,7 @@
                     }
                 ],
                 "hasThreatIndicator": true,
-                "matchedRuleNote": "[内置] 银狐:Temp 未签名进程注入远程线程(shellcode 注入,高危)",
+                "matchedRuleNote": "[内置] 注入与侧载 · 可写投递目录 \\appdata\\local\\temp\\ 内的程序发起远程线程注入(T1055)",
                 "memoryInjection": false,
                 "riskReasons": [
                     "无可信数字签名",
@@ -790,7 +796,8 @@
                 "riskScore": 100,
                 "source": "Rule",
                 "techniques": [
-                    "T1003.001 LSASS 内存转储"
+                    "T1003.001 LSASS 内存转储",
+                    "T1055 进程注入"
                 ],
                 "userTrusted": false
             }
@@ -798,28 +805,29 @@
         {
             "label": "step4-sideload-unsigned-dll-from-temp",
             "snapshot": {
-                "action": "Ask",
+                "action": "Allow",
                 "evidence": [
                     {
-                        "description": "命中规则:[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
-                        "kind": "Rule",
+                        "description": "有效数字签名:SomeVendor Ltd(健康),直接放行",
+                        "kind": "Trust",
                         "scoreDelta": 0,
-                        "source": "RuleEngine"
+                        "source": "TrustPolicy"
                     },
                     {
-                        "description": "最终裁决:询问用户(依据:命中规则;风险分 0)",
+                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
                 "hasThreatIndicator": false,
-                "matchedRuleNote": "[内置] 从 Temp 加载模块(疑似 DLL 搜索顺序劫持/侧载)",
+                "matchedRuleNote": "",
                 "memoryInjection": false,
                 "riskReasons": [
+                    "有效数字签名:SomeVendor Ltd(健康),直接放行"
                 ],
                 "riskScore": 0,
-                "source": "Rule",
+                "source": "TrustedSigner",
                 "techniques": [
                 ],
                 "userTrusted": false

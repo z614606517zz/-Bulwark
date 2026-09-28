@@ -26,6 +26,18 @@ struct DefenseRule {
     QString commandLinePattern;     // 命令行通配(*),空=不限
     QString parentPattern;          // 父进程通配(*),空=不限
     bool requireUnsigned = false;   // 仅当主体无可信签名才命中
+    //
+    // 仅当主体持有【健康签名】(有效签名 + 未失配 / 未吊销 / 未在证书过期后签名)才命中。
+    // 与 requireUnsigned 对称,专为「按厂商程序放行」这类 Allow 规则而加。
+    //
+    // 【为什么需要它】有一批内置 Allow 规则只能按文件名匹配主体,因为目标程序的安装位置
+    // 天然多变(浏览器可装 Program Files 也可装 %LOCALAPPDATA%;国内安全软件的目录随 OEM
+    // 定制而变),没法像系统组件那样锚定到唯一路径。而「仅文件名 + Allow」等于给任何改名成
+    // chrome.exe / 360tray.exe 的样本发放通行证 —— 那是 C2 外联最省事的绕过方式。
+    // 加上这个条件后,冒名者因为拿不到目标厂商的有效签名而无法命中,而真程序照常放行。
+    //
+    // 注意它与 requireUnsigned 互斥:两个都置 true 的规则永不命中(会被 loadRules 的护栏记下)。
+    bool requireSigned = false;
     bool exemptTrustedOsComponent = false; // 命中后可被强可信 OS 组件豁免
     bool hardOverride = false;      // 确定性恶意硬拦截(排序最高优先级)
     QSet<QString> actorHashes;      // 哈希黑/白名单(SHA-256),空=不限

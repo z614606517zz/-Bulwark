@@ -18,6 +18,8 @@ public:
                                int fanoutThreshold = 20, int maxPids = 4096);
 
     ScoreResult observe(const SecurityEvent& e);
+    // 无调用点,理由同 ProcessChainTracker::forget(没有「进程已退出」事件)。本监视器的窗口很短,
+    // PID 复用的影响随之很小。
     void forget(int pid);
     int trackedProcessCount();
 

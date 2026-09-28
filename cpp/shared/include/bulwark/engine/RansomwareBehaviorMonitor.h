@@ -27,6 +27,8 @@ public:
 
     void addCanaryFile(const QString& path);
     Result observe(const SecurityEvent& e);
+    // 无调用点,理由同 ProcessChainTracker::forget(没有「进程已退出」事件)。这里的淘汰窗口是
+    // 4 × windowSecs_(默认 40 秒),PID 复用的影响窗口很窄。
     void forget(int pid);
     int trackedProcessCount();
 

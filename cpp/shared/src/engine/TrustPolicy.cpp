@@ -45,8 +45,18 @@ const QSet<QString>& knownSecurityProcessNames() {
 }
 const QStringList& protectedInstallDirs() {
     static const QStringList s = {
-        "\\program files\\", "\\program files (x86)\\", "\\programdata\\",
+        "\\program files\\", "\\program files (x86)\\",
         "\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\defender\\",
+        //
+        // 【\programdata\ 已移除】它同时出现在 ThreatDetector::highSuspiciousDirs 里,
+        // 也就是本项目自己把它列为「可疑投放目录」。同一个目录不能既是「可疑投放点」
+        // 又是「受保护安装目录(放个杀软名字就无条件信任)」—— 那是直接矛盾,而且矛盾的
+        // 两边里放行的那一边赢了(共存放行在管线第 ② 步,早于一切检测)。
+        //
+        // 影响面:真正装在 ProgramData 下的安全软件(部分国产安全软件的引擎目录)不再走
+        // 这条「按名放行」通道,而是由签名信任层(isHealthySigned / isBenignSigner)放行。
+        // 它们都带厂商签名,所以不会被误拦;失去的只是「无签名也按名字放行」这一档。
+        //
     };
     return s;
 }
@@ -150,13 +160,61 @@ const QSet<QString>& scriptHostsSet() {
     return s;
 }
 
+//
+// ============ 目录判定必须锚定到盘符,不能用子串包含 ============
+//
+// 原实现是 `pathLower.contains(dir)`,而 dirs 里的条目形如 "\program files\"。于是:
+//     C:\Users\<u>\Program Files\evil.exe    含 "\program files\"
+//     C:\temp\Windows\System32\evil.exe      含 "\windows\system32\"
+// 这两个目录任何用户都能自己创建,不需要权限。
+//
+// 对 isTrustedSecurityProduct 这条路径尤其致命:它的判据只有「映像名 ∈ 60 余个杀软进程名」+
+// 「路径含受保护安装目录」,【完全不校验签名】,而受保护目录里还包含 \programdata\。也就是说
+// 把样本命名成 360tray.exe 丢进 C:\ProgramData\任意子目录,它就在管线第 ② 步拿到「已安装的
+// 知名安全软件,共存放行」——ThreatDetector、时序检测、全部规则一概不跑。
+//
+// 现在改为「盘符 + 目录」锚定前缀。UNC(\\server\share\...)不是本机安装目录,返回 false。
+//
+bool startsAfterDrive(const QString& pathLower, const QString& dirLower) {
+    // pathLower 形如 "c:\program files\..." ;dirLower 形如 "\program files\"
+    if (pathLower.size() < 2 || pathLower.at(1) != QLatin1Char(':')) return false;
+    return QStringView(pathLower).mid(2).startsWith(dirLower);
+}
 bool containsDir(const QStringList& dirs, const QString& pathLower) {
-    for (const QString& d : dirs) if (pathLower.contains(d)) return true;
+    for (const QString& d : dirs) if (startsAfterDrive(pathLower, d)) return true;
     return false;
 }
+//
+// 发行商匹配从「子串包含」改为「词边界匹配」。
+//
+// benignPublishers 里有 "360" / "Dell" / "Valve" / "Zoom" / "Oracle" 这类极短的条目,配上
+// contains 之后,一张主体名为 "360Secure Fake Ltd" 或 "Valverde Software" 的代码签名证书就
+// 进了良性发行商名单 —— 而按需要的名字申请一张 OV 代码签名证书是有组织的攻击者的常规操作。
+// 同理 strongPublishers 的 "Microsoft Windows" 也会被 "Microsoft Windows Helper Inc" 命中。
+//
+// 词边界的含义:匹配位置的前后必须是「字符串端点」或「非字母数字字符」。于是
+//   "Beijing Qihu Technology Co., Ltd." 对 "360"    -> 不命中(本来也不该由 "360" 命中)
+//   "360 Total Security"               对 "360"    -> 命中
+//   "360Secure Fake Ltd"               对 "360"    -> 不命中(360 后面紧跟字母)
+// 判定仍不区分大小写。
+//
 bool publisherMatches(const QString& publisher, const QStringList& list) {
     if (publisher.isEmpty()) return false;
-    for (const QString& p : list) if (publisher.contains(p, Qt::CaseInsensitive)) return true;
+    const QString hay = publisher.toLower();
+    for (const QString& p : list) {
+        const QString needle = p.toLower();
+        if (needle.isEmpty()) continue;
+        int from = 0;
+        for (;;) {
+            const int at = hay.indexOf(needle, from);
+            if (at < 0) break;
+            const int end = at + needle.size();
+            const bool leftOk = (at == 0) || !hay.at(at - 1).isLetterOrNumber();
+            const bool rightOk = (end == hay.size()) || !hay.at(end).isLetterOrNumber();
+            if (leftOk && rightOk) return true;
+            from = at + 1;
+        }
+    }
     return false;
 }
 
@@ -190,10 +248,24 @@ TrustDecision TrustPolicy::isTrustedSecurityProduct(const bulwark::SecurityEvent
     if (e.actorPath.isEmpty()) return {};
     const QString name = fileNameLower(e.actorPath);
     if (name.isEmpty() || !knownSecurityProcessNames().contains(name)) return {};
+    //
+    // 【必须校验签名】这一步是管线的第 ② 步,早于 ThreatDetector 与全部规则,给出的是
+    // 【无条件放行】。而原判据只有「映像名 ∈ 杀软进程名」+「路径含安装目录」两条,都不需要
+    // 任何凭据 —— 把样本改名成 avp.exe / 360tray.exe 放进 Program Files 的任一子目录即可通过。
+    //
+    // 对比同一文件里的 isTrustedVendorApp(IM 白名单):它明确要求「健康签名 + 良性发行商」,
+    // 理由写的是「仅凭文件名不足以放行,签名主体必须可信」。共存放行的风险更高(作用于全部
+    // 事件类型,而不是只有网络维度),却用了更松的判据,这个不一致本身就是问题。
+    //
+    // 现在要求签名健康(有效 / 未失配 / 未吊销 / 未在证书过期后签名)。真正装了的安全软件
+    // 一定带厂商签名,不受影响;冒名者拿不到。
+    //
+    if (!e.actorSigned || e.signatureMismatch || e.certRevoked || e.signedAfterCertExpiry)
+        return {};
     QString lower = e.actorPath.toLower();
     lower.replace(QLatin1Char('/'), QLatin1Char('\\'));
     if (!containsDir(protectedInstallDirs(), lower)) return {};
-    return { true, u("已安装的知名安全软件(") + name + u("),共存放行") };
+    return { true, u("已安装的知名安全软件(") + name + u(")·签名健康,共存放行") };
 }
 
 TrustDecision TrustPolicy::isStronglyTrusted(const bulwark::SecurityEvent& e) {
@@ -206,7 +278,11 @@ TrustDecision TrustPolicy::isStronglyTrusted(const bulwark::SecurityEvent& e) {
         strongTrustThumbprints().contains(e.actorCertThumbprint.toUpper()))
         return { true, u("证书指纹在强可信白名单") };
 
-    const QString pathLower = e.actorPath.toLower();
+    // containsDir 现在是【盘符锚定】前缀比较,所以这里必须先把 '/' 归一为 '\' ——
+    // 否则一条用正斜杠表示的路径会因为形态而不匹配(原来的 contains 对分隔符方向不敏感,
+    // 换成锚定后就敏感了)。
+    QString pathLower = e.actorPath.toLower();
+    pathLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
     if (publisherMatches(e.actorPublisher, strongPublishers()) && containsDir(systemDirs(), pathLower))
         return { true, u("微软签名且位于系统目录") };
 
@@ -254,7 +330,9 @@ TrustDecision TrustPolicy::isBenignSigner(const bulwark::SecurityEvent& e) {
                 return { true, u("合法签名发行商:") + pub };
     }
 
-    const QString pathLower = e.actorPath.toLower();
+    // 同上:containsDir 已是盘符锚定,需先归一分隔符。
+    QString pathLower = e.actorPath.toLower();
+    pathLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
     if (containsDir(trustedDirs(), pathLower))
         return { true, u("合法签名且位于标准安装目录") };
 

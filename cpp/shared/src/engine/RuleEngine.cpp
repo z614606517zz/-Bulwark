@@ -15,14 +15,89 @@ using detail::fileNameLower;
 
 namespace {
 // 本软件自身组件进程映像名(小写)。须与 CMake 构建产物名(下划线)一致——早期沿用
-// .NET 程序集名(点号 bulwark.service.exe)导致永不匹配真实的 bulwark_service.exe,自身
-// 组件放行形同虚设。按名匹配可被同名程序冒用,故仅作快速通道,真正的稳妥判定靠安装目录
-// 前缀(addSelfDirectory,由服务在启动时登记 applicationDirPath)。
+// .NET 程序集名(点号 bulwark.service.exe)导致永不匹配真实的 bulwark_service.exe。
+//
+// 【这份名单【只能】与安装目录前缀合取使用,绝不可单独判定】
+//
+// 原实现里 matchesSelf 先查这份名单,命中就直接 return true,而注释写的是「按名匹配可被
+// 同名程序冒用,故仅作快速通道,真正的稳妥判定靠安装目录前缀」—— 但代码里它就是终局判据,
+// 没有第二道。后果:把样本命名成 bulwark_ui.exe 放到任意目录(如 %TEMP%),它在
+// evaluateInternal 的第 ① 步就拿到「本软件自身组件,无条件放行」,跳过全部检测,连勒索蜜罐
+// 和硬指标都不处置。这是整条管线上最短的一条绕过路径。
+//
+// 现在名字只用来【剪掉绝大多数无关路径】(避免对每个事件都去遍历目录集合),命中之后仍必须
+// 通过目录前缀。见 matchesSelf。
 const QSet<QString>& selfImageNames() {
     static const QSet<QString> s = {
         "bulwark_service.exe", "bulwark_ui.exe",
     };
     return s;
+}
+
+// 按 Windows 命令行规则把命令行切成 argv:双引号内的空白不断词,"" 表示一个字面引号。
+//
+// 为什么维护脚本通道【必须】按词比对而不是按子串:contains() 判定只要求那几个字样
+// 在命令行里【出现过】,不要求它们真的是被执行的东西。于是
+//     powershell.exe -enc <base64 载荷>  # C:\Program Files\Bulwark\bulwark.ps1
+// 就同时满足「命令行里有安装目录」「命令行里有 bulwark.ps1」两条,拿到一次
+// 【规则匹配之前】的无条件放行 —— 写 Block 规则也盖不住。注释原本说这条通道的强度
+// 来自内核 SelfGuard 对安装目录的写保护,但 SelfGuard 保护的是文件内容,管不了
+// 命令行文本,所以那份强度对这个判定不成立。
+QStringList tokenizeCommandLine(const QString& cmd) {
+    QStringList out;
+    QString cur;
+    bool inQuotes = false;
+    bool started = false;   // 空词也要能产出(如 "" ),故单独记「本词已开始」
+    for (int i = 0; i < cmd.size(); ++i) {
+        const QChar c = cmd.at(i);
+        if (c == QLatin1Char('"')) {
+            if (inQuotes && i + 1 < cmd.size() && cmd.at(i + 1) == QLatin1Char('"')) {
+                cur += QLatin1Char('"');
+                ++i;
+            } else {
+                inQuotes = !inQuotes;
+            }
+            started = true;
+            continue;
+        }
+        if (!inQuotes && c.isSpace()) {
+            if (started) { out << cur; cur.clear(); started = false; }
+            continue;
+        }
+        cur += c;
+        started = true;
+    }
+    if (started) out << cur;
+    return out;
+}
+
+QString normalizePathToken(const QString& token) {
+    QString t = token.trimmed().toLower();
+    t.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    return t;
+}
+
+// 能让解释器执行【行内代码】的开关。命中任何一个就不是「执行安装目录里的脚本」,
+// 一律不给这条通道。用精确词表而不是前缀匹配:合法调用里有 -ExecutionPolicy,
+// 若按 "-e" 前缀去拒就会把正常的维护调用一起拒掉。
+bool isInlineCodeSwitch(const QString& tokenLower) {
+    static const QSet<QString> s = {
+        QStringLiteral("-command"),   QStringLiteral("/command"),
+        QStringLiteral("-c"),         QStringLiteral("/c:"),
+        QStringLiteral("-encodedcommand"), QStringLiteral("-encoded"),
+        QStringLiteral("-enc"),       QStringLiteral("-e"),
+        QStringLiteral("-ec"),        QStringLiteral("-encodedarguments"),
+    };
+    return s.contains(tokenLower);
+}
+
+// 可能把第二条命令串进去的元字符。-File 之后 PowerShell 不解释它们,但这条通道的
+// 代价太高,宁可严一点。
+bool hasCommandChaining(const QString& token) {
+    static const char* kBad[] = { ";", "&", "|", "`", "$(", "%0a", "\n", "\r" };
+    for (const char* b : kBad)
+        if (token.contains(QLatin1String(b))) return true;
+    return false;
 }
 } // namespace
 
@@ -37,16 +112,26 @@ void RuleEngine::addSelfDirectory(const QString& dir) {
 
 bool RuleEngine::matchesSelf(const QString& path) const {
     if (path.isEmpty()) return false;
+
+    //
+    // 判据 = 「映像名在自身组件名单里」【且】「路径落在已登记的安装目录下」。
+    //
+    // 两个条件必须【合取】。原实现是析取(名字命中即 return true),于是 %TEMP%\bulwark_ui.exe
+    // 就获得了无条件放行 —— 见 selfImageNames() 上方的说明。
+    //
+    // 目录集合为空(服务尚未调用 addSelfDirectory)时一律返回 false,不猜:宁可让自身组件走一遍
+    // 正常检测(它们带健康签名,会被后面的信任层放行),也不能在还不知道安装目录的时候按名字发
+    // 通行证。
+    //
     const QString name = fileNameLower(path);
-    if (!name.isEmpty() && selfImageNames().contains(name)) return true;
+    if (name.isEmpty() || !selfImageNames().contains(name)) return false;
 
     QMutexLocker locker(&selfDirLock_);
-    if (!selfDirectories_.isEmpty()) {
-        QString pathLower = path.toLower();
-        pathLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
-        for (const QString& d : selfDirectories_)
-            if (pathLower.startsWith(d)) return true;
-    }
+    if (selfDirectories_.isEmpty()) return false;
+    QString pathLower = path.toLower();
+    pathLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    for (const QString& d : selfDirectories_)
+        if (pathLower.startsWith(d)) return true;
     return false;
 }
 
@@ -69,30 +154,61 @@ bool RuleEngine::isSanctionedMaintenanceActor(const SecurityEvent& e) const {
     if (!sysRoot.endsWith(QLatin1Char('\\'))) sysRoot += QLatin1Char('\\');
     if (!actorLower.startsWith(sysRoot)) return false;
 
-    // 2) 命令行里必须出现本产品安装目录 —— 也就是它执行的脚本来自我们自己的目录。
-    //    这一条的强度来自内核 SelfGuard:安装目录「仅放行本产品自身进程写入,其余进程
-    //    写/删/改名一律拒绝」,所以攻击者没法把自己的脚本放进去,也没法替换 bulwark.ps1。
-    //    换句话说「脚本在我们目录里」是有实质保证的,不是一句自我声明。
+    // 2) + 3) 命令行必须【真的在执行】安装目录内的我方脚本。
+    //
+    //    按词解析,不按子串包含(理由见 tokenizeCommandLine 的说明:子串包含可被一句
+    //    注释伪造出无条件放行)。要同时满足:
+    //      · 存在一个词是【绝对路径】,前缀落在已登记的安装目录内,文件名在脚本白名单里;
+    //      · 该词的前一个词是 -File(PowerShell 唯一的「执行脚本文件」入口,可缩写),
+    //        也就是这个路径确实处在被执行的位置上,而不是出现在注释/参数/无关文本里;
+    //      · 没有任何词是行内代码开关(-Command / -EncodedCommand / -enc ...);
+    //      · 没有任何词带命令串接元字符。
+    //
+    //    目录前缀这一条的强度来自内核 SelfGuard:安装目录「仅放行本产品自身进程写入,
+    //    其余进程写/删/改名一律拒绝」,所以攻击者没法把自己的脚本放进去,也没法替换
+    //    bulwark.ps1。注意这份强度只覆盖「脚本文件的内容」,所以上面必须先把「该路径
+    //    确实被当作脚本执行」这件事验证掉,才轮得到它。
     const QString cmd = e.commandLine;
     if (cmd.isEmpty()) return false;
-    QString cmdLower = cmd.toLower();
-    cmdLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
-    bool inSelfDir = false;
+
+    QSet<QString> selfDirs;
     {
         QMutexLocker locker(&selfDirLock_);
         if (selfDirectories_.isEmpty()) return false;   // 目录还没登记时不猜,直接不放行
-        for (const QString& d : selfDirectories_)
-            if (cmdLower.contains(d)) { inSelfDir = true; break; }
+        selfDirs = selfDirectories_;
     }
-    if (!inSelfDir) return false;
 
-    // 3) 被执行的脚本名必须在白名单内。目录条件已经很强,但仍然把「能被当作维护脚本
-    //    执行的东西」限定成我们实际发布的那几个,避免以后往包里加了别的东西就顺带扩权。
-    static const char* kScripts[] = { "bulwark.ps1" };
-    bool named = false;
-    for (const char* s : kScripts)
-        if (cmdLower.contains(QLatin1String(s))) { named = true; break; }
-    return named;
+    static const QSet<QString> kScripts = { QStringLiteral("bulwark.ps1") };
+
+    const QStringList tokens = tokenizeCommandLine(cmd);
+    if (tokens.size() < 2) return false;
+
+    bool sanctioned = false;
+    for (int i = 0; i < tokens.size(); ++i) {
+        const QString tokenLower = tokens.at(i).toLower();
+        if (isInlineCodeSwitch(tokenLower)) return false;
+        if (hasCommandChaining(tokens.at(i))) return false;
+
+        const QString norm = normalizePathToken(tokens.at(i));
+        const int slash = norm.lastIndexOf(QLatin1Char('\\'));
+        if (slash < 0) continue;                        // 不是路径形态的词
+        if (!kScripts.contains(norm.mid(slash + 1))) continue;
+
+        // -File 必须紧邻在前(PowerShell 允许参数名缩写,故按前缀认 -f/-fi/-fil/-file)。
+        if (i == 0) continue;
+        const QString prev = tokens.at(i - 1).toLower();
+        if (!prev.startsWith(QLatin1Char('-')) || prev.size() < 2
+            || !QStringLiteral("-file").startsWith(prev)) {
+            continue;
+        }
+
+        bool underSelfDir = false;
+        for (const QString& d : selfDirs)
+            if (norm.startsWith(d)) { underSelfDir = true; break; }
+        if (underSelfDir)
+            sanctioned = true;                          // 继续扫完,确保后面没有行内代码开关
+    }
+    return sanctioned;
 }
 
 std::optional<QString> RuleEngine::trustNoteForPath(const QString& path) const {
@@ -186,9 +302,78 @@ const QVector<DefenseRule>& RuleEngine::bucketForLocked(EventType t) const {
     return it == byType_.constEnd() ? kEmpty : it.value();
 }
 
+//
+// ===================== Allow 规则的准入校验(防复发护栏)=====================
+//
+// 【为什么必须是代码里的一道闸,而不是「注意别这么写」】
+//
+// 规则集里曾经有一大批 Allow 规则的 actorPattern 只写了文件名,例如 "*\svchost.exe"。
+// DefenseRule::wildcardMatch 是纯通配,'*' 吃掉任意前缀,所以这类规则的真实语义是
+// 【任何位置、任何一个同名程序】—— 把样本改名成 svchost.exe 丢进 Temp,它的全部文件写入
+// 与注册表写入就都被无条件放行了。而且它还会赢:ruleTier 给它 0,但
+// specificity = actorPattern(2) + type(1) = 3,高于「写 Run 键 -> Ask」那条(=2)。
+//
+// 这种错误的特点是【写起来自然、读起来无害、后果隐蔽】:它不会让任何测试失败,只会让某一类
+// 样本静默通过。所以靠 review 守不住,必须在加载时机械地拒掉。
+//
+// 判据(精确,不过度):action == Allow 且 actorPattern 形如「'*' 或 '*\' 之后只剩一个文件名」
+// 且【没有】requireSigned 兜底 —— 也就是既不限定位置、也不限定签名。命中即拒绝该规则并记日志。
+//   "*\svchost.exe"                     -> 拒绝(不限位置、不限签名)
+//   "*\chrome.exe" + requireSigned      -> 放行(冒名者拿不到厂商签名)
+//   "?:\Windows\System32\svchost.exe"   -> 放行(位置锚定)
+//   "*\Google\Update\*"                 -> 放行(不是「只剩一个文件名」)
+// Block / Ask 规则不受此限:它们过宽只会带来更多审查,不会造成放行。
+//
+static bool isFilenameOnlyActorPattern(const QString& pattern) {
+    if (pattern.isEmpty()) return false;
+    // 取最后一个路径分隔符之后的部分;之前的部分必须只由通配构成才算「不限定位置」。
+    const int slash = pattern.lastIndexOf(QLatin1Char('\\'));
+    const QString head = slash < 0 ? QString() : pattern.left(slash);
+    const QString tail = slash < 0 ? pattern : pattern.mid(slash + 1);
+    // 头部只允许是空、"*" 这两种(其余形式说明写了真实目录成分)。
+    if (!(head.isEmpty() || head == QStringLiteral("*"))) return false;
+    // 尾部必须是一个具体文件名:非空、不含通配。含 '*' 的尾部(如 "*") 属于「放行整个目录」,
+    // 那是另一类问题,不在本护栏判据内。
+    if (tail.isEmpty() || tail.contains(QLatin1Char('*')) || tail.contains(QLatin1Char('?')))
+        return false;
+    return true;
+}
+
+bool RuleEngine::isUnsafeAllowRule(const DefenseRule& r, QString* whyOut) {
+    if (r.action != VerdictAction::Allow) return false;
+    if (r.requireUnsigned && r.requireSigned) {
+        if (whyOut) *whyOut = u("同时要求已签名与未签名,永不命中(配置矛盾)");
+        return true;
+    }
+    // 哈希精确匹配已经把主体钉死到具体文件内容,不受改名影响,无需再限定位置或签名。
+    if (!r.actorHashes.isEmpty()) return false;
+    // actorPath 是精确全路径匹配,同样已限定位置。
+    if (!r.actorPath.isEmpty()) return false;
+    if (r.requireSigned) return false;
+    if (isFilenameOnlyActorPattern(r.actorPattern)) {
+        if (whyOut)
+            *whyOut = u("Allow 规则的主体通配只写了文件名(") + r.actorPattern +
+                      u("),等于放行任何位置的同名程序;请锚定路径或加 requireSigned");
+        return true;
+    }
+    return false;
+}
+
 void RuleEngine::loadRules(const QVector<DefenseRule>& rules) {
     QHash<QUuid, DefenseRule> fresh;
-    for (const DefenseRule& r : rules) fresh.insert(r.id, r);
+    int rejected = 0;
+    for (const DefenseRule& r : rules) {
+        QString why;
+        if (isUnsafeAllowRule(r, &why)) {
+            ++rejected;
+            qWarning("[RuleEngine] 拒绝加载不安全的 Allow 规则:%s | note=%s",
+                     qUtf8Printable(why), qUtf8Printable(r.note));
+            continue;
+        }
+        fresh.insert(r.id, r);
+    }
+    if (rejected > 0)
+        qWarning("[RuleEngine] 共拒绝 %d 条不安全的 Allow 规则(见上方逐条说明)。", rejected);
     QWriteLocker locker(&rulesLock_);
     rules_ = std::move(fresh);
     rebuildIndexLocked();
@@ -217,6 +402,17 @@ int RuleEngine::pruneExpired() {
 }
 
 void RuleEngine::addRule(const DefenseRule& rule) {
+    // 同一道护栏也要覆盖【单条新增】:规则不只从内置集合来,还从 UI 的「添加规则」、
+    // 情报行为规则注入、以及更新包下发进来。只在 loadRules 里拦等于只拦住了内置那一条路。
+    // 用户「记住我的选择」产生的规则带精确 actorPath,不受影响(见 createRuleFrom)。
+    {
+        QString why;
+        if (isUnsafeAllowRule(rule, &why)) {
+            qWarning("[RuleEngine] 拒绝新增不安全的 Allow 规则:%s | note=%s",
+                     qUtf8Printable(why), qUtf8Printable(rule.note));
+            return;
+        }
+    }
     QWriteLocker locker(&rulesLock_);
     // 覆盖同 id 的旧规则时不能只往索引里追加,否则桶里会同时留着新旧两份 ——
     // 两者 id 相同,排序比较器分不出高下,胜出者变回不确定。这种情况整体重建。

@@ -19,6 +19,11 @@ bool DefenseRule::matches(const SecurityEvent& e) const {
     if (type.has_value() && *type != e.type) return false;
 
     if (requireUnsigned && e.actorSigned) return false;
+    // requireSigned 要求的是【健康】签名,不只是「有签名」:被吊销的证书、签名失配、
+    // 用过期证书补签的样本都算不上可信主体,否则「按厂商名放行」这条路又被盗证书打开了。
+    if (requireSigned && (!e.actorSigned || e.signatureMismatch || e.certRevoked ||
+                          e.signedAfterCertExpiry))
+        return false;
 
     if (!actorHashes.isEmpty()) {
         if (e.actorHash.isEmpty()) return false;
@@ -65,6 +70,7 @@ int DefenseRule::specificityScore() const {
     if (!targetPattern.isEmpty()) s += 1;
     if (type.has_value()) s += 1;
     if (requireUnsigned) s += 1;
+    if (requireSigned) s += 1;
     if (!actorHashes.isEmpty()) s += 4; // 哈希精确匹配,最具体
     return s;
 }
@@ -150,6 +156,7 @@ QJsonObject DefenseRule::toJson() const {
     o["commandLinePattern"] = commandLinePattern;
     o["parentPattern"] = parentPattern;
     o["requireUnsigned"] = requireUnsigned;
+    o["requireSigned"] = requireSigned;
     o["exemptTrustedOsComponent"] = exemptTrustedOsComponent;
     o["hardOverride"] = hardOverride;
     QJsonArray hashes;
@@ -177,6 +184,7 @@ DefenseRule DefenseRule::fromJson(const QJsonObject& o) {
     r.commandLinePattern = getStr(o, "commandLinePattern");
     r.parentPattern = getStr(o, "parentPattern");
     r.requireUnsigned = getBool(o, "requireUnsigned");
+    r.requireSigned = getBool(o, "requireSigned");
     r.exemptTrustedOsComponent = getBool(o, "exemptTrustedOsComponent");
     r.hardOverride = getBool(o, "hardOverride");
     r.actorHashes.clear();
