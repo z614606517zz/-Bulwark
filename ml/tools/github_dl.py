@@ -7,11 +7,13 @@ download URL. Covers Chinese-origin open-source apps + international open-source
 Only unambiguously-benign software (no proxy/VPN/game-cheat that AV flags as PUP).
 Downloads only, never executes. stdlib urllib only.
 """
-import json, os, urllib.request, urllib.error
+import argparse, json, os, urllib.request, urllib.error
 
-DL = r"C:\Users\61460\Desktop\新建文件夹\github"
-os.makedirs(DL, exist_ok=True)
-LOG = os.path.join(DL, "_github_dl.log")
+# Output dir is a CLI arg (--out). The default is a per-user folder so the script
+# carries no machine-specific path; pass --out to reuse an existing download dir.
+_DEFAULT_DL = os.path.join(os.path.expanduser("~"), "Downloads", "github_dl")
+DL = _DEFAULT_DL
+LOG = ""
 
 REPOS = [
     # --- Chinese-origin open-source ---
@@ -110,6 +112,15 @@ def download(url, dst):
 
 
 def main():
+    global DL, LOG
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=_DEFAULT_DL, help="download directory")
+    args = ap.parse_args()
+    DL = args.out
+    os.makedirs(DL, exist_ok=True)
+    LOG = os.path.join(DL, "_github_dl.log")
+    print(f"GitHub releases -> {DL}", flush=True)
+
     ok = fail = 0
     lf = open(LOG, "a", encoding="utf-8")
     for repo in REPOS:
