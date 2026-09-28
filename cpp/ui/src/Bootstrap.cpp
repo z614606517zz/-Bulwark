@@ -8,7 +8,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLocalSocket>
-#include <QMessageBox>
+#include "design/Confirm.h"
 #include <QProcess>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -129,9 +129,9 @@ bool ensureBackendRunning(QWidget* parent) {
 
     const QString exe = serviceExePath();
     if (exe.isEmpty()) {
-        QMessageBox::warning(parent, u("磐垒主动防御"),
+        ::ui::notice(parent, ::ui::NoticeTone::Warning, u("找不到防护服务"),
             u("找不到 bulwark_service.exe。请确保它与本程序在同一目录,"
-              "否则界面无法连上防护服务。"));
+              "否则界面无法连上防护服务。界面会以「未连接」状态打开。"));
         return false;
     }
 
@@ -140,8 +140,8 @@ bool ensureBackendRunning(QWidget* parent) {
         : runElevated(exe, QStringLiteral("--bootstrap"));
 
     if (r == RunResult::Refused) {
-        QMessageBox::information(parent, u("磐垒主动防御"),
-            u("需要管理员权限才能启动防护服务与内核驱动。\n\n"
+        ::ui::notice(parent, ::ui::NoticeTone::Info, u("已跳过启动防护服务"),
+            u("需要管理员权限才能启动防护服务与内核驱动。"
               "本次已跳过 —— 界面会以「未连接」状态打开,不影响你查看历史记录。"
               "想启用防护,重新打开本程序并在提权提示里选「是」即可。"));
         return false;
@@ -152,49 +152,49 @@ bool ensureBackendRunning(QWidget* parent) {
         return true;
 
     const QString detail = bootstrapStatus();
-    QMessageBox::warning(parent, u("磐垒主动防御"),
-        u("防护服务未能启动,界面将以「未连接」状态打开。\n\n")
-            + (detail.isEmpty() ? u("详见 %ProgramData%\\Bulwark\\service.log。") : detail));
+    ::ui::notice(parent, ::ui::NoticeTone::Danger, u("防护服务未能启动"),
+        u("界面将以「未连接」状态打开,系统此刻不受本软件保护。"),
+        detail.isEmpty() ? u("详见 %ProgramData%\\Bulwark\\service.log。") : detail);
     return false;
 }
 
-bool shutdownBackend() {
-    // 静默停止服务和驱动,不弹任何提示框
-    
-    // 1. 停止服务
-    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (scm) {
-        SC_HANDLE svc = ::OpenServiceW(scm, L"BulwarkService", SERVICE_STOP | SERVICE_QUERY_STATUS);
-        if (svc) {
-            SERVICE_STATUS st = {};
-            ::ControlService(svc, SERVICE_CONTROL_STOP, &st);
-            // 等待服务停止(最多5秒)
-            for (int i = 0; i < 10; ++i) {
-                DWORD needed = 0;
-                if (::QueryServiceStatus(svc, &st) && st.dwCurrentState == SERVICE_STOPPED)
-                    break;
-                ::Sleep(500);
-            }
-            ::CloseServiceHandle(svc);
-        }
-        ::CloseServiceHandle(scm);
+// shutdownBackend() 已移除 —— 理由见 Bootstrap.h。简言之:关界面不该关防护。
+
+bool ensureUiAutoStart() {
+    const QString exe = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+    if (exe.isEmpty())
+        return false;
+    // --tray:登录时静默驻留托盘,不把主窗口糊到用户脸上(见 ui/main.cpp 对该参数的处理)。
+    const std::wstring want = (QLatin1Char('"') + exe + QStringLiteral("\" --tray")).toStdWString();
+
+    HKEY key = nullptr;
+    if (::RegOpenKeyExW(HKEY_CURRENT_USER,
+                        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                        0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+        return false;
     }
 
-    // 2. 卸载驱动
-    ::Sleep(1000); // 给服务1秒时间完全退出
-    
-    scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (scm) {
-        SC_HANDLE driver = ::OpenServiceW(scm, L"Bulwark", SERVICE_STOP);
-        if (driver) {
-            SERVICE_STATUS st = {};
-            ::ControlService(driver, SERVICE_CONTROL_STOP, &st);
-            ::CloseServiceHandle(driver);
+    // 先读:已经是期望值就不写。注册表写入会被本产品自己的自启动项监控看到,常态下不该有动静。
+    bool same = false;
+    {
+        wchar_t cur[1024] = {};
+        DWORD size = sizeof(cur);
+        DWORD type = 0;
+        if (::RegQueryValueExW(key, L"Bulwark", nullptr, &type,
+                               reinterpret_cast<LPBYTE>(cur), &size) == ERROR_SUCCESS
+            && type == REG_SZ) {
+            same = (::_wcsicmp(cur, want.c_str()) == 0);
         }
-        ::CloseServiceHandle(scm);
     }
-
-    return true;
+    bool ok = same;
+    if (!same) {
+        // 路径变了(换目录 / 重新部署)也走这条,顺带把陈旧路径纠正过来。
+        ok = ::RegSetValueExW(key, L"Bulwark", 0, REG_SZ,
+                              reinterpret_cast<const BYTE*>(want.c_str()),
+                              static_cast<DWORD>((want.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+    }
+    ::RegCloseKey(key);
+    return ok;
 }
 
 } // namespace bulwark::ui::bootstrap

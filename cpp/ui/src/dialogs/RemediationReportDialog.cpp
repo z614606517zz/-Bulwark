@@ -1,31 +1,28 @@
 #include "dialogs/RemediationReportDialog.h"
+#include "Nav.h"
 #include "ai/AiScanner.h"
+#include "dialogs/AiCleanupDialog.h"
 #include "ipc/IpcClient.h"
-#include "widgets/AppIcon.h"
-#include "widgets/Cards.h"
-#include "widgets/Ui.h"
-#include "Theme.h"
+#include "design/Banner.h"
+#include "design/Components.h"
+#include "design/CountTile.h"
+#include "design/CountdownBar.h"
+#include "design/FitScroll.h"
+#include "design/Icons.h"
+#include "design/Theme.h"
+#include "widgets/WrapLabel.h"
 
-#include <QApplication>
 #include <QClipboard>
-#include <QDir>
+#include <QEnterEvent>
 #include <QFileInfo>
-#include <QGraphicsDropShadowEffect>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QMessageBox>
-#include <QMouseEvent>
-#include <QPlainTextEdit>
-#include <QProcess>
 #include <QPushButton>
-#include <QScreen>
-#include <QScrollArea>
-#include <QShowEvent>
-#include <QTemporaryFile>
-#include <QTimer>
-#include <QToolButton>
+#include <QScrollBar>
 #include <QVBoxLayout>
+
+#include <utility>
 
 using bulwark::ipc::RemediationReportPayload;
 using bulwark::ipc::RemediationSkippedItem;
@@ -34,45 +31,24 @@ namespace {
 
 QString u(const char* s) { return QString::fromUtf8(s); }
 
-// Caption above a value widget (mirrors the behavior prompt's field()).
-QWidget* field(const QString& caption, QWidget* value)
-{
-    auto* w = new QWidget;
-    auto* v = new QVBoxLayout(w);
-    v->setContentsMargins(0, 0, 0, 0);
-    v->setSpacing(3);
-    v->addWidget(ui::label(caption, "caption"));
-    v->addWidget(value);
-    return w;
-}
+constexpr int kCardW = 600;
+constexpr int kAutoCloseMs = 30000;
 
-// Section heading: a small coloured dot + bold title + count pill.
-QWidget* sectionHead(const QString& title, const QColor& color, int count)
-{
-    auto* w = new QWidget;
-    auto* h = new QHBoxLayout(w);
-    h->setContentsMargins(0, 6, 0, 0);
-    h->setSpacing(8);
-    h->addWidget(ui::statusDot(color), 0, Qt::AlignVCenter);
-    h->addWidget(ui::coloredText(title, 11, 700, theme::textPrimary()));
-    if (count > 0)
-        h->addWidget(ui::pill(QString::number(count), color), 0, Qt::AlignVCenter);
-    h->addStretch();
-    return w;
-}
-
-// A single "• path" list row (path elides, so long paths never widen the card).
+// "• path" row; the path wraps anywhere so it is readable in full.
 QWidget* pathRow(const QString& path, const QString& note = QString())
 {
     auto* w = new QWidget;
     auto* v = new QVBoxLayout(w);
-    v->setContentsMargins(17, 0, 0, 0); // indent under the section dot
+    v->setContentsMargins(18, 0, 0, 0);
     v->setSpacing(1);
-    auto* p = ui::elided(path, "mono");
-    p->setProperty("role", "muted");
+    auto* p = new WrapLabel(path);
+    p->setProperty("role", "mono");
     v->addWidget(p);
-    if (!note.isEmpty())
-        v->addWidget(ui::label(note, "muted"));
+    if (!note.isEmpty()) {
+        auto* n = ui::label(note, "muted");
+        n->setWordWrap(true);
+        v->addWidget(n);
+    }
     return w;
 }
 
@@ -80,168 +56,134 @@ QWidget* pathRow(const QString& path, const QString& note = QString())
 
 RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload& report,
                                                  IpcClient* ipc, AiScanner* ai, QWidget* parent)
-    : QDialog(parent), m_ipc(ipc), m_ai(ai), m_actorName(QFileInfo(report.actorPath).fileName())
+    : Sheet(parent), m_report(report), m_ipc(ipc), m_ai(ai)
 {
-    setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
-    setAttribute(Qt::WA_TranslucentBackground);
     setAttribute(Qt::WA_DeleteOnClose);
     setModal(false); // informational — never blocks the user's work
-    setFixedWidth(560);
+    setSheetWidth(kCardW);
 
-    const int cleaned = report.quarantinedFiles.size() + report.removedRegistryValues.size()
-                        + (report.actorQuarantined ? 1 : 0);
-    const int failed = report.skipped.size();
+    const int quarantined = int(report.quarantinedFiles.size()) + (report.actorQuarantined ? 1 : 0);
+    const int removed = int(report.removedRegistryValues.size());
+    const int failed = int(report.skipped.size());
     const QString when = report.timestampUtc.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
-    const QString actorName = QFileInfo(report.actorPath).fileName();
+    QString actorName = QFileInfo(report.actorPath).fileName();
+    if (actorName.isEmpty())
+        actorName = report.actorPath.isEmpty() ? u("未知程序") : report.actorPath;
 
-    auto* shell = new QVBoxLayout(this);
-    shell->setContentsMargins(24, 24, 24, 24);
+    const QColor tone = failed > 0 ? theme::warning() : theme::success();
+    setHeader(QStringLiteral("trash"), tone, u("恶意足迹清理报告"),
+              actorName + (report.actorPid > 0 ? u(" · PID %1").arg(report.actorPid) : QString()) + u(" · ") + when);
 
-    auto* cardW = ui::card();
-    auto* shadow = new QGraphicsDropShadowEffect(cardW);
-    shadow->setBlurRadius(54);
-    shadow->setOffset(0, 14);
-    shadow->setColor(QColor(15, 23, 42, 110));
-    cardW->setGraphicsEffect(shadow);
-    shell->addWidget(cardW);
+    QVBoxLayout* body = this->body();
+    body->setSpacing(12);
 
-    auto* v = new QVBoxLayout(cardW);
-    v->setContentsMargins(24, 22, 24, 22);
-    v->setSpacing(14);
-
-    // ── Header ──────────────────────────────────────────────────────────
-    auto* head = new QHBoxLayout;
-    head->setSpacing(14);
-    head->addWidget(ui::iconBadge(QStringLiteral("trash"), theme::accent(), 46, 24), 0, Qt::AlignTop);
-    auto* hcol = new QVBoxLayout;
-    hcol->setSpacing(2);
-    hcol->addWidget(ui::coloredText(u("恶意足迹清理报告"), 15, 700, theme::textPrimary()));
-    hcol->addWidget(ui::label(u("MALICIOUS FOOTPRINT REMEDIATION REPORT"), "caption"));
-    head->addLayout(hcol);
-    head->addStretch();
-    auto* closeX = new QToolButton;
-    closeX->setIcon(AppIcon::icon(QStringLiteral("close"), theme::textMuted(), 16));
-    closeX->setCursor(Qt::PointingHandCursor);
-    closeX->setAutoRaise(true);
-    closeX->setStyleSheet(QStringLiteral(
-        "QToolButton{border:none;background:transparent;padding:2px;}"
-        "QToolButton:hover{background:%1;border-radius:6px;}").arg(theme::surfaceAlt().name()));
-    connect(closeX, &QToolButton::clicked, this, &QDialog::accept);
-    head->addWidget(closeX, 0, Qt::AlignTop);
-    v->addLayout(head);
-    v->addWidget(ui::hDivider());
-
-    // ── Subject (name + PID) ────────────────────────────────────────────
-    auto* subjCol = new QVBoxLayout;
-    subjCol->setSpacing(3);
-    auto* nameRow = new QHBoxLayout;
-    nameRow->setSpacing(8);
-    nameRow->addWidget(ui::coloredText(actorName.isEmpty() ? u("未知程序") : actorName,
-                                       12, 700, theme::textPrimary()));
-    if (report.actorPid > 0)
-        nameRow->addWidget(ui::pill(QStringLiteral("PID %1").arg(report.actorPid), theme::textMuted()),
-                           0, Qt::AlignVCenter);
-    nameRow->addStretch();
-    auto* nameW = new QWidget; nameW->setLayout(nameRow);
-    subjCol->addWidget(nameW);
-    auto* subjPath = ui::elided(report.actorPath, "mono");
-    subjPath->setProperty("role", "muted");
-    subjCol->addWidget(subjPath);
-    auto* subjW = new QWidget; subjW->setLayout(subjCol);
-    v->addWidget(field(u("主体"), subjW));
-
-    // ── Verdict / reason ────────────────────────────────────────────────
+    if (!report.actorPath.isEmpty()) {
+        auto* p = new WrapLabel(report.actorPath);
+        p->setProperty("role", "mono");
+        p->setAccessibleName(u("主体路径"));
+        body->addWidget(p);
+    }
     if (!report.reason.isEmpty()) {
-        auto* rl = ui::label(report.reason, "secondary");
-        rl->setWordWrap(true);
-        v->addWidget(field(u("判定"), rl));
+        auto* r = ui::label(u("判定:") + report.reason, "secondary");
+        r->setWordWrap(true);
+        r->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        body->addWidget(r);
     }
 
-    // ── Tally line ──────────────────────────────────────────────────────
-    const QColor tallyColor = failed > 0 ? theme::warning() : theme::success();
-    auto* tally = ui::coloredText(
-        u("成功清理 ") + QString::number(cleaned) + u(" 项  ·  未能清理 ")
-            + QString::number(failed) + u(" 项  ·  ") + when,
-        10, 600, tallyColor);
-    v->addWidget(tally);
-    // 主动防护提示:据威胁情报行为画像生成的拦截规则数(让「不仅报毒,还免疫再感染」直观可见)。
-    if (report.intelRulesInjected > 0)
-        v->addWidget(ui::coloredText(
-            u("已据威胁情报行为画像生成 ") + QString::number(report.intelRulesInjected)
-                + u(" 条主动拦截规则,阻断该样本家族再次入侵"),
-            10, 600, theme::accentAlt()));
-    v->addWidget(ui::hDivider());
+    // ── summary tiles ──────────────────────────────────────────────────────────
+    auto* tiles = new QHBoxLayout;
+    tiles->setSpacing(10);
+    struct TileSpec { const char* key; QString label; int count; QColor color; };
+    const TileSpec specs[] = {
+        {"quarantined", u("已隔离"), quarantined, theme::success()},
+        {"removed", u("已移除自启动"), removed, theme::info()},
+        {"skipped", u("未能清理"), failed, theme::warning()},
+        {"intel", u("新增拦截规则"), report.intelRulesInjected, theme::accentAlt()},
+    };
+    for (const TileSpec& s : specs) {
+        auto* t = new CountTile(s.label, s.count, s.color);
+        const QString key = QString::fromLatin1(s.key);
+        connect(t, &QAbstractButton::clicked, this, [this, key] { scrollToGroup(key); });
+        tiles->addWidget(t);
+    }
+    body->addLayout(tiles);
 
-    // ── Result sections (scrollable so long lists never overgrow the card) ─
-    auto* scroll = new QScrollArea;
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    scroll->setMaximumHeight(300);
+    // ── groups (scroll inside a capped area) ────────────────────────────────────
+    m_scroll = new FitScrollArea(Sheet::screenHeightFor(parent, 0.40), kCardW - 48);
     auto* content = new QWidget;
-    scroll->setWidget(content);
     auto* list = new QVBoxLayout(content);
-    list->setContentsMargins(0, 0, 4, 0);
+    list->setContentsMargins(0, 0, 6, 0);
     list->setSpacing(6);
+    list->setAlignment(Qt::AlignTop);
 
-    if (report.actorQuarantined) {
-        list->addWidget(sectionHead(u("主体载荷已隔离"), theme::success(), 0));
-        list->addWidget(pathRow(report.actorPath));
-    }
-    if (!report.quarantinedFiles.isEmpty()) {
-        list->addWidget(sectionHead(u("已隔离文件"), theme::success(), report.quarantinedFiles.size()));
+    if (quarantined > 0) {
+        group(list, QStringLiteral("quarantined"), u("已隔离(可在隔离区还原)"), theme::success(), quarantined);
+        if (report.actorQuarantined)
+            list->addWidget(pathRow(report.actorPath, u("主体载荷")));
         for (const QString& f : report.quarantinedFiles)
             list->addWidget(pathRow(f));
     }
-    if (!report.removedRegistryValues.isEmpty()) {
-        list->addWidget(sectionHead(u("已移除自启动 / 注册表项"), theme::info(),
-                                    report.removedRegistryValues.size()));
+    if (removed > 0) {
+        group(list, QStringLiteral("removed"), u("已移除自启动 / 注册表项"), theme::info(), removed);
         for (const QString& r : report.removedRegistryValues)
             list->addWidget(pathRow(r));
     }
-    if (!report.skipped.isEmpty()) {
-        list->addWidget(sectionHead(u("未能自动清理"), theme::warning(), report.skipped.size()));
+    if (failed > 0) {
+        group(list, QStringLiteral("skipped"), u("未能自动清理"), theme::warning(), failed);
         for (const RemediationSkippedItem& s : report.skipped) {
             auto* rowW = new QWidget;
             auto* h = new QHBoxLayout(rowW);
-            h->setContentsMargins(17, 0, 0, 0);
+            h->setContentsMargins(0, 0, 0, 0);
             h->setSpacing(10);
             h->addWidget(pathRow(s.target, s.reason), 1);
             if (s.isFile) {
-                auto* retry = new QPushButton(u("重试隔离"));
-                retry->setProperty("variant", "primary");
-                retry->setProperty("size", "sm");
-                retry->setCursor(Qt::PointingHandCursor);
+                auto* retry = ui::button(u("重试隔离"), "ghost", QStringLiteral("refresh"), true);
                 const QString target = s.target;
                 connect(retry, &QPushButton::clicked, this, [this, retry, target] {
-                    if (m_ipc) m_ipc->manualQuarantine(target);
+                    if (!m_ipc || !m_ipc->isConnected()) {
+                        banners()->post(ui::Tone::Danger, u("未连接后台服务,无法重试隔离。"));
+                        return;
+                    }
+                    m_ipc->manualQuarantine(target);
                     retry->setEnabled(false);
                     retry->setText(u("已请求"));
+                    setPinned(true); // the user is acting on it: keep the report open
                 });
-                h->addWidget(retry, 0, Qt::AlignVCenter);
+                h->addWidget(retry, 0, Qt::AlignTop);
+                m_retry << qMakePair(target, retry);
             }
             list->addWidget(rowW);
         }
     }
 
-    // ── 情报补充:该样本(据 VT 等沙箱行为画像)已知会释放 / 外联什么。既解释了上面为何清理
-    //    这些项,也说明了据此生成的主动拦截规则覆盖了哪些 IOC。────────────────────────
-    const bool hasIntel = !report.intelDroppedFiles.isEmpty()
-                       || !report.intelContactedIps.isEmpty()
-                       || !report.intelContactedDomains.isEmpty()
-                       || !report.intelRegistryKeys.isEmpty();
-    if (hasIntel) {
-        const QString src = report.intelSource.trimmed().isEmpty() ? u("威胁情报")
-                                                                   : report.intelSource;
-        list->addWidget(sectionHead(u("情报补充 · ") + src, theme::accentAlt(), 0));
+    // 情报补充:该样本(据 VT 等沙箱行为画像)已知会释放 / 外联什么。既解释了上面为何清理
+    // 这些项,也说明了据此生成的主动拦截规则覆盖了哪些 IOC。
+    const bool hasIntel = !report.intelDroppedFiles.isEmpty() || !report.intelContactedIps.isEmpty()
+                       || !report.intelContactedDomains.isEmpty() || !report.intelRegistryKeys.isEmpty();
+    if (hasIntel || report.intelRulesInjected > 0) {
+        const QString src = report.intelSource.trimmed().isEmpty() ? u("威胁情报") : report.intelSource;
+        group(list, QStringLiteral("intel"), u("情报补充 · ") + src, theme::accentAlt(), 0);
+        if (report.intelRulesInjected > 0) {
+            auto* l = ui::label(u("已据行为画像生成 %1 条主动拦截规则,阻断该样本家族再次入侵。")
+                                    .arg(report.intelRulesInjected), "secondary");
+            l->setWordWrap(true);
+            l->setContentsMargins(18, 0, 0, 0);
+            list->addWidget(l);
+        }
         auto addCapped = [&](const QString& title, const QStringList& items) {
-            if (items.isEmpty()) return;
-            list->addWidget(pathRow(title + u("(") + QString::number(items.size()) + u(" 项)")));
-            const int cap = 10;
+            if (items.isEmpty())
+                return;
+            auto* t = ui::label(u("%1(%2 项)").arg(title).arg(items.size()), "caption");
+            t->setContentsMargins(18, 4, 0, 0);
+            list->addWidget(t);
+            constexpr int cap = 10;
             for (int i = 0; i < items.size() && i < cap; ++i)
-                list->addWidget(pathRow(QStringLiteral("· ") + items[i]));
-            if (items.size() > cap)
-                list->addWidget(pathRow(u("…… 还有 ") + QString::number(items.size() - cap) + u(" 项")));
+                list->addWidget(pathRow(items[i]));
+            if (items.size() > cap) {
+                auto* more = ui::label(u("…… 还有 %1 项").arg(items.size() - cap), "muted");
+                more->setContentsMargins(18, 0, 0, 0);
+                list->addWidget(more);
+            }
         };
         addCapped(u("已知释放文件"), report.intelDroppedFiles);
         addCapped(u("已知外联 IP"), report.intelContactedIps);
@@ -249,147 +191,211 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
         addCapped(u("已知写入注册表"), report.intelRegistryKeys);
     }
 
-    // ── AI 清理脚本:基于 VT 行为画像由 AI 生成 PowerShell 清理脚本───────────────
-    if (m_ai && m_ai->isConfigured() && hasIntel) {
-        list->addWidget(ui::hDivider());
-        list->addWidget(sectionHead(u("AI 清理脚本"), theme::accent(), 0));
-        m_genBtn = new QPushButton(u("🤖 生成清理脚本"));
-        m_genBtn->setProperty("variant", "primary");
-        m_genBtn->setCursor(Qt::PointingHandCursor);
-        connect(m_genBtn, &QPushButton::clicked, this, [this, report] {
-            m_genBtn->setEnabled(false);
-            m_genBtn->setText(u("AI 生成中…"));
-            m_ai->generateCleanupScript(report);
-        });
-        list->addWidget(m_genBtn);
+    // AI 清理:交给 AiCleanupDialog(同一套提权 + UTF-8 BOM 的执行流程)。
+    if (hasIntel) {
+        group(list, QStringLiteral("ai"), u("AI 清理方案"), theme::accent(), 0);
+        auto* rowW = new QWidget;
+        auto* h = new QHBoxLayout(rowW);
+        h->setContentsMargins(18, 0, 0, 0);
+        h->setSpacing(10);
+        const bool configured = m_ai && m_ai->isConfigured();
+        auto* l = ui::label(configured ? u("让大模型根据上面的行为画像写一份 PowerShell 清理脚本;你复核后再以管理员身份执行。")
+                                       : u("配置大模型后,可让 AI 根据行为画像生成清理脚本。"),
+                            "secondary");
+        l->setWordWrap(true);
+        h->addWidget(l, 1);
+        if (configured) {
+            auto* b = ui::button(u("生成清理方案…"), "ghost", QStringLiteral("sparkles"), true);
+            connect(b, &QPushButton::clicked, this, [this] {
+                bulwark::VtScanRecord rec;
+                rec.filePath = m_report.actorPath;
+                rec.fileName = QFileInfo(m_report.actorPath).fileName();
+                rec.outcome = bulwark::VtScanOutcome::Malicious; // the report exists because it was confirmed
+                rec.stage = bulwark::VtScanStage::Completed;
+                // Parent to the main window, not to this report: the report may
+                // auto-close, the cleanup wizard must not go with it.
+                (new AiCleanupDialog(rec, m_report, m_ipc, m_ai, parentWidget()))->show();
+                setPinned(true);
+            });
+            h->addWidget(b, 0, Qt::AlignTop);
+        } else {
+            auto* b = ui::button(u("去设置"), "ghost", QString(), true);
+            connect(b, &QPushButton::clicked, this, [] {
+                nav::go(nav::Settings, {{QStringLiteral("section"), QStringLiteral("ai")}});
+            });
+            h->addWidget(b, 0, Qt::AlignTop);
+        }
+        list->addWidget(rowW);
+    }
+    if (list->count() == 0)
+        list->addWidget(ui::label(u("本次没有需要列出的清理项。"), "muted"));
 
-        m_scriptView = new QPlainTextEdit;
-        m_scriptView->setReadOnly(true);
-        m_scriptView->setFont(QFont(QStringLiteral("Consolas"), 9));
-        m_scriptView->setMaximumHeight(250);
-        m_scriptView->setPlaceholderText(u("点击上方按钮,AI 将基于威胁情报生成清理脚本…"));
-        m_scriptView->hide();
-        list->addWidget(m_scriptView);
+    m_scroll->setContent(content);
+    body->addWidget(m_scroll, 1);
 
-        auto* actionRow = new QHBoxLayout;
-        actionRow->setSpacing(8);
-        m_copyBtn = new QPushButton(u("📋 复制脚本"));
-        m_copyBtn->setProperty("variant", "ghost");
-        m_copyBtn->setCursor(Qt::PointingHandCursor);
-        m_copyBtn->hide();
-        connect(m_copyBtn, &QPushButton::clicked, this, [this] {
-            QApplication::clipboard()->setText(m_scriptView->toPlainText());
-            m_copyBtn->setText(u("✅ 已复制"));
-        });
-        actionRow->addWidget(m_copyBtn);
-
-        m_runBtn = new QPushButton(u("▶ 一键执行(需确认)"));
-        m_runBtn->setProperty("variant", "primary");
-        m_runBtn->setCursor(Qt::PointingHandCursor);
-        m_runBtn->hide();
-        connect(m_runBtn, &QPushButton::clicked, this, [this] {
-            const QString title = u("确认执行清理脚本");
-            const QString msg = u("即将执行 AI 生成的 PowerShell 清理脚本,该脚本会:\n"
-                                  "1. 尝试终止相关进程\n"
-                                  "2. 删除释放的文件\n"
-                                  "3. 清理注册表项\n"
-                                  "4. 添加防火墙/hosts 阻断规则\n\n"
-                                  "请确认脚本内容后再执行。要继续吗?");
-            if (QMessageBox::warning(this, title, msg,
-                                     QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-                return;
-            QTemporaryFile tmp(QDir::tempPath() + QStringLiteral("/bulwark_cleanup_XXXXXX.ps1"));
-            if (tmp.open()) {
-                tmp.write(m_scriptView->toPlainText().toUtf8());
-                tmp.flush();
-                const QString scriptPath = tmp.fileName();
-                tmp.setAutoRemove(false);
-                tmp.close();
-                QProcess::startDetached(QStringLiteral("powershell"),
-                    { QStringLiteral("-NoProfile"), QStringLiteral("-ExecutionPolicy"),
-                      QStringLiteral("Bypass"), QStringLiteral("-File"), scriptPath });
-            }
-        });
-        actionRow->addWidget(m_runBtn);
-        actionRow->addStretch();
-        auto* actionW = new QWidget;
-        actionW->setLayout(actionRow);
-        actionW->hide();
-        list->addWidget(actionW);
-
-        // Store action widgets for show/hide on completion.
-        struct Scope {
-            QPushButton* copy;
-            QPushButton* run;
-            QPlainTextEdit* view;
-            QWidget* row;
-        };
-        auto* scope = new Scope{ m_copyBtn, m_runBtn, m_scriptView, actionW };
-        connect(m_ai, &AiScanner::cleanupScriptGenerated, this,
-                [this, scope](const QString& script) {
-            m_genBtn->setText(u("🤖 重新生成"));
-            m_genBtn->setEnabled(true);
-            if (script.isEmpty()) {
-                m_scriptView->setPlainText(u("AI 生成失败(网络/模型不可用)"));
-                m_scriptView->show();
-                return;
-            }
-            m_scriptView->setPlainText(script);
-            m_scriptView->show();
-            scope->copy->show();
-            scope->run->show();
-            scope->row->show();
-        });
+    // ── footer ──────────────────────────────────────────────────────────────────
+    if (failed == 0) {
+        m_autoClose = new CountdownBar;
+        m_autoClose->setColor(theme::textMuted());
+        m_autoClose->setFormatter([](int s) { return u("%1 秒后自动关闭").arg(s); });
+        m_autoClose->setToolTip(u("鼠标停在报告上时暂停"));
+        connect(m_autoClose, &CountdownBar::finished, this, &QDialog::accept);
+        addFooterLeft(m_autoClose);
+        m_pin = ui::button(QString(), "ghost", QStringLiteral("pin"), true);
+        m_pin->setToolTip(u("固定:保持报告打开,不自动关闭"));
+        m_pin->setAccessibleName(u("固定报告"));
+        m_pin->setAutoDefault(false);
+        connect(m_pin, &QPushButton::clicked, this, [this] { setPinned(true); });
+        addFooterLeft(m_pin);
+        m_autoClose->start(kAutoCloseMs);
+    } else {
+        // Said in the body, not squeezed into the footer next to the buttons.
+        auto* note = ui::label(u("有未能清理的项,这份报告不会自动关闭。"), "muted");
+        body->addWidget(note);
     }
 
-    list->addStretch();
-    v->addWidget(scroll);
-
-    // ── Footer ──────────────────────────────────────────────────────────
-    auto* footer = new QHBoxLayout;
-    footer->addWidget(ui::label(u("报告时间: ") + when, "muted"));
-    footer->addStretch();
-    auto* closeBtn = new QPushButton(u("关闭"));
-    closeBtn->setProperty("variant", "primary");
-    closeBtn->setCursor(Qt::PointingHandCursor);
-    closeBtn->setMinimumWidth(96);
-    connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
-    footer->addWidget(closeBtn);
-    v->addLayout(footer);
-
-    // 全自动:报告为纯通知,倒计时 5 秒后自动关闭(无需人工点「关闭」)。
-    // WA_DeleteOnClose 已设置,accept() 会关闭并销毁本对话框。悬停/拖动不停表。
-    closeBtn->setText(u("关闭 (5)"));
-    auto* autoClose = new QTimer(this);
-    connect(autoClose, &QTimer::timeout, this, [this, closeBtn, autoClose] {
-        if (--m_autoCloseLeft <= 0) { autoClose->stop(); accept(); return; }
-        closeBtn->setText(u("关闭 (") + QString::number(m_autoCloseLeft) + u(")"));
+    auto* copy = ui::button(u("复制报告"), "ghost", QStringLiteral("copy"), true);
+    copy->setAutoDefault(false);
+    connect(copy, &QPushButton::clicked, this, [this, copy] {
+        if (QClipboard* cb = QGuiApplication::clipboard())
+            cb->setText(reportText());
+        copy->setText(u("已复制"));
     });
-    autoClose->start(1000);
+    footer()->addWidget(copy);
+    auto* openQ = ui::button(u("打开隔离区"), "ghost", QStringLiteral("lock"), true);
+    openQ->setAutoDefault(false);
+    connect(openQ, &QPushButton::clicked, this, &RemediationReportDialog::openQuarantine);
+    footer()->addWidget(openQ);
+    if (!m_retry.isEmpty()) {
+        auto* all = ui::button(u("全部重试"), "ghost", QStringLiteral("refresh"), true);
+        all->setAutoDefault(false);
+        connect(all, &QPushButton::clicked, this, &RemediationReportDialog::retryAll);
+        footer()->addWidget(all);
+    }
+    QPushButton* close = addButton(u("关闭"), "primary", [this] { accept(); });
+    close->setMinimumWidth(84);
+
+    // Retry results land here too (the tray balloon alone is easy to miss).
+    if (m_ipc)
+        connect(m_ipc, &IpcClient::manualQuarantineResult, this,
+                [this](const bulwark::ipc::ManualQuarantineResultPayload& r) {
+                    banners()->post(r.success ? ui::Tone::Success : ui::Tone::Danger,
+                                    u("重试隔离:") + (r.message.isEmpty() ? (r.success ? u("已隔离") : u("未成功"))
+                                                                         : r.message));
+                    refit();
+                });
 }
 
-void RemediationReportDialog::showEvent(QShowEvent* e)
+QWidget* RemediationReportDialog::group(QVBoxLayout* into, const QString& key, const QString& title,
+                                        const QColor& color, int count)
 {
-    QDialog::showEvent(e);
-    if (m_centered)
+    auto* w = new QWidget;
+    auto* h = new QHBoxLayout(w);
+    h->setContentsMargins(0, into->count() > 0 ? 10 : 0, 0, 2);
+    h->setSpacing(8);
+    h->addWidget(ui::statusDot(color), 0, Qt::AlignVCenter);
+    h->addWidget(ui::coloredText(title, 10, 700, theme::textPrimary()), 0, Qt::AlignVCenter);
+    if (count > 0)
+        h->addWidget(ui::pill(QString::number(count), color), 0, Qt::AlignVCenter);
+    h->addStretch();
+    into->addWidget(w);
+    m_groups.insert(key, w);
+    return w;
+}
+
+void RemediationReportDialog::scrollToGroup(const QString& key)
+{
+    if (QWidget* w = m_groups.value(key))
+        m_scroll->ensureWidgetVisible(w, 0, 8);
+    if (QWidget* w = m_groups.value(key)) // put the group title at the top when possible
+        m_scroll->verticalScrollBar()->setValue(w->y());
+}
+
+void RemediationReportDialog::retryAll()
+{
+    if (!m_ipc || !m_ipc->isConnected()) {
+        banners()->post(ui::Tone::Danger, u("未连接后台服务,无法重试隔离。"));
+        refit();
         return;
-    m_centered = true;
-    adjustSize();
-    QScreen* scr = QGuiApplication::primaryScreen();
-    const QRect area = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
-    move(area.center().x() - width() / 2, area.center().y() - height() / 2);
+    }
+    int n = 0;
+    for (const auto& [path, btn] : std::as_const(m_retry)) {
+        if (!btn->isEnabled())
+            continue;
+        m_ipc->manualQuarantine(path);
+        btn->setEnabled(false);
+        btn->setText(u("已请求"));
+        ++n;
+    }
+    setPinned(true);
+    banners()->post(ui::Tone::Info, n > 0 ? u("已请求重试隔离 %1 个文件,结果会逐条显示在这里。").arg(n)
+                                          : u("没有待重试的文件。"));
+    refit();
 }
 
-void RemediationReportDialog::mousePressEvent(QMouseEvent* e)
+void RemediationReportDialog::openQuarantine()
 {
-    if (e->button() == Qt::LeftButton)
-        m_dragOffset = e->globalPosition().toPoint() - frameGeometry().topLeft();
-    QDialog::mousePressEvent(e);
+    if (QWidget* w = parentWidget() ? parentWidget()->window() : nullptr) {
+        w->show();
+        w->setWindowState((w->windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+        w->raise();
+        w->activateWindow();
+    }
+    nav::go(nav::Quarantine);
 }
 
-void RemediationReportDialog::mouseMoveEvent(QMouseEvent* e)
+QString RemediationReportDialog::reportText() const
 {
-    if (e->buttons() & Qt::LeftButton)
-        move(e->globalPosition().toPoint() - m_dragOffset);
-    QDialog::mouseMoveEvent(e);
+    const RemediationReportPayload& r = m_report;
+    QStringList out;
+    out << u("磐垒 · 恶意足迹清理报告");
+    out << u("时间:") + r.timestampUtc.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    out << u("主体:") + r.actorPath + (r.actorPid > 0 ? u(" (PID %1)").arg(r.actorPid) : QString());
+    if (!r.reason.isEmpty())
+        out << u("判定:") + r.reason;
+    if (r.actorQuarantined)
+        out << u("主体载荷已隔离");
+    if (!r.quarantinedFiles.isEmpty())
+        out << u("已隔离文件:") << r.quarantinedFiles;
+    if (!r.removedRegistryValues.isEmpty())
+        out << u("已移除自启动 / 注册表项:") << r.removedRegistryValues;
+    if (!r.skipped.isEmpty()) {
+        out << u("未能自动清理:");
+        for (const RemediationSkippedItem& s : r.skipped)
+            out << s.target + u(" —— ") + s.reason;
+    }
+    if (r.intelRulesInjected > 0)
+        out << u("据威胁情报新增拦截规则:%1 条").arg(r.intelRulesInjected);
+    return out.join(QLatin1Char('\n'));
+}
+
+void RemediationReportDialog::setPinned(bool pinned)
+{
+    m_pinned = pinned;
+    if (!m_autoClose)
+        return;
+    if (pinned) {
+        m_autoClose->stop();
+        m_autoClose->hide();
+        if (m_pin) {
+            m_pin->setEnabled(false);
+            m_pin->setText(u("已固定"));
+            m_pin->setIcon(QIcon());
+        }
+    }
+}
+
+void RemediationReportDialog::enterEvent(QEnterEvent* e)
+{
+    // Reading the report pauses its auto-close.
+    if (m_autoClose && !m_pinned)
+        m_autoClose->pause();
+    Sheet::enterEvent(e);
+}
+
+void RemediationReportDialog::leaveEvent(QEvent* e)
+{
+    if (m_autoClose && !m_pinned)
+        m_autoClose->resume();
+    Sheet::leaveEvent(e);
 }

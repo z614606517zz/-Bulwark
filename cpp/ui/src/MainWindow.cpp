@@ -1,6 +1,16 @@
 #include "MainWindow.h"
 #include "Bootstrap.h"
-#include "Theme.h"
+#include "Nav.h"
+#include "design/Backdrop.h"
+#include "design/Banner.h"
+#include "design/Components.h"
+#include "design/GlowCard.h"
+#include "design/IconTile.h"
+#include "design/Icons.h"
+#include "design/Identity.h"
+#include "design/Motion.h"
+#include "design/NavButton.h"
+#include "design/Theme.h"
 #include "dialogs/PromptDialog.h"
 #include "dialogs/RemediationReportDialog.h"
 #include "dialogs/ScanProgressWindow.h"
@@ -8,12 +18,9 @@
 #include "dialogs/UpdateDialog.h"
 #include "ipc/IpcClient.h"
 #include "pages/CardPages.h"
-#include "pages/CleanupPage.h"
-#include "pages/DashboardPage.h"
 #include "pages/TablePages.h"
-#include "widgets/AppIcon.h"
-#include "widgets/NavButton.h"
-#include "widgets/Ui.h"
+#include "pages/DashboardPage.h"
+#include "widgets/ElidingLabel.h"
 
 #include "bulwark/Version.h"
 #include "bulwark/ipc/Payloads.h"
@@ -23,47 +30,250 @@
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCloseEvent>
+#include <QDateTime>
 #include <QDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QPainter>
 #include <QPixmap>
 #include <QPushButton>
+#include <QScreen>
 #include <QScrollArea>
-#include <QDateTime>
-#include <QHash>
 #include <QSet>
+#include <QSettings>
+#include <QShortcut>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
 #include <QTimer>
+#include <QToolButton>
 #include <QUuid>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 
 #include <algorithm>
 
 namespace {
 
-// The tray icon is the shared app brand badge (teal rounded-square + white
-// shield), baked at multiple sizes so the tray/taskbar/title bar each pick a
-// crisp variant. Defined once in AppIcon::appBadge().
+QString u(const char* s) { return QString::fromUtf8(s); }
+
+constexpr int kRailW = 72;          // collapsed rail width
+constexpr int kAutoCollapseW = 1100; // window width below which the rail collapses by itself
+
+// The tray icon is the shared brand mark (jade badge + ivory shield),
+// baked at multiple sizes so the tray/taskbar/title bar each pick a crisp
+// variant. Defined once in AppIcon::appBadge().
 QIcon buildTrayIcon()
 {
     return AppIcon::appBadge();
 }
 
+// The brand mark as a standalone widget (sidebar header).
+class BrandMark : public QWidget
+{
+public:
+    explicit BrandMark(int px, QWidget* parent = nullptr) : QWidget(parent)
+    {
+        setFixedSize(px, px);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        AppIcon::drawBadge(p, QRectF(rect()));
+    }
+};
+
+// A tiny coloured dot + label + value row for the status card.
+struct StatusLine {
+    QLabel* dot = nullptr;
+    QLabel* name = nullptr;
+    QLabel* value = nullptr;
+};
+
+StatusLine makeStatusLine(QVBoxLayout* into, const QString& name)
+{
+    StatusLine s;
+    auto* row = new QHBoxLayout;
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(8);
+    s.dot = ui::statusDot(theme::textMuted());
+    s.name = ui::label(name, "muted");
+    s.value = ui::label(u("未知"), "muted");
+    s.value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    row->addWidget(s.dot, 0, Qt::AlignVCenter);
+    row->addWidget(s.name, 0, Qt::AlignVCenter);
+    row->addStretch();
+    row->addWidget(s.value, 0, Qt::AlignVCenter);
+    into->addLayout(row);
+    return s;
+}
+
+void paintStatusLine(StatusLine& s, const QString& value, const QColor& color)
+{
+    s.dot->setStyleSheet(QStringLiteral("background:%1; border-radius:4px;").arg(color.name()));
+    s.value->setText(value);
+    s.value->setStyleSheet(QStringLiteral("color:%1; font-size:9pt; font-weight:600;").arg(color.name()));
+}
+
+// A painted shield glyph in the protection-state colour (card header / rail tile).
+class StateGlyph : public QWidget
+{
+public:
+    StateGlyph(int px, QWidget* parent = nullptr) : QWidget(parent), m_px(px)
+    {
+        setFixedSize(px, px);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    void set(const QString& glyph, const QColor& c)
+    {
+        m_glyph = glyph;
+        m_color = c;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        AppIcon::draw(p, m_glyph, QRectF(0, 0, m_px, m_px), m_color, m_px >= 20 ? 1.9 : 1.7);
+    }
+
+private:
+    int m_px;
+    QString m_glyph = QStringLiteral("shield");
+    QColor m_color = theme::textMuted();
+};
+
 } // namespace
+
+// 侧栏底部的「防护状态」卡:把原先分散在右上角(防护状态灯)与侧栏(服务连接、信誉服务)
+// 的三盏灯合成一处。展开时逐行写清;折叠成图标栏时只剩一枚按防护状态着色的盾牌,
+// 完整信息在悬停提示里。它只负责呈现 —— 四态判定仍在 MainWindow::refreshProtectionPill()。
+class StatusCard : public GlowCard
+{
+public:
+    StatusCard()
+    {
+        setObjectName(QStringLiteral("CardAlt"));
+        setTone(GlowCard::Tone::Rail); // recessed into the jade-ink rail, not a warm card floating on it
+        setRadius(12);
+        setAccessibleName(u("防护状态"));
+
+        auto* outer = new QVBoxLayout(this);
+        outer->setContentsMargins(0, 0, 0, 0);
+
+        m_full = new QWidget;
+        auto* v = new QVBoxLayout(m_full);
+        v->setContentsMargins(12, 11, 12, 10);
+        v->setSpacing(6);
+        auto* head = new QHBoxLayout;
+        head->setSpacing(8);
+        m_glyph = new StateGlyph(18);
+        head->addWidget(m_glyph, 0, Qt::AlignVCenter);
+        m_state = ui::elided(u("状态未知"), "title");
+        head->addWidget(m_state, 1, Qt::AlignVCenter);
+        v->addLayout(head);
+        m_detail = ui::elided(QString(), "muted");
+        v->addWidget(m_detail);
+        v->addSpacing(2);
+        v->addWidget(ui::hDivider());
+        v->addSpacing(2);
+        m_service = makeStatusLine(v, u("后台服务"));
+        m_rep = makeStatusLine(v, u("信誉服务"));
+        outer->addWidget(m_full);
+
+        m_mini = new QWidget;
+        auto* mv = new QVBoxLayout(m_mini);
+        mv->setContentsMargins(0, 10, 0, 10);
+        m_miniGlyph = new StateGlyph(22);
+        mv->addWidget(m_miniGlyph, 0, Qt::AlignHCenter);
+        m_mini->hide();
+        outer->addWidget(m_mini);
+
+        paintStatusLine(m_service, u("未连接"), theme::textMuted());
+        paintStatusLine(m_rep, u("未知"), theme::textMuted());
+    }
+
+    void setCompact(bool compact)
+    {
+        m_full->setVisible(!compact);
+        m_mini->setVisible(compact);
+    }
+
+    void setProtection(const QString& text, const QColor& color, const QString& glyph,
+                       const QString& detail, const QString& tip)
+    {
+        m_state->setText(text);
+        m_state->setStyleSheet(QStringLiteral("color:%1; font-size:10.5pt; font-weight:600;").arg(color.name()));
+        m_detail->setText(detail);
+        m_glyph->set(glyph, color);
+        m_miniGlyph->set(glyph, color);
+        m_protTip = tip;
+        m_protText = text;
+        syncTip();
+    }
+
+    void setService(bool connected)
+    {
+        paintStatusLine(m_service, connected ? u("已连接") : u("未连接"),
+                        connected ? theme::success() : theme::textMuted());
+        m_svcText = connected ? u("后台服务已连接") : u("后台服务未连接");
+        syncTip();
+    }
+
+    void setReputation(const QString& value, const QColor& color, const QString& tip)
+    {
+        paintStatusLine(m_rep, value, color);
+        m_rep.value->setToolTip(tip);
+        m_rep.name->setToolTip(tip);
+        m_repText = u("信誉服务:") + value + (tip.isEmpty() ? QString() : u("(") + tip + u(")"));
+        syncTip();
+    }
+
+private:
+    void syncTip()
+    {
+        const QString all = QStringList{m_protText + u(" — ") + m_protTip, m_svcText, m_repText}
+                                .join(QLatin1Char('\n'));
+        setToolTip(all);
+        setAccessibleDescription(all);
+    }
+
+    QWidget* m_full = nullptr;
+    QWidget* m_mini = nullptr;
+    StateGlyph* m_glyph = nullptr;
+    StateGlyph* m_miniGlyph = nullptr;
+    ElidingLabel* m_state = nullptr;
+    ElidingLabel* m_detail = nullptr;
+    StatusLine m_service;
+    StatusLine m_rep;
+    QString m_protText, m_protTip, m_svcText, m_repText;
+};
 
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
 {
     setObjectName(QStringLiteral("Root"));
-    setWindowTitle(QString::fromUtf8("磐垒主动防御"));
+    setWindowTitle(u("磐垒主动防御"));
     setWindowIcon(AppIcon::appBadge()); // title bar / taskbar / Alt-Tab icon
-    resize(1240, 800);
     setMinimumSize(940, 620);
+    // 默认 1240x800,但不超过所在屏幕可用区域的 92%:1366x768 这类屏上整窗放不下时,
+    // 底部的状态区和按钮会落到屏幕外。最小尺寸仍然优先。
+    {
+        QSize want(1240, 800);
+        if (const QScreen* scr = screen())
+            want = want.boundedTo(scr->availableGeometry().size() * 0.92);
+        resize(want.expandedTo(minimumSize()));
+    }
+    m_prefCollapsed = QSettings().value(QStringLiteral("ui/sidebarCollapsed"), false).toBool();
 
     auto* root = new QHBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
@@ -71,41 +281,64 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     root->addWidget(buildSidebar());
     root->addWidget(buildContent(), 1);
 
-    auto u = [](const char* s) { return QString::fromUtf8(s); };
-
     // Create the IPC client up-front so each page can bind to its signals during
     // construction; start() is deferred to the end of the ctor (after wiring).
     m_ipc = new IpcClient(this);
 
-    addPage("dashboard", u("仪表盘"), u("仪表盘"), u("系统防护总览"), new DashboardPage(m_ipc));
-    addPage("shield-x", u("拦截记录"), u("拦截记录"), u("已阻止的恶意行为"), pages::interceptions(m_ipc));
-    addPage("activity", u("活动日志"), u("活动日志"), u("全部安全事件"), pages::activity(m_ipc));
-    addPage("clock", u("事件时间线"), u("事件时间线"), u("按时间回溯 · 攻击关系图"), pages::timeline(m_ipc));
-    addPage("target", u("进程管理"), u("进程管理"), u("在跑进程 · 服务与计划任务溯源"), pages::processes(m_ipc));
-    addPage("sliders", u("防护规则"), u("防护规则"), u("自定义放行 / 拦截策略"), pages::rules(m_ipc));
-    addPage("trust", u("信任名单"), u("信任名单"), u("受信任的程序与目录"), pages::trust(m_ipc));
-    addPage("lock", u("隔离区"), u("隔离区"), u("已隔离的威胁文件"), pages::quarantine(m_ipc));
-    addPage("power", u("自启动项"), u("自启动项"), u("开机持久化审计"), pages::persistence(m_ipc));
-    addPage("trash", u("垃圾清理"), u("垃圾清理"), u("按类别扫描 · 勾选后清理"), new CleanupPage(m_ipc));
-    addPage("cloud", u("云信誉"), u("云信誉"), u("多引擎哈希信誉查询"), pages::reputation(m_ipc));
-    addPage("link", u("攻击链"), u("攻击链"), u("动作组合定性 · 命中记录"), pages::attackChain(m_ipc));
-    addPage("sparkles", u("AI 研判"), u("AI 研判"), u("大模型行为研判"), pages::aiScan(m_ipc));
-    addPage("settings", u("设置"), u("设置"), u("防护与情报配置"), pages::settings(m_ipc));
+    // 导航按用途分三组:监控(看发生了什么)/ 管控(决定允许什么)/ 情报(判断它是什么)。
+    // 页面键是稳定标识(见 Nav.h),与导航文字、图标、分组、顺序都无关。
+    addPage(nav::Dashboard, u("监控"), "dashboard", u("仪表盘"), u("仪表盘"), u("系统防护总览"),
+            new DashboardPage(m_ipc));
+    // 事件记录 = 原「拦截记录」+「活动日志」(同一份历史,用分段切换视角;分段会被记住)。
+    addPage(nav::Events, QString(), "activity", u("事件记录"), u("事件记录"), u("拦截 · 询问 · 放行的全部安全事件"),
+            pages::interceptions(m_ipc));
+    addPage(nav::Timeline, QString(), "clock", u("事件时间线"), u("事件时间线"), u("按时间回溯 · 攻击关系图"),
+            pages::timeline(m_ipc));
+    addPage(nav::Chain, QString(), "link", u("攻击链"), u("攻击链"), u("动作组合定性 · 命中记录"),
+            pages::attackChain(m_ipc));
+    addPage(nav::Processes, u("管控"), "target", u("进程管理"), u("进程管理"), u("在跑进程 · 服务与计划任务溯源"),
+            pages::processes(m_ipc));
+    addPage(nav::Rules, QString(), "sliders", u("防护规则"), u("防护规则"), u("自定义放行 / 拦截策略"),
+            pages::rules(m_ipc));
+    addPage(nav::Trust, QString(), "trust", u("信任名单"), u("信任名单"), u("受信任的程序与目录"),
+            pages::trust(m_ipc));
+    addPage(nav::Quarantine, QString(), "lock", u("隔离区"), u("隔离区"), u("已隔离的威胁文件"),
+            pages::quarantine(m_ipc));
+    addPage(nav::Persistence, QString(), "power", u("自启动项"), u("自启动项"), u("开机持久化审计"),
+            pages::persistence(m_ipc));
+    addPage(nav::Reputation, u("情报"), "cloud", u("云信誉"), u("云信誉"), u("多引擎哈希信誉查询"),
+            pages::reputation(m_ipc));
+    addPage(nav::Ai, QString(), "sparkles", u("AI 研判"), u("AI 研判"), u("大模型行为研判"),
+            pages::aiScan(m_ipc));
+    addPage(nav::Settings, QString(), "settings", u("设置"), u("设置"), u("防护与情报配置"),
+            pages::settings(m_ipc), /*pinned*/ true);
 
     if (auto* b = m_navGroup->button(0))
         b->setChecked(true);
     onNavClicked(0);
 
+    // In-app navigation requests (dashboard tiles, "查询云信誉", "去设置"…).
+    connect(NavHub::instance(), &NavHub::requested, this,
+            [this](const QString& key, const QVariantMap& args) { navigateTo(key, args); });
+
+    // Ctrl+F: jump to the current page's search box.
+    auto* find = new QShortcut(QKeySequence::Find, this);
+    connect(find, &QShortcut::activated, this, &MainWindow::focusPageSearch);
+
     // Corner toast notifications (block / AI-scan) + the system tray presence.
     m_toasts = new ToastNotifier(this);
-    connect(m_toasts, &ToastNotifier::blockToastClicked, this,
-            [this] { showFromTray(); navigateTo(QStringLiteral("shield-x")); });
-    // 点攻击链 toast -> 跳到「攻击链」页面看完整命中记录("link" 即该页的导航图标)。
-    connect(m_toasts, &ToastNotifier::attackChainToastClicked, this,
-            [this] { showFromTray(); navigateTo(QStringLiteral("link")); });
+    connect(m_toasts, &ToastNotifier::blockToastClicked, this, [this] {
+        showFromTray();
+        navigateTo(nav::Events, {{QStringLiteral("segment"), QStringLiteral("block")}});
+    });
+    // 点攻击链 toast -> 跳到「攻击链」页面看完整命中记录。
+    connect(m_toasts, &ToastNotifier::attackChainToastClicked, this, [this] {
+        showFromTray();
+        navigateTo(nav::Chain);
+    });
     setupTray();
 
-    // Live named-pipe link to the service. Drives the connection pill, pops the
+    // Live named-pipe link to the service. Drives the status card, pops the
     // behavior prompt when a verdict is needed, and raises toast notifications
     // for outright blocks and AI-scan research. (m_ipc was created above so the
     // pages could bind to it; we connect the window-level slots and start here.)
@@ -115,12 +348,23 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     connect(m_ipc, &IpcClient::attackChainHit, this, &MainWindow::onAttackChainHit);
     connect(m_ipc, &IpcClient::aiScanStarted, this, &MainWindow::onAiScanStarted);
     connect(m_ipc, &IpcClient::remediationReport, this, &MainWindow::onRemediationReport);
+    // 未读角标:新拦截(事件记录)。只数真正进入「拦截」分段的记录(裁决为拦截)。
+    connect(m_ipc, &IpcClient::eventLogReceived, this, [this](const bulwark::ipc::EventLogPayload& p) {
+        if (p.action == bulwark::VerdictAction::Block)
+            bumpBadge(nav::Events);
+    });
     // Keep the prompt-timeout + default verdict in sync with the service so the
     // behavior prompt can auto-decide on timeout (honours PromptTimeoutSeconds).
     connect(m_ipc, &IpcClient::settingsReceived, this,
             [this](const bulwark::RuntimeSettings& s) {
                 m_promptTimeoutSeconds = s.promptTimeoutSeconds;
                 m_defaultBlock = s.defaultBlock;
+                // 防护状态卡的真实数据来源(原先右上角那个标签是写死的绿色"防护开启")。
+                m_protectionEnabled = s.protectionEnabled;
+                m_kernelConnected = s.kernelConnected;
+                m_kernelStatus = s.kernelStatus;
+                m_haveSettings = true;
+                refreshProtectionPill();
             });
     // Centered "cloud scan in progress" card (ports the .NET AiScanToastWindow):
     // VT double-click/dropped-payload scans push live progress + verdict here, and
@@ -143,7 +387,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     connect(m_ipc, &IpcClient::manualQuarantineResult, this,
             [this](const bulwark::ipc::ManualQuarantineResultPayload& r) {
                 if (m_tray && QSystemTrayIcon::isSystemTrayAvailable())
-                    m_tray->showMessage(QString::fromUtf8("重试隔离"), r.message,
+                    m_tray->showMessage(u("重试隔离"), r.message,
                                         r.success ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 4000);
             });
 
@@ -163,14 +407,14 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                 if (!m_tray || !QSystemTrayIcon::isSystemTrayAvailable()) return;
                 m_updateBalloonShown = true;
                 m_tray->showMessage(
-                    QString::fromUtf8("有新版本 ") + p.version,
-                    QString::fromUtf8("当前 ") + p.currentVersion
-                        + QString::fromUtf8("。在「设置 > 关于与更新」里查看更新说明并安装。"),
+                    u("有新版本 ") + p.version,
+                    u("当前 ") + p.currentVersion
+                        + u("。在「设置 > 关于与更新」里查看更新说明并安装。"),
                     QSystemTrayIcon::Information, 6000);
             });
 
-    // 中央信誉服务在线状态灯:连接后 + 每 30s 探测一次(source=ReputationProxy 定向探测代理
-    // /health,服务端非阻塞返回),按 requestId 回填侧栏状态。离线仅提示,本地直连情报源照常兜底。
+    // 中央信誉服务在线状态:连接后 + 每 30s 探测一次(source=ReputationProxy 定向探测代理
+    // /health,服务端非阻塞返回),按 requestId 回填侧栏状态卡。离线仅提示,本地直连情报源照常兜底。
     m_repTimer = new QTimer(this);
     m_repTimer->setInterval(30000);
     connect(m_repTimer, &QTimer::timeout, this, &MainWindow::pingReputation);
@@ -180,143 +424,230 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                     return; // 只认本窗口发起的健康探测;各页自身的查询 / 测试连接自动忽略
                 m_repPingId = QUuid();
                 const bool online = resp.success;
-                const bool checking = !online && resp.message.contains(QString::fromUtf8("检测中"));
+                const bool checking = !online && resp.message.contains(u("检测中"));
                 // 「限流中」是在线的一种:链路好着,只是服务端对本出口 IP 的配额暂时用满,
                 // 本地直连情报照常兜底。单独画成警示色,别再和「离线」混为一谈 —— 以前服务端
                 // 一回 429 就报离线,而不受限流管辖的 /health 仍是 200,状态灯于是来回跳。
-                const bool throttled = online && resp.message.contains(QString::fromUtf8("限流"));
-                ui::stylePill(m_repPill,
-                              throttled ? QString::fromUtf8("◐ 信誉服务限流中")
-                                        : (online ? QString::fromUtf8("● 信誉服务在线")
-                                                  : (checking ? QString::fromUtf8("○ 信誉服务检测中")
-                                                              : QString::fromUtf8("○ 信誉服务离线"))),
-                              throttled ? theme::warning()
-                                        : (online ? theme::success()
-                                                  : (checking ? theme::textMuted() : theme::danger())));
-                m_repPill->setToolTip(resp.message.isEmpty()
-                                          ? (online ? QString::fromUtf8("中央信誉服务连接正常")
-                                                    : QString::fromUtf8("中央信誉服务不可达,已回退本地直连"))
-                                          : resp.message);
+                const bool throttled = online && resp.message.contains(u("限流"));
+                const QString value = throttled ? u("限流中")
+                                      : online  ? u("在线")
+                                      : checking ? u("检测中")
+                                                 : u("离线");
+                const QColor color = throttled ? theme::warning()
+                                     : online  ? theme::success()
+                                     : checking ? theme::textMuted()
+                                                : theme::danger();
+                const QString tip = resp.message.isEmpty()
+                                        ? (online ? u("中央信誉服务连接正常")
+                                                  : u("中央信誉服务不可达,已回退本地直连"))
+                                        : resp.message;
+                m_status->setReputation(value, color, tip);
                 if (checking) // 尚无结论(缓存预热中),稍后再探一次尽快收敛
                     QTimer::singleShot(4000, this, &MainWindow::pingReputation);
             });
+    m_status->setReputation(u("未知"), theme::textMuted(),
+                            u("中央信誉服务(云端共享缓存 + 多引擎)连接状态。离线时本地直连情报源自动兜底,"
+                              "实时防护不受影响。"));
+    refreshProtectionPill();
     m_ipc->start();
 }
 
 QWidget* MainWindow::buildSidebar()
 {
-    auto* bar = new QFrame;
-    bar->setObjectName(QStringLiteral("Sidebar"));
-    bar->setFixedWidth(theme::metric::sidebarW);
+    m_sidebar = new Backdrop(Backdrop::Kind::Sidebar);
+    m_sidebar->setObjectName(QStringLiteral("Sidebar"));
+    m_sidebar->setFixedWidth(theme::metric::sidebarW);
 
-    auto* v = new QVBoxLayout(bar);
-    v->setContentsMargins(16, 20, 16, 16);
+    auto* v = new QVBoxLayout(m_sidebar);
+    m_sidebarLayout = v;
+    v->setContentsMargins(14, 18, 14, 12);
     v->setSpacing(0);
 
     // brand
-    auto* brand = new QHBoxLayout;
-    brand->setSpacing(11);
-    auto* logo = new AppIcon(QStringLiteral("shield"));
-    logo->setColor(theme::accent());
-    logo->setPx(28);
-    logo->setFixedSize(30, 30);
-    brand->addWidget(logo);
-    auto* bt = new QVBoxLayout;
+    m_brandRow = new QHBoxLayout;
+    m_brandRow->setContentsMargins(6, 0, 0, 0);
+    m_brandRow->setSpacing(12);
+    m_brandRow->addWidget(new BrandMark(36), 0, Qt::AlignVCenter);
+    m_brandText = new QWidget;
+    auto* bt = new QVBoxLayout(m_brandText);
+    bt->setContentsMargins(0, 0, 0, 0);
     bt->setSpacing(0);
-    bt->addWidget(ui::label(QString::fromUtf8("磐垒"), "title"));
-    bt->addWidget(ui::label(QString::fromUtf8("主动防御"), "caption"));
-    brand->addLayout(bt);
-    brand->addStretch();
-    v->addLayout(brand);
-    v->addSpacing(22);
+    bt->addWidget(ui::coloredText(u("磐垒"), 13, 700, theme::textPrimary()));
+    bt->addWidget(ui::label(u("主动防御 · HIPS"), "muted"));
+    m_brandRow->addWidget(m_brandText, 1);
+    v->addLayout(m_brandRow);
+    v->addSpacing(18);
 
-    // nav items host。导航项已有 13 项(仪表盘 / 拦截记录 / 活动日志 / 事件时间线 / 进程管理 /
-    // 防护规则 / 信任名单 / 隔离区 / 自启动项 / 云信誉 / 攻击链 / AI 研判 / 设置),在最小窗口
-    // 高度(620)下会挤不下,故放进一个无边框透明滚动区:窗口够高时看不出区别,不够高时可滚动,
-    // 而不是把底部的连接状态条挤掉。
+    // 导航项放进一个无边框透明滚动区:13 项加三个分组标题在最小窗口高度(620)下放不下,
+    // 窗口够高时看不出区别,不够高时这一段可滚动,而不是把底部的设置与状态区挤掉。
     auto* navHost = new QWidget;
-    navHost->setStyleSheet(QStringLiteral("background:transparent;"));
     m_navLayout = new QVBoxLayout(navHost);
     m_navLayout->setContentsMargins(0, 0, 0, 0);
-    m_navLayout->setSpacing(3);
+    m_navLayout->setSpacing(1);
     m_navLayout->addStretch(); // 末尾留一个弹簧,导航项始终顶部对齐(addPage 插在它之前)
 
-    auto* navScroll = new QScrollArea;
-    navScroll->setWidgetResizable(true);
-    navScroll->setFrameShape(QFrame::NoFrame);
-    navScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    navScroll->setStyleSheet(QStringLiteral("QScrollArea{background:transparent;}"));
-    navScroll->viewport()->setStyleSheet(QStringLiteral("background:transparent;"));
-    navScroll->setWidget(navHost);
-    v->addWidget(navScroll, 1);
+    m_navScroll = new QScrollArea;
+    m_navScroll->setWidgetResizable(true);
+    m_navScroll->setFrameShape(QFrame::NoFrame);
+    m_navScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_navScroll->setWidget(navHost);
+    navHost->setAutoFillBackground(false); // let the rail's canvas light show through
+    v->addWidget(m_navScroll, 1);
 
-    v->addWidget(ui::hDivider());
-    v->addSpacing(12);
-    m_connPill = ui::pill(QString::fromUtf8("○ 未连接服务"), theme::textMuted());
-    v->addWidget(m_connPill, 0, Qt::AlignLeft);
+    // 固定在底部:设置入口 + 防护状态卡 + 折叠按钮。
+    m_navFooter = new QVBoxLayout;
+    m_navFooter->setContentsMargins(0, 8, 0, 0);
+    m_navFooter->setSpacing(2);
+    v->addLayout(m_navFooter);
+    v->addSpacing(10);
+
+    m_status = new StatusCard;
+    v->addWidget(m_status);
     v->addSpacing(6);
-    m_repPill = ui::pill(QString::fromUtf8("○ 信誉服务未知"), theme::textMuted());
-    m_repPill->setToolTip(QString::fromUtf8(
-        "中央信誉服务(云端共享缓存 + 多引擎)连接状态。离线时本地直连情报源自动兜底,实时防护不受影响。"));
-    v->addWidget(m_repPill, 0, Qt::AlignLeft);
-    v->addSpacing(8);
-    // 版本串来自 bulwark/Version.h —— 与 exe 的 VERSIONINFO、更新清单比较用的是
-    // 同一个数字。以前这里是硬编字面量,是全产品唯一的版本来源。
-    v->addWidget(ui::label(bulwark::version::displayString(), "muted"));
+
+    // Bottom row: collapse toggle + version. 版本串来自 bulwark/Version.h —— 与 exe 的
+    // VERSIONINFO、更新清单比较用的是同一个数字。
+    auto* bottom = new QHBoxLayout;
+    m_bottomRow = bottom;
+    bottom->setContentsMargins(0, 0, 4, 0);
+    bottom->setSpacing(6);
+    m_toggle = new QToolButton;
+    m_toggle->setObjectName(QStringLiteral("SidebarToggle"));
+    m_toggle->setCursor(Qt::PointingHandCursor);
+    m_toggle->setAutoRaise(true);
+    m_toggle->setIconSize(QSize(16, 16));
+    connect(m_toggle, &QToolButton::clicked, this, &MainWindow::toggleSidebar);
+    bottom->addWidget(m_toggle, 0, Qt::AlignVCenter);
+    bottom->addStretch();
+    m_version = ui::label(bulwark::version::displayString(), "muted");
+    m_version->setToolTip(bulwark::version::displayString());
+    bottom->addWidget(m_version, 0, Qt::AlignVCenter);
+    v->addLayout(bottom);
 
     m_navGroup = new QButtonGroup(this);
     m_navGroup->setExclusive(true);
     connect(m_navGroup, &QButtonGroup::idClicked, this, &MainWindow::onNavClicked);
-    return bar;
+
+    m_sideAnim = new QVariantAnimation(this);
+    m_sideAnim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(m_sideAnim, &QVariantAnimation::valueChanged, this, [this](const QVariant& val) {
+        const int w = val.toInt();
+        m_sidebar->setFixedWidth(w);
+        // Expanding: switch to the full content once there is room for it.
+        if (!m_collapsed && m_compactContent && w > 170)
+            setSidebarCompact(false);
+    });
+    connect(m_sideAnim, &QVariantAnimation::finished, this, [this] {
+        if (!m_collapsed && m_compactContent)
+            setSidebarCompact(false);
+    });
+    return m_sidebar;
 }
 
 QWidget* MainWindow::buildContent()
 {
-    auto* content = new QFrame;
+    auto* content = new Backdrop(Backdrop::Kind::Content);
     content->setObjectName(QStringLiteral("Content"));
     auto* v = new QVBoxLayout(content);
     v->setContentsMargins(0, 0, 0, 0);
     v->setSpacing(0);
 
-    // topbar
+    // page header: floats on the canvas, no bar or rule of its own; the page's
+    // own primary actions sit at its right end.
     auto* top = new QFrame;
-    top->setObjectName(QStringLiteral("Topbar"));
+    top->setObjectName(QStringLiteral("PageHeader"));
     top->setFixedHeight(theme::metric::topbarH);
     auto* h = new QHBoxLayout(top);
-    h->setContentsMargins(theme::metric::pagePad, 0, theme::metric::pagePad, 0);
+    h->setContentsMargins(theme::metric::pagePad, 14, theme::metric::pagePad, 0);
+    h->setSpacing(16);
 
+    // The page's glyph in its identity hue, beside the title — the same tile the
+    // page's rail item, list card and empty states are keyed to.
+    auto* titleRow = new QHBoxLayout;
+    titleRow->setSpacing(14);
+    m_titleTile = new IconTile(QStringLiteral("dashboard"), theme::accent(), 40, 20);
+    titleRow->addWidget(m_titleTile, 0, Qt::AlignVCenter);
     auto* tcol = new QVBoxLayout;
-    tcol->setSpacing(1);
+    tcol->setSpacing(2);
     m_title = ui::label(QString(), "h1");
     m_subtitle = ui::label(QString(), "secondary");
     tcol->addWidget(m_title);
     tcol->addWidget(m_subtitle);
-    h->addLayout(tcol);
+    titleRow->addLayout(tcol);
+    h->addLayout(titleRow);
     h->addStretch();
 
-    h->addWidget(ui::pill(QString::fromUtf8("● 防护开启"), theme::success()));
+    auto* actions = new QWidget;
+    m_headerActions = new QHBoxLayout(actions);
+    m_headerActions->setContentsMargins(0, 0, 0, 0);
+    m_headerActions->setSpacing(8);
+    h->addWidget(actions, 0, Qt::AlignVCenter);
     v->addWidget(top);
+
+    // In-page message strip for every page (operation results, failures with
+    // their reason). A direct child of the content area, so BannerHost::find()
+    // reaches it from any page.
+    m_banners = new BannerHost(content);
+    if (QLayout* bl = m_banners->layout())
+        bl->setContentsMargins(theme::metric::pagePad, 8, theme::metric::pagePad, 0);
+    v->addWidget(m_banners);
 
     m_stack = new QStackedWidget;
     v->addWidget(m_stack, 1);
     return content;
 }
 
-void MainWindow::addPage(const QString& icon, const QString& nav,
-                         const QString& title, const QString& subtitle, QWidget* page)
+void MainWindow::addPage(const QString& key, const QString& section, const QString& icon, const QString& nav,
+                         const QString& title, const QString& subtitle, QWidget* page, bool pinned)
 {
     const int idx = m_stack->count();
+    const QColor hue = identity::page(key);
     auto* btn = new NavButton(icon, nav);
-    // 插在末尾弹簧之前,保持导航项顶部对齐。
-    m_navLayout->insertWidget(std::max(0, m_navLayout->count() - 1), btn);
+    btn->setIdentity(hue);
+    if (pinned) {
+        m_navFooter->addWidget(btn);
+    } else {
+        // 插在末尾弹簧之前,保持导航项顶部对齐。第一个分组紧贴品牌区,其后的分组留出间隔。
+        if (!section.isEmpty()) {
+            const bool first = m_navLayout->count() <= 1;
+            auto* head = ui::eyebrow(section);
+            head->setContentsMargins(14, first ? 0 : 12, 0, 3);
+            m_navLayout->insertWidget(std::max(0, m_navLayout->count() - 1), head);
+            m_sectionHeads << head;
+            // Collapsed rail: a short hairline stands in for the group title.
+            auto* rule = new QWidget;
+            auto* rl = new QVBoxLayout(rule);
+            rl->setContentsMargins(10, first ? 0 : 10, 10, 6);
+            rl->addWidget(ui::hDivider());
+            rule->hide();
+            m_navLayout->insertWidget(std::max(0, m_navLayout->count() - 1), rule);
+            m_sectionRules << rule;
+        }
+        m_navLayout->insertWidget(std::max(0, m_navLayout->count() - 1), btn);
+    }
     m_navGroup->addButton(btn, idx);
+    m_navButtons << btn;
     m_stack->addWidget(page);
     m_titles << title;
     m_subtitles << subtitle;
-    m_pageKeys << icon; // the icon name doubles as a stable page key
+    m_pageKeys << key;
+    m_pageIcons << icon;
+    m_pageHues << hue;
+
+    QWidget* actions = ui::pageActions(page);
+    if (actions) {
+        m_headerActions->addWidget(actions);
+        actions->hide();
+    }
+    m_pageActions << actions;
 }
 
-void MainWindow::navigateTo(const QString& pageKey)
+QString MainWindow::currentKey() const
+{
+    return m_pageKeys.value(m_stack ? m_stack->currentIndex() : -1);
+}
+
+void MainWindow::navigateTo(const QString& pageKey, const QVariantMap& args)
 {
     const int idx = m_pageKeys.indexOf(pageKey);
     if (idx < 0)
@@ -324,15 +655,168 @@ void MainWindow::navigateTo(const QString& pageKey)
     if (auto* b = m_navGroup->button(idx))
         b->setChecked(true);
     onNavClicked(idx);
+    NavHub::instance()->deliver(pageKey, args);
 }
 
 void MainWindow::onNavClicked(int index)
 {
     if (index < 0 || index >= m_stack->count())
         return;
+    // Banners report on what was just done on the page being left (and failures
+    // are sticky): carried over they would sit, out of context, on top of the next
+    // page — "无法添加规则" above the dashboard.
+    if (index != m_stack->currentIndex() && m_banners)
+        m_banners->clear();
     m_stack->setCurrentIndex(index);
+    m_titleTile->set(m_pageIcons.value(index), m_pageHues.value(index, theme::accent()));
     m_title->setText(m_titles.value(index));
     m_subtitle->setText(m_subtitles.value(index));
+    for (int i = 0; i < m_pageActions.size(); ++i)
+        if (QWidget* a = m_pageActions[i])
+            a->setVisible(i == index);
+    clearBadge(m_pageKeys.value(index));
+}
+
+void MainWindow::focusPageSearch()
+{
+    QWidget* page = m_stack ? m_stack->currentWidget() : nullptr;
+    if (!page)
+        return;
+    const auto boxes = page->findChildren<QLineEdit*>(QStringLiteral("PageSearch"));
+    for (QLineEdit* e : boxes) {
+        if (e->isVisible() && e->isEnabled()) {
+            e->setFocus(Qt::ShortcutFocusReason);
+            e->selectAll();
+            return;
+        }
+    }
+}
+
+// ---- rail collapse ------------------------------------------------------------
+
+void MainWindow::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    const bool narrow = width() < kAutoCollapseW;
+    if (narrow != m_narrow || !m_sidebarReady) {
+        m_narrow = narrow;
+        m_narrowExpand = false; // a temporary expand doesn't survive crossing the threshold
+        applySidebar(m_sidebarReady);
+    }
+}
+
+void MainWindow::toggleSidebar()
+{
+    if (m_narrow) {
+        m_narrowExpand = !m_narrowExpand;
+    } else {
+        m_prefCollapsed = !m_prefCollapsed;
+        QSettings().setValue(QStringLiteral("ui/sidebarCollapsed"), m_prefCollapsed);
+    }
+    applySidebar(true);
+}
+
+void MainWindow::applySidebar(bool animate)
+{
+    const bool collapse = m_narrow ? !m_narrowExpand : m_prefCollapsed;
+    if (m_sidebarReady && collapse == m_collapsed)
+        return;
+    m_sidebarReady = true;
+    m_collapsed = collapse;
+    const int target = collapse ? kRailW : theme::metric::sidebarW;
+
+    // Collapsing: switch to glyph-only content first, so labels aren't squeezed.
+    if (collapse)
+        setSidebarCompact(true);
+
+    m_toggle->setIcon(AppIcon::icon(collapse ? QStringLiteral("chevrons-right") : QStringLiteral("chevrons-left"),
+                                    theme::textMuted(), 16));
+    m_toggle->setText(collapse ? QString() : u("收起侧栏"));
+    m_toggle->setToolButtonStyle(collapse ? Qt::ToolButtonIconOnly : Qt::ToolButtonTextBesideIcon);
+    const QString tip = collapse ? u("展开侧栏") : u("收起侧栏");
+    m_toggle->setToolTip(tip);
+    m_toggle->setAccessibleName(tip);
+
+    m_sideAnim->stop();
+    const int ms = animate ? motion::duration(180) : 0;
+    if (ms <= 0) {
+        m_sidebar->setFixedWidth(target);
+        if (!collapse)
+            setSidebarCompact(false);
+        return;
+    }
+    m_sideAnim->setDuration(ms);
+    m_sideAnim->setStartValue(m_sidebar->width());
+    m_sideAnim->setEndValue(target);
+    m_sideAnim->start();
+}
+
+void MainWindow::setSidebarCompact(bool compact)
+{
+    m_compactContent = compact;
+    for (NavButton* b : std::as_const(m_navButtons))
+        b->setCompact(compact);
+    m_brandText->setVisible(!compact);
+    m_brandRow->setContentsMargins(compact ? 4 : 6, 0, 0, 0);
+    for (QWidget* w : std::as_const(m_sectionHeads))
+        w->setVisible(!compact);
+    for (QWidget* w : std::as_const(m_sectionRules))
+        w->setVisible(compact);
+    m_status->setCompact(compact);
+    m_version->setVisible(!compact);
+    if (m_bottomRow) // centre the lone toggle on the 44 px rail
+        m_bottomRow->setContentsMargins(compact ? 7 : 0, 0, 4, 0);
+    // The 44 px rail has no room for a scrollbar next to the glyphs; it still
+    // scrolls with the wheel when the window is very short.
+    m_navScroll->setVerticalScrollBarPolicy(compact ? Qt::ScrollBarAlwaysOff : Qt::ScrollBarAsNeeded);
+}
+
+// ---- unread badges ---------------------------------------------------------------
+
+bool MainWindow::isViewing(const QString& key) const
+{
+    return isVisible() && !isMinimized() && currentKey() == key;
+}
+
+void MainWindow::bumpBadge(const QString& key)
+{
+    if (isViewing(key))
+        return;
+    const int idx = m_pageKeys.indexOf(key);
+    if (idx < 0 || idx >= m_navButtons.size())
+        return;
+    const int n = ++m_unread[key];
+    const QColor c = key == QLatin1String(nav::Chain) ? theme::warning() : theme::danger();
+    m_navButtons[idx]->setBadge(n, c);
+}
+
+void MainWindow::clearBadge(const QString& key)
+{
+    if (!m_unread.value(key))
+        return;
+    m_unread.remove(key);
+    const int idx = m_pageKeys.indexOf(key);
+    if (idx >= 0 && idx < m_navButtons.size())
+        m_navButtons[idx]->setBadge(0);
+}
+
+void MainWindow::clearViewedBadge()
+{
+    if (isVisible() && !isMinimized())
+        clearBadge(currentKey());
+}
+
+void MainWindow::changeEvent(QEvent* event)
+{
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::WindowStateChange || event->type() == QEvent::ActivationChange)
+        clearViewedBadge();
+}
+
+void MainWindow::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    clearViewedBadge();
 }
 
 void MainWindow::onPromptReceived(const bulwark::SecurityEvent& event)
@@ -348,12 +832,68 @@ void MainWindow::onPromptReceived(const bulwark::SecurityEvent& event)
                        static_cast<bulwark::RememberScope>(dlg.scopeIndex()));
 }
 
+// 防护状态(侧栏「防护状态」卡 + 托盘提示)。四种状态如实区分,任何一种"说不清"都不显示为绿色:
+//   未连接服务      -> 灰。界面此刻对防护状态一无所知,不能替它作保。
+//   总开关关闭      -> 红。用户主动关了防护,必须显眼。
+//   开启但内核未连  -> 橙。用户态仍在拦,但少了内核前置拦截(真正的动作前阻断),
+//                      这是能力差异,不该和"完全开启"共用一个绿灯。
+//   开启且内核已连  -> 绿。
+void MainWindow::refreshProtectionPill()
+{
+    if (!m_status)
+        return;
+
+    QString text;
+    QColor color;
+    QString tip;
+    QString glyph;
+    QString detail;
+
+    if (!m_svcConnected || !m_haveSettings) {
+        text   = u("○ 状态未知");
+        color  = theme::textMuted();
+        tip    = u("尚未与后台服务建立连接,无法确认防护状态。");
+        glyph  = QStringLiteral("shield");
+        detail = m_svcConnected ? u("正在读取防护配置…") : u("等待后台服务连接");
+    } else if (!m_protectionEnabled) {
+        text   = u("● 防护已关闭");
+        color  = theme::danger();
+        tip    = u("防护总开关处于关闭状态,系统当前不受保护。可在「设置」中重新开启。");
+        glyph  = QStringLiteral("shield-x");
+        detail = u("总开关已关闭");
+    } else if (!m_kernelConnected) {
+        text   = u("◐ 防护开启 · 无内核");
+        color  = theme::warning();
+        tip    = m_kernelStatus.isEmpty()
+                     ? u("防护已开启,但内核驱动未连接:仅有用户态观测与补偿处置,"
+                         "缺少「动作发生前阻断」能力。")
+                     : m_kernelStatus;
+        glyph  = QStringLiteral("shield-alert");
+        detail = u("内核驱动未连接");
+    } else {
+        text   = u("● 防护开启");
+        color  = theme::success();
+        tip    = m_kernelStatus.isEmpty() ? u("防护已开启,内核驱动已连接。") : m_kernelStatus;
+        glyph  = QStringLiteral("trust");
+        detail = u("内核驱动已连接");
+    }
+
+    // text 前两个字符是状态符号 + 空格:卡片上有按状态着色的盾牌,文字只保留纯文案。
+    m_status->setProtection(text.mid(2), color, glyph, detail, tip);
+    m_status->setService(m_svcConnected);
+
+    // 托盘提示同步。它原先也是一句写死的「防护运行中」—— 主界面关掉后托盘是用户唯一能看到
+    // 的状态入口,那里更不能谎报。
+    if (m_tray)
+        m_tray->setToolTip(u("磐垒主动防御 — ") + text.mid(2));
+}
+
 void MainWindow::setConnected(bool connected)
 {
-    ui::stylePill(m_connPill,
-                  connected ? QString::fromUtf8("● 已连接服务")
-                            : QString::fromUtf8("○ 未连接服务"),
-                  connected ? theme::success() : theme::textMuted());
+    m_svcConnected = connected;
+    if (!connected)
+        m_haveSettings = false;   // 断链后旧设置快照不再可信,退回"未知"而不是继续显示上次的状态
+    refreshProtectionPill();
     // Refresh prompt-timeout / default-action the moment the link comes up, so a
     // prompt arriving right after connect already has the correct countdown.
     if (connected && m_ipc) {
@@ -363,8 +903,8 @@ void MainWindow::setConnected(bool connected)
     } else {
         if (m_repTimer) m_repTimer->stop();
         m_repPingId = QUuid();
-        if (m_repPill) // 与服务断链时无从得知代理状态,置灰
-            ui::stylePill(m_repPill, QString::fromUtf8("○ 信誉服务未知"), theme::textMuted());
+        // 与服务断链时无从得知代理状态,置灰。
+        m_status->setReputation(u("未知"), theme::textMuted(), u("与后台服务断开,无法得知中央信誉服务状态。"));
     }
 }
 
@@ -392,6 +932,7 @@ void MainWindow::onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit
     // 静默模式把询问降级成放行,恰好造出「命中了但用户毫不知情」的盲区。
     if (m_toasts)
         m_toasts->showAttackChain(hit);
+    bumpBadge(nav::Chain);
 }
 
 void MainWindow::onAiScanStarted(const bulwark::SecurityEvent& event)
@@ -425,15 +966,14 @@ void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayloa
     // and how many items couldn't be cleaned. Shown as a tray balloon (the report
     // detail also rides the event/audit log on the service side).
     const QString name = QFileInfo(report.actorPath).fileName();
-    QString body = QString::fromUtf8("%1:隔离 %2 文件 · 移除 %3 持久化")
+    QString body = u("%1:隔离 %2 文件 · 移除 %3 持久化")
                        .arg(name.isEmpty() ? report.reason : name)
                        .arg(report.quarantinedFiles.size())
                        .arg(report.removedRegistryValues.size());
     if (!report.skipped.isEmpty())
-        body += QString::fromUtf8(" · %1 项未清理").arg(report.skipped.size());
+        body += u(" · %1 项未清理").arg(report.skipped.size());
     if (m_tray && QSystemTrayIcon::isSystemTrayAvailable())
-        m_tray->showMessage(QString::fromUtf8("已清理恶意足迹"), body,
-                            QSystemTrayIcon::Information, 5000);
+        m_tray->showMessage(u("已清理恶意足迹"), body, QSystemTrayIcon::Information, 5000);
 
     // 完整报告卡片:主体 / 判定 / 已隔离项 / 未能清理项(文件可一键重试强制隔离)。
     // 非模态,不打断用户;自身带滚动区与关闭按钮。
@@ -458,21 +998,22 @@ void MainWindow::setupTray()
     if (m_tray)
         return; // already created (a retry raced a now-ready tray)
 
-    auto u = [](const char* s) { return QString::fromUtf8(s); };
-
     m_tray = new QSystemTrayIcon(this);
     m_tray->setIcon(buildTrayIcon());
-    m_tray->setToolTip(u("磐垒主动防御 — 防护运行中"));
+    m_tray->setToolTip(u("磐垒主动防御"));   // 真实状态随后由 refreshProtectionPill() 补上
 
     auto* menu = new QMenu(this);
     auto* actShow = menu->addAction(u("显示主界面"));
     auto* actScan = menu->addAction(u("立即扫描"));
     menu->addSeparator();
-    auto* actQuit = menu->addAction(u("退出磐垒防护"));
+    // 措辞必须与实际行为一致。原来叫「退出磐垒防护」,而它真的会去停服务 + 卸驱动;
+    // 现在退出只关界面、防护继续常驻(见 quitApp 的说明),所以名字也要如实说明。
+    auto* actQuit = menu->addAction(u("退出界面(防护继续运行)"));
+    actQuit->setToolTip(u("仅关闭界面,后台防护保持运行。如需停用防护请在「设置」中关闭总开关。"));
     connect(actShow, &QAction::triggered, this, &MainWindow::showFromTray);
     connect(actScan, &QAction::triggered, this, [this] {
         showFromTray();
-        navigateTo(QStringLiteral("sparkles"));
+        navigateTo(nav::Ai);
     });
     connect(actQuit, &QAction::triggered, this, &MainWindow::quitApp);
     m_tray->setContextMenu(menu);
@@ -485,6 +1026,7 @@ void MainWindow::setupTray()
             });
 
     m_tray->show();
+    refreshProtectionPill(); // 托盘刚建好:把当前已知状态写进它的提示文字
 
     // First appearance: point the user at the tray. Windows usually folds a new
     // app's icon into the overflow ("^") flyout, so a one-time balloon helps them
@@ -504,17 +1046,21 @@ void MainWindow::showFromTray()
     setWindowState((windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
     raise();
     activateWindow();
+    clearViewedBadge();
 }
 
 void MainWindow::quitApp()
 {
-    // UI 关闭时自动停止服务和卸载驱动
-    if (!qEnvironmentVariableIsEmpty("BULWARK_UI_SMOKE")) {
-        // 冒烟测试模式不执行关闭清理
-    } else {
-        bulwark::ui::bootstrap::shutdownBackend();
-    }
-    
+    // 【退出界面 ≠ 关闭防护】
+    //
+    // 原实现在这里调 bootstrap::shutdownBackend() —— 那个函数会 stop BulwarkService
+    // 并 unload 内核驱动。也就是说用户从托盘点一下"退出",整台机器的防护就没了,而这是
+    // 除"关到托盘"以外【唯一】的退出路径。这正是「服务无法常驻、关掉就失效」的直接原因:
+    // 界面是前台程序,用户关它是常事;防护是后台常驻服务,不该跟着前台程序一起死。
+    //
+    // 杀毒/HIPS 的通行语义是:关掉主界面,引擎继续在后台跑。要真正停用防护,得走
+    // 「设置」里的防护总开关(可撤销)或卸载程序(彻底移除)—— 两条路都还在,
+    // 「随时可停、可卸」这条底线不受影响,只是不再由"关窗口"这个动作误触发。
     m_forceQuit = true;
     qApp->quit();
 }
@@ -529,8 +1075,8 @@ void MainWindow::closeEvent(QCloseEvent* event)
         if (!m_trayHintShown) {
             m_trayHintShown = true;
             m_tray->showMessage(
-                QString::fromUtf8("磐垒仍在后台防护"),
-                QString::fromUtf8("已最小化到系统托盘,防护持续运行。右键托盘图标可退出。"),
+                u("磐垒仍在后台防护"),
+                u("已最小化到系统托盘,防护持续运行。右键托盘图标可退出。"),
                 QSystemTrayIcon::Information, 4000);
         }
         return;

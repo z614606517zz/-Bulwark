@@ -76,16 +76,7 @@ public:
     void downloadUpdate();
     // 就地应用已下载的更新。替换由服务自己做 —— UI 既不提权、也不启动任何脚本。
     void applyUpdate();
-    // ---- 磁盘垃圾清理。服务端异步作答(要遍历数万文件),响应经 junkScanReceived /
-    //      junkCleanDone 到达,中途 junkProgress 报进度。两者都返回本次请求的 id ——
-    //      服务端是广播,页面据此只认自己发出去的那一次(多开界面时不会串)。----
-    QUuid requestJunkScan(const QList<int>& categories = {}, int minAgeHours = 0);
-    // 清理【只按类别】,没有路径参数 —— 范围由服务端那份编译期固定的类别表决定。
-    // 空 categories 会被服务端当成「什么都不做」,这里也不做特殊处理。
-    QUuid requestJunkClean(const QList<int>& categories, int minAgeHours = 0);
-    // 大文件查找(纯只读)。【没有配套的删除方法,也不会有】—— 界面只提供「打开所在位置」,
-    // 理由见 bulwark/models/JunkEntry.h 里 LargeFileEntry 的说明。
-    QUuid requestLargeFiles(qint64 minBytes = 0, int limit = 0);
+    
     void requestVtHistory();
     void manualQuarantine(const QString& path); // 清理报告「重试隔离」
     void vtQuery(const bulwark::ipc::VtRequestPayload& p);
@@ -129,11 +120,7 @@ signals:
     void updateProgress(const bulwark::ipc::UpdateProgressPayload& payload);
     void updateDownloadFinished(const bulwark::ipc::UpdateDownloadResponsePayload& payload);
     void updateApplyFinished(const bulwark::ipc::UpdateApplyResponsePayload& payload);
-    // 磁盘垃圾清理:扫描结果 / 清理结果 / 扫描与清理的进度。
-    void junkScanReceived(const bulwark::ipc::JunkScanResponsePayload& payload);
-    void junkCleanDone(const bulwark::ipc::JunkCleanResponsePayload& payload);
-    void junkProgress(const bulwark::ipc::JunkProgressPayload& payload);
-    void largeFilesReceived(const bulwark::ipc::LargeFileScanResponsePayload& payload);
+    
     // 攻击链刚命中一次(实时推送,用于右下角 toast);不受静默模式影响。
     void attackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
     void processListReceived(const bulwark::ipc::ProcessListResponsePayload& payload);

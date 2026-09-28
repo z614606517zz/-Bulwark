@@ -1,21 +1,30 @@
 #pragma once
-#include <QColor>
-#include <QDialog>
-#include <QPoint>
+#include "design/Sheet.h"
 
 #include "bulwark/models/SecurityEvent.h"
 
-class QComboBox;
-class QCheckBox;
+class CountdownBar;
 class QPushButton;
-class QTimer;
+class Segmented;
 
-// The behavior-prompt window — the core HIPS interaction. Shows a gray-zone
-// SecurityEvent with the full evidence set (actor + signature/publisher, command
-// line, target, SHA-256, risk factors, evidence-chain highlights, ATT&CK) and
-// lets the user Allow/Block and optionally remember the choice (scope). A "查看
-// 攻击时间线" link opens the full AttackTimelineWindow. Frameless, draggable.
-class PromptDialog : public QDialog
+// The behavior prompt — the core HIPS interaction, laid out in the order the
+// user has to think in:
+//
+//   ▌高危 82 · 行为防护
+//   powershell.exe 正试图向 explorer.exe (PID 2204) 注入远程线程   ← what is happening
+//   C:\…\powershell.exe   [已签名 · Microsoft] [本机首见] [VT 3/70] ← who is doing it
+//   为什么提示  ● reason  ● reason  [T1055] [T1059.001] …            ← the evidence
+//   ▸ 展开详情:命令行 · 父进程 · 启动来源 · SHA-256
+//   记住选择  [仅本次 | 本次会话 | 1 小时 | 1 天 | 永久]              ← the decision
+//   ━━━━━━━━━━━━━━░░░░  18 秒后自动放行
+//   查看攻击时间线                                   [拦截]  [放行]
+//
+// The evidence scrolls inside a height-limited area; the decision row and the
+// verdict buttons are always on screen. The countdown shows the real default
+// (the emphasised button, the bar's caption and Enter all agree) and never
+// pauses — the service keeps its own timeout. Esc / closing = 拦截 (the
+// conservative path).
+class PromptDialog : public Sheet
 {
     Q_OBJECT
 public:
@@ -28,26 +37,17 @@ public:
 
     bool allowed() const { return m_allowed; }
     bool remember() const;
-    int scopeIndex() const; // 0 永久 / 1 会话 / 2 一小时 / 3 一天
-
-protected:
-    void mousePressEvent(QMouseEvent*) override;
-    void mouseMoveEvent(QMouseEvent*) override;
+    int scopeIndex() const; // 0 永久 / 1 会话 / 2 一小时 / 3 一天 (RememberScope)
 
 private:
-    void updateCountdown(); // refresh the default-action button's "(Ns)" suffix
+    void decide(bool allow);
 
     bulwark::SecurityEvent m_event;
     bool m_allowed = false;
-    QCheckBox* m_remember = nullptr;
-    QComboBox* m_scope = nullptr;
-    QPoint m_dragOffset;
-
-    // Auto-decision countdown (see ctor doc). m_timeoutSeconds <= 0 => disabled.
+    Segmented* m_scope = nullptr;       // 0 仅本次 · 1 本次会话 · 2 1 小时 · 3 1 天 · 4 永久
+    CountdownBar* m_countdown = nullptr;
     int m_timeoutSeconds = 0;
-    int m_remaining = 0;
     bool m_defaultAllow = true;
-    QTimer* m_countdown = nullptr;
     QPushButton* m_allowBtn = nullptr;
     QPushButton* m_blockBtn = nullptr;
 };

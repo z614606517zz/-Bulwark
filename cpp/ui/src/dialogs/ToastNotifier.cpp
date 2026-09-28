@@ -1,4 +1,5 @@
 #include "dialogs/ToastNotifier.h"
+#include "dialogs/EventFormat.h"
 #include "dialogs/ToastWindow.h"
 
 #include "bulwark/ipc/Payloads.h"
@@ -17,30 +18,9 @@ namespace {
 
 QString u(const char* s) { return QString::fromUtf8(s); }
 
-// Short human verb for an event type — mirrors the phrasing used by the
-// behavior prompt so the toast reads consistently with the rest of the UI.
-QString actionVerb(bulwark::EventType t)
-{
-    using bulwark::EventType;
-    switch (t) {
-    case EventType::ProcessCreate:    return u("创建进程");
-    case EventType::ProcessTerminate: return u("结束进程");
-    case EventType::RemoteThread:     return u("注入远程线程");
-    case EventType::ImageLoad:        return u("加载模块 / 驱动");
-    case EventType::FileWrite:        return u("写入 / 修改文件");
-    case EventType::FileDelete:       return u("删除文件");
-    case EventType::RegistryWrite:    return u("写入注册表");
-    case EventType::NetworkConnect:   return u("网络外联");
-    case EventType::SelfProtect:      return u("触发自我保护");
-    case EventType::DnsQuery:         return u("发起 DNS 解析");
-    }
-    return u("敏感行为");
-}
-
 QString actorName(const SecurityEvent& e)
 {
-    const QString name = QFileInfo(e.actorPath).fileName();
-    return name.isEmpty() ? u("未知程序") : name;
+    return evtfmt::actorName(e.actorPath);
 }
 
 } // namespace
@@ -93,19 +73,18 @@ void ToastNotifier::showAttackChain(const bulwark::ipc::AttackChainHitPayload& h
                           : hit.grade == QLatin1String("strong") ? u("阻断或强提示")
                                                                 : u("弹窗询问");
 
-    QList<ToastField> fields;
-    fields << ToastField{u("程序"), program};
-    // 动作链是这条通知的主体信息 —— 它回答「凭什么定性」,而不只是「拦了谁」。
-    fields << ToastField{u("动作链"), hit.titles.join(u(" ＋ "))};
+    // 一句话:谁凑齐了哪几个动作。动作链是这条通知的主体 —— 它回答「凭什么定性」,
+    // 而不只是「拦了谁」。
+    const QString sentence = u("%1 凑齐 %2").arg(program, hit.titles.join(u(" → ")));
+    QString meta = u("%1 个恶意样本作证 · 强度「%2」").arg(hit.support).arg(gradeCn);
     if (!hit.families.trimmed().isEmpty())
-        fields << ToastField{u("常见家族"), hit.families};
+        meta += u(" · 常见家族 ") + hit.families.trimmed();
+    if (hit.dryRun)
+        meta += u(" · 只记录不拦截,未参与裁决");
 
-    const QString subtitle = u("%1 个恶意样本作证 · 强度「%2」")
-                                 .arg(hit.support).arg(gradeCn);
-
-    // 存活期比拦截 toast 更长:动作链常有两三个动作名要读完。悬停会暂停倒计时(ToastWindow 已有)。
-    auto* t = new ToastWindow(ToastWindow::Kind::AttackChain, u("攻击链组合命中"), subtitle,
-                              QString(), fields, QStringList(), kChainLifetimeMs, nullptr, act);
+    // 存活期比拦截 toast 更长:动作链常有两三个动作名要读完。悬停会暂停倒计时。
+    auto* t = new ToastWindow(ToastWindow::Kind::AttackChain, u("攻击链组合命中"), sentence, meta,
+                              QStringList(), kChainLifetimeMs, act, u("查看详情 ›"));
     connect(t, &ToastWindow::clicked, this, [this](ToastWindow*) {
         emit attackChainToastClicked();
     });
@@ -137,32 +116,22 @@ void ToastNotifier::showBlock(const SecurityEvent& e)
     }
     m_lastBlockToastMs = now;
 
-    QString program = actorName(e);
-    if (e.actorPid > 0)
-        program += QStringLiteral(" (PID %1)").arg(e.actorPid);
-
-    // 来源 = why it was blocked: the matched rule note, else the top risk reason.
+    // 依据 = why it was blocked: the matched rule note, else the top risk reason.
     QString source = e.matchedRuleNote.trimmed();
     if (source.isEmpty() && !e.riskReasons.isEmpty())
         source = e.riskReasons.first();
     if (source.isEmpty())
         source = u("命中高危行为规则");
 
-    const QString target = e.target.isEmpty() ? e.actorPath : e.target;
-
-    const QList<ToastField> fields = {
-        {u("来源"), source},
-        {u("程序"), program},
-        {u("行为"), actionVerb(e.type)},
-        {u("目标"), target},
-    };
+    // 一句话代替原来四行「标签:值」:谁、做了什么、对谁。
     auto* t = new ToastWindow(ToastWindow::Kind::Block,
                               u("已拦截危险行为"),
-                              u("磐垒已自动处置,无需手动操作"),
-                              QString(), // structured fields carry the detail
-                              fields,
+                              evtfmt::arrowLine(e),
+                              u("依据:") + source,
                               e.techniques,
-                              8000);
+                              8000,
+                              u("已拦截"),
+                              u("查看详情 ›"));
     present(t, /*isBlock=*/true);
 }
 
@@ -170,18 +139,17 @@ void ToastNotifier::showAiScan(const SecurityEvent& e)
 {
     auto* t = new ToastWindow(ToastWindow::Kind::AiScan,
                               u("AI 安全研判中"),
-                              actorName(e),                          // subtitle = program name
-                              u("正在对该程序进行大模型行为研判…"),   // detail line
-                              {},                                     // no structured fields
+                              actorName(e),
+                              u("正在对该程序进行大模型行为研判…"),
                               e.techniques,
-                              5000);
+                              5000,
+                              u("研判中"));
     present(t, /*isBlock=*/false);
 }
 
 void ToastNotifier::showInfo(const QString& heading, const QString& detail)
 {
-    auto* t = new ToastWindow(ToastWindow::Kind::Info, heading, QString(), detail,
-                              {}, {}, 5000);
+    auto* t = new ToastWindow(ToastWindow::Kind::Info, heading, detail, QString(), {}, 5000);
     present(t, /*isBlock=*/false);
 }
 
@@ -195,8 +163,11 @@ void ToastNotifier::present(ToastWindow* toast, bool isBlock)
     m_stack.prepend(toast);
 
     // Cap the visible stack; retire the oldest surplus toasts immediately.
-    while (m_stack.size() > kMaxVisible)
-        m_stack.takeLast()->deleteLater();
+    while (m_stack.size() > kMaxVisible) {
+        ToastWindow* old = m_stack.takeLast();
+        old->hide(); // deleteLater alone would leave it on screen until the event loop runs
+        old->deleteLater();
+    }
 
     reflow();
 }
@@ -235,9 +206,9 @@ void ToastNotifier::flushSuppressed()
     m_lastBlockToastMs = QDateTime::currentMSecsSinceEpoch();
     auto* t = new ToastWindow(ToastWindow::Kind::Block,
                               u("已批量拦截危险行为"),
+                              u("短时间内共拦截 %1 项").arg(n),
                               u("磐垒已自动处置,无需手动操作"),
-                              u("短时间内共拦截 ") + QString::number(n) + u(" 项(点击查看拦截记录)"),
-                              {}, {}, 6000);
+                              {}, 6000, u("已拦截"), u("查看拦截记录 ›"));
     present(t, /*isBlock=*/true);
 }
 

@@ -1,27 +1,29 @@
 #pragma once
 #include <QColor>
-#include <QList>
-#include <QPair>
 #include <QPoint>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
 
-class QTimer;
+class CountdownBar;
 class QPropertyAnimation;
 
-// A labelled detail line for the block toast, e.g. {"来源", "从桌面执行未签名程序"}.
-using ToastField = QPair<QString, QString>;
-
 // A single corner "toast" notification — the building block behind the block
-// (拦截通知) and AI-scan (AI 扫描提示) toasts described in the README.
+// (拦截通知), attack-chain and AI-scan toasts.
+//
+//   ┃ [glyph] 已拦截危险行为                      [已拦截]  ✕
+//   ┃         powershell.exe 注入远程线程 → explorer.exe
+//   ┃         依据:命中高危行为规则         [T1055] [T1059]
+//   ┃         查看详情 ›
+//   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  (time left; hover pauses)
+//
+// One sentence says what happened, instead of four 标签:值 rows. ✕ only closes;
+// only 「查看详情」 navigates (clicking the body used to jump to a page with no
+// way to just dismiss).
 //
 // Frameless, translucent, always-on-top and non-activating (never steals focus
-// from the user's work). A rounded white card with a colour-coded icon badge,
-// heading, actor + detail lines and optional ATT&CK tags. Fades in, auto-
-// dismisses after `lifetimeMs`, pauses while hovered and closes on click.
-// Placement/stacking is owned by ToastNotifier; this widget only knows how to
-// paint itself and animate to a target position.
+// from the user's work). Placement/stacking is owned by ToastNotifier; this
+// widget only knows how to paint itself and animate to a target position.
 class ToastWindow : public QWidget
 {
     Q_OBJECT
@@ -31,17 +33,12 @@ public:
     // 会在放行的情况下变成谎报。
     enum class Kind { Block, AiScan, Info, AttackChain };
 
-    // `subtitle` is a small line under the heading ("磐垒已自动处置,无需操作").
-    // `detail` is a single free-text line (AI-scan / info toasts). `fields` are
-    // structured 标签:值 rows (block toast: 来源/程序/行为/目标). Pass whichever
-    // fits the kind; empty ones are simply skipped.
-    // `badgeText` 覆盖右上角那枚徽标的文字。攻击链要用它如实写出处置
-    //(已拦截 / 已询问 / 已放行)—— 处置由数据决定,不由种类决定。
-    // 放在参数表末尾并给默认值,现有调用点不必改。
-    ToastWindow(Kind kind, const QString& heading, const QString& subtitle,
-                const QString& detail, const QList<ToastField>& fields,
-                const QStringList& tags, int lifetimeMs, QWidget* parent = nullptr,
-                const QString& badgeText = QString());
+    // `badgeText` is the status capsule (the attack chain passes its REAL
+    // disposition: 已拦截 / 已询问 / 已放行 / 仅记录). Empty = no capsule, except
+    // Block which defaults to 已拦截. `actionText` empty = no 「查看详情」 link.
+    ToastWindow(Kind kind, const QString& heading, const QString& sentence, const QString& meta,
+                const QStringList& tags, int lifetimeMs, const QString& badgeText = QString(),
+                const QString& actionText = QString(), QWidget* parent = nullptr);
 
     // Move to `topLeft`. The first call fades the toast in at that spot; later
     // calls slide it (used when the stack re-flows as toasts come and go).
@@ -49,18 +46,17 @@ public:
 
 signals:
     void closed(ToastWindow* self);
-    void clicked(ToastWindow* self);
+    void clicked(ToastWindow* self); // 「查看详情」
 
 protected:
     void enterEvent(QEnterEvent*) override;
     void leaveEvent(QEvent*) override;
-    void mousePressEvent(QMouseEvent*) override;
 
 private slots:
     void beginClose();
 
 private:
-    QTimer* m_life = nullptr;
+    CountdownBar* m_bar = nullptr;
     QPropertyAnimation* m_fade = nullptr;
     QPropertyAnimation* m_slide = nullptr;
     int m_lifetimeMs = 6000;

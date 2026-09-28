@@ -1,17 +1,18 @@
 #include "dialogs/AttackTimelineWindow.h"
-#include "dialogs/AttackGraphWindow.h"
 #include "dialogs/EventFormat.h"
-#include "widgets/AppIcon.h"
-#include "widgets/Cards.h"
-#include "widgets/Ui.h"
-#include "Theme.h"
+#include "dialogs/EventViews.h"
+#include "design/Backdrop.h"
+#include "design/Components.h"
+#include "design/Format.h"
+#include "design/IconTile.h"
+#include "design/Inspector.h"
+#include "design/Theme.h"
 
-#include <QDialogButtonBox>
-#include <QFileInfo>
-#include <QFrame>
+#include <QBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QScrollArea>
 #include <QVBoxLayout>
 
@@ -19,237 +20,143 @@ using evtfmt::u;
 
 namespace {
 
-// A titled card returning its inner content layout.
-QVBoxLayout* sectionCard(QVBoxLayout* parent, const QString& title)
+constexpr int kStackBelow = 900; // narrower than this, the two columns stack
+
+// A titled card in a column; returns the layout to fill.
+QVBoxLayout* cardSection(QVBoxLayout* column, const QString& title)
 {
     auto* c = ui::card();
     auto* v = new QVBoxLayout(c);
-    v->setContentsMargins(18, 15, 18, 15);
+    v->setContentsMargins(18, 15, 18, 16);
     v->setSpacing(9);
-    v->addWidget(ui::label(title, "h2"));
-    v->addWidget(ui::hDivider());
-    parent->addWidget(c);
+    v->addWidget(ui::eyebrow(title));
+    column->addWidget(c);
     return v;
-}
-
-QWidget* detailRow(const QString& caption, const QString& value, bool mono = false)
-{
-    auto* w = new QWidget;
-    auto* h = new QHBoxLayout(w);
-    h->setContentsMargins(0, 2, 0, 2);
-    h->setSpacing(12);
-    auto* cap = ui::label(caption, "caption");
-    cap->setFixedWidth(96);
-    h->addWidget(cap, 0, Qt::AlignTop);
-    auto* val = ui::label(value.isEmpty() ? u("—") : value, mono ? "mono" : "secondary");
-    val->setWordWrap(true);
-    val->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    h->addWidget(val, 1);
-    return w;
 }
 
 } // namespace
 
-AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWidget* parent,
-                                          IpcClient* ipc)
+AttackTimelineWindow::AttackTimelineWindow(const bulwark::SecurityEvent& e, QWidget* parent, IpcClient* ipc,
+                                           std::optional<evtview::Outcome> outcome)
     : QDialog(parent)
 {
-    setWindowTitle(u("攻击时间线"));
-    setModal(true);
-    resize(680, 720);
+    const QString name = evtfmt::actorName(e.actorPath);
+    setWindowTitle(u("攻击时间线 · %1").arg(name));
+    setAccessibleName(windowTitle());
+    Backdrop::install(this); // same work-area material as the main window
+    resize(1080, 740);
+    setMinimumSize(700, 480);
+    setSizeGripEnabled(true);
 
     auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(0, 0, 0, 0);
-    outer->setSpacing(0);
+    outer->setContentsMargins(24, 20, 24, 18);
+    outer->setSpacing(14);
 
-    // Header banner.
-    auto* head = new QFrame;
-    head->setObjectName(QStringLiteral("Topbar"));
-    auto* hh = new QHBoxLayout(head);
-    hh->setContentsMargins(20, 16, 20, 16);
-    hh->setSpacing(14);
-    hh->addWidget(ui::iconBadge("activity", evtfmt::riskColor(e.riskScore), 46, 24));
-    auto* hcol = new QVBoxLayout;
-    hcol->setSpacing(2);
-    const QString name = QFileInfo(e.actorPath).fileName();
-    hcol->addWidget(ui::coloredText(name.isEmpty() ? u("未知程序") : name, 15, 700, theme::textPrimary()));
-    hcol->addWidget(ui::label(evtfmt::verb(e.type) + u("  ·  ")
-                              + e.timestampUtc.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
-                              "secondary"));
-    hh->addLayout(hcol);
-    hh->addStretch();
-    hh->addWidget(ui::pill(evtfmt::riskLevel(e.riskScore) + QStringLiteral("  ·  %1").arg(e.riskScore),
-                           evtfmt::riskColor(e.riskScore)), 0, Qt::AlignTop);
-    outer->addWidget(head);
+    // ---- header: who · what · when, and the two verdict facts --------------------
+    const QColor tone = e.riskScore >= 50 ? evtfmt::riskColor(e.riskScore) : theme::info();
+    auto* head = new QHBoxLayout;
+    head->setSpacing(14);
+    head->addWidget(new IconTile(evtfmt::typeGlyph(e.type), tone, 46, 23), 0, Qt::AlignTop);
+    auto* hc = new QVBoxLayout;
+    hc->setSpacing(3);
+    auto* title = ui::label(name, "h1");
+    title->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    hc->addWidget(title);
+    hc->addWidget(ui::label(QStringLiteral("%1  ·  PID %2  ·  %3")
+                                .arg(evtfmt::typeLabel(e.type))
+                                .arg(e.actorPid)
+                                .arg(fmt::absoluteTime(e.timestampUtc)),
+                            "secondary"));
+    head->addLayout(hc, 1);
+    QList<QPair<QString, QColor>> top;
+    if (outcome) {
+        const evtfmt::Badge d = evtfmt::disposition(outcome->action, outcome->enforcement);
+        top << qMakePair(d.text, d.color);
+    }
+    if (e.riskScore > 0)
+        top << qMakePair(QStringLiteral("%1 %2").arg(evtfmt::riskLevel(e.riskScore)).arg(e.riskScore),
+                         evtfmt::riskColor(e.riskScore));
+    for (const auto& [text, color] : top)
+        head->addWidget(ui::pill(text, color), 0, Qt::AlignTop);
+    outer->addLayout(head);
 
+    auto* lead = ui::label(evtfmt::sentence(e, !outcome.has_value()), "lead");
+    lead->setWordWrap(true);
+    lead->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    outer->addWidget(lead);
+    if (const auto facts = evtview::factChips(e); !facts.isEmpty())
+        outer->addWidget(Inspector::makeChips(facts));
+
+    // ---- two columns: the story | the facts ---------------------------------------
     auto* scroll = new QScrollArea;
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    outer->addWidget(scroll, 1);
+    scroll->viewport()->setAutoFillBackground(false);
     auto* content = new QWidget;
-    scroll->setWidget(content);
-    auto* v = new QVBoxLayout(content);
-    v->setContentsMargins(20, 18, 20, 18);
-    v->setSpacing(14);
+    m_columns = new QBoxLayout(QBoxLayout::LeftToRight, content);
+    m_columns->setContentsMargins(0, 0, 4, 0);
+    m_columns->setSpacing(16);
+    auto* left = new QVBoxLayout;
+    left->setSpacing(14);
+    auto* right = new QVBoxLayout;
+    right->setSpacing(14);
+    m_columns->addLayout(left, 3);
+    m_columns->addLayout(right, 2);
 
-    // ---- 启动来源(服务 / 计划任务)----
-    // 单独成块而不是塞进取证详情:溯源链上「父进程是 svchost.exe」这一步本身没有信息量,
-    // 真正需要看到的是「哪个服务 / 哪个计划任务把它拉起来的」。
-    if (e.originKind != bulwark::ProcessOriginKind::Unknown && !e.originLabel().isEmpty()) {
-        auto* box = sectionCard(v, u("启动来源"));
-        auto* row = new QHBoxLayout;
-        row->setSpacing(10);
-        const bool notable = e.originKind == bulwark::ProcessOriginKind::Service
-                          || e.originKind == bulwark::ProcessOriginKind::ScheduledTask;
-        row->addWidget(ui::pill(e.originKind == bulwark::ProcessOriginKind::ScheduledTask
-                                    ? u("计划任务")
-                                    : (e.originKind == bulwark::ProcessOriginKind::Service
-                                           ? u("服务") : u("来源")),
-                                notable ? theme::info() : theme::textMuted()),
-                       0, Qt::AlignTop);
-        auto* col = new QVBoxLayout;
-        col->setSpacing(1);
-        auto* main = ui::label(e.originLabel(), "title");
-        main->setWordWrap(true);
-        main->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        col->addWidget(main);
-        if (!e.originDetail.isEmpty()) {
-            auto* why = ui::label(e.originDetail, "muted");
-            why->setWordWrap(true);
-            col->addWidget(why);
-        }
-        auto* rw = new QWidget; rw->setLayout(col);
-        row->addWidget(rw, 1);
-        box->addLayout(row);
-    }
-
-    // ---- 进程溯源链 ----
-    {
-        auto* box = sectionCard(v, u("进程溯源链"));
-        if (e.chainContext.isEmpty()) {
-            // 无链上下文:用父进程 -> 主体两步兜底展示。
-            if (!e.parentPath.isEmpty())
-                box->addWidget(detailRow(u("父进程"),
-                                         QStringLiteral("%1 (PID %2)").arg(e.parentPath).arg(e.parentPid), true));
-            box->addWidget(detailRow(u("主体"),
-                                     QStringLiteral("%1 (PID %2)").arg(e.actorPath).arg(e.actorPid), true));
-        } else {
-            int step = 1;
-            for (const bulwark::ChainEventInfo& c : e.chainContext) {
-                auto* row = new QHBoxLayout;
-                row->setSpacing(10);
-                row->addWidget(ui::pill(QString::number(step++), theme::info()), 0, Qt::AlignTop);
-                auto* col = new QVBoxLayout;
-                col->setSpacing(1);
-                col->addWidget(ui::label(QStringLiteral("%1  ·  %2 (PID %3)")
-                                             .arg(evtfmt::typeLabel(c.type),
-                                                  QFileInfo(c.actorPath).fileName().isEmpty()
-                                                      ? c.actorPath : QFileInfo(c.actorPath).fileName())
-                                             .arg(c.actorPid), "title"));
-                // 链上每一级的启动来源:让 svchost.exe 这一级显示成「服务:Schedule」,
-                // 否则读到这里只能看到一个没有区分度的宿主进程名。
-                if (!c.originLabel.isEmpty())
-                    col->addWidget(ui::label(u("启动来源:") + c.originLabel, "muted"));
-                if (!c.target.isEmpty())
-                    col->addWidget(ui::label(u("→ ") + c.target, "muted"));
-                auto* rw = new QWidget; rw->setLayout(col);
-                row->addWidget(rw, 1);
-                box->addLayout(row);
-            }
-        }
-    }
-
-    // ---- 证据链时间线 ----
-    if (!e.evidenceChain.isEmpty()) {
-        auto* box = sectionCard(v, u("判定依据 · 证据链时间线"));
-        for (const bulwark::Evidence& ev : e.evidenceChain) {
-            auto* row = new QHBoxLayout;
-            row->setSpacing(10);
-            row->addWidget(ui::pill(evtfmt::evidenceKindLabel(ev.kind), evtfmt::evidenceKindColor(ev.kind)),
-                           0, Qt::AlignTop);
-            auto* col = new QVBoxLayout;
-            col->setSpacing(1);
-            auto* desc = ui::label(ev.description, "secondary");
-            desc->setWordWrap(true);
-            col->addWidget(desc);
-            QStringList meta;
-            if (!ev.source.isEmpty()) meta << ev.source;
-            if (ev.scoreDelta != 0) meta << QStringLiteral("%1%2").arg(ev.scoreDelta > 0 ? u("+") : QString()).arg(ev.scoreDelta);
-            if (!ev.technique.isEmpty())
-                meta << (ev.techniqueName.isEmpty() ? ev.technique : QStringLiteral("%1 %2").arg(ev.technique, ev.techniqueName));
-            if (!meta.isEmpty())
-                col->addWidget(ui::label(meta.join(QStringLiteral("  ·  ")), "muted"));
-            auto* rw = new QWidget; rw->setLayout(col);
-            row->addWidget(rw, 1);
-            box->addLayout(row);
-        }
-    } else if (!e.riskReasons.isEmpty()) {
-        auto* box = sectionCard(v, u("风险因素"));
-        for (const QString& r : e.riskReasons) {
-            auto* rl = ui::label(QStringLiteral("· ") + r, "secondary");
-            rl->setWordWrap(true);
-            box->addWidget(rl);
-        }
-    }
-
-    // ---- 命中规则(这条裁决是哪条规则做出的;此前只在弹窗一闪而过,详情里看不到)----
-    if (!e.matchedRuleNote.trimmed().isEmpty()) {
-        auto* box = sectionCard(v, u("命中规则"));
-        auto* rl = ui::label(QStringLiteral("· ") + e.matchedRuleNote, "secondary");
-        rl->setWordWrap(true);
-        box->addWidget(rl);
-    }
-
-    // ---- 命中技战术 ----
+    QVBoxLayout* s = cardSection(left, u("判定依据 · 证据链"));
+    s->addWidget(evtview::evidenceList(e));
     if (!e.techniques.isEmpty()) {
-        auto* box = sectionCard(v, u("命中 ATT&CK 技战术"));
-        auto* flow = new QHBoxLayout;
-        flow->setSpacing(8);
+        QList<QPair<QString, QColor>> tech;
         for (const QString& t : e.techniques)
-            flow->addWidget(ui::pill(t, theme::info()));
-        flow->addStretch();
-        box->addLayout(flow);
+            tech << qMakePair(t, theme::info());
+        s->addSpacing(4);
+        s->addWidget(ui::label(u("命中 ATT&CK 技战术"), "caption"));
+        s->addWidget(Inspector::makeChips(tech));
     }
+    s = cardSection(left, u("进程溯源"));
+    s->addWidget(evtview::processChain(e));
+    left->addStretch(1);
 
-    // ---- 详情 ----
-    {
-        auto* box = sectionCard(v, u("取证详情"));
-        box->addWidget(detailRow(u("主体路径"), e.actorPath, true));
-        box->addWidget(detailRow(u("数字签名"),
-                                 e.actorSigned ? (e.actorPublisher.isEmpty() ? u("有效") : u("有效 · ") + e.actorPublisher)
-                                               : (e.signatureMismatch ? u("签名失配(内嵌但校验失败)") : u("无 / 无效"))));
-        if (!e.commandLine.isEmpty()) box->addWidget(detailRow(u("命令行"), e.commandLine, true));
-        if (!e.target.isEmpty())      box->addWidget(detailRow(u("操作目标"), e.target, true));
-        if (!e.actorHash.isEmpty())   box->addWidget(detailRow(u("SHA-256"), e.actorHash, true));
-        if (e.originatorPid > 0)
-            box->addWidget(detailRow(u("真凶溯源"),
-                                     QStringLiteral("%1 (PID %2)").arg(e.originatorPath).arg(e.originatorPid), true));
-        if (!e.detail.isEmpty())      box->addWidget(detailRow(u("说明"), e.detail));
-    }
+    s = cardSection(right, u("处置"));
+    auto* disp = ui::label(outcome ? evtfmt::dispositionDetail(outcome->action, outcome->enforcement)
+                                   : u("这条行为正在等待你的裁决。"),
+                           "secondary");
+    disp->setWordWrap(true);
+    s->addWidget(disp);
+    if (!e.matchedRuleNote.trimmed().isEmpty())
+        s->addWidget(Inspector::makeField(u("命中规则"), e.matchedRuleNote));
+    s = cardSection(right, u("取证"));
+    evtview::addForensicFields(s, e);
+    right->addStretch(1);
 
-    v->addStretch();
+    scroll->setWidget(content);
+    content->setAutoFillBackground(false); // setWidget() turns it on; the window shows through
+    outer->addWidget(scroll, 1);
 
+    // ---- footer ----------------------------------------------------------------------
     auto* bar = new QHBoxLayout;
-    bar->setContentsMargins(20, 0, 20, 16);
-    bar->addStretch();
+    bar->setSpacing(10);
+    bar->addStretch(1);
     if (ipc) {
-        auto* graph = new QPushButton(u("查看攻击关系图"));
-        graph->setProperty("variant", "ghost");
-        graph->setCursor(Qt::PointingHandCursor);
-        const QUuid eventId = e.id;
-        const int actorPid = e.actorPid;
-        const QString name = QFileInfo(e.actorPath).fileName();
-        connect(graph, &QPushButton::clicked, this, [this, ipc, eventId, actorPid, name] {
-            AttackGraphWindow dlg(ipc, eventId, actorPid, name, this);
-            dlg.exec();
-        });
+        auto* graph = ui::button(u("查看攻击关系图"), "ghost", QStringLiteral("link"));
+        const QUuid seed = e.id;
+        const int pid = e.actorPid;
+        connect(graph, &QPushButton::clicked, this,
+                [this, ipc, seed, pid, name] { evtview::openGraph(this, ipc, seed, pid, name); });
         bar->addWidget(graph);
     }
-    auto* close = new QPushButton(u("关闭"));
-    close->setProperty("variant", "primary");
-    close->setCursor(Qt::PointingHandCursor);
+    auto* close = ui::button(u("关闭"), "primary");
+    close->setMinimumWidth(96);
+    close->setDefault(true);
     connect(close, &QPushButton::clicked, this, &QDialog::accept);
     bar->addWidget(close);
     outer->addLayout(bar);
+}
+
+void AttackTimelineWindow::resizeEvent(QResizeEvent* e)
+{
+    QDialog::resizeEvent(e);
+    if (m_columns)
+        m_columns->setDirection(width() < kStackBelow ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
 }

@@ -1,22 +1,34 @@
 #pragma once
-#include <QDialog>
-#include <QPoint>
+#include "design/Sheet.h"
 
 #include "bulwark/ipc/Payloads.h"
 
-class AiScanner;
-class IpcClient;
-class QPlainTextEdit;
-class QPushButton;
-class QShowEvent;
+#include <QHash>
+#include <QList>
 
-// "恶意足迹清理报告" — surfaced after the service confirms an actor malicious,
-// quarantines its payload and cleans its persistence footprint. A light-theme
-// card mirroring the behavior prompt's look: subject + verdict, a cleaned /
-// un-cleaned tally, the quarantined payload / files / registry entries, and any
-// items that couldn't be cleaned (with a one-click retry-quarantine for leftover
-// files). Frameless, draggable, non-modal — it reports, it never blocks the user.
-class RemediationReportDialog : public QDialog
+class AiScanner;
+class CountdownBar;
+class FitScrollArea;
+class IpcClient;
+class QPushButton;
+class QVBoxLayout;
+
+// 「恶意足迹清理报告」 — surfaced after the service confirms an actor malicious,
+// quarantines its payload and cleans its persistence footprint.
+//
+//   header   subject · PID · time
+//   tiles    [已隔离 N] [已移除自启动 N] [未能清理 N] [新增拦截规则 N]  (click → group)
+//   groups   quarantined files · removed autostarts · leftovers (retry) · intel
+//   footer   auto-close (30 s, hover pauses, pin keeps it) · 复制报告 · 打开隔离区 ·
+//            全部重试 · 关闭
+//
+// A report with leftovers never closes by itself — those need a decision. The
+// AI cleanup script is not generated or run here any more: 「用 AI 生成清理方案」
+// hands the profile to AiCleanupDialog, whose runner elevates (UAC) and writes
+// the script with a UTF-8 BOM — one execution path, not two.
+//
+// Non-modal (it reports, it never blocks the user), frameless, draggable.
+class RemediationReportDialog : public Sheet
 {
     Q_OBJECT
 public:
@@ -24,19 +36,24 @@ public:
                             IpcClient* ipc, AiScanner* ai, QWidget* parent = nullptr);
 
 protected:
-    void mousePressEvent(QMouseEvent*) override;
-    void mouseMoveEvent(QMouseEvent*) override;
-    void showEvent(QShowEvent*) override;
+    void enterEvent(QEnterEvent* e) override;
+    void leaveEvent(QEvent* e) override;
 
 private:
+    QWidget* group(QVBoxLayout* into, const QString& key, const QString& title, const QColor& color, int count);
+    void scrollToGroup(const QString& key);
+    void retryAll();
+    void openQuarantine();
+    QString reportText() const;
+    void setPinned(bool pinned);
+
+    bulwark::ipc::RemediationReportPayload m_report;
     IpcClient* m_ipc = nullptr;
     AiScanner* m_ai = nullptr;
-    QPlainTextEdit* m_scriptView = nullptr;
-    QPushButton* m_genBtn = nullptr;
-    QPushButton* m_copyBtn = nullptr;
-    QPushButton* m_runBtn = nullptr;
-    QString m_actorName;
-    QPoint m_dragOffset;
-    bool m_centered = false;
-    int m_autoCloseLeft = 5;   // 全自动:报告为纯通知,倒计时自动关闭(秒)
+    FitScrollArea* m_scroll = nullptr;
+    QHash<QString, QWidget*> m_groups;
+    QList<QPair<QString, QPushButton*>> m_retry; // leftover file -> its retry button
+    CountdownBar* m_autoClose = nullptr;
+    QPushButton* m_pin = nullptr;
+    bool m_pinned = false;
 };

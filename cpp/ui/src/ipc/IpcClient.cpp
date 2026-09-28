@@ -170,19 +170,8 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::UpdateApplyResponse:
         emit updateApplyFinished(msg->payloadAs<UpdateApplyResponsePayload>());
         break;
-    // ---- 磁盘垃圾清理 ----
-    case IpcMessageType::JunkScanResponse:
-        emit junkScanReceived(msg->payloadAs<JunkScanResponsePayload>());
-        break;
-    case IpcMessageType::JunkCleanResponse:
-        emit junkCleanDone(msg->payloadAs<JunkCleanResponsePayload>());
-        break;
-    case IpcMessageType::JunkProgressNotification:
-        emit junkProgress(msg->payloadAs<JunkProgressPayload>());
-        break;
-    case IpcMessageType::LargeFileScanResponse:
-        emit largeFilesReceived(msg->payloadAs<LargeFileScanResponsePayload>());
-        break;
+    // 双击 / 释放载荷查毒的实时进度与结论(服务端 IpcServer::sendVtScanUpdate)。
+    // 主窗口的「云查杀进行中」卡片与云信誉页都挂在 vtScanUpdate 上,少了这一条它们永远收不到数据。
     case IpcMessageType::VtScanUpdate:
         emit vtScanUpdate(msg->payloadAs<bulwark::VtScanRecord>());
         break;
@@ -192,7 +181,6 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::ManualQuarantineResponse:
         emit manualQuarantineResult(msg->payloadAs<ManualQuarantineResultPayload>());
         break;
-
     // ---- request/response channel ----
     case IpcMessageType::RulesResponse:
         emit rulesReceived(msg->payloadAs<RulesResponsePayload>().rules);
@@ -202,9 +190,7 @@ void IpcClient::dispatch(const QString& line)
         break;
     case IpcMessageType::SettingsResponse: {
         const auto s = msg->payloadAs<bulwark::RuntimeSettings>();
-        m_ai->setConfig(s.aiBaseUrl, s.aiApiKey, s.aiModel); // keep the AI client in sync with settings
-        // 这三项与下面两项此前只在 RuntimeSettings 里被序列化、无人消费(静态特征提取用硬编码常量,
-        // 「额度守卫」功能根本不存在)。在这里一并同步,它们才真正生效。
+        m_ai->setConfig(s.aiBaseUrl, s.aiApiKey, s.aiModel);
         StaticFeatureLimits lim;
         lim.maxReadBytes   = static_cast<qint64>(s.aiScanBinarySampleLimitMb) * 1024 * 1024;
         lim.scriptCapBytes = s.aiScanScriptTextLimitKb * 1024;
@@ -381,33 +367,6 @@ void IpcClient::downloadUpdate()
 void IpcClient::applyUpdate()
 {
     send(IpcMessage::create(IpcMessageType::UpdateApplyRequest, {}));
-}
-
-QUuid IpcClient::requestJunkScan(const QList<int>& categories, int minAgeHours)
-{
-    JunkScanRequestPayload p;
-    p.categories = categories;
-    p.minAgeHours = minAgeHours;
-    send(IpcMessage::from(IpcMessageType::JunkScanRequest, p));
-    return p.requestId;
-}
-
-QUuid IpcClient::requestJunkClean(const QList<int>& categories, int minAgeHours)
-{
-    JunkCleanRequestPayload p;
-    p.categories = categories;
-    p.minAgeHours = minAgeHours;
-    send(IpcMessage::from(IpcMessageType::JunkCleanRequest, p));
-    return p.requestId;
-}
-
-QUuid IpcClient::requestLargeFiles(qint64 minBytes, int limit)
-{
-    LargeFileScanRequestPayload p;
-    p.minBytes = minBytes;
-    p.limit = limit;
-    send(IpcMessage::from(IpcMessageType::LargeFileScanRequest, p));
-    return p.requestId;
 }
 
 void IpcClient::manualQuarantine(const QString& path)

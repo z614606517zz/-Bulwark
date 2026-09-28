@@ -1,20 +1,30 @@
 #pragma once
-#include <QDialog>
+#include "design/Sheet.h"
 
 #include "bulwark/ipc/Payloads.h"
 #include "bulwark/models/VtScanRecord.h"
 
 class AiScanner;
 class IpcClient;
+class QCheckBox;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+class QStackedWidget;
+class Stepper;
 
-// "AI 智能清理" —— 从「云信誉详情」对某个判为恶意/可疑的文件发起:把该文件的行为画像
-// (释放文件 / 外联 IP·域名 / 注册表 IOC + 结论)发送给大模型,由 AI 生成一份 PowerShell
-// 清理方案,用户复核脚本内容后可一键(触发 UAC 提权)执行。清理逻辑走 UI 侧 AiScanner
-// (与「设置」里的大模型接口/Key/模型同步),脚本执行前必须二次确认——绝不自动无声删除。
-class AiCleanupDialog : public QDialog
+// 「AI 智能清理」 — a three-step wizard, started from the cloud-reputation detail
+// or the cleanup report for a file judged malicious / suspicious:
+//
+//   ① 行为画像   what is known about the sample (IOC counts; expand for items)
+//   ② 生成方案   the model writes a PowerShell cleanup script (monospace, copyable)
+//   ③ 执行       tick 「我已复核脚本」, then 「以管理员身份执行」 (UAC, visible window)
+//
+// The model only ever sees the behaviour profile (never the file). Nothing runs
+// without the user reviewing and explicitly confirming — no silent deletion. This
+// is the single script runner in the product (the cleanup report hands over to
+// it): elevated via UAC, script written with a UTF-8 BOM so Chinese output reads.
+class AiCleanupDialog : public Sheet
 {
     Q_OBJECT
 public:
@@ -23,6 +33,11 @@ public:
                     IpcClient* ipc, AiScanner* ai, QWidget* parent = nullptr);
 
 private:
+    QWidget* buildProfile(const bulwark::VtScanRecord& record);
+    QWidget* buildScript();
+    QWidget* buildRun();
+    void goTo(int step);
+    void syncNav();
     void startGeneration();
     void onScriptReady(const QString& script);
     void executeScript();
@@ -33,10 +48,18 @@ private:
     QString m_fileName;
     QString m_filePath;
 
-    QLabel* m_status = nullptr;
-    QPushButton* m_genBtn = nullptr;
-    QPushButton* m_copyBtn = nullptr;
-    QPushButton* m_runBtn = nullptr;
+    Stepper* m_steps = nullptr;
+    QStackedWidget* m_pages = nullptr;
+    QPushButton* m_back = nullptr;
+    QPushButton* m_next = nullptr;
+    QLabel* m_genStatus = nullptr;
+    QPushButton* m_regen = nullptr;
+    QPushButton* m_copy = nullptr;
     QPlainTextEdit* m_scriptView = nullptr;
+    QCheckBox* m_ack = nullptr;
+    QLabel* m_runStatus = nullptr;
+    int m_step = 0;
     bool m_awaiting = false;
+    bool m_hasScript = false;
+    bool m_launched = false;
 };

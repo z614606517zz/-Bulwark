@@ -2,12 +2,12 @@
 //
 // A single desktop app that connects to the headless service over a named pipe
 // and renders the dashboard / prompts / management pages. Pure Widgets =>
-// QApplication. The global dark theme is applied once via a Qt Style Sheet.
+// QApplication. The "Bedrock" design system (design/) is applied once below.
 #include "Bootstrap.h"
 #include "MainWindow.h"
-#include "Theme.h"
+#include "design/Icons.h"
+#include "design/Theme.h"
 #include "dialogs/PromptDialog.h"
-#include "widgets/AppIcon.h"
 
 #include <QApplication>
 #include <QBuffer>
@@ -20,10 +20,11 @@
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QPixmap>
+#include <QSystemTrayIcon>
 #include <QTimer>
 
-// Write the brand badge (teal shield) to a multi-size Windows .ico file so the
-// build can embed it as the application icon (Explorer / taskbar / shortcuts).
+// Write the brand mark (jade badge + shield) to a multi-size Windows .ico so
+// the build can embed it as the application icon (Explorer / taskbar / shortcuts).
 // Each frame is stored PNG-compressed (Vista+ .ico supports this), so no image
 // plugin beyond Qt's built-in PNG writer is needed. Hidden CLI: --export-icon.
 static bool exportAppIco(const QString& path)
@@ -117,11 +118,9 @@ int main(int argc, char* argv[])
     QLocalServer instanceServer;
     instanceServer.listen(kInstanceKey);
 
-    QFont f(QStringLiteral("Segoe UI"), 10);
-    f.setStyleStrategy(QFont::PreferAntialias);
-    app.setFont(f);
-
-    app.setStyleSheet(theme::styleSheet());
+    // The whole look in one call: base style, dark palette, fonts, style sheet and
+    // native window chrome (see design/Theme.h).
+    theme::apply(app);
 
     // ── 双击即用:把后台服务 + 内核驱动带起来,不用再手工 sc start / fltmc load。
     //    服务已在跑(开机自启)时这里立即返回,零 UAC、零等待;只有没跑起来才提权一次。
@@ -130,8 +129,21 @@ int main(int argc, char* argv[])
     if (qEnvironmentVariableIsEmpty("BULWARK_UI_SMOKE"))
         bulwark::ui::bootstrap::ensureBackendRunning();
 
+    // ── 重启后界面自己回来 ────────────────────────────────────────────────────
+    // 服务是开机自启的,防护本身重启后会回来;但界面不会,于是用户重启后看不到托盘图标、
+    // 收不到行为提示,只能手工再打开一次。这里登记 HKCU 的登录自启动(幂等,值没变就不写)。
+    // 用 HKCU 是刻意的:不需要提权,而且会出现在「任务管理器 > 启动应用」里让用户能自行关掉。
+    if (qEnvironmentVariableIsEmpty("BULWARK_UI_SMOKE"))
+        bulwark::ui::bootstrap::ensureUiAutoStart();
+
+    // --tray:由登录自启动带起来时用,静默驻留托盘,不弹主窗口打断用户开机后的工作。
+    // 托盘不可用时仍然显示窗口 —— 否则进程会变成一个用户完全看不见、也叫不出来的幽灵。
+    const bool startInTray = app.arguments().contains(QStringLiteral("--tray"))
+                             && QSystemTrayIcon::isSystemTrayAvailable();
+
     MainWindow w;
-    w.show();
+    if (!startInTray)
+        w.show();
 
     // 后续被拉起的实例会连进来:把主窗口从托盘/最小化恢复并抢到前台,让用户「再点一次」有反馈。
     QObject::connect(&instanceServer, &QLocalServer::newConnection, &w, [&instanceServer, &w] {
