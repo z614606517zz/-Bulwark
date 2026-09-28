@@ -1,3 +1,7 @@
+---
+inclusion: manual
+---
+
 # Product Overview
 
 **Bulwark (磐垒主动防御)** is a Host-based Intrusion Prevention System (HIPS) for Windows, comparable in category to antivirus/EDR products.

@@ -15,6 +15,8 @@ build-ascii/
 build-rt/
 build-fix/
 build_pkg/
+# 一次性的对照/评审构建树(cpp/build-review、根目录 build-review-driver)
+build-review*/
 cpp/dist/
 dist/
 bld/
@@ -130,16 +132,21 @@ ml/.venv/
 __pycache__/
 *.pyc
 
-# ---- 单下划线的一次性调试产物 ----
-# 注意:上面已有的是 __*.txt(双下划线),覆盖不到这些单下划线的。仅限仓库根目录。
-/_probe.txt
-/_probe2.txt
-/_ssh_diag.txt
-/_svc_state.txt
-/_tf_check.txt
+# ---- 根目录下单下划线开头的一次性调试产物 ----
+# 注意:上面已有的是 __*.txt(双下划线),覆盖不到这些单下划线的。
+# 仅限仓库根目录(前导 / 锚定):scripts/、ml/ 下以 _ 开头的文件不归这几条管。
+# 这里敢用通配,是因为根目录没有任何已入库的 _ 开头文件,不会出现下面 scripts/
+# 那段说的「规则看似排除、实际仍被跟踪」。以后真要入库这样的文件,用 git add -f。
+# 根目录的 _*.log 已被上面的 *.log 覆盖。
+/_*.txt
+/_*.py
+/_*.sh
+/_*.ps1
+# 上面是【文件】通配,匹配不到目录,一次性目录逐个列出:
+#   _rule_review/  bulwark_snapshot --dump-rules 的规则库转储,随时可重新生成
+/_rule_review/
 /start
 /nul
-/_diag.txt
 
 # ---- 服务端网页的本地暂存目录 ----
 # 上面的 __*.txt / __*.ps1 是【文件】通配,匹配不到目录,故单列一条。
@@ -188,6 +195,14 @@ packaging/redaction-needles.txt
 # 而且会把节点地址和密钥文件名带出去。服务端的【代码】照常入库,
 # 连到哪台机器由环境变量在部署时给。
 scripts/_*.sh
+# 根目录 _ops/:对主服务器做排查/恢复的一次性 Python 脚本及其输出,
+# 同样含节点 IP、密钥文件路径和口令相关字段。
+/_ops/
+
+# ---- 从远端节点拉回的数据备份(整库 + 节点 config.json,含情报源密钥)----
+# 例如 server/bulwark-intel-backup-node-45/:1.5 GB 的 cache.db 和明文 API key。
+# 不入库只是防误提交,不代表可以删:里面可能有主服务器没有的数据,删前先核对。
+server/bulwark-intel-backup-*/
 
 # ---- 一次性排查输出(其中 bw_dashurl / bw_url2 带着可用的会话 token)----
 /bw_*.txt
