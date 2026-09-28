@@ -1,12 +1,13 @@
 /*++
     Protocol.h
     内核驱动 <-> 用户态服务 通过 Minifilter 通信端口交换的消息结构定义。
-    用户态(C#)需以相同的内存布局解释这些结构。
+    用户态服务直接 #include 本头(cpp/service/src/DriverEventSource.cpp),两端共用同一份结构定义。
 --*/
 
 #pragma once
 
-// 与 Bulwark.Core.Models.EventType 对应(只列驱动当前产生的类型)
+// 驱动当前产生的事件类型。用户态在 DriverEventSource.cpp 里按 case 逐项映射到
+// bulwark::EventType(cpp/shared/include/bulwark/models/Enums.h),两边数值不要求一致。
 typedef enum _BLW_EVENT_TYPE {
     BlwEventProcessCreate = 0,
     BlwEventProcessTerminate = 1,
@@ -34,7 +35,7 @@ typedef enum _BLW_EVENT_TYPE {
                                   //   「离线破解 SAM 偷本机账户口令」这条不经过 lsass 的凭据窃取路径。
 } BLW_EVENT_TYPE;
 
-// 裁决动作,与 Bulwark.Core.Models.VerdictAction 对应
+// 裁决动作。用户态把 bulwark::VerdictAction 折成这两个值回给内核(Ask 是引擎内部态,不回内核)
 typedef enum _BLW_VERDICT {
     BlwVerdictAllow = 0,
     BlwVerdictBlock = 1,

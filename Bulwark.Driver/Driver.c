@@ -195,6 +195,9 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     // 拦截热路径上)全程无锁,故这把锁几乎不会被争用。用自旋锁而非 FAST_MUTEX,以便
     // 将来在任意 IRQL 下也能安全变更该集合。
     KeInitializeSpinLock(&g_Blw.BannedLock);
+    // 「受保护 / 反注入 / 凭据保护」三个 PID 集的写侧锁。必须在注册任何回调之前初始化 ——
+    // 进程退出回调一注册就可能立刻走 BlwRemoveTrackedPid 取这把锁。
+    KeInitializeSpinLock(&g_Blw.PidSetLock);
     // 客户端端口 rundown 保护:初始化后立即置为"已 run down",
     // 这样未连接时发送方 ExAcquireRundownProtection 会失败并安全放行;
     // 连接时 BlwConnectNotify 通过 ExReInitializeRundownProtection 重新激活。

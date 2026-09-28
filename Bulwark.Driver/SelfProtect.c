@@ -100,17 +100,40 @@ BlwPidSetContains(_In_ volatile LONG* Set, _In_ volatile LONG64* Mask, _In_ ULON
     return FALSE;
 }
 
+// 按当前槽位内容重算某个集合的布隆掩码。调用方必须持有 PidSetLock。
+// (与封禁集的 BlwRebuildBannedMask 同一套逻辑,只是参数化了 —— 摘除需要它。)
+static void
+BlwRebuildPidMaskLocked(_In_ volatile LONG* Set, _Inout_ volatile LONG64* Mask)
+{
+    ULONG64 m = 0;
+    ULONG i;
+
+    for (i = 0; i < BLW_MAX_PROTECTED; i++) {
+        ULONG p = (ULONG)Set[i];
+        if (p != 0) {
+            m |= BLW_PID_BIT(p);
+        }
+    }
+    InterlockedExchange64(Mask, (LONG64)m);
+}
+
 static void
 BlwPidSetAdd(_Inout_ volatile LONG* Set, _Inout_ volatile LONG64* Mask, _In_ ULONG Pid)
 {
+    KIRQL oldIrql;
     ULONG i;
 
     if (Pid == 0) {
         return;
     }
+
+    // 写侧互斥:加入 vs 进程退出摘除会并发(见 BLW_GLOBALS::PidSetLock)。读侧不受影响。
+    KeAcquireSpinLock(&g_Blw.PidSetLock, &oldIrql);
+
     // 去重
     for (i = 0; i < BLW_MAX_PROTECTED; i++) {
         if ((ULONG)Set[i] == Pid) {
+            KeReleaseSpinLock(&g_Blw.PidSetLock, oldIrql);
             return;
         }
     }
@@ -124,18 +147,54 @@ BlwPidSetAdd(_Inout_ volatile LONG* Set, _Inout_ volatile LONG64* Mask, _In_ ULO
             break;
         }
     }
+
+    KeReleaseSpinLock(&g_Blw.PidSetLock, oldIrql);
+}
+
+//
+// 从集合里摘除一个 PID。进程退出时调用,防 PID 复用把豁免带给新进程。
+//
+// 先做【无锁】布隆位测试:位未置说明这个 PID 绝不在集合里,直接返回 —— 系统里绝大多数
+// 进程退出都走这条路,既不取锁也不扫表(与 BlwRemoveBannedPid 同一思路)。
+//
+static void
+BlwPidSetRemove(_Inout_ volatile LONG* Set, _Inout_ volatile LONG64* Mask, _In_ ULONG Pid)
+{
+    KIRQL oldIrql;
+    ULONG i;
+
+    if (Pid == 0) {
+        return;
+    }
+    if (((ULONG64)*Mask & BLW_PID_BIT(Pid)) == 0) {
+        return;
+    }
+
+    KeAcquireSpinLock(&g_Blw.PidSetLock, &oldIrql);
+    for (i = 0; i < BLW_MAX_PROTECTED; i++) {
+        if ((ULONG)Set[i] == Pid) {
+            // 定序铁律:先清槽位,再重算掩码 —— 中间态只会「掩码有、集合无」(安全)。
+            InterlockedExchange(&Set[i], 0);
+            BlwRebuildPidMaskLocked(Set, Mask);
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_Blw.PidSetLock, oldIrql);
 }
 
 static void
 BlwPidSetClear(_Inout_ volatile LONG* Set, _Inout_ volatile LONG64* Mask)
 {
+    KIRQL oldIrql;
     ULONG i;
 
+    KeAcquireSpinLock(&g_Blw.PidSetLock, &oldIrql);
     // 定序铁律:【先清槽位,再清掩码】。中间态同样只会是「掩码有、集合无」(安全)。
     for (i = 0; i < BLW_MAX_PROTECTED; i++) {
         InterlockedExchange(&Set[i], 0);
     }
     InterlockedExchange64(Mask, 0);
+    KeReleaseSpinLock(&g_Blw.PidSetLock, oldIrql);
 }
 
 //
@@ -202,6 +261,31 @@ BOOLEAN
 BlwPidIsCredProtected(_In_ ULONG Pid)
 {
     return BlwPidSetContains(g_Blw.CredProtPids, &g_Blw.CredProtPidMask, Pid);
+}
+
+//
+// ===== 进程退出:把 PID 从三个「被保护目标」集合里摘掉 =====
+//
+// 【为什么这是安全问题,不是内存卫生问题】这三个集合原来只增不减,而 Windows 的 PID 是复用的。
+// 一个恶意进程只要拿到某个已退出的受保护 PID 的号(反复起进程即可撞到),就白拿了本产品自身
+// 进程的全部豁免:
+//   · BlwPreCreate / BlwPreSetInformation 里 SelfGuard 与 ProtectedPaths 的拒绝对它失效
+//     (那两处都是 !BlwPidIsProtected(actorPid) 才拦);
+//   · BlwKillProcessById 的护栏 2 会拒绝结束它;
+//   · BlwAddBannedPid 会拒绝把它加入封禁集;
+//   · ObCallbacks 里它对受保护进程的操作被整体豁免(actorPid 命中 BlwPidIsProtected)。
+// 也就是说 PID 复用能把「自我保护」变成「给攻击者的保护」。封禁集早就意识到了这个问题并
+// 实现了 BlwRemoveBannedPid,这三个集合漏了。
+//
+void
+BlwRemoveTrackedPid(_In_ ULONG Pid)
+{
+    if (Pid == 0) {
+        return;
+    }
+    BlwPidSetRemove(g_Blw.ProtectedPids, &g_Blw.ProtectedPidMask, Pid);
+    BlwPidSetRemove(g_Blw.MemProtPids, &g_Blw.MemProtPidMask, Pid);
+    BlwPidSetRemove(g_Blw.CredProtPids, &g_Blw.CredProtPidMask, Pid);
 }
 
 //

@@ -322,34 +322,56 @@ BlwImageIsLolBin(_In_ PCWSTR Path, _In_ USHORT Chars)
 // 体感等价:命中此白名单的程序"启动零延迟"——这是参考 Sysmon/Defender 等
 // 商业驱动的做法。这些目录里若真出现恶意,前置防御(签名/规则/MOTW)早已介入。
 //
-// 用"子串包含"而非"严格前缀":CreateInfo->ImageFileName 可能是
-// \??\C:\Windows\System32\... 也可能是 \Device\HarddiskVolumeN\Windows\System32\...
-// 等形式,严格前缀会漏判,导致 svchost 等关键进程意外走 IPC,
-// 一旦用户态裁决错误/超时即可能拒绝创建关键进程而蓝屏(0xEF)。
+// 【曾经用「子串包含」,那是一个可直接利用的漏洞,已改为卷根锚定前缀】
+//
+// 原注释的理由是:ImageFileName 可能是 \??\C:\... 也可能是 \Device\HarddiskVolumeN\...,
+// 严格前缀会漏判。这个顾虑是对的,但结论走偏了 —— 正确解法是先剥掉卷前缀再做锚定比较
+// (BlwVolumeRelativeOffset,见 Driver.h),而不是退化成子串包含。
+//
+// 子串包含的后果:用户只要自己建一个目录就能进白名单,不需要任何权限 ——
+//     C:\Users\<u>\Program Files\evil.exe     含 "\Program Files\"
+//     C:\temp\Windows\System32\evil.exe       含 "\Windows\System32\"
+// 命中白名单意味着这个进程创建【既不拦也不上报】,用户态规则引擎根本看不到它。
+//
+// 现在改为「剥掉卷标识后,剩余路径必须以下列目录之一开头」。认不出卷前缀时不匹配 ——
+// 方向是 fail-safe:白名单不命中只是多走一次上报,不会变成放行。
 //
 static BOOLEAN
 BlwImageIsTrustedSystemPath(_In_ PCWSTR Path, _In_ USHORT Chars)
 {
-    static const PCWSTR kNeedles[] = {
+    // 每条都必须是【卷根之后】的完整目录前缀,且以 '\' 开头、以 '\' 结尾。
+    static const BLW_NAME_ENTRY kPrefixes[] = {
         // 系统目录(WRP / 高 ACL)
-        L"\\Windows\\System32\\",
-        L"\\Windows\\SysWOW64\\",
-        L"\\Windows\\WinSxS\\",
-        L"\\Windows\\servicing\\",
-        L"\\Windows\\SystemApps\\",
-        L"\\Windows\\ImmersiveControlPanel\\",
-        L"\\Windows Defender\\",
-        L"\\Windows Defender Advanced Threat Protection\\",
-        L"\\Microsoft.NET\\",
+        BLW_NAME(L"\\Windows\\System32\\"),
+        BLW_NAME(L"\\Windows\\SysWOW64\\"),
+        BLW_NAME(L"\\Windows\\WinSxS\\"),
+        BLW_NAME(L"\\Windows\\servicing\\"),
+        BLW_NAME(L"\\Windows\\SystemApps\\"),
+        BLW_NAME(L"\\Windows\\ImmersiveControlPanel\\"),
+        BLW_NAME(L"\\Windows\\Microsoft.NET\\"),
 
         // 标准安装目录(普通用户无写权限,正常软件 99% 装在这里)
-        L"\\Program Files\\",
-        L"\\Program Files (x86)\\",
+        BLW_NAME(L"\\Program Files\\"),
+        BLW_NAME(L"\\Program Files (x86)\\"),
+        // Defender 的两处安装位置(原来是不带卷根的裸子串,现在补全为卷根锚定)。
+        BLW_NAME(L"\\Program Files\\Windows Defender\\"),
+        BLW_NAME(L"\\Program Files (x86)\\Windows Defender\\"),
+        BLW_NAME(L"\\ProgramData\\Microsoft\\Windows Defender\\"),
     };
 
-    ULONG i;
-    for (i = 0; i < RTL_NUMBER_OF(kNeedles); i++) {
-        if (BlwWideContainsCI(Path, Chars, kNeedles[i])) {
+    USHORT off;
+    ULONG  i;
+
+    if (Path == NULL || Chars == 0) {
+        return FALSE;
+    }
+    off = BlwVolumeRelativeOffset(Path, Chars);
+    if (off == 0) {
+        return FALSE;
+    }
+    for (i = 0; i < RTL_NUMBER_OF(kPrefixes); i++) {
+        if (BlwStartsWithCI(Path + off, (USHORT)(Chars - off),
+                            kPrefixes[i].Name, kPrefixes[i].Chars)) {
             return TRUE;
         }
     }
@@ -363,15 +385,25 @@ BlwImageIsTrustedSystemPath(_In_ PCWSTR Path, _In_ USHORT Chars)
 // 用它来给「关键系统进程」放行,等于把 C:\Program Files\Foo\csrss.exe 也认成关键进程。
 // 关键进程护栏的语义是「这个文件就是 Windows 自己的那一份」,判据必须收得比可信目录更紧。
 //
+// 【同样必须锚定,而且这一处的后果比上面那个白名单更严重】
+//
+// 本函数是 BlwIsCriticalSystemProcess 的路径条件,而「关键系统进程」拿到的是两项豁免:
+// 执行前拦截不拦它、BlwKillProcessById 拒绝结束它。原实现用子串包含,于是
+//     C:\temp\Windows\System32\csrss.exe
+// 这个任何用户都能造出来的路径,同时满足「文件名命中关键进程名单」与「位于系统目录」,
+// 直接获得免疫 —— 而收紧路径判据的初衷恰恰是为了不让改名样本白拿这份免疫
+// (见上方 BlwIsCriticalSystemProcess 注释里记录的 SalatStealer 现场)。子串包含让那次
+// 收紧只挡住了「不在任何 Windows\System32 子串里」的样本,换个目录名就又绕回去了。
+//
 static BOOLEAN
 BlwPathIsSystemImageDir(_In_opt_ PCWSTR Path, _In_ USHORT Chars)
 {
     if (Path == NULL || Chars == 0) {
         return FALSE;
     }
-    return BlwWideContainsCI(Path, Chars, L"\\Windows\\System32\\")
-        || BlwWideContainsCI(Path, Chars, L"\\Windows\\SysWOW64\\")
-        || BlwWideContainsCI(Path, Chars, L"\\Windows\\WinSxS\\");
+    return BLW_VOLPATH_STARTS(Path, Chars, L"\\Windows\\System32\\")
+        || BLW_VOLPATH_STARTS(Path, Chars, L"\\Windows\\SysWOW64\\")
+        || BLW_VOLPATH_STARTS(Path, Chars, L"\\Windows\\WinSxS\\");
 }
 
 //
@@ -462,6 +494,13 @@ BlwCreateProcessNotifyEx(
     if (CreateInfo == NULL) {
         // 进程退出:从封禁集摘除该 PID,防止 PID 复用时误伤新进程。
         BlwRemoveBannedPid(HandleToULong(ProcessId));
+        //
+        // 同时从「受保护 / 反注入 / 凭据保护」三个集合里摘除。原来只摘封禁集,于是这三个
+        // 集合只增不减 —— PID 复用后,拿到已退出受保护 PID 号的恶意进程会白拿本产品自身
+        // 进程的全部豁免(免 SelfGuard/ProtectedPaths 拒绝、免内核结束、免被封禁)。
+        // 详见 BlwRemoveTrackedPid 的说明。内部自带无锁布隆快速否决,与本 PID 无关时零开销。
+        //
+        BlwRemoveTrackedPid(HandleToULong(ProcessId));
         return;
     }
 

@@ -160,6 +160,111 @@ BlwUpcaseChar(_In_ WCHAR c)
 }
 
 //
+// ============ 卷前缀剥离:把「子串包含」升级为「锚定前缀」的基础 ============
+//
+// 【为什么必须有这个函数】
+//
+// 内核里同一个文件会以多种前缀出现:
+//     \??\C:\Windows\System32\x.exe                  (进程创建回调的 CreateInfo->ImageFileName)
+//     \Device\HarddiskVolume3\Windows\System32\x.exe (SeLocateProcessImageName / 规范化文件名)
+// 原实现为了同时覆盖这两种形式,把「这个映像是不是系统组件」写成了【子串包含】判断
+// (BlwWideContainsCI(path, L"\\Windows\\System32\\") 之类)。那是错的,而且是可直接利用的错:
+//
+//     C:\Users\<u>\Program Files\evil.exe        含有 "\Program Files\"
+//     C:\temp\Windows\System32\csrss.exe         含有 "\Windows\System32\"
+//
+// 第一条让样本进了「可信系统路径」快速白名单 —— 进程创建既不拦也不上报,用户态根本看不到它。
+// 第二条更严重:它同时满足 BlwIsCriticalSystemProcess 的两个条件(文件名命中关键进程名单 +
+// 「位于系统目录」),于是那个样本获得了关键系统进程的全部豁免 —— 执行前拦截不拦它、
+// BlwKillProcessById 拒绝结束它。而这两个目录用户都能自己创建,不需要任何权限。
+//
+// 正确做法是先剥掉卷标识,再对【剩余路径】做锚定前缀比较。本函数返回剩余路径的起始下标。
+//
+// 识别不出卷前缀时返回 0,调用方一律按「不匹配」处理 —— 方向是 fail-safe:白名单不命中意味着
+// 多一次上报/多一层审查,而不是多一次放行。
+//
+FORCEINLINE BOOLEAN
+BlwStartsWithCI(_In_reads_(Chars) PCWSTR Path, _In_ USHORT Chars,
+                _In_ PCWSTR Literal, _In_ USHORT LiteralChars)
+{
+    USHORT i;
+
+    if (Path == NULL || Chars < LiteralChars) {
+        return FALSE;
+    }
+    for (i = 0; i < LiteralChars; i++) {
+        if (BlwUpcaseChar(Path[i]) != BlwUpcaseChar(Literal[i])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+FORCEINLINE USHORT
+BlwVolumeRelativeOffset(_In_reads_(Chars) PCWSTR Path, _In_ USHORT Chars)
+{
+    if (Path == NULL || Chars < 3) {
+        return 0;
+    }
+
+    // \??\C:\...  -> 剩余从下标 6 开始(即 "\Windows\...")
+    if (BlwStartsWithCI(Path, Chars, L"\\??\\", 4)) {
+        // \??\UNC\... 是网络路径,不可能是本机系统目录 -> 不识别(返回 0 = 不匹配)。
+        if (BlwStartsWithCI(Path, Chars, L"\\??\\UNC\\", 8)) {
+            return 0;
+        }
+        if (Chars >= 7 && Path[5] == L':' && Path[6] == L'\\') {
+            return 6;
+        }
+        return 0;
+    }
+
+    // \Device\HarddiskVolumeN\...  -> 跳过数字,剩余从其后开始
+    if (BlwStartsWithCI(Path, Chars, L"\\Device\\HarddiskVolume", 22)) {
+        USHORT i = 22;
+        while (i < Chars && Path[i] >= L'0' && Path[i] <= L'9') {
+            i++;
+        }
+        // 必须真的读到过数字,且其后紧跟 '\'
+        if (i > 22 && i < Chars && Path[i] == L'\\') {
+            return i;
+        }
+        return 0;
+    }
+
+    // C:\...(极少见:内核路径通常带前缀,但归一化过的输入可能是这种形式)
+    if (Chars >= 3 && Path[1] == L':' && Path[2] == L'\\') {
+        return 2;
+    }
+
+    return 0;
+}
+
+//
+// 「剥掉卷前缀后,剩余路径是否以 Literal 开头」。这是替代 BlwWideContainsCI 做系统目录判定的
+// 唯一正确形式。Literal 必须以 '\' 开头(如 L"\\Windows\\System32\\")。
+//
+FORCEINLINE BOOLEAN
+BlwVolumePathStartsWith(_In_opt_ PCWSTR Path, _In_ USHORT Chars,
+                        _In_ PCWSTR Literal, _In_ USHORT LiteralChars)
+{
+    USHORT off;
+
+    if (Path == NULL || Chars == 0) {
+        return FALSE;
+    }
+    off = BlwVolumeRelativeOffset(Path, Chars);
+    if (off == 0) {
+        return FALSE;   // 认不出卷前缀 -> 不匹配(fail-safe)
+    }
+    return BlwStartsWithCI(Path + off, (USHORT)(Chars - off), Literal, LiteralChars);
+}
+
+// 便于书写:对宽字符串字面量自动算长度。
+#define BLW_VOLPATH_STARTS(path, chars, lit) \
+    BlwVolumePathStartsWith((path), (chars), (lit), (USHORT)(sizeof(lit) / sizeof(WCHAR) - 1))
+
+//
 // 预归一化的匹配目标。
 //
 // 一次文件 IRP_MJ_CREATE 最多要对 4 个名单做子串匹配,一次注册表写要对 2 个。原实现每个
@@ -194,6 +299,29 @@ typedef struct _BLW_GLOBALS {
                                        // 发送方先 acquire,断开时 wait-for-idle 后再关闭,
                                        // 避免对已释放端口做 FltSendMessage(use-after-free 蓝屏)。
     BOOLEAN         ProcessCallbackRegistered;
+
+    //
+    // ============ 已连接客户端是否通过身份校验 ============
+    //
+    // 【为什么必须有这个标志】通信端口的安全描述符是 FltBuildDefaultSecurityDescriptor,
+    // 也就是「管理员 / SYSTEM 可连」,而 BlwConnectNotify 原来对连接方【零校验】
+    // (ConnectionContext 直接 UNREFERENCED_PARAMETER)。于是任何管理员级进程都可以:
+    //   1) 先把服务停掉,抢占这个端口(MaxConnections = 1);
+    //   2) 下发 BLW_CMD_CLEAR_FILEHARD / CLEAR_EXECBLOCK / CLEAR_PATHS 把内核自持基线清空
+    //      —— 而这些 CLEAR 原本还会被写回注册表,于是「防护被关掉」跨重启保持;
+    //   3) 基线一空,BlwCleanupForceDelete 的自毁护栏(只查 SelfGuard + FileHardBlock)也空了,
+    //      再用 BLW_CMD_FORCE_DELETE 以内核权限删掉本产品自身的任何文件(含 .sys);
+    //   4) BLW_CMD_KILL_PID 结束任意非关键进程。
+    // 也就是说自我保护可以被一条 IPC 消息从内部拆掉。
+    //
+    // 【为什么是「标记不可信」而不是「拒绝连接」】直接拒连更干净,但一旦记录的服务映像路径
+    // 与实际不符(产品被移动目录、手工部署到别处),服务就再也连不上内核,防护静默退化成
+    // 「只有内核基线」而用户毫无察觉 —— 那是用一个可用性事故换一个安全边界。折中:连接照常
+    // 建立(遥测与常规配置不受影响),但【毁灭性命令】必须来自通过校验的客户端。
+    // 校验规则见 Comms.c 的 BlwClientIsTrusted。
+    //
+    volatile BOOLEAN ClientTrusted;
+
     volatile BOOLEAN Active;         // 是否已连接客户端并启用拦截。volatile:由连接/断开回调写,
                                      // 由所有拦截回调读,不能让编译器把它缓存进寄存器。
                                      //
@@ -299,6 +427,23 @@ typedef struct _BLW_GLOBALS {
     volatile LONG   ProtectedPids[BLW_MAX_PROTECTED]; // 受保护进程 PID(0 表示空槽)
     volatile LONG64 ProtectedPidMask;                 // 布隆快速否决位(见 BLW_PID_BIT)
 
+    //
+    // 保护「受保护 / 反注入 / 凭据保护」三个 PID 集的【写侧】(加入 / 摘除 / 清空)。读侧全程无锁。
+    //
+    // 【为什么现在需要这把锁,而原来不需要】原实现里这三个集合只在「配置下发」这条单线程路径上
+    // 变更,所以注释写的是「只在配置下发(单线程)时变更」,不需要互斥。但它们也因此【从不摘除】——
+    // 进程退出时只有 BannedPids 会被清掉(BlwRemoveBannedPid),这三个集合里的 PID 一直留着。
+    // Windows 的 PID 是复用的,于是一个恶意进程只要拿到某个已退出的受保护 PID 的号,就白拿了
+    // 本产品自身进程的全部豁免:SelfGuard 与 ProtectedPaths 的拒绝对它失效、内核结束进程的
+    // 护栏 2 拒绝杀它、BlwAddBannedPid 也拒绝封它。
+    //
+    // 补上退出摘除之后,这三个集合就和 BannedPids 一样存在并发写(进程退出 vs 配置下发),
+    // 而摘除必须重算掩码 —— 重算若与并发加入交错,会把刚加入 PID 的位擦掉,造成【真正的假否决】
+    // (集合里有、掩码里没有)。这正是 BannedLock 存在的理由,同一个理由在这里同样成立。
+    // 三个集合共用一把锁:写侧本来就极低频(配置下发 + 进程退出且布隆位命中),争用可忽略。
+    //
+    KSPIN_LOCK      PidSetLock;
+
     // 内存防护(反注入):高价值受害进程 PID 列表(0 表示空槽)。
     // 非可信进程对这些 PID 申请「写内存 / 远程线程」类权限时,在同一个 ObCallbacks
     // 回调里剥离这些权限,使跨进程注入写不进去。与 ProtectedPids 复用回调,
@@ -394,6 +539,18 @@ typedef struct _BLW_GLOBALS {
     // 实现裁决缓存跨【杀服务】与【重启】持久化。仅 DriverEntry 保存一次,之后只读。
     WCHAR           RegistryPathBuffer[300];
     UNICODE_STRING  RegistryPath;
+
+    //
+    // 期望的用户态服务映像路径(NT 形式,如 \Device\HarddiskVolume3\Program Files\Bulwark\
+    // bulwark_service.exe)。由 \Policy\ServiceImagePath 载入;首次有合法客户端连接时记录
+    // (trust-on-first-use)。BlwClientIsTrusted 拿它与连接方的映像路径做精确比较。
+    //
+    // TOFU 的残余风险与取舍:全新安装后的第一次连接若被抢占,攻击者就把自己记成了「服务」。
+    // 但那要求攻击者在安装流程(bulwark.ps1 先注册驱动、再启动服务)的窗口里抢跑,而那个
+    // 窗口里机器本来就在管理员手上。相比原先「永远不校验」,这是实质收敛。
+    //
+    WCHAR           ServiceImageBuffer[BLW_MAX_PATH];
+    volatile LONG   ServiceImageChars;   // 0 = 尚未记录(此时按 TOFU 接受第一个合法客户端)
 
     // ============ 内核本地「事后研判」:内置已知恶意 SHA-256 集合 + 异步哈希扫描 ============
     // 默认惰性:KnownBadCount==0 时进程创建回调根本不入队,本能力零开销、零风险。
@@ -547,6 +704,13 @@ BOOLEAN  BlwPidIsMemProtected(_In_ ULONG Pid);
 void     BlwClearCredProtPids(void);
 void     BlwAddCredProtPid(_In_ ULONG Pid);
 BOOLEAN  BlwPidIsCredProtected(_In_ ULONG Pid);
+
+//
+// 进程退出时把该 PID 从上面三个集合里摘掉(防 PID 复用误授豁免,见 BLW_GLOBALS::PidSetLock)。
+// 由 BlwCreateProcessNotifyEx 的退出分支统一调用;内部自带无锁快速否决,与本 PID 无关时
+// 连锁都不取,故放在「每个进程退出都会走」的路径上也没有可观开销。
+//
+void     BlwRemoveTrackedPid(_In_ ULONG Pid);
 // 已封禁主体(情报确认恶意)PID 管理:命中即各回调全维拒绝其行为。护栏:绝不封 PID<=4 /
 // 本软件受保护进程 / 凭据保护进程。进程退出时由 BlwRemoveBannedPid 摘除以防 PID 复用误伤。
 void     BlwClearBannedPids(void);
@@ -586,6 +750,13 @@ void     BlwLoadPolicyFromRegistry(void);                            // 从 \Pol
 NTSTATUS BlwStartPolicyPersist(void);                    // DriverEntry 启动写回线程
 void     BlwStopPolicyPersist(void);                     // Unload:刷完脏位并等线程退出
 void     BlwMarkPolicyDirty(_In_ LONG DirtyBits);        // 标脏(可在 PASSIVE_LEVEL 调用)
+
+// 期望的服务映像路径:载入 / 写回 \Policy\ServiceImagePath。用于连接方身份校验
+// (见 BLW_GLOBALS::ServiceImageChars 与 Comms.c 的 BlwClientIsTrusted)。
+// BlwSetServiceImagePath 的签名与 Policy.c 的字符串枚举器回调一致,以便复用它。
+// 写回是同步的:只有一条短字符串,且只在 TOFU 首次记录时发生一次,不值得走去抖线程。
+void     BlwSetServiceImagePath(_In_ PCWSTR Path, _In_ USHORT Length);
+void     BlwPersistServiceImagePath(void);
 
 // Cleanup.c
 // 内核级足迹清理:以「忽略共享访问检查」读取 / POSIX 强制删除被独占锁定、已映射的文件

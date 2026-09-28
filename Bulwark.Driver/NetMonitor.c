@@ -19,8 +19,31 @@
 #ifndef NDIS_SUPPORT_NDIS6
 #define NDIS_SUPPORT_NDIS6 1
 #endif
+
+//
+// ============ 为什么这里要局部关掉 C4201 ============
+//
+// 本工程是 /W4 /WX(警告即错误)—— 那是内核驱动应有的默认:用户态漏一个未初始化变量是崩一个
+// 进程,内核里是蓝屏。但 WDK 自带的 km\ndis.h 里有 6 处「无名称的结构/联合」(C4201),
+// 而 fwpsk.h -> ndis.h 是 WFP 的必经依赖,于是本文件成了整个工程里唯一编不过的一个。
+//
+// 三种处理方式,只有一种是对的:
+//   · 全局关 /WX —— 等于为了一个系统头里的风格警告,把我们自己代码里所有真实告警一起放过去。
+//     这恰恰是原先的状态(TreatWarningAsError=false),也正因如此源码里那几处「因为 /WX 才这么写」
+//     的注释一直在防一个并未启用的条件。
+//   · 全局 /wd4201 —— 会连我们自己代码里的匿名联合一起放过,范围过宽。
+//   · 只在包含系统头的这几行 push/disable/pop —— 精确到「WDK 头里的这一类警告」,
+//     本文件后面自己的代码仍然受 /W4 /WX 约束。选它。
+//
+// 注意 push/pop 必须紧贴 include:C4201 是在【展开系统头】时报出来的,把 disable 放在
+// 函数体上方是不起作用的。
+//
+#pragma warning(push)
+#pragma warning(disable: 4201)   // nonstandard extension: nameless struct/union(WDK ndis.h)
 #include <fwpsk.h>
 #include <fwpmk.h>
+#pragma warning(pop)
+
 #include <initguid.h>
 
 // 本驱动 WFP 标识 GUID

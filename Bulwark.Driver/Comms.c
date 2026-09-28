@@ -11,8 +11,114 @@
 #include "Driver.h"
 
 //
+// ==================== 连接方身份校验 ====================
+//
+// 见 BLW_GLOBALS::ClientTrusted 处的说明:端口 ACL 只挡到「管理员 / SYSTEM」,而能在这个端口上
+// 下发的命令包含「清空内核自持基线」「以内核权限强删任意文件」「结束任意进程」。原实现对连接方
+// 零校验,等于把自我保护的拆卸开关放在了同一个门里。
+//
+// 判据(两条都要过):
+//   1) 映像文件名必须是 bulwark_service.exe —— 挡住任意工具随手抢占端口;
+//   2) 完整映像路径必须与记录过的服务路径逐字符相同。尚未记录时按 TOFU 记下这一条
+//      (仅当第 1 条也成立),并写回 \Policy 以便跨重启沿用。
+//
+// 校验失败不拒连(理由见 ClientTrusted 注释:避免路径漂移把防护静默降级成不可用),
+// 而是让 ClientTrusted 保持 FALSE,毁灭性命令随后被 BlwMessageNotify 一律拒掉。
+//
+static BOOLEAN
+BlwClientIsTrusted(void)
+{
+    PUNICODE_STRING imageName = NULL;
+    NTSTATUS status;
+    BOOLEAN trusted = FALSE;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;   // 取不到映像名 -> 不可信(fail-closed)
+    }
+
+    status = SeLocateProcessImageName(PsGetCurrentProcess(), &imageName);
+    if (!NT_SUCCESS(status) || imageName == NULL ||
+        imageName->Buffer == NULL || imageName->Length == 0) {
+        if (imageName != NULL) {
+            ExFreePool(imageName);
+        }
+        KdPrint(("[Bulwark] Client auth: cannot resolve connecting image (0x%x) -> untrusted.\n",
+                 status));
+        return FALSE;
+    }
+
+    {
+        const USHORT chars = (USHORT)(imageName->Length / sizeof(WCHAR));
+        static const BLW_NAME_ENTRY kService[] = { BLW_NAME(L"bulwark_service.exe") };
+
+        // 条件 1:文件名。
+        if (!BlwImageNameIn(kService, RTL_NUMBER_OF(kService), imageName->Buffer, chars)) {
+            KdPrint(("[Bulwark] Client auth: unexpected image name %wZ -> untrusted.\n", imageName));
+        } else {
+            const LONG known = g_Blw.ServiceImageChars;
+            if (known == 0) {
+                // 条件 2 的 TOFU 分支:第一次见到合法服务映像,记下来(内存 + 注册表)。
+                if (chars > 0 && chars < BLW_MAX_PATH) {
+                    RtlCopyMemory(g_Blw.ServiceImageBuffer, imageName->Buffer,
+                                  (SIZE_T)chars * sizeof(WCHAR));
+                    g_Blw.ServiceImageBuffer[chars] = L'\0';
+                    InterlockedExchange(&g_Blw.ServiceImageChars, (LONG)chars);
+                    BlwPersistServiceImagePath();
+                    trusted = TRUE;
+                    KdPrint(("[Bulwark] Client auth: recorded service image %wZ (TOFU).\n", imageName));
+                }
+            } else if ((USHORT)known == chars &&
+                       RtlEqualMemory(g_Blw.ServiceImageBuffer, imageName->Buffer,
+                                      (SIZE_T)chars * sizeof(WCHAR))) {
+                trusted = TRUE;
+            } else {
+                KdPrint(("[Bulwark] Client auth: image path mismatch (%wZ) -> untrusted; "
+                         "destructive commands will be refused.\n", imageName));
+            }
+        }
+    }
+
+    ExFreePool(imageName);
+    return trusted;
+}
+
+//
+// 这条命令是否属于【毁灭性】命令 —— 必须来自通过身份校验的客户端。
+//
+// 收录判据:能直接削弱防护本身、或能以内核权限造成不可逆后果的命令。普通配置下发
+// (ADD_* / SET_FILETELEMETRY / 握手 / 隔离区读取)不在此列 —— 它们只会让防护更严或纯读。
+//
+// 注意 CLEAR_* 全部在内:「清空硬拦名单」在效果上等价于「关掉这一维防护」,而它原本还会被
+// 持久化写回注册表,后果跨重启保持。
+//
+static BOOLEAN
+BlwCommandIsDestructive(_In_ ULONG Command)
+{
+    switch (Command) {
+    case BLW_CMD_CLEAR_PATHS:
+    case BLW_CMD_CLEAR_REGKEYS:
+    case BLW_CMD_CLEAR_PIDS:
+    case BLW_CMD_CLEAR_BLOCKIP:
+    case BLW_CMD_CLEAR_REGHARD:
+    case BLW_CMD_CLEAR_FILEHARD:
+    case BLW_CMD_CLEAR_MEMPROT:
+    case BLW_CMD_CLEAR_NOLOAD:
+    case BLW_CMD_CLEAR_EXECBLOCK:
+    case BLW_CMD_CLEAR_CREDPROT:
+    case BLW_CMD_CLEAR_BANNED:
+    case BLW_CMD_CLEAR_SELFGUARD:
+    case BLW_CMD_CLEAR_CMDBLOCK:
+    case BLW_CMD_FORCE_DELETE:
+    case BLW_CMD_KILL_PID:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+//
 // 用户态调用 FilterConnectCommunicationPort 时触发。
-// 记录客户端端口,标记激活。
+// 记录客户端端口,标记激活,并校验连接方身份(见 BlwClientIsTrusted)。
 //
 static NTSTATUS
 BlwConnectNotify(
@@ -26,13 +132,16 @@ BlwConnectNotify(
     UNREFERENCED_PARAMETER(ConnectionContext);
     UNREFERENCED_PARAMETER(SizeOfContext);
 
+    // 必须在置 Active 之前定下可信性:MessageNotify 一旦开始收命令就会读这个标志。
+    g_Blw.ClientTrusted = BlwClientIsTrusted();
+
     g_Blw.ClientPort = ClientPort;
     // 重新初始化端口 rundown(允许此后发送方获取保护)
     ExReInitializeRundownProtection(&g_Blw.ClientPortRundown);
     g_Blw.Active = TRUE;
     *ConnectionPortCookie = NULL;
 
-    KdPrint(("[Bulwark] User-mode service connected.\n"));
+    KdPrint(("[Bulwark] User-mode service connected (trusted=%d).\n", g_Blw.ClientTrusted));
     return STATUS_SUCCESS;
 }
 
@@ -48,6 +157,8 @@ BlwDisconnectNotify(_In_opt_ PVOID ConnectionCookie)
 
     // 先停用,阻止新的发送方进入
     g_Blw.Active = FALSE;
+    // 可信标记随连接生命周期作废 —— 下一个连接必须重新过一遍身份校验。
+    g_Blw.ClientTrusted = FALSE;
 
     // 自保护足迹随断连清除:自保是「owner-aware(仅放行本产品进程)」,而属主判定依赖运行中的
     // 受保护 PID —— 服务停了就不该再拦。清除后,更新/卸载本产品(复制新文件、删除安装目录)无需
@@ -114,6 +225,20 @@ BlwMessageNotify(
         }
         *ReturnOutputBufferLength = sizeof(BLW_HANDSHAKE_REPLY);
         return STATUS_SUCCESS;
+    }
+
+    //
+    // ==================== 毁灭性命令的身份闸门 ====================
+    //
+    // 放在【握手之后、其余一切之前】:握手必须始终可用(用户态要靠它判断布局是否一致,拒绝握手
+    // 只会让服务整体降级),而毁灭性命令必须来自通过校验的连接方。
+    //
+    // 不通过时返回 STATUS_ACCESS_DENIED 而不是 STATUS_INVALID_PARAMETER —— 后者是「旧驱动不认
+    // 这条命令」的既有语义,服务侧会据此静默降级;这里要的是明确的「拒绝」,以便在日志里区分。
+    //
+    if (BlwCommandIsDestructive(cfg.Command) && !g_Blw.ClientTrusted) {
+        KdPrint(("[Bulwark] REFUSED destructive command %u from untrusted client.\n", cfg.Command));
+        return STATUS_ACCESS_DENIED;
     }
 
     //
@@ -203,10 +328,21 @@ BlwMessageNotify(
     }
 
     switch (cfg.Command) {
+    //
+    // ============ CLEAR_* 一律【不再】写回注册表 ============
+    //
+    // 原实现在每条 CLEAR 之后也 BlwMarkPolicyDirty,于是「清空某份硬拦名单」这个动作会被
+    // 持久化 —— 一次成功的清空就把该维防护关到了下次重启之后,而磁盘上的基线也一起没了。
+    // 这把「运行期状态变更」和「持久基线」混成了一件事,放大了任何一次误清 / 恶意清空的后果。
+    //
+    // 现在的语义:【只持久化 ADD,不持久化 CLEAR】。清空只作用于当前运行期;重启后由
+    // BlwLoadPolicyFromRegistry 从磁盘基线重新载入。服务连接时的正常流程是
+    // 「CLEAR 再逐条 ADD」,ADD 仍会标脏并写回,所以最终落盘内容与配置一致 —— 也就是说
+    // 正常路径的行为不变,变的只是「只 CLEAR 不 ADD」这种异常/恶意序列不再能擦掉磁盘基线。
+    //
     case BLW_CMD_CLEAR_PATHS:
         BlwClearProtectedPaths();
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_PATHS);
-        KdPrint(("[Bulwark] Protected paths cleared.\n"));
+        KdPrint(("[Bulwark] Protected paths cleared (runtime only; disk baseline kept).\n"));
         break;
     case BLW_CMD_ADD_PATH:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -220,8 +356,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_REGKEYS:
         BlwClearProtectedRegKeys();
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_REGKEYS);
-        KdPrint(("[Bulwark] Protected reg keys cleared.\n"));
+        KdPrint(("[Bulwark] Protected reg keys cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_REGKEY:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -250,8 +385,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_REGHARD:
         BlwClearRegHardBlock();
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_REGHARD);
-        KdPrint(("[Bulwark] Reg hard-block list cleared.\n"));
+        KdPrint(("[Bulwark] Reg hard-block list cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_REGHARD:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -264,8 +398,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_FILEHARD:
         BlwClearFileHardBlock();
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_FILEHARD);
-        KdPrint(("[Bulwark] File hard-block list cleared.\n"));
+        KdPrint(("[Bulwark] File hard-block list cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_FILEHARD:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -318,8 +451,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_NOLOAD:
         BlwClearFileNoLoad();
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_NOLOAD);
-        KdPrint(("[Bulwark] No-load module list cleared.\n"));
+        KdPrint(("[Bulwark] No-load module list cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_NOLOAD:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -332,9 +464,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_CMDBLOCK:
         BlwClearCmdHardBlock();
-        // 裁决持久化:把(已清空的)命令行硬拦名单写回注册表,使清空跨重启生效。
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_CMDHARD);
-        KdPrint(("[Bulwark] Command hard-block list cleared.\n"));
+        KdPrint(("[Bulwark] Command hard-block list cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_CMDBLOCK:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
@@ -361,9 +491,7 @@ BlwMessageNotify(
         break;
     case BLW_CMD_CLEAR_EXECBLOCK:
         BlwClearFileExecBlock();
-        // 裁决持久化:把(已清空的)执行前拦截名单写回注册表,使清空跨重启生效。
-        BlwMarkPolicyDirty(BLW_POLICY_DIRTY_EXECBLOCK);
-        KdPrint(("[Bulwark] Exec-block list cleared.\n"));
+        KdPrint(("[Bulwark] Exec-block list cleared (runtime only).\n"));
         break;
     case BLW_CMD_ADD_EXECBLOCK:
         if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {

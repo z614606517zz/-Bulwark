@@ -26,6 +26,16 @@
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
     <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <!--
+      SpectreMitigation 保持 false 是【有意的】,不是漏配:
+        · 内核里 Spectre v1 缓解要求整条链(含所用的 WDK 静态库)都用 /Qspectre 编过,
+          而这套 WDK 的 spectre-mitigated 库需要在 VS 安装器里单独勾选组件;
+          缺库时开这个开关会直接链接失败,那会把「能不能出包」变成环境依赖。
+        · 本驱动的热路径不做「用不可信索引去读数组」这类推测执行可利用的模式:
+          几个名单都是定长数组 + 先判 InUse 的线性扫描,索引来自循环变量而非外部输入。
+      若将来要打开:先在 VS 安装器里加上对应 WDK spectre 库组件,再改这里并重新过一遍
+      导入表检查(BlwVerifyImportFloor)。
+    -->
     <SpectreMitigation>false</SpectreMitigation>
     <SignMode>Off</SignMode>
   </PropertyGroup>
@@ -38,7 +48,29 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <WppEnabled>false</WppEnabled>
-      <TreatWarningAsError>false</TreatWarningAsError>
+      <!--
+        ================ 为什么这里【必须】是 true ================
+
+        源码里有至少四处防御性写法,注释明确说理由是「本工程 warning-as-error,不这么写会
+        编译失败」:
+          · ProcessMonitor.c 用 MmGetSystemRoutineAddress 运行时解析 PsIsProcessCritical,
+            理由是「直接调用报 C4013,而本工程 warning-as-error,编译直接失败」;
+          · 同文件用 union 转换函数指针,理由是「MSVC 对数据指针强转函数指针报 C4055,
+            本工程把警告当错误,那条会直接让编译失败」;
+          · FileMonitor.c 的 BlwLogPattern 末尾补 UNREFERENCED_PARAMETER,理由是
+            「Release 构建里 KdPrint 是空宏,这两行避免 C4100/C4189(/WX 下会直接编译失败)」;
+          · NetMonitor.c 的 BlwBfeStateChangeFn 同理。
+
+        但这个属性一直是 false —— 也就是说那些约定在防一个并未启用的条件。两个后果:
+          1) 那些迂回写法看起来是无谓的复杂度,后来者很可能「简化」掉,而它们各自都在解决
+             真实的可移植性/加载失败问题(见各处注释);
+          2) 更要紧的是反过来:内核代码里真正的告警(未初始化变量、类型截断、缺 return)
+             会静默通过。用户态出这类问题是崩一个进程,内核里是蓝屏。
+
+        Level4 + WX 是内核驱动应有的默认。若某处确有无法消除的告警,应在该文件局部
+        #pragma warning(suppress: ...) 并写明理由,而不是全局关掉。
+      -->
+      <TreatWarningAsError>true</TreatWarningAsError>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <!--

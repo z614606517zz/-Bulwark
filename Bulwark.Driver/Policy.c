@@ -310,8 +310,63 @@ BlwLoadPolicyFromRegistry(void)
     // 复用字符串名单枚举器,逐条交给 BlwAddKnownBadHex 解析入集合。
     BlwApplyStringList(hKey, L"KnownBadSha256",   BlwAddKnownBadHex);
 
+    // 连接方身份校验用的期望服务映像路径(单条 REG_MULTI_SZ,复用同一个枚举器)。
+    // 缺失 = 尚未记录,首次有合法客户端连接时按 TOFU 记下(见 Comms.c 的 BlwClientIsTrusted)。
+    BlwApplyStringList(hKey, L"ServiceImagePath", BlwSetServiceImagePath);
+
     ZwClose(hKey);
     KdPrint(("[Bulwark] Policy baseline loaded from registry.\n"));
+}
+
+//
+// 记录期望的服务映像路径(供 BlwApplyStringList 复用同一签名)。只接受第一条非空项。
+//
+void
+BlwSetServiceImagePath(_In_ PCWSTR Path, _In_ USHORT Length)
+{
+    if (Path == NULL || Length == 0 || Length >= BLW_MAX_PATH) {
+        return;
+    }
+    if (g_Blw.ServiceImageChars != 0) {
+        return;   // 已有记录,忽略多余项
+    }
+    RtlCopyMemory(g_Blw.ServiceImageBuffer, Path, (SIZE_T)Length * sizeof(WCHAR));
+    g_Blw.ServiceImageBuffer[Length] = L'\0';
+    InterlockedExchange(&g_Blw.ServiceImageChars, (LONG)Length);
+    KdPrint(("[Bulwark] Policy: expected service image loaded (%u chars).\n", Length));
+}
+
+//
+// 把已记录的服务映像路径写回 \Policy\ServiceImagePath。仅 TOFU 首次记录时调用一次。
+//
+void
+BlwPersistServiceImagePath(void)
+{
+    HANDLE hKey = NULL;
+    const LONG chars = g_Blw.ServiceImageChars;
+
+    if (chars <= 0 || chars >= BLW_MAX_PATH) {
+        return;
+    }
+    if (!NT_SUCCESS(BlwOpenOrCreatePolicyKey(TRUE, &hKey)) || hKey == NULL) {
+        return;
+    }
+    {
+        UNICODE_STRING valName;
+        // REG_MULTI_SZ:一条字符串 + 结尾双 NUL。
+        const ULONG cb = (ULONG)((chars + 2) * sizeof(WCHAR));
+        PWCH data = (PWCH)BlwAllocPool(PagedPool, cb, BLW_TAG);
+        if (data != NULL) {
+            RtlCopyMemory(data, g_Blw.ServiceImageBuffer, (SIZE_T)chars * sizeof(WCHAR));
+            data[chars] = L'\0';
+            data[chars + 1] = L'\0';
+            RtlInitUnicodeString(&valName, L"ServiceImagePath");
+            ZwSetValueKey(hKey, &valName, 0, REG_MULTI_SZ, data, cb);
+            ExFreePoolWithTag(data, BLW_TAG);
+            KdPrint(("[Bulwark] Policy: persisted expected service image path.\n"));
+        }
+    }
+    ZwClose(hKey);
 }
 
 //
