@@ -81,14 +81,6 @@ public:
     std::function<void()>                                    updateDownloadRequested;
     // 就地应用已下载的更新。同样是异步的:要重新校验三个 PE 的签名并做文件替换。
     std::function<void()>                                    updateApplyRequested;
-    // ---- 磁盘垃圾清理。两者都是【异步】的:要遍历 %TEMP% / 浏览器缓存这类动辄数万文件的
-    //      目录,秒级到十几秒。宿主在后台线程做完后经 sendJunkScan / sendJunkClean 回推,
-    //      中途用 sendJunkProgress 报进度 —— 与取证查询、进程列表、在线更新同一约定。----
-    std::function<void(const bulwark::ipc::JunkScanRequestPayload&)>  junkScanRequested;
-    std::function<void(const bulwark::ipc::JunkCleanRequestPayload&)> junkCleanRequested;
-    // 大文件查找。同样异步(要遍历整块磁盘)。注意【没有对应的删除回调】—— 本功能纯只读,
-    // 界面只提供「打开所在位置」,详见 JunkCleaner.h 里 LargeFileScanner 的说明。
-    std::function<void(const bulwark::ipc::LargeFileScanRequestPayload&)> largeFileScanRequested;
     std::function<void(int)>                                 uiProcessConnected;
 
     // ---- 服务 -> UI 广播 ----
@@ -114,11 +106,6 @@ public:
     void sendUpdateProgress(const bulwark::ipc::UpdateProgressPayload& payload);            // UpdateProgressNotification
     void sendUpdateDownloadResult(const bulwark::ipc::UpdateDownloadResponsePayload& p);    // UpdateDownloadResponse
     void sendUpdateApplyResult(const bulwark::ipc::UpdateApplyResponsePayload& p);          // UpdateApplyResponse
-    // 磁盘垃圾清理的异步回推(同上,须在主线程调用)。
-    void sendJunkScan(const bulwark::ipc::JunkScanResponsePayload& payload);                // JunkScanResponse
-    void sendJunkClean(const bulwark::ipc::JunkCleanResponsePayload& payload);              // JunkCleanResponse
-    void sendJunkProgress(const bulwark::ipc::JunkProgressPayload& payload);                // JunkProgressNotification
-    void sendLargeFileScan(const bulwark::ipc::LargeFileScanResponsePayload& payload);      // LargeFileScanResponse
 
     // 主动推送最新快照(改动后回推,UI 无需再请求)。
     void sendRules();
@@ -142,6 +129,10 @@ private slots:
 private:
     void broadcast(const bulwark::ipc::IpcMessage& msg);
     void handleLine(QLocalSocket* sock, const QString& line);
+
+    // 单帧(一行 JSON)字节上限。真实请求里最大的是规则/信任名单批量下发,量级在几十 KB;
+    // 4 MB 留了两个数量级的余量,同时让「只发数据不发换行符」的客户端撑不垮服务。
+    static constexpr int kMaxFrameBytes = 4 * 1024 * 1024;
 
     QLocalServer* server_ = nullptr;
     QHash<QLocalSocket*, QByteArray> buffers_; // 每连接的行缓冲(仅【已通过认证】的连接入表)

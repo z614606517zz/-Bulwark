@@ -1385,7 +1385,8 @@ std::optional<QJsonObject> AttackChainFeed::fetchTable() {
     if (grade == QLatin1String("hard") || grade == QLatin1String("strong"))
         url += QStringLiteral("&min_grade=") + grade;
 
-    const auto res = reputation::ReputationCurl::get(url, {}, timeout);
+    // 自有端点(攻击链组合表来自同一台服务器):走 Pinned 私有信任锚。
+    const auto res = reputation::ReputationCurl::get(url, {}, timeout, reputation::TlsMode::Pinned);
     if (res.first != 200) {
         log_.info(QStringLiteral("攻击链组合表拉取失败:%1 返回 HTTP %2(保持现有表)。")
                       .arg(maskedUrl_).arg(res.first));

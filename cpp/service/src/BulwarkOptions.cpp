@@ -300,16 +300,6 @@ void bindUpdate(const QJsonObject& o, UpdateOptions& u) {
     bindStrList(o, "AllowedThumbprints", u.AllowedThumbprints);
 }
 
-void bindDiskCleanup(const QJsonObject& o, DiskCleanupOptions& d) {
-    bindBool(o, "Enabled", d.Enabled);
-    bindInt(o, "MinFileAgeHours", d.MinFileAgeHours);
-    bindInt(o, "MaxFilesPerCategory", d.MaxFilesPerCategory);
-    bindInt(o, "MaxSeconds", d.MaxSeconds);
-    // 注意这里【只】绑定排除表,没有「包含表」——清理范围写死在 JunkCleaner 的类别表里,
-    // 配置只能让范围变小。见 DiskCleanupOptions 的说明。
-    bindStrList(o, "ExcludePaths", d.ExcludePaths);
-}
-
 void bindReputationProxy(const QJsonObject& o, ReputationProxyOptions& p) {
     bindStr(o, "BaseUrl", p.BaseUrl);
     bindStr(o, "BaseUrlObfuscated", p.BaseUrlObfuscated);
@@ -382,9 +372,15 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindReputationProxy(sub("ReputationProxy"), ReputationProxy);
     bindAttackChain(sub("AttackChainEngine"), AttackChainEngine);
     bindUpdate(sub("Update"), Update);
-    bindDiskCleanup(sub("DiskCleanup"), DiskCleanup);
     bindAi(sub("Ai"), Ai);
     bindEtw(sub("Etw"), Etw);
+    {
+        // 自有端点的 TLS 信任锚。两项都留空 = 按公网 CA 完整校验(最严的默认值),
+        // 故本段缺失时行为是安全的,不需要任何兜底逻辑。
+        const QJsonObject t = sub("SelfHostedTls");
+        bindStr(t, "CaBundlePath", SelfHostedTls.CaBundlePath);
+        bindStrList(t, "PinnedPublicKeys", SelfHostedTls.PinnedPublicKeys);
+    }
     return true;
 }
 

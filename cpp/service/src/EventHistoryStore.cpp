@@ -36,6 +36,7 @@ struct EventHistoryStore::Impl {
     std::thread worker;
     bool disposed = false;
     bool clearRequested = false;           // clear() 请求;由写线程截断文件(单线程持有文件)
+    quint64 droppedRecords = 0;            // 因落盘队列满而丢弃的记录数(取证缺口,必须可见)
 
     Impl() {
         const QString dir = QDir(programDataDir()).filePath(QStringLiteral("history"));
@@ -82,7 +83,22 @@ struct EventHistoryStore::Impl {
             std::lock_guard<std::mutex> lk(mutex);
             buffer.push_back(payload);
             while (static_cast<int>(buffer.size()) > kMaxRecords) buffer.pop_front();
-            if (queue.size() < kQueueCapacity) queue.push_back(line); // else drop newest
+            if (queue.size() < kQueueCapacity) {
+                queue.push_back(line);
+            } else {
+                // 落盘队列满 -> 丢弃本条。这是【取证轨迹的缺口】,不能静默发生:
+                // 事件历史与审计日志按设计「不参与折叠」,就是为了让事后追溯能相信它是完整的。
+                // 静默丢弃会让人对着一份有洞的时间线做判断,却不知道有洞。
+                // 计数 + 首次与每 1000 条记一条日志(不能每条都记 —— 那会在同一个突发里
+                // 再放大一轮 IO,把问题变严重)。
+                ++droppedRecords;
+                if (droppedRecords == 1 || droppedRecords % 1000 == 0) {
+                    Logger(QStringLiteral("bulwark.service.EventHistory"))
+                        .warning(QStringLiteral("事件历史落盘队列已满(容量 %1),累计丢弃 %2 条记录 —— "
+                                                "取证时间线在此期间不完整")
+                                     .arg(kQueueCapacity).arg(droppedRecords));
+                }
+            }
         }
         cv.notify_one();
     }

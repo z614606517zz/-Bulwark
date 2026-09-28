@@ -47,9 +47,15 @@ bool IpcServer::start() {
 }
 
 void IpcServer::stop() {
-    for (auto it = buffers_.constBegin(); it != buffers_.constEnd(); ++it)
-        it.key()->disconnectFromServer();
+    // 先取键快照再清表,然后才断开。
+    //
+    // 原实现是「边遍历 buffers_ 边 disconnectFromServer()」:那个调用可以【同步】发出
+    // disconnected,进而走到 onDisconnected() 里的 buffers_.remove(sock) —— 正在遍历的
+    // 迭代器就地失效,是未定义行为。停服务是每次升级/重启都走的路径,不是边角情况。
+    const QList<QLocalSocket*> socks = buffers_.keys();
     buffers_.clear();
+    for (QLocalSocket* sock : socks)
+        if (sock) sock->disconnectFromServer();
     if (server_) server_->close();
 }
 
@@ -94,6 +100,16 @@ void IpcServer::onReadyRead() {
         buf.remove(0, nl + 1);
         const QString line = QString::fromUtf8(lineBytes).trimmed();
         if (!line.isEmpty()) handleLine(sock, line);
+    }
+    // 帧长上限。协议是「一行一条 JSON」,分帧只靠 '\n',所以一个不发换行符的客户端会让
+    // 这个缓冲区一直长下去 —— 普通权限进程即可把一个以 SYSTEM 运行的防护服务撑到分配
+    // 失败,防护随之下线。管道的 DACL 按设计是放开给普通用户的(见构造函数说明),所以
+    // 这里必须自己设界:超限即判定为畸形/恶意客户端并断开,而不是继续陪它涨。
+    if (buf.size() > kMaxFrameBytes) {
+        log().warning(QStringLiteral("控制管道客户端单帧超过 %1 字节仍无换行符,已断开该连接(疑似畸形或恶意客户端)")
+                          .arg(kMaxFrameBytes));
+        buf.clear();
+        sock->disconnectFromServer();
     }
 }
 
@@ -328,49 +344,6 @@ void IpcServer::handleLine(QLocalSocket* /*sock*/, const QString& line) {
                 break;
             }
 
-            // ---- 磁盘垃圾清理:异步 —— 宿主后台遍历,算完经 sendJunkScan / sendJunkClean 回推。
-            //      未绑定回调时【立刻】回一条 enabled=false / success=false 的结论,而不是什么都
-            //      不发 —— 后者会让界面一直停在「正在扫描…」,用户无从判断是没这功能还是卡住了。
-            case IpcMessageType::JunkScanRequest: {
-                const auto req = JunkScanRequestPayload::fromJson(msg->payloadObject());
-                if (junkScanRequested) {
-                    junkScanRequested(req);
-                } else {
-                    JunkScanResponsePayload res;
-                    res.requestId = req.requestId;
-                    res.enabled = false;
-                    res.message = QString::fromUtf8("本服务未启用磁盘垃圾清理。");
-                    sendJunkScan(res);
-                }
-                break;
-            }
-            case IpcMessageType::JunkCleanRequest: {
-                const auto req = JunkCleanRequestPayload::fromJson(msg->payloadObject());
-                if (junkCleanRequested) {
-                    junkCleanRequested(req);
-                } else {
-                    JunkCleanResponsePayload res;
-                    res.requestId = req.requestId;
-                    res.success = false;
-                    res.message = QString::fromUtf8("本服务未启用磁盘垃圾清理。");
-                    sendJunkClean(res);
-                }
-                break;
-            }
-            case IpcMessageType::LargeFileScanRequest: {
-                const auto req = LargeFileScanRequestPayload::fromJson(msg->payloadObject());
-                if (largeFileScanRequested) {
-                    largeFileScanRequested(req);
-                } else {
-                    LargeFileScanResponsePayload res;
-                    res.requestId = req.requestId;
-                    res.enabled = false;
-                    res.message = QString::fromUtf8("本服务未启用大文件查找。");
-                    sendLargeFileScan(res);
-                }
-                break;
-            }
-
             // ---- 事件时间线(取证回溯):异步 —— 宿主后台扫历史,算完经 sendTimeline 回推 ----
             case IpcMessageType::EventTimelineRequest: {
                 const auto req = TimelineRequestPayload::fromJson(msg->payloadObject());
@@ -563,22 +536,6 @@ void IpcServer::sendUpdateDownloadResult(const UpdateDownloadResponsePayload& p)
 
 void IpcServer::sendUpdateApplyResult(const UpdateApplyResponsePayload& p) {
     broadcast(IpcMessage::from(IpcMessageType::UpdateApplyResponse, p));
-}
-
-void IpcServer::sendJunkScan(const JunkScanResponsePayload& payload) {
-    broadcast(IpcMessage::from(IpcMessageType::JunkScanResponse, payload));
-}
-
-void IpcServer::sendJunkClean(const JunkCleanResponsePayload& payload) {
-    broadcast(IpcMessage::from(IpcMessageType::JunkCleanResponse, payload));
-}
-
-void IpcServer::sendJunkProgress(const JunkProgressPayload& payload) {
-    broadcast(IpcMessage::from(IpcMessageType::JunkProgressNotification, payload));
-}
-
-void IpcServer::sendLargeFileScan(const LargeFileScanResponsePayload& payload) {
-    broadcast(IpcMessage::from(IpcMessageType::LargeFileScanResponse, payload));
 }
 
 // 未绑定回调时回一个 enabled=false 的空负载 —— UI 据此显示「引擎未启用」而不是空白页。

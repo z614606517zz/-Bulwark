@@ -1,5 +1,6 @@
 #include "bulwark/service/BaselineStore.h"
 #include "bulwark/service/Logger.h"
+#include "bulwark/service/AtomicFile.h"
 #include "bulwark/json/JsonSupport.h"
 
 #include <QDir>
@@ -71,14 +72,15 @@ void BaselineStore::save(const BaselineSnapshot& snapshot) {
     root["programs"] = progs;
     const QByteArray bytes = QJsonDocument(root).toJson(QJsonDocument::Compact);
 
-    // 原子保存:先写 .tmp 再替换,避免中途崩溃留下半截文件。
-    const QString tmp = path_ + QStringLiteral(".tmp");
-    QFile tf(tmp);
-    if (!tf.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
-    tf.write(bytes);
-    tf.close();
-    QFile::remove(path_);
-    if (!QFile::rename(tmp, path_)) QFile::remove(tmp);
+    // 真正的原子保存。原实现的注释说的是「先写 .tmp 再替换」,做的却是
+    //   write(tmp) -> remove(path_) -> rename(tmp, path_)
+    // 也就是【先把好文件删掉】,再指望改名成功;改名失败时还顺手把 tmp 也删了,两份都没。
+    // 而且 tf.write() 的返回值没人看,磁盘满 / 配额不足时会静默写出半截 JSON,下次启动
+    // 解析失败 = 基线清零,「偏离自身历史基线」这条检测要重新经历学习期。
+    // 这个函数每 5 分钟被定时器调一次、退出时还要再调一次,不是边角路径。
+    if (!writeFileAtomically(path_, bytes, QStringLiteral("行为基线")))
+        Logger(QStringLiteral("bulwark.service.BaselineStore"))
+            .warning(QStringLiteral("行为基线落盘失败,内存态仍有效:%1").arg(path_));
 }
 
 } // namespace bulwark::service

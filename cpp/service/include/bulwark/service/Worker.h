@@ -90,6 +90,10 @@ public:
     // 延迟的硬上限,原实现没有它,一条事件就能把流水线堵住二十多秒。
     void setInlineReputationBudgetMs(int ms) { inlineRepBudgetMs_ = ms; }
 
+    // 把「防护总开关」的当前值发布给后台兜底扫描线程。主线程每次应用设置后调用一次。
+    // 见 sweepProtectionEnabled_ 的说明:后台线程不能直接读那个会被整体赋值的结构体。
+    void publishProtectionEnabled(bool enabled) { sweepProtectionEnabled_.store(enabled); }
+
     // 注入 ECS 告警导出器(appsettings 的 ExportEcsAlerts 开启时才由 main 构造并注入)。
     // 为空则不导出。此前 AlertExporter / EcsAlertFormatter / ExportEcsAlerts 三者互相引用但
     // 没有任何外部入口,整条 SIEM 导出链是死的 —— 这个 setter 是它接入产品的唯一途径。
@@ -109,6 +113,14 @@ public:
     // 信誉缓存判恶意)比对,漏网的补封禁+结束+隔离 —— 防实时链路漏检(遥测丢包 / 云端确认迟到 /
     // 进程在防护启动前就在跑)。由 main 在接线完成后调用。
     void startMaliciousSweep();
+
+    // 登记「本产品自身」的目录(安装目录 + %ProgramData%\Bulwark\),供兜底扫描与
+    // 「拦截时隔离」的免扫判定使用。
+    //
+    // 【为什么必须由 main 显式登记,而不是在函数里判断名字】原实现用 path.contains("bulwark")
+    // 判定「是不是本产品」,于是任何路径里带这个子串的文件都免于兜底扫描与隔离 —— 建一个
+    // 名叫 bulwark 的目录就能让样本躲过最后一道网。真实路径只有 main 知道,所以只能由它传进来。
+    static void setSelfExemptDirs(const QStringList& dirs);
 
     // 手动强制隔离某文件(UI 在清理报告里点「重试隔离」)。
     // 转发到 ThreatRemediator::forceQuarantine —— 那个方法原本无人调用,而 main 里另写了一份
@@ -195,6 +207,10 @@ private:
     void rememberMaliciousHash(const QString& sha256);                    // 线程安全登记已确认恶意哈希(小写)
     void seedMaliciousHashesFromRules();                                  // 启动时从引擎规则 seed(含持久化记忆哈希)
     static bool isSweepExemptPath(const QString& path);                   // 系统目录/本软件 -> 免扫
+    // 免扫目录集合(安装目录 + 数据目录),由 main 启动时登记。static 是因为 isSweepExemptPath
+    // 本身是 static(sweep 线程与 maybeQuarantineOnBlock 都要用它,且不持有 Worker 实例)。
+    static QStringList s_sweepExemptDirs;
+    static QMutex s_sweepExemptMx;
 
     // 网络外联 IP 情报互证(后台限流查询 + 恶意即补偿):合格外联入队 -> 后台查微步 IP 信誉 ->
     // 确认恶意再编组回主线程做补偿处置(结束外联进程树)。仅可疑外联才查(保护极低月配额)。
@@ -287,7 +303,11 @@ private:
     // 供超时巡检与超量驱逐共用,保证两条路径的处置与记录完全一致。
     void resolvePromptByDefault(const bulwark::SecurityEvent& e, const QString& why);
 
-    QHash<QUuid, bulwark::SecurityEvent> aiPending_; // 已请求 UI AI 研判、等待回执的事件
+    // 已请求 UI AI 研判、等待回执的事件。上限 + 按最旧优先逐条淘汰(不是超限清空 ——
+    // 清空会把 UI 正要回「恶意」的那些结论一起丢掉,见 onEvent 里 aiPendingOrder_ 处的说明)。
+    static constexpr int kMaxAiPending = 256;
+    QHash<QUuid, bulwark::SecurityEvent> aiPending_;
+    QQueue<QUuid> aiPendingOrder_;   // 插入顺序台账(QHash 无序,没有它做不到「淘汰最旧」)
     Logger log_{QStringLiteral("Worker")};
 
     // ---- 零风险放行的文本日志折叠 ----
@@ -334,6 +354,11 @@ private:
     QQueue<IpJob> ipQueue_;
     QSet<QString> ipInflight_;                                             // 在途去重(ip)
     QHash<QString, QPair<bulwark::ReputationVerdict, QDateTime>> ipCache_; // 结果强缓存
+    // ipCache_ 的上限。TTL 只在【读】的时候判,过期条目从不被删除,所以没有这道闸时这张表
+    // 是单调增长的(旁边的 ipQueue_/vtQueue_ 都有 kIpQueueMax/kVtQueueMax,只有它漏了)。
+    // 长时间运行 + 外联目标多的机器上,这就是一处稳定的内存泄漏。
+    static constexpr int kIpCacheMax = 4096;
+    void pruneIpCacheLocked();   // 调用方须已持有 ipMx_
 
     // ---- 双击 / 释放载荷 VirusTotal 病毒扫描后台 worker ----
     reputation::VirusTotalClient* vt_ = nullptr;
@@ -356,13 +381,26 @@ private:
     QSet<QUuid> vtQueuedIds_;    // 入队时已推「排队中」卡片的扫描 id;命中去重短路时据此用缓存结论收尾该卡片
 
     // ---- 内存防护 VT 验证(限流) ----
-    QMutex memVtMx_;                        // 保护 memVtCachedMalicious_
+    static constexpr int kMemVtCacheMax   = 1024; // 已确认恶意哈希缓存上限
+    static constexpr int kMemVtCacheEvict = 128;  // 超限时一次淘汰多少条(最早进来的)
+    QMutex memVtMx_;                        // 保护 memVtCachedMalicious_ / memVtCacheOrder_
     reputation::TokenBucket memVtBucket_;    // MemoryProtectionVtVerifyPerHour 限流
     QSet<QString> memVtCachedMalicious_;     // 已确认恶意的哈希缓存(避免重复查)
+    // 插入顺序台账。QSet 自身没有顺序(Qt6 每进程随机化桶序),没有这份台账就做不到
+    // 「淘汰最早的」—— 原实现从 begin() 删 N 条,删掉的是任意一批,可能正是刚确认的那条。
+    QQueue<QString> memVtCacheOrder_;
 
     // ---- 兜底扫描后台 worker ----
     std::thread sweepWorker_;
     std::atomic<bool> sweepRunning_{false};
+    // 总开关的【无锁镜像】,供 sweep 线程读取。
+    //
+    // sweepLoop 原先直接读 settings_->protectionEnabled。settings_ 指向 main 里的那个
+    // RuntimeSettings,而主线程在 ipc.settingsUpdated 里对它整体赋值(settings = updated)。
+    // RuntimeSettings 内含 QString / QStringList,整体拷贝赋值不是原子操作 —— 与后台线程
+    // 的并发读构成实打实的数据竞争(读到半更新的 QString 内部指针即崩溃或读脏)。
+    // 主线程每次应用设置时调 publishProtectionEnabled(),后台线程只读这个 atomic。
+    std::atomic<bool> sweepProtectionEnabled_{true};
     QMutex maliciousHashMx_;                  // 保护 confirmedMaliciousHashes_
     QSet<QString> confirmedMaliciousHashes_;  // 已确认恶意 SHA-256(小写):sweep 线程只读 + 主线程写
 };

@@ -48,8 +48,14 @@ void RuleStore::save(const QVector<bulwark::DefenseRule>& rules) {
     }
     // 原子落盘:规则库里有用户的加白项,一次截断写就能把它们全弄丢(见 AtomicFile.h)。
     // 环境性写入失败(权限/占用)不应崩溃:内存规则仍生效,仅本次不落盘。
-    writeFileAtomically(path_, QJsonDocument(arr).toJson(QJsonDocument::Indented),
-                        QStringLiteral("规则库"));
+    // 但【必须报出来】:失败时用户已经看到「已加入文件信任」的提示了(main.cpp 在调用本函数
+    // 之前就记了那条日志),重启后加白却消失 —— 表现正是"加白不生效、时不时还拦"。
+    if (!writeFileAtomically(path_, QJsonDocument(arr).toJson(QJsonDocument::Indented),
+                             QStringLiteral("规则库"))) {
+        Logger(QStringLiteral("bulwark.service.RuleStore"))
+            .error(QStringLiteral("规则库落盘失败,本次规则/信任项变更仅在内存中生效,重启后将丢失:%1")
+                       .arg(path_));
+    }
 }
 
 } // namespace bulwark::service

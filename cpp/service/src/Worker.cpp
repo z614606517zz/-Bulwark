@@ -470,9 +470,16 @@ void Worker::onEvent(const SecurityEvent& incoming) {
     if (!skipDetection && e.type == bulwark::EventType::ProcessCreate && v.action != VerdictAction::Block
         && settings_ && settings_->aiGrayZoneConsultEnabled && settings_->aiConfigured()
         && shouldAiScan(e)) {
-        if (aiPending_.size() > 256)
-            aiPending_.clear(); // 有界:UI 未回执也不无限增长
+        // 有界:UI 未回执也不无限增长。
+        //
+        // 原实现是超限就 aiPending_.clear() —— 一次把【全部】在途研判请求丢光,包括那些
+        // UI 正要回「恶意」的。onAiScanResponse 找不到 id 会直接早退,于是那些结论静默丢失。
+        // 旁边的 pending_(弹窗)早就是按最旧优先逐条淘汰的,这里照同一口径来:只挤掉最旧的
+        // 那几条,而不是清空。
+        while (aiPending_.size() >= kMaxAiPending && !aiPendingOrder_.isEmpty())
+            aiPending_.remove(aiPendingOrder_.dequeue());
         aiPending_.insert(e.id, e);
+        aiPendingOrder_.enqueue(e.id);
         ipc_->requestAiScan(e);
     }
 
@@ -1116,7 +1123,32 @@ bool Worker::abortIfTrustedNow(const SecurityEvent& e, const QString& stage) {
 std::pair<bool, QString> Worker::forceQuarantine(const QString& path) {
     if (!remediator_)
         return { false, QStringLiteral("清理器不可用(隔离区未就绪)") };
-    const std::pair<bool, QString> r = remediator_->forceQuarantine(path);
+
+    const QString p = path.trimmed();
+    if (p.isEmpty())
+        return { false, QStringLiteral("未提供文件路径") };
+
+    // 这条路径是【用户从 UI 点「重试隔离」】进来的,原先一道护栏都没有:IPC 侧只检查了
+    // 路径非空,这里直接转发给清理器。而隔离失败会回退到 MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)
+    // ——以 SYSTEM 身份的"重启后删除任意文件"。也就是说一条任意路径就能让下次开机时删掉
+    // 系统文件,把机器搞成起不来。自动处置路径(maybeQuarantineOnBlock)本来就有三道护栏,
+    // 唯独这条用户触发的没有。
+    //
+    // 这里补上其中【与"别把系统搞坏"直接相关】的部分,刻意不加"已加白就拒绝"那道:
+    // 用户明确点了重试隔离,那是他自己的意图,不该被自己先前的加白挡住。
+    //
+    // 注意不能拿 TrustPolicy::isHealthySigned 来当这里的签名护栏:那个判据读的是
+    // SecurityEvent 上【富化之后】的签名字段(它的注释也写明"需在 ThreatDetector::analyze
+    // 之后调用")。本函数只有一个路径,临时造一个空事件传进去会恒定返回"未签名",
+    // 那就是一道看着像护栏、实际永不生效的死代码。要按路径判就得用按路径验签的接口。
+    if (isSweepExemptPath(p))
+        return { false, QStringLiteral("拒绝隔离:该路径属于系统目录或本产品自身,隔离它会破坏系统或防护自身") };
+    // 按路径验签(嵌入式 + catalog)。带可信签名的文件本体几乎不会是载荷 —— 拦下来的通常是
+    // LOLBin 的【用法】,把 powershell.exe 本体搬进隔离区是灾难性误伤。
+    if (ProcessInspector::isSigned(p))
+        return { false, QStringLiteral("拒绝隔离:该文件持有可信数字签名,隔离文件本体属于误伤(拦截的是行为,不是文件)") };
+
+    const std::pair<bool, QString> r = remediator_->forceQuarantine(p);
     if (r.first)
         ipc_->sendQuarantineList();   // 成功即回推,隔离区页面无需再请求
     return r;
@@ -1234,9 +1266,18 @@ void Worker::reconcileKernelBlocksAfterTrust() {
         if (!t.isEmpty())
             trustedNeedles << t;
     }
+    // 只保留【与内核匹配语义一致】的那一个方向。
+    //
+    // 内核按「加白路径(去盘符)包含该条目子串」来挡人,所以判据就是 t.contains(entry)。
+    // 原实现还额外或上了反向的 entry.contains(t) —— 那个方向不对应任何内核行为,只会误伤:
+    // 目录信任被 chop("\*") 后留下的是很短的针(例如 "\users\bob\"),几乎任何一条位于该
+    // 目录下的内核「禁止执行」条目都会被它反向包含,于是【已确认恶意】的映像被当成
+    // 「会挡住加白程序」而从名单里删掉 —— 加白一个目录等于给该目录下所有已封禁恶意体解禁。
     auto wouldBlockTrusted = [&trustedNeedles](const QString& entry) {
+        if (entry.isEmpty())
+            return false;
         for (const QString& t : trustedNeedles)
-            if (t.contains(entry, Qt::CaseInsensitive) || entry.contains(t, Qt::CaseInsensitive))
+            if (t.contains(entry, Qt::CaseInsensitive))
                 return true;
         return false;
     };
@@ -1616,6 +1657,15 @@ void Worker::onAiScanResponse(const bulwark::ipc::AiScanResponsePayload& resp) {
         return; // 未知/手动扫描回执:服务未追踪,忽略
     const SecurityEvent e = it.value();
     aiPending_.erase(it);
+    // 顺序台账里同 id 的记录已失效。逐个查找删除代价太高(QQueue 是线性容器),改为攒到
+    // 一定量再整体压实:只保留仍在 aiPending_ 里的 id,顺序不变。
+    if (aiPendingOrder_.size() > 4 * kMaxAiPending) {
+        QQueue<QUuid> live;
+        for (const QUuid& id : aiPendingOrder_)
+            if (aiPending_.contains(id))
+                live.enqueue(id);
+        aiPendingOrder_.swap(live);
+    }
 
     // 把 AI 研判视为对该观测事件的灰区会诊,按 AiDecisionPolicy 折叠:恶意 -> 补偿处置。
     const bulwark::engine::AiDecisionPolicy::Outcome outcome =
@@ -1766,24 +1816,62 @@ void Worker::ipConsumeLoop() {
             job = ipQueue_.dequeue();
         }
 
-        const bulwark::IpReputation rep = ipIntel_->queryIp(job.ip); // 阻塞:限流 + 一次 curl
-        {
+        // 同 vtScanLoop:异常逸出线程函数 = std::terminate = 防护服务整体死亡。
+        // queryIp 内部有限流等待与一次 curl 调用,不是不会抛的代码。
+        try {
+            const bulwark::IpReputation rep = ipIntel_->queryIp(job.ip); // 阻塞:限流 + 一次 curl
+            {
+                QMutexLocker lk(&ipMx_);
+                ipInflight_.remove(job.ip);
+                if (rep.querySucceeded) // 失败不缓存(下次可重试),与 .NET fail-open 一致
+                    ipCache_.insert(job.ip, { rep.verdict, QDateTime::currentDateTimeUtc() });
+                pruneIpCacheLocked();
+            }
+
+            if (rep.querySucceeded && rep.verdict == bulwark::ReputationVerdict::Malicious) {
+                const bulwark::SecurityEvent ev = job.e;
+                const QString ip = job.ip;
+                const QString label = rep.threatLabel;
+                // 编组回主线程处置(碰 IPC/进程操作须在主线程,与其它引擎变更串行)。
+                QMetaObject::invokeMethod(
+                    this, [this, ev, ip, label] { onEgressMalicious(ev, ip, label); },
+                    Qt::QueuedConnection);
+            }
+        } catch (const std::exception& ex) {
+            QMutexLocker lk(&ipMx_);
+            ipInflight_.remove(job.ip);   // 否则该 IP 永久卡在「在途」,再也不查
+            log_.error(QStringLiteral("IP 情报线程异常(已忽略本次任务 %1):%2")
+                           .arg(job.ip, QString::fromUtf8(ex.what())));
+        } catch (...) {
             QMutexLocker lk(&ipMx_);
             ipInflight_.remove(job.ip);
-            if (rep.querySucceeded) // 失败不缓存(下次可重试),与 .NET fail-open 一致
-                ipCache_.insert(job.ip, { rep.verdict, QDateTime::currentDateTimeUtc() });
-        }
-
-        if (rep.querySucceeded && rep.verdict == bulwark::ReputationVerdict::Malicious) {
-            const bulwark::SecurityEvent ev = job.e;
-            const QString ip = job.ip;
-            const QString label = rep.threatLabel;
-            // 编组回主线程处置(碰 IPC/进程操作须在主线程,与其它引擎变更串行)。
-            QMetaObject::invokeMethod(
-                this, [this, ev, ip, label] { onEgressMalicious(ev, ip, label); },
-                Qt::QueuedConnection);
+            log_.error(QStringLiteral("IP 情报线程未知异常(已忽略本次任务 %1)").arg(job.ip));
         }
     }
+}
+
+// 先按 TTL 清掉真正过期的条目;若仍超上限,再按时间戳丢最旧的一批。
+// 只在插入后调用,复杂度与表大小同阶但触发很稀疏(每次外联查询一次 TTL 扫描)。
+void Worker::pruneIpCacheLocked() {
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    for (auto it = ipCache_.begin(); it != ipCache_.end();) {
+        if (it.value().second.msecsTo(now) >= kIpIntelCacheTtlMs)
+            it = ipCache_.erase(it);
+        else
+            ++it;
+    }
+    if (ipCache_.size() <= kIpCacheMax)
+        return;
+    // 仍超限(TTL 内的活跃条目就很多):按时间戳升序丢掉最旧的,保留最近的 kIpCacheMax 条。
+    QList<QPair<QDateTime, QString>> byAge;
+    byAge.reserve(ipCache_.size());
+    for (auto it = ipCache_.constBegin(); it != ipCache_.constEnd(); ++it)
+        byAge.append({ it.value().second, it.key() });
+    std::sort(byAge.begin(), byAge.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    const int drop = ipCache_.size() - kIpCacheMax;
+    for (int i = 0; i < drop; ++i)
+        ipCache_.remove(byAge.at(i).second);
 }
 
 void Worker::onEgressMalicious(const bulwark::SecurityEvent& e, const QString& ip, const QString& label) {
@@ -2180,9 +2268,19 @@ void Worker::maybeVerifyMemoryInjection(const bulwark::SecurityEvent& e) {
         log_.debug(QStringLiteral("内存防护 VT 验证跳过(超限流,默认 4/小时):%1").arg(hash.left(12)));
         return;
     }
-    // 同步查 VT(限流 4/小时,1 次 HTTP 往返对主线程影响可忽略);priority=true 占用 VT 预留的
-    // 优先级配额,内存防护/反注入验证尽量不被双击查杀等普通查询挤占。
-    const bulwark::FileReputation rep = reputation_->queryNow(hash, /*priority=*/true);
+    // 【曾是事件线程上的一处无界停摆】原实现调 reputation_->queryNow(hash, priority=true),
+    // 注释写的是「1 次 HTTP 往返对主线程影响可忽略」——但那个接口在本线程上一路阻塞:
+    // ReputationCurl 起 curl.exe 并 waitForStarted(5s) + waitForFinished((timeout+10)s),
+    // 期间不跑事件循环。而本函数是从 onEvent 同步调进来的,出队 / 富化 / 裁决 / IPC /
+    // 弹窗超时巡检全在这同一个线程上串行,于是一次注入验证就能让内核事件在 4096 深的
+    // 队列里堆到丢弃 —— 与 enrich 第 6 步当年那个 bug 是同一个,只是这条路径没跟着改。
+    //
+    // 换成同一个有界车道:预算内答复照旧参与本次补偿处置;超预算则放手,查询仍在车道
+    // 线程上跑完并回填缓存,若结论恶意由车道线程走 onMalicious_(与后台队列确认恶意同
+    // 一条补偿处置链路)。限流令牌不浪费,检测能力不减。
+    if (!reputation_)
+        return;
+    const bulwark::FileReputation rep = reputation_->queryNowBounded(e, inlineRepBudgetMs_);
     if (!rep.querySucceeded) {
         log_.debug(QStringLiteral("内存防护 VT 验证查询失败:%1").arg(hash.left(12)));
         return;
@@ -2195,12 +2293,19 @@ void Worker::maybeVerifyMemoryInjection(const bulwark::SecurityEvent& e) {
     // VT 确认恶意:记缓存 + 补偿处置(注入已阻止,但仍需结束作恶进程树 + 隔离载荷)。
     {
         QMutexLocker lk(&memVtMx_);
-        memVtCachedMalicious_.insert(hash);
-        if (memVtCachedMalicious_.size() > 1024) {
-            // 有界缓存:移除最旧的 128 条。
-            auto it = memVtCachedMalicious_.begin();
-            for (int i = 0; i < 128 && it != memVtCachedMalicious_.end(); ++i)
-                it = memVtCachedMalicious_.erase(it);
+        if (!memVtCachedMalicious_.contains(hash)) {
+            memVtCachedMalicious_.insert(hash);
+            memVtCacheOrder_.enqueue(hash);
+        }
+        if (memVtCachedMalicious_.size() > kMemVtCacheMax) {
+            // 有界缓存。注意【不能】按 QSet 的迭代顺序删:Qt6 的 QHash/QSet 每进程随机化
+            // 桶序,"begin() 起的 N 条" 既不是最旧的、也不是稳定的一批,原实现那句
+            // 「移除最旧的 128 条」是做不到的 —— 结果可能把刚确认恶意的哈希立刻删掉,
+            // 下一次注入又要再花一枚 4/小时的令牌去查同一个样本。
+            // 改成按插入顺序记账的 FIFO,删的就是真正最早进来的那批。
+            const int drop = memVtCachedMalicious_.size() - kMemVtCacheMax + kMemVtCacheEvict;
+            for (int i = 0; i < drop && !memVtCacheOrder_.isEmpty(); ++i)
+                memVtCachedMalicious_.remove(memVtCacheOrder_.dequeue());
         }
     }
     log_.warning(QStringLiteral("内存防护 VT 验证:注入源确认恶意(%1/%2),Hash=%3,路径=%4")
@@ -2222,13 +2327,38 @@ void Worker::vtScanLoop() {
                 return;
             job = vtQueue_.dequeue();
         }
-        runVtScan(job);
+        // 后台兜底线程绝不因异常带崩服务(与 startMaliciousSweep 同口径)。
+        // runVtScan 里有 JSON 解析、文件读写、哈希与四次网络往返;异常一旦逸出线程函数,
+        // 标准要求调用 std::terminate —— 整个防护服务直接死掉,而不只是这一次扫描失败。
+        try {
+            runVtScan(job);
+        } catch (const std::exception& ex) {
+            log_.error(QStringLiteral("双击/释放载荷病毒扫描线程异常(已忽略本次任务):%1")
+                           .arg(QString::fromUtf8(ex.what())));
+        } catch (...) {
+            log_.error(QStringLiteral("双击/释放载荷病毒扫描线程未知异常(已忽略本次任务)"));
+        }
     }
 }
 
 void Worker::runVtScan(bulwark::SecurityEvent e) {
     // 入队去重键(在算哈希之前定,与 maybeScan* 入队键一致,才能正确移除在途标记)。
     const QString key = e.actorHash.isEmpty() ? e.actorPath : e.actorHash;
+
+    // 在途标记用 RAII 摘除,而不是在每条返回路径上手写一遍。
+    //
+    // 原实现只在两处显式 remove(命中历史的早退 + 函数末尾)。本函数中间要做 JSON 解析、
+    // 文件读写、哈希计算和四次网络往返,任何一处抛异常都会跳过那两句 —— 这个 key 就永久
+    // 留在 vtInflight_ 里,该文件此后【再也不会被扫描】(maybeScan* 每次都判为「在途」直接
+    // 返回)。这是静默的检测能力丢失,不会有任何日志。
+    struct InflightGuard {
+        Worker* self;
+        const QString& key;
+        ~InflightGuard() {
+            QMutexLocker lk(&self->vtMx_);
+            self->vtInflight_.remove(key);
+        }
+    } inflightGuard{this, key};
     // 入队时是否已推过「排队中」卡片(仅双击路径会推)。取出该标记:命中去重短路时需用缓存结论
     // 收尾这张卡片,否则「排队中」会一直悬着(直到 UI 兜底超时才关);正常流程则由后续各阶段推送收尾。
     bool queuedCardShown;
@@ -2269,9 +2399,7 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
                 rep.querySucceeded = true;
                 confirmReputationMaliciousAsync(e, rep); // 后台拉画像后编组回主线程处置
             }
-            QMutexLocker lk(&vtMx_);
-            vtInflight_.remove(key);
-            return; // 命中历史结论 -> 不重复扫
+            return; // 命中历史结论 -> 不重复扫(在途标记由 inflightGuard 摘除)
         }
     }
 
@@ -2480,9 +2608,7 @@ void Worker::runVtScan(bulwark::SecurityEvent e) {
     } else if (suspend) {
         ProcessInspector::tryResume(e.actorPid); // 非恶意 -> 恢复运行
     }
-
-    QMutexLocker lk(&vtMx_);
-    vtInflight_.remove(key);
+    // 在途标记由 inflightGuard 在作用域结束时摘除(含异常路径)。
 }
 
 void Worker::finalizeVtRecord(bulwark::VtScanRecord& record, const bulwark::FileReputation& rep) {
@@ -2637,30 +2763,84 @@ void Worker::seedMaliciousHashesFromRules() {
     }
 }
 
+//
+// 兜底扫描的免扫判定。
+//
+// 【原实现的两处子串信任都必须收掉】
+//   1) p.contains("bulwark") —— 任何路径里出现这个子串就免扫。于是
+//      C:\Users\<u>\Downloads\bulwark_setup.exe、或者干脆建一个名叫 bulwark 的目录,
+//      就跳过了「防漏检的最后一道网」,顺带也跳过了 maybeQuarantineOnBlock 的隔离
+//      (那里同样调本函数)。
+//   2) p.contains("\\windows\\system32\\") 等 —— C:\temp\Windows\System32\evil.exe 免扫。
+//
+// 现在:系统目录按【盘符锚定前缀】判定;本产品自身按【安装目录 / 数据目录前缀】判定,
+// 由 main 在启动时经 setSelfExemptDirs 登记真实路径,不再靠名字猜。
+//
+QStringList Worker::s_sweepExemptDirs;
+QMutex Worker::s_sweepExemptMx;
+
+void Worker::setSelfExemptDirs(const QStringList& dirs) {
+    QMutexLocker lk(&s_sweepExemptMx);
+    s_sweepExemptDirs.clear();
+    for (const QString& d : dirs) {
+        QString n = d.trimmed().toLower();
+        if (n.isEmpty()) continue;
+        n.replace(QLatin1Char('/'), QLatin1Char('\\'));
+        if (!n.endsWith(QLatin1Char('\\'))) n += QLatin1Char('\\');
+        s_sweepExemptDirs << n;
+    }
+}
+
 bool Worker::isSweepExemptPath(const QString& path) {
     if (path.isEmpty())
         return true;
-    const QString p = path.toLower();
-    // 系统目录(WRP/高 ACL、微软签名,不会命中恶意情报且数量大)+ 本产品自身 -> 免扫,省开销防误伤。
-    if (p.contains(QStringLiteral("\\windows\\system32\\")) ||
-        p.contains(QStringLiteral("\\windows\\syswow64\\")) ||
-        p.contains(QStringLiteral("\\windows\\winsxs\\")) ||
-        p.contains(QStringLiteral("bulwark")))
-        return true;
+    QString p = path.toLower();
+    p.replace(QLatin1Char('/'), QLatin1Char('\\'));
+
+    // 盘符锚定的系统目录(WRP/高 ACL、微软签名,不会命中恶意情报且数量大)-> 免扫。
+    if (p.size() >= 2 && p.at(1) == QLatin1Char(':')) {
+        const QStringView rel = QStringView(p).mid(2);
+        if (rel.startsWith(QStringLiteral("\\windows\\system32\\")) ||
+            rel.startsWith(QStringLiteral("\\windows\\syswow64\\")) ||
+            rel.startsWith(QStringLiteral("\\windows\\winsxs\\")))
+            return true;
+    }
+
+    // 本产品自身(安装目录 + %ProgramData%\Bulwark\),按真实路径前缀而不是名字子串。
+    {
+        QMutexLocker lk(&s_sweepExemptMx);
+        for (const QString& d : s_sweepExemptDirs)
+            if (p.startsWith(d)) return true;
+    }
     return false;
 }
 
 void Worker::sweepLoop() {
     // 后台线程:严禁直接碰主线程 Qt 对象(engine_/ipc_ 等)。只用线程安全的哈希快照
     //(maliciousHashMx_ 保护)+ 信誉只读缓存;命中后 QueuedConnection 编组回主线程处置。
-    QHash<QString, QString> pathHashCache; // path -> 大写 SHA-256(本线程私有,避免重复哈希)
+    //
+    // 哈希缓存的键是【路径 + 大小 + 修改时间】,不是光路径。
+    //
+    // 原实现只用路径做键,有两个后果,第二个是检测漏洞:
+    //   1) 这张表只增不减,进程路径多的机器上长期驻留;
+    //   2) 文件被【原地替换】后(恶意软件自更新、被投毒的升级包写回同一路径),缓存里
+    //      仍是旧哈希,于是兜底扫描永远拿旧哈希去比对情报,新的恶意体一次都不会被逮到。
+    //      而"兜底扫描"的全部意义就是逮住漏网的那一个。
+    struct HashEntry {
+        QString hashUpper;
+        qint64 size = 0;
+        qint64 mtimeMs = 0;
+    };
+    QHash<QString, HashEntry> pathHashCache;
+    constexpr int kSweepHashCacheMax = 2048;
 
     // 首轮延迟:等握手/规则加载/信誉预热稳定后再扫,减少启动期抖动。
     for (int i = 0; i < 15 && sweepRunning_.load(); ++i)
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
     while (sweepRunning_.load()) {
-        const bool enabled = !settings_ || settings_->protectionEnabled; // 总开关关闭时不扫
+        // 读无锁镜像,不碰 settings_(那个结构体会被主线程整体赋值,见 sweepProtectionEnabled_)。
+        const bool enabled = sweepProtectionEnabled_.load();
         if (enabled) {
             const QList<int> pids = ProcessInspector::enumeratePids();
             for (int pid : pids) {
@@ -2670,11 +2850,24 @@ void Worker::sweepLoop() {
                 if (path.isEmpty() || isSweepExemptPath(path))
                     continue;
 
-                QString hashU = pathHashCache.value(path);
+                // 先 stat 一次,拿到判断缓存是否仍然有效所需的身份信息。
+                const QFileInfo fi(path);
+                const qint64 size = fi.size();
+                const qint64 mtimeMs = fi.lastModified().toMSecsSinceEpoch();
+
+                QString hashU;
+                const auto it = pathHashCache.constFind(path);
+                if (it != pathHashCache.constEnd()
+                    && it.value().size == size && it.value().mtimeMs == mtimeMs) {
+                    hashU = it.value().hashUpper;    // 同一个文件,复用哈希
+                }
                 if (hashU.isEmpty()) {
                     hashU = ProcessInspector::tryComputeSha256(path); // 大写十六进制
-                    if (!hashU.isEmpty())
-                        pathHashCache.insert(path, hashU);
+                    if (!hashU.isEmpty()) {
+                        if (pathHashCache.size() >= kSweepHashCacheMax)
+                            pathHashCache.clear();   // 有界:整体丢弃,下轮重算(纯性能缓存)
+                        pathHashCache.insert(path, HashEntry{ hashU, size, mtimeMs });
+                    }
                 }
                 if (hashU.size() != 64)
                     continue;

@@ -36,6 +36,13 @@ public:
         }
         cv_.notify_all();
         if (worker_.joinable()) worker_.join();
+        // running_ 是 std::atomic。原先它是普通 bool:这一句在【锁外】写,而 enqueue()
+        // 在持锁状态下读它 —— 无保护的并发读写,正是数据竞争的定义。全服务十几个线程都
+        // 在写日志,停服务时必然与之重叠。
+        //
+        // 刻意保留「join 之后才清 running_」的顺序:若提前在锁内清掉,一个并发的 start()
+        // 就会看到 running_==false 并对仍处于 joinable 状态的 worker_ 赋值 —— 那是
+        // std::terminate。顺序不动,只把类型换成原子的。
         running_ = false;
     }
 
@@ -50,9 +57,15 @@ public:
     }
 
 private:
+    // 批量取、批量写。
+    //
+    // 原实现每轮只取【一行】,而 writeOne 对每一行都做一次 QFileInfo stat + open + write +
+    // close。防护事件是突发的(本项目自己的注释就描述过「几秒钟写满 5MB 日志」的场景),
+    // 那等于每秒几万次开关文件句柄 —— 磁盘 IO 全花在文件系统元数据上,日志线程追不上队列,
+    // 队列到 8192 就开始丢日志。改成一次排空队列、一次开文件写完整批,轮转检查也只做一次。
     void writeLoop() {
         for (;;) {
-            QString line;
+            QByteArray batch;
             {
                 std::unique_lock<std::mutex> lk(mutex_);
                 cv_.wait(lk, [this] { return disposed_ || !queue_.empty(); });
@@ -60,36 +73,43 @@ private:
                     if (disposed_) return;
                     continue;
                 }
-                line = queue_.front();
-                queue_.pop_front();
+                int count = 0;
+                while (!queue_.empty() && count < kMaxBatch) {
+                    batch += queue_.front().toUtf8();
+                    queue_.pop_front();
+                    ++count;
+                }
             }
-            writeOne(line);
+            if (!batch.isEmpty())
+                writeBatch(batch);
         }
     }
 
-    void writeOne(const QString& line) {
+    void writeBatch(const QByteArray& bytes) {
         // Roll to .1 when the file grows past ~5 MB, to bound disk usage.
         QFileInfo fi(path_);
-        if (fi.exists() && fi.size() > 5LL * 1024 * 1024) {
+        if (fi.exists() && fi.size() > kMaxLogBytes) {
             const QString bak = path_ + ".1";
             QFile::remove(bak);
             QFile::rename(path_, bak); // failure here is non-fatal
         }
         QFile f(path_);
         if (f.open(QIODevice::Append | QIODevice::WriteOnly)) {
-            f.write(line.toUtf8());
+            f.write(bytes);
             f.close();
         }
         // A failed write must never disturb the business logic -> swallow.
     }
 
-    static constexpr size_t kMaxQueue = 8192;
+    static constexpr size_t kMaxQueue   = 8192;
+    static constexpr int    kMaxBatch   = 512;                 // 一次最多攒多少行再落盘
+    static constexpr qint64 kMaxLogBytes = 5LL * 1024 * 1024;  // 轮转阈值(原先是裸字面量)
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<QString> queue_;
     std::thread worker_;
-    bool running_ = false;
-    bool disposed_ = false;
+    std::atomic<bool> running_{false};   // 见 stop():最后一次写在锁外,故必须是原子的
+    bool disposed_ = false;              // 只在 mutex_ 保护下访问
     QString path_;
 };
 

@@ -40,8 +40,14 @@ void SettingsStore::save(const bulwark::RuntimeSettings& settings) {
     o.remove(QStringLiteral("kernelConnected"));
     o.remove(QStringLiteral("kernelStatus"));
     // 原子落盘:一次截断写就能把用户的全部设置清空(见 AtomicFile.h)。
-    writeFileAtomically(path_, QJsonDocument(o).toJson(QJsonDocument::Indented),
-                        QStringLiteral("运行时设置"));
+    // 返回值必须看:两条写入路径都失败时 writeFileAtomically 一声不响地返回 false,
+    // 于是「设置已保存」在 UI 上照常显示,重启后却回到旧值 —— 用户无从得知。
+    if (!writeFileAtomically(path_, QJsonDocument(o).toJson(QJsonDocument::Indented),
+                             QStringLiteral("运行时设置"))) {
+        Logger(QStringLiteral("bulwark.service.SettingsStore"))
+            .error(QStringLiteral("运行时设置落盘失败,本次修改仅在内存中生效,重启后将丢失:%1")
+                       .arg(path_));
+    }
 }
 
 } // namespace bulwark::service

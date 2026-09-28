@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QUrl>   // 回环例外要解析 host,不能靠 contains(见 check() 里的说明)
 
 #include <algorithm>
 
@@ -87,13 +88,25 @@ UpdateInfo UpdateService::check()
         out.error = QStringLiteral("未配置更新端点,也没有可复用的信誉代理地址。");
         return out;
     }
+    //
     // http 明文一律拒绝。更新是「下载并以 SYSTEM 执行」,明文信道上任何人都能替换载荷;
     // 虽然签名校验仍会拦住,但没有理由先把自己放到那个位置。localhost 放行,便于本地联调。
-    if (!baseUrl_.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)
-        && !baseUrl_.contains(QStringLiteral("127.0.0.1"))
-        && !baseUrl_.contains(QStringLiteral("localhost"), Qt::CaseInsensitive)) {
-        out.error = QStringLiteral("更新端点不是 https —— 拒绝在明文信道上取更新。");
-        return out;
+    //
+    // 【回环例外必须解析 host 后精确比较,不能用 contains】原实现是
+    //     baseUrl_.contains("127.0.0.1") || baseUrl_.contains("localhost")
+    // 于是 http://evil.example/?x=127.0.0.1 这样的地址就绕过了 https 强制 —— 一个本意是
+    // 「方便本地联调」的口子变成了「把这两个字串写进 URL 任意位置即可走明文」。
+    //
+    if (!baseUrl_.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)) {
+        const QUrl u(baseUrl_);
+        const QString host = u.host().toLower();
+        const bool loopback = (host == QStringLiteral("127.0.0.1")) ||
+                              (host == QStringLiteral("localhost")) ||
+                              (host == QStringLiteral("::1"));
+        if (!loopback) {
+            out.error = QStringLiteral("更新端点不是 https —— 拒绝在明文信道上取更新。");
+            return out;
+        }
     }
 
     const QString url = baseUrl_ + QStringLiteral("/v1/update/manifest?channel=") + channel_;
@@ -101,7 +114,11 @@ UpdateInfo UpdateService::check()
     if (!token_.isEmpty())
         headers << (QStringLiteral("Authorization: Bearer ") + token_);
 
-    const auto res = ReputationCurl::get(url, headers, timeoutSecs_);
+    // 自有端点:走 Pinned(私有信任锚)。清单决定「下载哪些文件、期望什么哈希」,被篡改的
+    // 后果是被引导去下一份攻击者的载荷 —— 载荷侧还有钉死的 Authenticode 指纹兜底,但清单
+    // 本身没有第二道,所以传输层必须校验。
+    const auto res =
+        ReputationCurl::get(url, headers, timeoutSecs_, reputation::TlsMode::Pinned);
     if (res.first == 0) {
         out.error = QStringLiteral("连不上更新服务器(网络不通或 curl 不可用)。");
         return out;
@@ -424,7 +441,8 @@ UpdateDownloadResult UpdateService::download(
             url = baseUrl_ + QStringLiteral("/v1/update/file/") + channel_ + QLatin1Char('/') + f.name;
 
         if (onProgress) onProgress(done, total, f.name, QStringLiteral("下载中"));
-        const auto res = ReputationCurl::download(url, dest, headers, downloadTimeoutSecs_);
+        const auto res = ReputationCurl::download(url, dest, headers, downloadTimeoutSecs_,
+                                                  reputation::TlsMode::Pinned);
         if (res.first != 200) {
             // 非 200 时 curl 已经把错误响应体写进了目标文件,必须删掉:留着就是一个
             // 长度不对的 exe 躺在暂存目录里。

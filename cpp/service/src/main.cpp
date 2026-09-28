@@ -18,7 +18,6 @@
 #include "bulwark/service/UserModeBehaviorSource.h"
 #include "bulwark/service/EventSourceCoordinator.h"
 #include "bulwark/service/PersistenceScanner.h"
-#include "bulwark/service/JunkCleaner.h"
 #include "bulwark/service/ForensicsService.h"
 #include "bulwark/service/Worker.h"
 #include "bulwark/service/AttackChainEngine.h"
@@ -125,98 +124,6 @@ int runInspect(const QString& path) {
         rf.close();
     }
     QTextStream(stdout) << buf << "result written to: " << resultPath << "\n";
-    return 0;
-}
-
-// ============================ 垃圾清理:只读干跑 =============================
-//
-// --junk-scan
-//
-// 跑一次真实的垃圾扫描并把结果打出来,然后立即退出。【纯只读】:调的是 JunkCleaner::scan,
-// 它一个字节都不删;也不启动事件循环 / ETW / 驱动 / IPC。
-//
-// 为什么值得有这个入口:垃圾清理是本产品里唯一会主动删用户文件的功能,它的正确性首先体现在
-// 「它认为自己该动哪些位置」。有了这个模式,验证「范围对不对」就不必先起服务、开界面、点按钮
-// —— 而且在真机上排查「为什么某类清不动」时,能直接看到是哪条根目录被护栏拒了(拒绝原因由
-// JunkCleaner 写进服务日志)。
-int runJunkScanDryRun(const BulwarkOptions& options) {
-    QTextStream out(stdout);
-    out << "=== JunkCleaner dry-run (read-only) ===\n";
-
-    JunkCleanerPolicy pol;
-    pol.enabled = options.DiskCleanup.Enabled;
-    pol.minAgeHours = options.DiskCleanup.MinFileAgeHours;
-    pol.maxFilesPerCategory = options.DiskCleanup.MaxFilesPerCategory;
-    pol.maxSeconds = options.DiskCleanup.MaxSeconds;
-    pol.excludes = options.DiskCleanup.ExcludePaths;
-    pol.selfDir = QCoreApplication::applicationDirPath();
-    // 诊断入口不接引擎,故不查用户信任名单(isUserTrusted 留空 = 不查)。这只影响
-    // 「本来会被跳过的位置这里也算进来」,不会让它多删什么 —— 它根本不删。
-
-    bulwark::ipc::JunkScanRequestPayload req;
-    const bulwark::ipc::JunkScanResponsePayload res = JunkCleaner::scan(req, pol);
-
-    out << "enabled: " << (res.enabled ? "true" : "false") << "\n";
-    out << "minAgeHours: " << res.minAgeHours << "\n";
-    out << "truncated: " << (res.truncated ? "true" : "false") << "\n";
-    out << "elapsedMs: " << res.elapsedMs << "   unreadableDirs: " << res.unreadable << "\n";
-    out << "message: " << res.message << "\n";
-    out << "total: " << res.totalBytes << " bytes / " << res.totalFiles << " files\n\n";
-    for (const bulwark::JunkCategoryResult& c : res.categories) {
-        out << QStringLiteral("[%1] %2\n")
-                   .arg(bulwark::junk::categoryKey(c.category), c.title);
-        out << QStringLiteral("    risk=%1 available=%2 cleanable=%3 recommended=%4 elapsed=%5ms\n")
-                   .arg(c.risk == bulwark::junk::Risk::Safe ? QStringLiteral("safe")
-                                                            : QStringLiteral("caution"))
-                   .arg(c.available).arg(c.cleanable).arg(c.recommended).arg(c.elapsedMs);
-        out << QStringLiteral("    %1 bytes / %2 files / %3 skipped / %4 unreadable\n")
-                   .arg(c.bytes).arg(c.fileCount).arg(c.skipped).arg(c.unreadable);
-        if (!c.message.isEmpty())
-            out << "    note: " << c.message << "\n";
-        for (const bulwark::JunkLocation& loc : c.locations)
-            out << QStringLiteral("      - %1  (%2 bytes / %3 files / %4 skipped / %5 unreadable)"
-                                  "%6\n")
-                       .arg(loc.path).arg(loc.bytes).arg(loc.fileCount).arg(loc.skipped)
-                       .arg(loc.unreadable)
-                       .arg(loc.note.isEmpty() ? QString()
-                                               : QStringLiteral("  [%1]").arg(loc.note));
-    }
-    out.flush();
-    return 0;
-}
-
-// ============================ 大文件查找:只读干跑 ============================
-//
-// --large-files [阈值MB]
-//
-// 与 --junk-scan 同样是纯只读的诊断入口。大文件查找本身就没有删除路径(见 LargeFileScanner
-// 的说明),所以这个模式和生产路径做的是完全同一件事,只是把结果打到 stdout。
-int runLargeFileScan(const BulwarkOptions& options, qint64 minBytes) {
-    QTextStream out(stdout);
-    out << "=== LargeFileScanner dry-run (read-only) ===\n";
-
-    LargeFileScannerPolicy pol;
-    pol.excludes = options.DiskCleanup.ExcludePaths;
-    pol.selfDir = QCoreApplication::applicationDirPath();
-
-    bulwark::ipc::LargeFileScanRequestPayload req;
-    req.minBytes = minBytes;
-    req.limit = 30;
-    const bulwark::ipc::LargeFileScanResponsePayload res = LargeFileScanner::scan(req, pol);
-
-    out << "minBytes: " << res.minBytes << "\n";
-    out << "scannedFiles: " << res.scannedFiles << "   unreadableDirs: " << res.unreadable << "\n";
-    out << "truncated: " << (res.truncated ? "true" : "false")
-        << "   elapsedMs: " << res.elapsedMs << "\n";
-    out << "message: " << res.message << "\n";
-    out << "listed: " << res.files.size() << " files / " << res.totalBytes << " bytes\n\n";
-    for (const bulwark::LargeFileEntry& f : res.files) {
-        out << QStringLiteral("%1 MB  %2  [%3]\n")
-                   .arg(f.bytes / (1024 * 1024), 6)
-                   .arg(f.path)
-                   .arg(f.suffix.isEmpty() ? QStringLiteral("-") : f.suffix);
-    }
-    out.flush();
     return 0;
 }
 
@@ -484,6 +391,8 @@ int runAttackChainCheck() {
     if (base.trimmed().isEmpty()) { out << "-> no endpoint resolved\n"; return 1; }
 
     reputation::ReputationCurl::proxyUrl = options.ProxyUrl;
+    reputation::ReputationCurl::ownCaBundlePath = options.SelfHostedTls.CaBundlePath;
+    reputation::ReputationCurl::ownPinnedPublicKeys = options.SelfHostedTls.PinnedPublicKeys;
     AttackChainEngine engine(ac);
     AttackChainFeed feed(ac, base);
     out << "\nfetching table ...\n";
@@ -604,8 +513,7 @@ static int serviceRun(int argc, char** argv) {
     QCoreApplication::setApplicationName(QStringLiteral("Bulwark Defense"));
     std::set_terminate(onTerminate);
 
-    // 控制台代码页对齐到 UTF-8。诊断入口(--inspect / --attackchain-check / --junk-scan /
-    // --large-files)的结论文案是中文,而 QTextStream(stdout) 在 Qt6 里固定按 UTF-8 编码;
+    // 控制台代码页对齐到 UTF-8。诊断入口(--inspect / --attackchain-check)的结论文案是中文,而 QTextStream(stdout) 在 Qt6 里固定按 UTF-8 编码;
     // 中文版 Windows 的控制台默认是 936(GBK),于是每一行中文都渲染成乱码 —— 一个「给人看的
     // 诊断输出」看不懂,就等于没有。
     //
@@ -647,37 +555,6 @@ static int serviceRun(int argc, char** argv) {
     // 按配置决定证书吊销校验是否联网(默认 false:仅用本机缓存 CRL,绝不联网/阻塞富化)。
     monitoring::ProcessInspector::onlineRevocationCheck = options.OnlineCertRevocationCheck;
 
-    // 垃圾清理的只读干跑。放在这里(而不是上面那个诊断块)是因为它要用真实的 appsettings 配置;
-    // 放在存储层与事件源初始化【之前】,所以它不会碰规则库、不会起 ETW / 驱动 / IPC。
-    //
-    // ⚠ 必须显式 stopFileLog():此处已经在 startFileLog() 之后,而文件日志是一条后台写入线程。
-    // 直接 return 会让它在全局析构期间还活着,进程退出时以 0xC0000409(STATUS_STACK_BUFFER_OVERRUN)
-    // 收场 —— 结果全都打印对了、退出码却是崩溃。上面那两个诊断入口(--inspect /
-    // --attackchain-selftest)在 startFileLog() 【之前】就返回了,所以它们没有这个问题;
-    // 任何以后加在这个位置的诊断入口都得记得停日志线程。
-    if (QCoreApplication::arguments().contains(QStringLiteral("--junk-scan"))) {
-        const int rc = runJunkScanDryRun(options);
-        stopFileLog();
-        return rc;
-    }
-    // 同上,也必须显式 stopFileLog()(见上面那段关于 0xC0000409 的说明)。
-    {
-        const QStringList args = QCoreApplication::arguments();
-        const int li = args.indexOf(QStringLiteral("--large-files"));
-        if (li >= 0) {
-            qint64 minBytes = 0;   // 0 = 用 LargeFileScanner 的默认阈值(100 MB)
-            if (li + 1 < args.size()) {
-                bool ok = false;
-                const qint64 mb = args.at(li + 1).toLongLong(&ok);
-                if (ok && mb > 0)
-                    minBytes = mb * 1024 * 1024;
-            }
-            const int rc = runLargeFileScan(options, minBytes);
-            stopFileLog();
-            return rc;
-        }
-    }
-
     // 存储层。
     SettingsStore settingsStore;
     RuleStore ruleStore;
@@ -716,6 +593,18 @@ static int serviceRun(int argc, char** argv) {
     // 无条件放行,不把自己的行为当第三方来评估。仅按映像名匹配可被同名程序冒用,故同时按
     // 安装目录前缀匹配(此前 addSelfDirectory 从未被调用,自身目录集恒为空)。
     engine.addSelfDirectory(QCoreApplication::applicationDirPath());
+    //
+    // 同一份「本产品自身目录」也给 Worker 的免扫判定用。
+    //
+    // Worker::isSweepExemptPath 原来是靠 path.contains("bulwark") 判定「是不是本产品」——
+    // 那等于任何路径里带这个子串的文件都免于兜底扫描与「拦截时隔离」,建一个名叫 bulwark 的
+    // 目录就能让样本躲过最后一道网。真实路径只有这里知道,所以必须显式传进去。
+    //
+    Worker::setSelfExemptDirs({
+        QCoreApplication::applicationDirPath(),
+        QDir(qEnvironmentVariable("ProgramData", QStringLiteral("C:\\ProgramData")))
+            .filePath(QStringLiteral("Bulwark")),
+    });
     QVector<bulwark::DefenseRule> rules = bulwark::engine::DefaultRules::build();
     // 内置规则以代码为准:丢弃持久化库中的旧内置副本(build() 已提供最新版),否则每次
     // 落盘 + 重启会让内置规则重复累积(现在 ThreatFox 情报刷新会周期性落盘,尤需如此)。
@@ -767,6 +656,10 @@ static int serviceRun(int argc, char** argv) {
     // (MalwareBazaar / OTX / MetaDefender / HybridAnalysis),各源按配置/密钥自行启用;
     // 未配置任何源时后台 worker 不启动(纯本地启发式照常)。
     reputation::ReputationCurl::proxyUrl = options.ProxyUrl;
+    // 自有端点(信誉代理 / 更新服务器)的 TLS 信任锚。第三方公网源不受此配置影响 ——
+    // 它们一律走 curl 默认的完整校验。见 ReputationCurl.h 里 TlsMode 的说明。
+    reputation::ReputationCurl::ownCaBundlePath = options.SelfHostedTls.CaBundlePath;
+    reputation::ReputationCurl::ownPinnedPublicKeys = options.SelfHostedTls.PinnedPublicKeys;
     std::vector<std::unique_ptr<reputation::IHashReputationService>> repSources;
     // 保留 VT 客户端具体句柄:上传扫描(uploadAndScan)是接口外的 VT 专有方法,供双击/释放
     // 载荷病毒扫描直接调用(不经聚合器的哈希查询接口)。
@@ -877,6 +770,31 @@ static int serviceRun(int argc, char** argv) {
                      .arg(removed).arg(rules.size()));
     });
 
+    // ---- 内置规则库需要的受关注注册表键(必须在任何消费者拿到 options 之前并入)----
+    //
+    // 注册表事件只在键命中受关注名单时才产生(驱动 RegistryMonitor 与 ETW Kernel-Registry
+    // 同一模型)。appsettings 的默认名单只有 6 条(Run / RunOnce / Policies\Explorer\Run /
+    // IFEO / Winlogon / Services),而内置规则库的段 2(持久化)与段 3(防御规避)里有过半的
+    // 注册表规则盯的是 Defender 排除项、UAC 策略、WDigest、SafeBoot、AppCertDlls、
+    // ms-settings 劫持这些键 —— 不并进来,那些规则【结构性永不命中】,而且不会有任何报错:
+    // 界面照常显示规则已装载,日志里也看不出异常。这正是 registryWatchFragments() 长期只有
+    // 声明与定义、没有调用点时的实际状态。
+    //
+    // 只补缺的、不重复:名单是定长 64 槽的内核数组(BLW_MAX_PROTECTED),与攻击链派生键共用。
+    {
+        int added = 0;
+        for (const QString& frag : bulwark::engine::DefaultRules::registryWatchFragments()) {
+            if (frag.trimmed().isEmpty()) continue;
+            if (options.ProtectedRegistryKeys.contains(frag, Qt::CaseInsensitive)) continue;
+            options.ProtectedRegistryKeys.append(frag);
+            ++added;
+        }
+        if (added > 0)
+            log.info(QStringLiteral("内置规则库:并入 %1 个受关注注册表键片段(共 %2 条;仅上报、"
+                                    "不拦截。不并入则段 2/段 3 的注册表规则结构性永不命中)。")
+                         .arg(added).arg(options.ProtectedRegistryKeys.size()));
+    }
+
     // 攻击链组合引擎:服务器从每日采集的真实样本沙箱记录里数出「哪几个动作凑一起就是病毒」,
     // 客户端下载该表并给每个进程记账,凑齐即定性。端点默认复用中央信誉代理(同一台服务器)。
     // 默认 dry-run —— 只记录不影响裁决,先在真机观察有无误伤,确认后再在 appsettings 关掉。
@@ -979,6 +897,11 @@ static int serviceRun(int argc, char** argv) {
     // 事件源协调器句柄(下方创建后赋值):供 settingsRequested 回报内核连接状态,
     // 供 settingsUpdated 运行时切换内核驱动开关 / 用户态行为监控开关。
     EventSourceCoordinator* coordinatorPtr = nullptr;
+    // Worker 句柄(下方创建后赋值),用途同上:settingsUpdated 里要把「防护总开关」发布给
+    // 后台兜底扫描线程。后台线程不能直接读 settings 这个结构体 —— 主线程在本回调里对它
+    // 整体赋值(settings = updated),而它内含 QString,整体拷贝与并发读是数据竞争。
+    // 与 coordinatorPtr 同理:回调只在 app.exec() 的事件循环里触发,那时赋值早已完成。
+    Worker* workerPtr = nullptr;
 
     // ---- 绑定 IPC 请求处理回调(对应 .NET Worker 里的 _ipc.* 绑定)----
     // 全部在主线程(Qt 事件循环)上调用,与事件处理串行;引擎内部另有读写锁。
@@ -1063,7 +986,7 @@ static int serviceRun(int argc, char** argv) {
     // options 拖进 settingsUpdated 的捕获列表。
     const int contribUploadHour = options.ReputationProxy.ContributionUploadHour;
     ipc.settingsUpdated = [&settings, &engine, &settingsStore, &repAggregate, &repManager,
-                           &applyIntelSourceToggles, &coordinatorPtr, &intelUploader,
+                           &applyIntelSourceToggles, &coordinatorPtr, &workerPtr, &intelUploader,
                            &intelContrib, contribUploadHour, serverOnlyMode, &log](
                               const bulwark::RuntimeSettings& s) {
         const bool wasContribOn = settings.cloudBehaviorUploadEnabled;
@@ -1071,6 +994,9 @@ static int serviceRun(int argc, char** argv) {
         updated.eventSource = settings.eventSource; // 只读字段保持不变
         updated.cloudServerOnly = serverOnlyMode;   // 同上:策略来自 appsettings,UI 改不了
         settings = updated;
+        // 把总开关发布给后台兜底扫描线程(它读 atomic 镜像,不读这个结构体)。
+        if (workerPtr)
+            workerPtr->publishProtectionEnabled(settings.protectionEnabled);
         engine.trustSignedActors = settings.trustSignedActors;
         engine.enableBaseline = settings.behaviorBaselineEnabled;
         settingsStore.save(settings);
@@ -1547,120 +1473,6 @@ static int serviceRun(int argc, char** argv) {
         }).detach();
     };
 
-    // ================= 磁盘垃圾清理 =================
-    //
-    // 与取证查询同一套路(后台线程 + forensicsInflight 计数 + invokeMethod 编组回主线程),
-    // 理由也相同:遍历 %TEMP% / 浏览器缓存动辄数万文件,秒级到十几秒,绝不能占着 IPC 线程。
-    //
-    // 清理范围【不】来自请求:JunkCleaner 内部有一份编译期写死的类别/根目录表,请求里只有
-    // 类别序号。这里唯一从配置读的是「要不要开、留多久、上限多少、额外排除哪些」这类旋钮,
-    // 它们只能让清理范围变小。详见 JunkCleaner.h 顶部的七道护栏。
-    //
-    // 用户信任名单在这里接进去:用户显式信任过的路径连「它是不是垃圾」都不由我们判断。查询
-    // 走 engine.trustNoteForPath —— 它内部自带读锁,后台线程调用是安全的(与兜底扫描同样用法)。
-    auto junkPolicy = [&options, &engine]() {
-        JunkCleanerPolicy pol;
-        pol.enabled = options.DiskCleanup.Enabled;
-        pol.minAgeHours = options.DiskCleanup.MinFileAgeHours;
-        pol.maxFilesPerCategory = options.DiskCleanup.MaxFilesPerCategory;
-        pol.maxSeconds = options.DiskCleanup.MaxSeconds;
-        pol.excludes = options.DiskCleanup.ExcludePaths;
-        pol.selfDir = QCoreApplication::applicationDirPath();
-        pol.isUserTrusted = [&engine](const QString& path) {
-            return engine.trustNoteForPath(path).has_value();
-        };
-        return pol;
-    };
-
-    ipc.junkScanRequested = [&ipc, junkPolicy, forensicsInflight](
-                                const bulwark::ipc::JunkScanRequestPayload& req) {
-        forensicsInflight->fetch_add(1);
-        const JunkCleanerPolicy pol = junkPolicy();
-        std::thread([&ipc, req, pol, forensicsInflight] {
-            struct Guard {
-                std::shared_ptr<std::atomic<int>> c;
-                ~Guard() { c->fetch_sub(1); }
-            } guard{ forensicsInflight };
-            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
-                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
-                                          Qt::QueuedConnection);
-            };
-            bulwark::ipc::JunkScanResponsePayload res;
-            try {
-                res = JunkCleaner::scan(req, pol, progress);
-            } catch (...) {
-                res.message = QStringLiteral("垃圾扫描失败(目录访问异常)");
-            }
-            res.requestId = req.requestId;
-            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendJunkScan(res); },
-                                      Qt::QueuedConnection);
-        }).detach();
-    };
-
-    ipc.junkCleanRequested = [&ipc, junkPolicy, &log, forensicsInflight](
-                                 const bulwark::ipc::JunkCleanRequestPayload& req) {
-        forensicsInflight->fetch_add(1);
-        const JunkCleanerPolicy pol = junkPolicy();
-        // 删除动作必须留痕:谁请求的、清了哪几类。逐类别的明细由 JunkCleaner 自己写日志。
-        QStringList keys;
-        for (int c : req.categories)
-            keys << bulwark::junk::categoryKey(static_cast<bulwark::junk::Category>(c));
-        log.info(QStringLiteral("垃圾清理请求:%1 类(%2),保留时长 %3 小时")
-                     .arg(req.categories.size())
-                     .arg(keys.join(QStringLiteral(", ")))
-                     .arg(req.minAgeHours > 0 ? req.minAgeHours : pol.minAgeHours));
-        std::thread([&ipc, req, pol, forensicsInflight] {
-            struct Guard {
-                std::shared_ptr<std::atomic<int>> c;
-                ~Guard() { c->fetch_sub(1); }
-            } guard{ forensicsInflight };
-            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
-                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
-                                          Qt::QueuedConnection);
-            };
-            bulwark::ipc::JunkCleanResponsePayload res;
-            try {
-                res = JunkCleaner::clean(req, pol, progress);
-            } catch (...) {
-                res.success = false;
-                res.message = QStringLiteral("垃圾清理失败(目录访问异常)");
-            }
-            res.requestId = req.requestId;
-            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendJunkClean(res); },
-                                      Qt::QueuedConnection);
-        }).detach();
-    };
-
-    // 大文件查找。纯只读,所以【没有】对应的删除回调 —— 界面只提供「打开所在位置」。
-    // 遍历整块磁盘比垃圾扫描更久,同样丢后台线程并纳入停机等待。
-    ipc.largeFileScanRequested = [&ipc, &options, forensicsInflight](
-                                     const bulwark::ipc::LargeFileScanRequestPayload& req) {
-        forensicsInflight->fetch_add(1);
-        LargeFileScannerPolicy pol;
-        // 排除表沿用垃圾清理的那一份:部署方列进去的位置,在两个功能里都该被绕开。
-        pol.excludes = options.DiskCleanup.ExcludePaths;
-        pol.selfDir = QCoreApplication::applicationDirPath();
-        std::thread([&ipc, req, pol, forensicsInflight] {
-            struct Guard {
-                std::shared_ptr<std::atomic<int>> c;
-                ~Guard() { c->fetch_sub(1); }
-            } guard{ forensicsInflight };
-            auto progress = [&ipc](const bulwark::ipc::JunkProgressPayload& p) {
-                QMetaObject::invokeMethod(&ipc, [&ipc, p] { ipc.sendJunkProgress(p); },
-                                          Qt::QueuedConnection);
-            };
-            bulwark::ipc::LargeFileScanResponsePayload res;
-            try {
-                res = LargeFileScanner::scan(req, pol, progress);
-            } catch (...) {
-                res.message = QStringLiteral("大文件查找失败(目录访问异常)");
-            }
-            res.requestId = req.requestId;
-            QMetaObject::invokeMethod(&ipc, [&ipc, res] { ipc.sendLargeFileScan(res); },
-                                      Qt::QueuedConnection);
-        }).detach();
-    };
-
     // ================= 进程管理 =================
     //
     // 「本软件自身组件」判定:自身 PID + 已连接的 UI PID + 映像位于安装目录。进程管理页是
@@ -2018,6 +1830,8 @@ static int serviceRun(int argc, char** argv) {
     // 事件热路径上同步云查的等待预算。这是单条事件能拖慢整条流水线的硬上限 ——
     // 没有它的话,一次缓存未命中(代理端口不可达 / 情报源超时)就能让富化、裁决、IPC、
     // 弹窗超时巡检一起停摆二十多秒,内核事件在队列里堆到丢弃。见 Worker::enrich 第 6 步。
+    workerPtr = &worker;   // 供 settingsUpdated 回调把总开关发布给后台兜底扫描线程
+    worker.publishProtectionEnabled(settings.protectionEnabled); // 发布启动时的初值
     worker.setInlineReputationBudgetMs(options.InlineReputationBudgetMs);
     worker.setIpIntel(threatBookPtr); // 注入微步客户端并启动后台 IP 情报 worker(网络外联互证)
     worker.setVtScan(virusTotalPtr, &vtHistory); // 注入 VT 客户端 + 历史,启动后台双击/释放载荷病毒扫描
@@ -2172,17 +1986,41 @@ namespace {
 const wchar_t* kSvcName = L"BulwarkService";
 const wchar_t* kSvcDisplay = L"\u78D0\u5792\u4E3B\u52A8\u9632\u5FA1\u670D\u52A1"; // 磐垒主动防御服务
 
+// 服务依赖(SCM 要求的双 \0 结尾列表;字符串字面量自带一个 \0,故写一个即成双)。
+//
+// 【为什么必须声明】本服务是 SERVICE_AUTO_START,开机时 SCM 会和一大票驱动/服务并行拉起。
+// 而它启动过程里要 fltmc load 自己的 minifilter —— 那要求筛选器管理器 FltMgr 已经就绪。
+// 原先一条依赖都没声明,于是开机时存在「服务先跑起来、FltMgr 还没好」的竞态:驱动加载失败,
+// 严重时整个启动流程失败退出。配合原先"退出码恒为 0 所以永不自愈"的问题,表现就是
+// 每次重启都得手工再打开一次。内核驱动服务自己声明了 depend= FltMgr,用户态这边漏了。
+//
+// FltMgr 是 Windows 自带的 boot-start 驱动,任何机器上都存在,声明它不会带来"依赖缺失
+// 导致服务起不来"的风险;而驱动加载失败时服务仍会降级为 ETW 用户态观测,不影响可用性。
+const wchar_t kSvcDependencies[] = L"FltMgr\0";
+
 SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 SERVICE_STATUS g_status = {};
 int g_svcArgc = 0;
 char** g_svcArgv = nullptr;
 
-void reportStatus(DWORD state, DWORD waitHint = 0) {
+// 本次停止是否由「用户 / 系统」主动要求(sc stop、服务管理器、关机)。
+//
+// 这个标志决定 SCM 会不会把服务再拉起来,是「异常终止要自愈」与「随时可停不能赖着不走」
+// 两个要求的分界线。必须是原子的:它由 SCM 的控制分发线程写,由 serviceMain 所在线程读。
+std::atomic<bool> g_stopRequested{false};
+
+// 上报服务状态。
+//
+// 【dwWin32ExitCode 必须如实填】原实现无条件写 0,也就是不管怎么退出都告诉 SCM「干净停止」。
+// 后果是整套 FailureActions 自动恢复策略【永远不会触发】—— 服务初始化失败、事件循环异常
+// 退出、被样本打死后仍然上报了 STOPPED,SCM 一律当成正常停止,于是主机就一直没有防护,
+// 直到用户手工再打开一次。这正是「重启就失效要重新打开」的核心原因之一。
+void reportStatus(DWORD state, DWORD waitHint = 0, DWORD win32ExitCode = NO_ERROR) {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCurrentState = state;
     g_status.dwControlsAccepted =
         (state == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
-    g_status.dwWin32ExitCode = 0;
+    g_status.dwWin32ExitCode = win32ExitCode;
     g_status.dwWaitHint = waitHint;
     static DWORD checkPoint = 1;
     g_status.dwCheckPoint =
@@ -2192,6 +2030,7 @@ void reportStatus(DWORD state, DWORD waitHint = 0) {
 
 void WINAPI serviceCtrlHandler(DWORD ctrl) {
     if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
+        g_stopRequested.store(true);   // 主动停止:退出时按干净停止上报,SCM 不再拉起
         reportStatus(SERVICE_STOP_PENDING, 8000);
         if (auto* a = QCoreApplication::instance())
             QMetaObject::invokeMethod(a, "quit", Qt::QueuedConnection); // 干净退出事件循环
@@ -2203,9 +2042,28 @@ void WINAPI serviceMain(DWORD, LPWSTR*) {
     if (!g_statusHandle) return;
     reportStatus(SERVICE_START_PENDING, 8000);
     reportStatus(SERVICE_RUNNING);
-    const int rc = serviceRun(g_svcArgc, g_svcArgv); // 阻塞在 app.exec(),STOP 时经 quit 返回
-    reportStatus(SERVICE_STOPPED);
-    (void)rc;
+
+    // serviceRun 里有驱动加载、ETW 会话、管道监听、各存储加载 —— 开机时这些都可能因为
+    // 时序(依赖的子系统还没就绪)而失败。异常绝不能就这么逸出:那会变成进程直接死掉,
+    // 且退出码语义不受控。统一收敛成一个返回码,由下面决定要不要让 SCM 自愈。
+    int rc = 1;
+    try {
+        rc = serviceRun(g_svcArgc, g_svcArgv); // 阻塞在 app.exec(),STOP 时经 quit 返回
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "serviceRun 异常终止:%s\n", ex.what());
+        rc = 1;
+    } catch (...) {
+        std::fprintf(stderr, "serviceRun 未知异常终止\n");
+        rc = 1;
+    }
+
+    // 分两种停止如实上报,配合 applyFailureActions 里打开的 FAILURE_ACTIONS_FLAG:
+    //   · 用户/系统主动停止 -> 退出码 0 -> SCM 不拉起(「随时可停、可卸」这条底线);
+    //   · 其余任何情况(启动失败 / 事件循环异常退出)-> 非 0 -> SCM 按 5s/5s/60s 策略重启。
+    // 注意这里【只看 g_stopRequested】而不看 rc:用户既然要求停,就一定不能再被拉起来,
+    // 否则表现成"关不掉",那比不自愈更糟。
+    const bool userAsked = g_stopRequested.load();
+    reportStatus(SERVICE_STOPPED, 0, userAsked ? NO_ERROR : ERROR_PROCESS_ABORTED);
 }
 
 // ── 失败自动恢复(SCM FailureActions)────────────────────────────────────────
@@ -2214,14 +2072,31 @@ void WINAPI serviceMain(DWORD, LPWSTR*) {
 // 只会记一条「服务意外停止」然后就此不管 —— 实测事件日志里累计 23 次,每次都要人手动
 // `sc start` 才回来。在那之前主机是完全没有防护的,这比崩溃本身严重。
 //
-// 语义上刻意只覆盖【异常终止】:FailureActions 的默认行为(fFailureActionsOnNonCrashFailures
-// 保持 FALSE)是仅当服务进程终止而【没有】上报 SERVICE_STOPPED 时才触发。用户从服务管理器
-// 或 `sc stop` 正常停止时,serviceMain 会上报 SERVICE_STOPPED,SCM 不会把它拉起来 ——
-// 「随时可停、可卸」这条底线不受影响,不存在「关不掉」。
+// 覆盖范围:【进程被打死】+【上报了 STOPPED 但退出码非 0】两种都算失败,都自愈。
+//
+// 原实现刻意把 fFailureActionsOnNonCrashFailures 留成 FALSE,注释的理由是"这样用户正常
+// 停止就不会被拉起来"。但那个理由建立在一个错误前提上:它以为只有"没上报 STOPPED"才算
+// 失败,所以留 FALSE 就够了。实际后果是 —— 服务【初始化失败】或【事件循环异常退出】时
+// 也会走到 reportStatus(SERVICE_STOPPED),于是 SCM 同样当成正常停止,一次都不重启。
+// 开机时序抖动(FltMgr/ETW 还没就绪)导致的启动失败因此永久不恢复,必须人工再打开一次。
+//
+// 现在改成 TRUE,并让 reportStatus 如实填退出码:
+//   · 用户/系统主动停止 -> serviceCtrlHandler 置 g_stopRequested -> 退出码 0 -> 不拉起;
+//   · 启动失败 / 异常退出 / 被打死 -> 退出码非 0(或根本没上报)-> 按策略重启。
+// 「随时可停、可卸」这条底线由退出码而不是由这个开关来保证,语义比原来更准确。
 //
 // 策略:第 1/2 次失败 5 秒后重启,之后每次 60 秒后重启;计数 24 小时清零(避免长期运行中
 // 偶发一次就永久停留在 60 秒档)。
 bool applyFailureActions(SC_HANDLE svc) {
+    // 先把「非崩溃失败也算失败」这个开关打上 —— 它独立于下面的动作表,且下面命中
+    // "配置已一致"时会提前返回,所以必须放在前面,否则老服务永远补不上这个开关。
+    {
+        SERVICE_FAILURE_ACTIONS_FLAG flag = {};
+        flag.fFailureActionsOnNonCrashFailures = TRUE;
+        // 失败不致命(可能被内核自保护挡住),不影响下面的动作表配置。
+        ::ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag);
+    }
+
     SC_ACTION actions[3] = {};
     actions[0].Type = SC_ACTION_RESTART; actions[0].Delay = 5000;
     actions[1].Type = SC_ACTION_RESTART; actions[1].Delay = 5000;
@@ -2260,7 +2135,7 @@ int installService() {
     int rc = 0;
     SC_HANDLE svc = ::CreateServiceW(scm, kSvcName, kSvcDisplay, SERVICE_ALL_ACCESS,
                                      SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-                                     bin.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
+                                     bin.c_str(), nullptr, nullptr, kSvcDependencies, nullptr, nullptr);
     if (!svc) {
         const DWORD e = ::GetLastError();
         if (e == ERROR_SERVICE_EXISTS) std::printf("BulwarkService 已存在。\n");
@@ -2376,7 +2251,7 @@ bool ensureServiceRunning() {
     if (!svc) {
         svc = ::CreateServiceW(scm, kSvcName, kSvcDisplay, SERVICE_ALL_ACCESS,
                                SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-                               bin.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
+                               bin.c_str(), nullptr, nullptr, kSvcDependencies, nullptr, nullptr);
         if (!svc) {
             note(QString::fromUtf8("注册服务失败(错误 %1)。").arg(::GetLastError()));
             ::CloseServiceHandle(scm);
@@ -2395,13 +2270,21 @@ bool ensureServiceRunning() {
             const bool pathStale = cfg->lpBinaryPathName == nullptr
                                    || ::_wcsicmp(cfg->lpBinaryPathName, bin.c_str()) != 0;
             const bool notAuto = cfg->dwStartType != SERVICE_AUTO_START;
-            if (pathStale || notAuto) {
+            // 老版本装出来的服务没有 FltMgr 依赖(开机与筛选器管理器抢跑,见 kSvcDependencies
+            // 的说明)。这里一并补上,否则升级上来的机器仍会保持原有的开机竞态。
+            const bool depsMissing = cfg->lpDependencies == nullptr
+                                     || cfg->lpDependencies[0] == L'\0';
+            if (pathStale || notAuto || depsMissing) {
                 if (::ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
                                            pathStale ? bin.c_str() : nullptr,
-                                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
-                    note(QString::fromUtf8("已修正服务配置(%1%2)。")
-                             .arg(pathStale ? QString::fromUtf8("程序路径 ") : QString(),
-                                  notAuto ? QString::fromUtf8("开机自启") : QString()));
+                                           nullptr, nullptr,
+                                           depsMissing ? kSvcDependencies : nullptr,
+                                           nullptr, nullptr, nullptr)) {
+                    QStringList fixed;
+                    if (pathStale)   fixed << QString::fromUtf8("程序路径");
+                    if (notAuto)     fixed << QString::fromUtf8("开机自启");
+                    if (depsMissing) fixed << QString::fromUtf8("FltMgr 依赖");
+                    note(QString::fromUtf8("已修正服务配置(%1)。").arg(fixed.join(QStringLiteral(" / "))));
                 } else {
                     note(QString::fromUtf8("修正服务配置失败(错误 %1)——可能被内核自保护挡住,"
                                            "如需改动请先在界面里关闭内核驱动。")

@@ -385,7 +385,7 @@ void ProxyReputationService::maybeSyncToServer(const bulwark::FileReputation& re
     const int timeout = timeoutSecs_;
     const QString tag = rep.sha256.left(12);
     std::thread([health, url, body, headers, timeout, tag] {
-        const auto res = ReputationCurl::postRaw(url, body, headers, timeout);
+        const auto res = ReputationCurl::postRaw(url, body, headers, timeout, TlsMode::Pinned);
         // 存活判定只认传输层(HTTP 0 才是离线证据);收到任何状态码都说明服务器活着。这一点
         // 很关键 —— 若把 404 也记成离线,熔断会立刻打开,接下来的「服务器优先查询」全部跳过
         // 服务器:一个纯属锦上添花的回传把主链路给降级了。判定逻辑与查询侧共用 noteOutcome,
@@ -527,7 +527,7 @@ bulwark::FileReputation ProxyReputationService::queryProxy(const QString& sha256
     if (!token_.isEmpty())
         headers << (QStringLiteral("Authorization: Bearer ") + token_);
 
-    const auto res = ReputationCurl::postRaw(url, body, headers, timeoutSecs_);
+    const auto res = ReputationCurl::postRaw(url, body, headers, timeoutSecs_, TlsMode::Pinned);
     // 真实查询本身就是最好的存活探针:据结果刷新存活/限流状态。注意它【不写 atMs】——
     // atMs 只属于 /health 探测缓存,查询侧去顶新它会把 UI 的重新探测饿死(见 HealthCache)。
     noteOutcome(health_, res.first, res.second);
@@ -587,7 +587,8 @@ std::pair<bool, QString> ProxyReputationService::testConnection() {
         if (fallback_ && !serverOnly_) return fallback_->testConnection();
         return { false, QString::fromUtf8("信誉代理未启用") };
     }
-    const auto res = ReputationCurl::get(baseUrl_ + QStringLiteral("/health"), {}, timeoutSecs_);
+    const auto res =
+        ReputationCurl::get(baseUrl_ + QStringLiteral("/health"), {}, timeoutSecs_, TlsMode::Pinned);
     if (res.first == 0)
         return { false, QString::fromUtf8("连接失败(curl 不可用或网络不通)") };
     if (res.first != 200)
@@ -625,7 +626,7 @@ std::pair<bool, QString> ProxyReputationService::healthCheckNonBlocking() {
                     ~ProbeGuard() { if (h) h->probing.store(false); }
                 } guard{ health };
 
-                const auto res = ReputationCurl::get(url, {}, timeout);
+                const auto res = ReputationCurl::get(url, {}, timeout, TlsMode::Pinned);
                 const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
                 const bool throttled = health->throttledUntilMs.load() > nowMs;
                 if (res.first == 200) {

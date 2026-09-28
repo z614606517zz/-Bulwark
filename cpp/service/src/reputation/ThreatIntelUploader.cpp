@@ -104,7 +104,8 @@ int ThreatIntelUploader::uploadNow() {
 
         // 本类在 bulwark::service 下,ReputationCurl 在 bulwark::service::reputation 下,需限定。
         const auto res =
-            reputation::ReputationCurl::postRaw(url, QString::fromUtf8(body), headers, timeoutSecs_);
+            reputation::ReputationCurl::postRaw(url, QString::fromUtf8(body), headers, timeoutSecs_,
+                                                reputation::TlsMode::Pinned);
         if (res.first == 404 || res.first == 405 || res.first == 501) {
             // 服务器没这个接口(旧版本 / 已关闭共享):记下来,今后不再尝试。本地暂存保留 ——
             // 用户若关掉开关,会由 purgeAll 清掉;不会悄悄堆积到无限大(队列本身有 500 条上限)。

@@ -56,8 +56,7 @@ qt_add_executable(bulwark_service
     src/ThreatRemediator.cpp
     # persistence audit (read-only enumeration of 7 autostart points + risk scoring)
     src/PersistenceScanner.cpp
-    # 磁盘垃圾清理:编译期固定的类别/根目录表 + 扫描 + 删除,七道安全护栏见 JunkCleaner.h
-    src/JunkCleaner.cpp
+
     # ipc + orchestration (Q_OBJECT headers listed so AUTOMOC processes them)
     include/bulwark/service/EventSource.h
     include/bulwark/service/EtwProcessEventSource.h
@@ -111,9 +110,7 @@ if(WIN32)
     # ole32/uuid/oleaut32: COM + IShellLink (UserModeBehaviorSource resolves startup .lnk
     #   targets) + ITaskService (ProcessOriginResolver matches a PID to its scheduled task;
     #   oleaut32 provides VariantInit/SysFreeString used on that path).
-    # shell32: SHQueryRecycleBin / SHEmptyRecycleBin (JunkCleaner 的回收站维度 —— 刻意走
-    #   Shell API 而不是手工遍历 $Recycle.Bin,见 JunkCleaner.h 的产品决定)。
-    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32 shell32)
+    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32)
 endif()
 
 target_compile_features(bulwark_service PRIVATE cxx_std_20)

@@ -297,22 +297,25 @@ struct UpdateOptions {
     QString resolveBaseUrl(const QString& reputationProxyBaseUrl) const;
 };
 
-// --- 磁盘垃圾清理 -------------------------------------------------------------
-// 功能本身的范围(哪些目录算垃圾)是【编译期写死】的,不在配置里 —— 一个能删文件的功能
-// 如果从配置读路径,那份配置就成了任意文件删除的输入。这里只放「要不要开、留多久、扫多久」
-// 这类不改变删除范围的旋钮,以及一份【只会让范围变小】的额外排除表。
-struct DiskCleanupOptions {
-    bool Enabled = true;
-    // 只清理「最后修改时间早于 N 小时」的文件。正在被安装程序使用的临时文件通常刚写下 ——
-    // 这个阈值就是为了不把别人正在进行的安装弄坏,是本功能最重要的一个旋钮。
-    // 0 表示不按时间过滤(不建议:实测装大型软件时 %TEMP% 里确有正在使用的解压中间文件)。
-    int MinFileAgeHours = 24;
-    // 单类别的条数上限与单次操作的时间上限。防一个病态目录树(几百万文件 / 极深嵌套)把
-    // 服务卡住;命中上限时结果标记为「下限估计」,如实告诉用户而不是假装扫完了。
-    int MaxFilesPerCategory = 300000;
-    int MaxSeconds = 120;
-    // 额外排除(不区分大小写的路径子串)。只能【缩小】清理范围,加进来的路径永远不会被动。
-    QStringList ExcludePaths;
+// --- 自有端点(信誉代理 / 更新服务器)的 TLS 信任锚 ---------------------------
+//
+// 本类存在的唯一原因:自有端点可能用自签证书,而本产品出网的每一条通道(情报查询、
+// 情报上传、文件上传、更新清单、更新载荷下载)都要在这条链上跑。
+//
+// 【为什么不能靠关掉校验解决】原实现给每一条 curl 命令都加了 -k(--insecure),于是所有
+// 请求头里的 bearer token 与各家 API 密钥、上传的用户文件、以及「取下来要以 SYSTEM 执行」
+// 的更新载荷,全部暴露在任意中间人面前。详见 ReputationCurl.h 里 TlsMode 的说明。
+//
+// 【为什么这两项不算「可配置地放宽安全」】它们不是开关,是【指定信任谁】:
+//   · CaBundlePath 收窄信任根(比默认的公网 CA 池更严);
+//   · PinnedPublicKeys 把连接钉死在指定公钥上(证书被换掉就连不上)。
+// 两项都不填时行为是「按公网 CA 完整校验」,即最严的默认值 —— 配错只会连不上,不会静默降级。
+struct SelfHostedTlsOptions {
+    // 自有端点证书链的 PEM 文件(推荐)。非空时只信这一份锚,链与主机名校验全部保留。
+    QString CaBundlePath;
+    // 公钥固定值,形如 "sha256//base64=="(可多条,证书轮换期同时接受新旧)。
+    // 仅在 CaBundlePath 为空时使用。取法见 ReputationCurl.h。
+    QStringList PinnedPublicKeys;
 };
 
 // --- Root options ("Bulwark") ------------------------------------------------
@@ -329,6 +332,9 @@ struct BulwarkOptions {
     QStringList UiClientAllowedThumbprints;      // SHA-1 thumbprint allowlist (normalized)
     QStringList UiClientAllowedPublishers;       // subject/CN substring allowlist
     bool OnlineCertRevocationCheck = false;      // online CRL/OCSP (may block seconds)
+
+    // 自有端点的 TLS 信任锚(见 SelfHostedTlsOptions 的说明)。留空 = 按公网 CA 完整校验。
+    SelfHostedTlsOptions SelfHostedTls;
 
     // --- 防护链路延迟(detection -> verdict)的两个硬上限 ------------------------
     // 内核事件出队间隔(毫秒)。读线程把事件放进队列,主线程按这个节拍取走再富化/裁决,
@@ -372,7 +378,6 @@ struct BulwarkOptions {
     ReputationProxyOptions ReputationProxy; // central shared intel proxy (proxy-first, fail-open)
     AttackChainOptions AttackChainEngine;   // 攻击链组合引擎(服务器挖组合,客户端记账对号)
     UpdateOptions Update;                   // 在线更新(签名钉死,见 bulwark/UpdateTrust.h)
-    DiskCleanupOptions DiskCleanup;         // 磁盘垃圾清理(范围写死在代码里,这里只有旋钮)
 
     QString ProxyUrl;                    // global HTTP proxy for all intel sources
     QStringList TrustedDirectories;      // wildcard dirs whose executables are fully allowed

@@ -11,10 +11,17 @@ class QByteArray;
 namespace bulwark::service {
 
 // 内核驱动事件源:通过 fltlib 连接 Bulwark.sys 的 Minifilter 通信端口(\BulwarkPort),
-// 接收「行为发生前」被内核拦下并同步等待裁决的敏感操作(文件删除/重命名、注册表写/删、
-// 结束进程),转成 SecurityEvent 交规则引擎/UI,拿到裁决后经 FilterReplyMessage 回写内核
-// 放行或阻止。进程创建/映像加载/远程线程/自保/网络/内存防护等为「fire-and-forget」遥测
-// (内核不等待回复),其中进程创建标记 userModeObserved,Block 时由 Worker 事后补偿。
+// 把内核遥测转成 SecurityEvent 交规则引擎/UI。
+//
+// 【模型:全部 fire-and-forget,内核从不等待用户态裁决】
+// 这一段以前写的是「接收『行为发生前』被内核拦下并同步等待裁决的敏感操作……拿到裁决后经
+// FilterReplyMessage 回写内核放行或阻止」——那个模型在协议 v9 已经不存在了(内核发消息时
+// 不传回复缓冲,也没有处理回复的分支;详见 EventSource.h 里 wantsVerdict 处的完整说明)。
+// 保留错误描述的代价很高:它会让人以为「引擎判 Block 就等于行为被阻止了」,而真实情况是
+// 引擎的 Block 一律靠事后补偿(结束进程树 / 下发内核禁运名单)兑现。
+//
+// 事件里带 kernelBlocked=true 的那些,表示【内核已经用自己的本地名单在动作前拒绝了】,与
+// 用户态裁决无关;带 userModeObserved=true 的表示动作已经发生,只能事后处置。
 //
 // 这是真正的「行为前」主动防御,取代/补充 ETW 用户态观测。对应 .NET
 // Bulwark.Service/Monitoring/DriverEventSource.cs —— C++ 直接 #include 驱动的 Protocol.h,
@@ -33,8 +40,18 @@ public:
     void stop() override;
     bool isAvailable() const override;        // 已连接并通过协议握手
 
-    // 阻塞源:引擎裁决后需回写内核(放行/拦截)。
-    bool wantsVerdict() const override { return true; }
+    //
+    // 【返回 false:当前驱动不等待任何裁决】
+    //
+    // 原来返回 true,于是每条文件/注册表事件在得出终裁后都会走一次 submitVerdict ->
+    // FilterReplyMessage —— 而那个调用在 v9 协议下【必然失败】(内核发消息时没有传回复缓冲),
+    // 失败还会写一行 rep 日志。代价是每条事件多一次端口互斥 + 一次注定失败的系统调用,
+    // 收益为零;更糟的是它让调用侧看起来「裁决已经回写生效」,掩盖了「引擎无法行为前拦截」
+    // 这个真实的架构约束。
+    //
+    // submitVerdict 的实现保留(见 .cpp),以便将来协议若重新引入同步裁决可以直接打开。
+    //
+    bool wantsVerdict() const override { return false; }
     void submitVerdict(const bulwark::SecurityEvent& e, bulwark::VerdictAction action) override;
 
     // ---- 运行时配置下发(可在连接后任意时刻调用;未连接时安全 no-op)----------

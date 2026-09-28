@@ -78,12 +78,14 @@ void EventSourceCoordinator::setKernelEnabled(bool on) {
         driver_->start();                  // 连接 + 握手(同步)
         for (int pid : protectedPids_)     // 补发受保护 UI PID
             driver_->addProtectedPid(pid);
+        // 无论首次是否连上,都把看护定时器开起来(见 onKernelRetry 的说明):
+        // 连上了它负责发现"中途掉线",没连上它负责持续重试。
+        kernelRetry_->start();
         if (driver_->isAvailable()) {
             attachFailed_ = false;
             log_.info(QStringLiteral("内核驱动事件源已连接(行为前拦截 + 用户态补偿)。"));
         } else {
             attachFailed_ = true;
-            kernelRetry_->start();         // 后台自愈重试,期间降级为用户态观测
             log_.warning(QStringLiteral("内核驱动暂不可用,已降级为用户态观测,后台将持续重试。"));
         }
     } else {
@@ -94,14 +96,32 @@ void EventSourceCoordinator::setKernelEnabled(bool on) {
     }
 }
 
+// 内核连接看护。
+//
+// 【原实现连上就把定时器停了】—— 只能自愈"启动时没连上"这一种情况。一旦驱动在运行期间掉了
+// (被 fltmc unload、被升级脚本卸载、驱动自身重载、或外部工具卸载),就再也没有人发现:
+// 服务还活着、界面还显示"防护开启",但内核前置拦截已经没了,而且要等到下次重启服务才恢复。
+// 这是「防护静默失效」——比服务直接挂掉更难察觉。
+// 现在只要启用了内核驱动,这个定时器就一直跑;已连上时每轮只做一次极轻的句柄检查。
 void EventSourceCoordinator::onKernelRetry() {
     if (!kernelEnabled_ || !driver_) { kernelRetry_->stop(); return; }
-    if (driver_->isAvailable()) { kernelRetry_->stop(); attachFailed_ = false; return; }
+    if (driver_->isAvailable()) {
+        // 连接正常:清掉失败标记但【不停表】,继续看护掉线。
+        if (attachFailed_) {
+            attachFailed_ = false;
+            log_.info(QStringLiteral("内核驱动连接已恢复。"));
+        }
+        return;
+    }
+    // 走到这里说明「本该有内核却没有」:要么从没连上,要么中途掉了。两种都按同一条路自愈。
+    if (!attachFailed_) {
+        attachFailed_ = true;
+        log_.warning(QStringLiteral("内核驱动连接已断开(驱动被卸载或重载),正在尝试重新加载并接回。"));
+    }
     DriverControl::ensureLoaded();
     driver_->setMemoryProtectionEnabled(memProtEnabled_); // 同上:必须早于 start()
     driver_->start();
     if (driver_->isAvailable()) {
-        kernelRetry_->stop();
         attachFailed_ = false;
         for (int pid : protectedPids_)
             driver_->addProtectedPid(pid);

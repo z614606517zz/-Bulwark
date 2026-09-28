@@ -14,15 +14,64 @@
 namespace bulwark::service::reputation {
 
 QString ReputationCurl::proxyUrl;
+QString ReputationCurl::ownCaBundlePath;
+QStringList ReputationCurl::ownPinnedPublicKeys;
+
+bool ReputationCurl::ownTrustAnchorConfigured() {
+    return !ownCaBundlePath.trimmed().isEmpty() || !ownPinnedPublicKeys.isEmpty();
+}
+
+//
+// 全类唯一决定 TLS 校验强度的地方。见 ReputationCurl.h 里 TlsMode 的说明。
+//
+QStringList ReputationCurl::tlsArgs(TlsMode mode) {
+    // 第三方公网端点:curl 默认行为就是完整校验(证书链 + 主机名),不需要任何额外参数。
+    // 显式返回空列表而不是「什么都不做」,是为了让这条分支在代码里看得见。
+    if (mode == TlsMode::PublicCa)
+        return {};
+
+    const QString ca = ownCaBundlePath.trimmed();
+    if (!ca.isEmpty()) {
+        // 首选档:把信任根收窄到我们自己那一份 PEM。链校验与主机名校验【全部保留】。
+        return { QStringLiteral("--cacert"), ca };
+    }
+
+    if (!ownPinnedPublicKeys.isEmpty()) {
+        // 次选档:公钥固定。curl 的 --pinnedpubkey 是叠加在常规校验之上的,而自签证书过不了
+        // 常规校验,所以这里必须同时跳过链/主机名校验 —— 但公钥对不上依然连不上,故安全性
+        // 来自 pin 而不是来自链。这是 `-k` 在本文件里【唯一】还允许出现的位置。
+        QStringList pins;
+        for (const QString& p : ownPinnedPublicKeys) {
+            const QString t = p.trimmed();
+            if (!t.isEmpty())
+                pins << (t.startsWith(QStringLiteral("sha256//")) ? t : (QStringLiteral("sha256//") + t));
+        }
+        if (!pins.isEmpty()) {
+            return { QStringLiteral("--pinnedpubkey"), pins.join(QLatin1Char(';')),
+                     QStringLiteral("-k") };
+        }
+    }
+
+    // 都没配:退回完整公网校验,而不是退回「不校验」。只提醒一次,免得刷满诊断日志。
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        diag(QStringLiteral("自有端点未配置 TLS 信任锚(SelfHostedTls.CaBundlePath / PinnedPublicKeys 均为空),"
+                            "本次及后续请求按公网 CA 完整校验。若自有端点用自签证书,请配置其中之一。"));
+    }
+    return {};
+}
 
 QStringList ReputationCurl::buildArgs(const QString& method, const QString& url,
                                       const QStringList& headers,
-                                      const QList<QPair<QString, QString>>* form, int timeoutSeconds) {
+                                      const QList<QPair<QString, QString>>* form, int timeoutSeconds,
+                                      TlsMode tls) {
     QStringList args;
-    args << QStringLiteral("-sS") << QStringLiteral("-k") << QStringLiteral("-L")
+    args << QStringLiteral("-sS") << QStringLiteral("-L")
          << QStringLiteral("--max-redirs") << QStringLiteral("5")
          << QStringLiteral("--max-time") << QString::number(std::max(5, timeoutSeconds))
          << QStringLiteral("-X") << method;
+    args << tlsArgs(tls);
     if (!proxyUrl.isEmpty())
         args << QStringLiteral("--proxy") << proxyUrl;
     for (const QString& h : headers)
@@ -80,23 +129,27 @@ std::pair<int, QString> ReputationCurl::run(const QStringList& args, int timeout
     return { code, body };
 }
 
-std::pair<int, QString> ReputationCurl::get(const QString& url, const QStringList& headers, int timeoutSeconds) {
-    return run(buildArgs(QStringLiteral("GET"), url, headers, nullptr, timeoutSeconds), timeoutSeconds);
+std::pair<int, QString> ReputationCurl::get(const QString& url, const QStringList& headers, int timeoutSeconds,
+                                            TlsMode tls) {
+    return run(buildArgs(QStringLiteral("GET"), url, headers, nullptr, timeoutSeconds, tls), timeoutSeconds);
 }
 
 std::pair<int, QString> ReputationCurl::postForm(const QString& url,
                                                  const QList<QPair<QString, QString>>& form,
-                                                 const QStringList& headers, int timeoutSeconds) {
-    return run(buildArgs(QStringLiteral("POST"), url, headers, &form, timeoutSeconds), timeoutSeconds);
+                                                 const QStringList& headers, int timeoutSeconds,
+                                                 TlsMode tls) {
+    return run(buildArgs(QStringLiteral("POST"), url, headers, &form, timeoutSeconds, tls), timeoutSeconds);
 }
 
 std::pair<int, QString> ReputationCurl::postRaw(const QString& url, const QString& body,
-                                                const QStringList& headers, int timeoutSeconds) {
+                                                const QStringList& headers, int timeoutSeconds,
+                                                TlsMode tls) {
     QStringList args;
-    args << QStringLiteral("-sS") << QStringLiteral("-k") << QStringLiteral("-L")
+    args << QStringLiteral("-sS") << QStringLiteral("-L")
          << QStringLiteral("--max-redirs") << QStringLiteral("5")
          << QStringLiteral("--max-time") << QString::number(std::max(5, timeoutSeconds))
          << QStringLiteral("-X") << QStringLiteral("POST");
+    args << tlsArgs(tls);
     if (!proxyUrl.isEmpty())
         args << QStringLiteral("--proxy") << proxyUrl;
     for (const QString& h : headers)
@@ -111,14 +164,16 @@ std::pair<int, QString> ReputationCurl::postRaw(const QString& url, const QStrin
 }
 
 std::pair<int, QString> ReputationCurl::postFile(const QString& url, const QString& filePath,
-                                                 const QStringList& headers, int timeoutSeconds) {
+                                                 const QStringList& headers, int timeoutSeconds,
+                                                 TlsMode tls) {
     // Multipart upload; -F implies POST. File transfers can be slow, so floor
     // the timeout higher than the JSON-request default.
     const int t = std::max(30, timeoutSeconds);
     QStringList args;
-    args << QStringLiteral("-sS") << QStringLiteral("-k") << QStringLiteral("-L")
+    args << QStringLiteral("-sS") << QStringLiteral("-L")
          << QStringLiteral("--max-redirs") << QStringLiteral("5")
          << QStringLiteral("--max-time") << QString::number(t);
+    args << tlsArgs(tls);
     if (!proxyUrl.isEmpty())
         args << QStringLiteral("--proxy") << proxyUrl;
     for (const QString& h : headers)
@@ -131,13 +186,15 @@ std::pair<int, QString> ReputationCurl::postFile(const QString& url, const QStri
 }
 
 std::pair<int, QString> ReputationCurl::download(const QString& url, const QString& destPath,
-                                                 const QStringList& headers, int timeoutSeconds) {
+                                                 const QStringList& headers, int timeoutSeconds,
+                                                 TlsMode tls) {
     // 下载几 MB 的载荷,超时地板比 JSON 请求高得多。
     const int t = std::max(30, timeoutSeconds);
     QStringList args;
-    args << QStringLiteral("-sS") << QStringLiteral("-k") << QStringLiteral("-L")
+    args << QStringLiteral("-sS") << QStringLiteral("-L")
          << QStringLiteral("--max-redirs") << QStringLiteral("5")
          << QStringLiteral("--max-time") << QString::number(t);
+    args << tlsArgs(tls);
     if (!proxyUrl.isEmpty())
         args << QStringLiteral("--proxy") << proxyUrl;
     for (const QString& h : headers)

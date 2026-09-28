@@ -1,6 +1,7 @@
 #pragma once
 #include "bulwark/models/FileReputation.h"
 
+#include <QDateTime>
 #include <QHash>
 #include <QMutex>
 #include <QString>
@@ -30,10 +31,22 @@ public:
 
 private:
     void load();
+    // 丢弃过期条目并整份重写 reputation.jsonl(每哈希一条)。调用方须持 lock_。
+    void compactLocked();
+    bool isExpiredLocked(const bulwark::FileReputation& rep, const QDateTime& now) const;
+
+    // 内存条目上限,以及"追加多少条新哈希后压实一次文件"。
+    //
+    // 两者都是原先缺失的界:cache_ 从不淘汰(过期项只是查不中,对象还在),
+    // reputation.jsonl 只追加且同一哈希每次刷新都留一条新行 —— 文件与内存都随使用时间
+    // 单调增长,而启动时这个文件要整份解析。
+    static constexpr int kMaxEntries          = 50000;
+    static constexpr int kCompactEveryAppends = 2000;
 
     QString path_;
     QHash<QString, bulwark::FileReputation> cache_; // keys lower-cased
     QMutex lock_;
+    int appendsSinceCompact_ = 0;
     qint64 cleanTtlMs_;
     qint64 unknownTtlMs_;
     qint64 suspiciousTtlMs_;

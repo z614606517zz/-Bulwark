@@ -16,11 +16,26 @@ public:
     // 源是否成功就绪(如 ETW 实时会话需管理员;失败时返回 false,服务其余部分照常)。
     virtual bool isAvailable() const { return true; }
 
-    // ---- 同步裁决回写(仅内核驱动等「行为前」阻塞源需要)----------------------
-    // 内核驱动在动作发生前同步等待用户态裁决:引擎判定后必须把 Allow/Block 回写内核
-    // (FilterReplyMessage),否则内核超时兜底。纯观测源(ETW/WMI)无法在动作前
-    // 阻断,保持默认空实现,拦截由 Worker 事后补偿(结束进程树)。
-    // wantsVerdict()==true 时,Worker 会在得出终裁后调用 submitVerdict。
+    // ---- 同步裁决回写 ----------------------------------------------------------
+    //
+    // 【这段注释以前描述的是一个已经不存在的模型,必须纠正】
+    //
+    // 原文写的是「内核驱动在动作发生前同步等待用户态裁决:引擎判定后必须把 Allow/Block 回写
+    // 内核(FilterReplyMessage),否则内核超时兜底」。当前(协议 v9)的驱动【不是这样】:
+    //   · 内核的 BlwReportEvent 用 FltSendMessage(..., timeout = 0) 且【不传回复缓冲】;
+    //   · BlwMessageNotify 里没有任何 BLW_VERDICT_REPLY 的处理分支;
+    //   · 驱动源自己也承认「当前驱动为 fire-and-forget,回写为尽力而为」
+    //     (DriverEventSource.cpp 的 needsVerdict 注释)。
+    // 也就是说 FilterReplyMessage 恒失败,回写没有任何效果。
+    //
+    // 由此必须明确的架构事实:【用户态规则引擎没有行为前拦截能力】。引擎产出的每一个 Block
+    // 都是事后补偿(结束进程树 / 加内核禁运名单)。真正的 pre-action 阻断只来自内核自持的
+    // 那几份本地名单(FileHardBlock / SelfGuard / FileNoLoad / FileExecBlock / CmdHardBlock /
+    // RegHardBlock)、WFP 黑名单、以及 ObCallbacks 的权限剥离。
+    //
+    // 这个接口保留下来(而不是删掉):若将来重新引入「内核等待裁决」的通道,这里就是接入点。
+    // 但默认必须是 false —— 让每条文件/注册表事件都去做一次注定失败的 FilterReplyMessage
+    // (还要取一次端口互斥),是纯粹的浪费,也会让人误以为拦截是同步生效的。
     virtual bool wantsVerdict() const { return false; }
     virtual void submitVerdict(const bulwark::SecurityEvent& /*e*/,
                                bulwark::VerdictAction /*action*/) {}
