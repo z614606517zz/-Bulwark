@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   # Package to check. Omit only when exactly one package exists on the Desktop --
   # verifying whichever folder happened to sort first is how a leak gets missed.
@@ -101,17 +101,43 @@ Emit "=== sensitive-string scan (all text files in package) ==="
 # hand. They used to be duplicated here AND (in plaintext) inside the shipped
 # bulwark.ps1, which is how the release package ended up carrying our endpoint,
 # token and IPs in a file any user can open in Notepad.
-$needleFile = Join-Path $root 'packaging\redaction-needles.txt'
-if (-not (Test-Path $needleFile)) {
+# WHERE THE NEEDLE LIST LIVES
+#   packaging\redaction-needles.txt is the single source of truth. It holds plaintext
+#   infrastructure fingerprints, so it is deliberately excluded from version control
+#   (see the entry in .gitignore) as well as from every release package.
+#
+#   That exclusion has one awkward consequence worth handling: a fresh clone, a CI
+#   runner, or anyone self-building has no such file, and the previous code threw a
+#   bare "needle list missing" with a single hard-coded path -- which reads like a
+#   broken script rather than "you need to supply this out-of-band". Two fixes:
+#     · accept the file from a few conventional out-of-band locations, so a CI secret
+#       or a release-machine copy works without editing this script;
+#     · when it is missing, say what the file is for and point at the committed
+#       template (packaging\redaction-needles.txt.example) that documents the format.
+#       The format used to be documented *inside* the excluded file, i.e. exactly the
+#       people who need it never saw it.
+$needleCandidates = @()
+if ($env:BULWARK_REDACTION_NEEDLES) { $needleCandidates += $env:BULWARK_REDACTION_NEEDLES }
+$needleCandidates += (Join-Path $root 'packaging\redaction-needles.txt')          # canonical
+$needleCandidates += (Join-Path $root 'packaging\redaction-needles.local.txt')    # dev copy
+if ($env:ProgramData) {
+  $needleCandidates += (Join-Path $env:ProgramData 'Bulwark\redaction-needles.txt')  # release box
+}
+
+$needleFile = $needleCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $needleFile) {
   # Do not degrade to "no patterns -> clean". A scan that silently checks nothing
   # is worse than no scan: it prints a green line and gets trusted.
-  throw ("needle list missing: " + $needleFile)
+  throw ("needle list not found. It is intentionally not in version control (plaintext " +
+         "infrastructure fingerprints). Set BULWARK_REDACTION_NEEDLES, or create the file at one of:`n  " +
+         (($needleCandidates | Select-Object -Unique) -join "`n  ") +
+         "`nFormat and purpose: packaging\redaction-needles.txt.example")
 }
 $pats = @(Get-Content -LiteralPath $needleFile |
           ForEach-Object { $_.Trim() } |
           Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
 if ($pats.Count -eq 0) { throw ("needle list is empty: " + $needleFile) }
-Emit ("patterns: " + $pats.Count + " (from packaging\redaction-needles.txt)")
+Emit ("patterns: " + $pats.Count + " (from " + $needleFile + ")")
 $hit = $false
 foreach ($f in (Get-ChildItem $pkg -Recurse -File -Include *.txt,*.json,*.bat,*.ps1,*.html,*.sh -ErrorAction SilentlyContinue)) {
   $t = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
@@ -218,6 +244,55 @@ else {
       Emit "  )"
     }
   }
+}
+
+Emit ""
+Emit "=== TLS verification (source scan) ==="
+# WHY THIS CHECK EXISTS
+#   ReputationCurl used to pass `-k` (--insecure) on every single curl invocation, which
+#   disabled certificate and hostname verification for: the reputation proxy (bearer token
+#   in the header), six third-party intel APIs (each with its own API key), threat-intel
+#   upload, user-file upload, and the online-update manifest + payload download. A single
+#   forgotten `-k` re-introduces all of that at once, and nothing at runtime would complain.
+#
+#   So the invariant is checked statically: inside ReputationCurl.cpp, `-k` may appear only
+#   on a line that also mentions --pinnedpubkey (public-key pinning replaces chain
+#   validation there). Anywhere else -- and in any other source file that shells out to
+#   curl -- it is a defect.
+$srcRoot = Join-Path $root 'cpp'
+if (-not (Test-Path $srcRoot)) { Emit "  SKIP: no cpp\ tree next to this script (running against a package only)" }
+else {
+  $bad = New-Object System.Collections.Generic.List[string]
+  foreach ($f in (Get-ChildItem $srcRoot -Recurse -File -Include *.cpp,*.h -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notmatch '\\(build|build-[^\\]*|build_[^\\]*|dist|x64|Debug|Release|third_party)\\' })) {
+    # 不变量是【语句级】的:-k 只允许和 --pinnedpubkey 出现在同一个 curl 参数列表里。
+    # 原来逐行判,于是一个换行的 return 就成了缺陷:
+    #     return { QStringLiteral("--pinnedpubkey"), pins.join(QLatin1Char(';')),
+    #              QStringLiteral("-k") };          <-- 这一行不含 pinnedpubkey
+    # 代码没错,检查太窄。而一个每次发版都固定报一条 DEFECT 的检查,会被人学会忽略 ——
+    # 那时真漏了 -k 也没人看见。所以往前看几行(同一语句内),窗口有上限,孤立的 -k 照样抓。
+    $lines = @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)
+    $window = 3
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+      $line = $lines[$i]
+      # Match the curl switch as an argument literal, not the letter k in prose.
+      if ($line -match '"\-k"' -or $line -match '"--insecure"') {
+        # 往前收集同一语句的文本:遇到语句结束符(;)或空行就停。
+        $ctx = $line
+        for ($j = $i - 1; $j -ge 0 -and $i - $j -le $window; $j--) {
+          $prev = $lines[$j]
+          if ($prev.Trim() -eq '') { break }
+          $ctx = $prev + "`n" + $ctx
+          if ($prev -match ';\s*$') { break }
+        }
+        if ($ctx -notmatch 'pinnedpubkey') {
+          $bad.Add(('  DEFECT: {0}:{1} passes -k/--insecure without public-key pinning' -f $f.FullName.Substring($srcRoot.Length + 1), ($i + 1)))
+        }
+      }
+    }
+  }
+  if ($bad.Count -eq 0) { Emit "  clean -- no unpinned -k/--insecure in the C++ tree" }
+  else { foreach ($b in $bad) { Emit $b } }
 }
 
 Emit ""

@@ -13,8 +13,9 @@
 #    -Configuration  Release (default) | Debug   (service/ui)
 #
 #  NOTE: messages are intentionally ASCII-only. PowerShell 5.1 misreads a
-#  non-BOM UTF-8 script as GBK and can corrupt string/path literals (see the
-#  warning in cpp\.tools\build.ps1). All paths are derived at runtime.
+#  non-BOM UTF-8 script as GBK and can corrupt string/path literals (same
+#  pitfall as noted at the top of scripts\make-update-package.ps1). All paths
+#  are derived at runtime.
 #
 #  WARNING: loading the kernel driver flips test-signing ON (needs one reboot)
 #  and loads Bulwark.sys. A faulty kernel callback can BSOD. Prefer a VM with a

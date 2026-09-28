@@ -1,0 +1,48 @@
+# Bulwark -- redaction needles (TEMPLATE; safe to commit)
+#
+# WHAT THIS IS
+#   Fingerprints of our own infrastructure that must never leak out of a machine
+#   through a user-submitted diagnostic bundle: the intel endpoint host, its IP
+#   addresses, and the reputation-proxy bearer token. They do NOT appear in
+#   appsettings.json (they come from fallback addresses baked into the binary and
+#   from DNS-resolution lines in service.log), so the config-driven redaction in
+#   bulwark.ps1 cannot derive them -- they have to be listed somewhere.
+#
+# WHY THIS TEMPLATE EXISTS
+#   The real list (packaging\redaction-needles.txt) is plaintext, so it is excluded
+#   both from every release package and from version control (see .gitignore). That
+#   is correct -- but it meant the *format documentation* lived inside the excluded
+#   file, i.e. the only people who ever needed it (fresh clone, CI runner, anyone
+#   self-building) were exactly the people who never received it. verify_portable.ps1
+#   used to fail with a bare "needle list missing" and one hard-coded path, which
+#   reads like a broken script rather than "supply this out-of-band".
+#
+# WHERE THE REAL LIST GOES (verify_portable.ps1 resolves in this order)
+#   1) $env:BULWARK_REDACTION_NEEDLES               -- CI secret / build machine
+#   2) packaging\redaction-needles.txt              -- canonical, git-ignored
+#   3) packaging\redaction-needles.local.txt        -- extra developer copy
+#   4) %ProgramData%\Bulwark\redaction-needles.txt  -- release machine
+#
+# HOW IT IS CONSUMED
+#   verify_portable.ps1     reads it as the sensitive-string scan pattern list
+#   tools\test-redaction.ps1 same
+#   bulwark.ps1             carries only SHA-256 of each entry (see
+#                           $script:RedactNeedleHashes) and matches by hash, so the
+#                           shipped log collector never contains the plaintext
+#
+# AFTER EDITING THE REAL LIST
+#   Run:  powershell -File verify_portable.ps1 -Package <any package>
+#   The "redaction needle set" section fails on desync and prints the exact hash
+#   lines to paste into packaging\portable-scripts\bulwark.ps1.
+#
+# FORMAT
+#   One needle per line. Blank lines and #-comments ignored. Matching is
+#   case-insensitive (both sides are lowercased before hashing).
+#
+# ASCII-only: PS 5.1 on a zh-CN box reads files without a BOM as GBK.
+#
+# ---- EXAMPLE ENTRIES (replace with your real values) ----
+# intel.example.invalid
+# 203.0.113.10
+# 198.51.100.7
+# REPLACE_WITH_REAL_PROXY_TOKEN
