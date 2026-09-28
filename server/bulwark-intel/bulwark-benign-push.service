@@ -18,6 +18,14 @@ Group=root
 Environment=BULWARK_SYNC_KEY=/root/.ssh/id_sync23
 # Fill in your own master before enabling this unit. bulwark-benign-push.py exits 2
 # rather than ssh to an empty destination, so a forgotten value fails loudly.
+#
+# Same address and same forced-command channel as bulwark-sync.service; keep the two
+# in step. As there, the real address does not belong in this tracked file -- set it
+# per-machine with a drop-in:
+#
+#   /etc/systemd/system/bulwark-benign-push.service.d/10-master.conf
+#     [Service]
+#     Environment=BULWARK_MASTER=root@<master-ip>
 Environment=BULWARK_MASTER=root@master.example
 ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-benign-push.py
 Nice=10

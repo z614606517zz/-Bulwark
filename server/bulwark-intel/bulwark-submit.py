@@ -112,6 +112,25 @@ SUBMIT_RETRY_MIN = 5
 # daily quota on "still unavailable"; the per-pass budget caps the damage either way.
 DEGRADED_RETRY_MIN = 10
 
+# ---- upload-first gating -----------------------------------------------------
+# The dashboard refreshes UPLOAD_MARK every time it finishes receiving a file, and a
+# *.part in staging means one is streaming right now. Between them they answer "is the
+# browser still sending?" without the page having to promise anything it might not keep.
+UPLOAD_MARK = os.path.join(SPOOL, ".upload-active")
+# How long the upload has to be silent before the query half starts. Long enough to
+# bridge the gap between two files in a batch (the page uploads 3 at a time), short
+# enough that a single dropped file is not left waiting.
+QUIET_SEC = int(os.environ.get("BULWARK_SUBMIT_QUIET_SEC", "20"))
+# Upper bound on the wait. A huge folder can take a long time, but the pass must still
+# end well inside the unit's TimeoutStartSec=1800 with room for the queries themselves.
+QUIET_MAX_WAIT_SEC = int(os.environ.get("BULWARK_SUBMIT_QUIET_MAX_WAIT", "600"))
+# How long a *.part may go without growing before it is treated as an abandoned upload
+# rather than a live one. More generous than QUIET_SEC because this is measured against
+# 1 MB chunk writes: 60s still tolerates a ~17 KB/s trickle. Past that the queue matters
+# more than the straggler. The real cleanup stays where it was -- drain_orphans() at
+# ORPHAN_MIN=30min; this only decides whether to *wait* on the file.
+PART_LIVE_SEC = int(os.environ.get("BULWARK_SUBMIT_PART_LIVE", "60"))
+
 
 def log(*a):
     print("[submit %s]" % datetime.now(timezone.utc).strftime("%H:%M:%S"), *a, flush=True)
@@ -1408,6 +1427,79 @@ def trigger_sync():
         log("could not trigger sync: %s" % e)
 
 
+def newest_part_age():
+    """Seconds since the most recently written *.part in staging, or None if there is none."""
+    now = time.time()
+    best = None
+    try:
+        names = os.listdir(STAGING)
+    except OSError:
+        return None
+    for nm in names:
+        if not nm.endswith(".part"):
+            continue
+        try:
+            age = now - os.path.getmtime(os.path.join(STAGING, nm))
+        except OSError:
+            continue                      # vanished mid-listing: it just got renamed in
+        if best is None or age < best:
+            best = age
+    return best
+
+
+def upload_in_flight():
+    """(still_uploading, why). Two signals, and each needs its own freshness window.
+
+    A *.part that is still growing means bytes are landing right now -- this signal has
+    to exist on its own, because one 650 MB file streams for minutes without producing
+    any record, so the marker's mtime alone would look idle. But a *.part that has
+    stopped growing is an orphan (tab closed, dashboard restarted, connection dropped),
+    and orphans survive until drain_orphans() sweeps them at ORPHAN_MIN=30min. Treating
+    those as live is what made a pass sit in the wait loop for the full bound, ten passes
+    running, for one interrupted upload. Hence PART_LIVE_SEC.
+
+    The marker answers the other half: the dashboard refreshes it each time a file lands
+    completely, so a fresh marker means "another file of this batch just arrived".
+    """
+    age = newest_part_age()
+    if age is not None and age < PART_LIVE_SEC:
+        return True, "有文件正在写入(%ds 前仍在增长)" % int(age)
+    try:
+        mark_age = time.time() - os.path.getmtime(UPLOAD_MARK)
+    except OSError:
+        # No marker: nothing has ever been uploaded through this spool, or it was
+        # cleaned. Idle -- a missing file must never be able to block the queue.
+        return False, "没有上传活动标记"
+    if mark_age < QUIET_SEC:
+        return True, "%ds 前刚收完一个文件" % int(mark_age)
+    stale = "" if age is None else ",另有 %d 分钟没动过的残片" % int(age / 60)
+    return False, "上传已静默 %ds%s" % (int(mark_age), stale)
+
+
+def wait_for_upload_quiet():
+    """Hold the query half until the upload half is done. Returns seconds waited."""
+    busy, why = upload_in_flight()
+    if not busy:
+        return 0.0
+    began = time.monotonic()
+    log("上传仍在进行(%s),查询让路(静默 %ds 后开始,最多等 %ds)"
+        % (why, QUIET_SEC, QUIET_MAX_WAIT_SEC))
+    last_report = 0.0
+    while True:
+        waited = time.monotonic() - began
+        if waited >= QUIET_MAX_WAIT_SEC:
+            log("已等 %d 秒仍在上传(%s),不再等待,本轮照常查询" % (int(waited), why))
+            return waited
+        time.sleep(2)
+        busy, why = upload_in_flight()
+        if not busy:
+            log("上传结束(%s),等待 %d 秒后开始查询" % (why, int(waited)))
+            return waited
+        if waited - last_report >= 30:
+            last_report = waited
+            log("  仍在上传中(%s),已等 %d 秒" % (why, int(waited)))
+
+
 def main():
     c = cfg()
     u = ucfg(c)
@@ -1444,6 +1536,11 @@ def main():
     if not base:
         log("本机 intel 服务不可达,本轮跳过查询(记录保持排队)")
         return 0
+
+    # Upload first: everything below spends time and quota, so let the upload finish.
+    # intake() above already ran -- it is local and it drains the inbox, which is what
+    # keeps the level-triggered path unit from re-firing while we wait here.
+    wait_for_upload_quiet()
 
     started = time.monotonic()
     # 解压先做,而且是在 todo 之前扫的:这样这一轮解出来的文件当轮就会被排进去查,
@@ -1508,8 +1605,20 @@ def main():
         % (len(todo), advanced, vt_used, vt_budget, master_used_total, master_budget,
            freed, dropped, marks, wm or "无"))
     if len(todo) > advanced:
-        log("本轮额度用完,还有 %d 个等下一轮(每 %d 分钟一轮)"
-            % (len(todo) - advanced, RETRY_MIN + 1))
+        # 「几分钟 1 条」,不是「几分钟一轮」。一轮只花 vt_budget 次 VT 调用(线上配的是
+        # 1),写成「每 3 分钟一轮」会被读成「3 分钟处理一批」—— 队列有多长就差多少倍。
+        #
+        # 清空时间按【本轮真实推进数】算,不按 VT 预算算。两条通道都在推进队列:主库是
+        # cache-only、不花 VT 配额,每轮最多 max_master_per_pass 次;VT 每轮 vt_budget 次。
+        # 早先这里只除 vt_budget,在主库答不了任何东西的那段时间是对的,主库一修好就立刻
+        # 变成大幅高估(实测那一轮主库推进 12 个、VT 1 个,却仍报 37 小时)。用实测速度还
+        # 有个好处:主库哪天又答不上来,估算会自己爬回去,不用再维护第二个常数。
+        per = RETRY_MIN + 1
+        left = len(todo) - advanced
+        eta_h = left * per / float(60 * max(1, advanced))
+        log("本轮额度用完:还有 %d 个排队。本轮推进 %d 个(主库 %d 次 + VT %d 次),"
+            "VT 限速每 %d 分钟 %d 条;按本轮速度约 %.1f 小时清完"
+            % (left, advanced, master_used_total, vt_used, per, vt_budget, eta_h))
     if stored_any:
         trigger_sync()
     return 0

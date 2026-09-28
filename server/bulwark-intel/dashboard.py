@@ -777,6 +777,10 @@ def file_records(limit=0):
             "upload_ok": bool(x.get("upload_ok")),
             "skipped_budget": bool(x.get("skipped_budget")),
             "skipped_stale": bool(x.get("skipped_stale")),
+            # 上传没成的两个具体原因。以前没往上送,页面只能说「未提交」,
+            # 说不出是哈希对不上还是超了 VT 的 32 MB 上限。
+            "hash_mismatch": bool(x.get("hash_mismatch")),
+            "too_big": bool(x.get("too_big")),
             "zip_bad": bool(x.get("zip_bad")),
             "error": x.get("error", ""),
         })
@@ -851,6 +855,9 @@ def upload_cfg():
             # 拒收一个文件。
             "disk_floor_mb": int(d.get("disk_floor_mb", 4096) or 4096),
             "poll_minutes": int(d.get("poll_minutes", 3) or 3),
+            # 同名同默认值,和 bulwark-submit.py 的 ucfg() 一致 —— 页面写「每 N 分钟查 M
+            # 个」就必须是 worker 真正的每轮预算,否则又是一句页面自己编的节奏。
+            "max_vt_per_pass": int(d.get("max_vt_per_pass", 6) or 6),
             "keep_days": float(d.get("keep_days", 7) or 7),
             # 这两个的默认值必须和 bulwark-submit.py 的 ucfg() 一字不差,否则页面写着
             # 「会自动解压、口令 infected」而 worker 用的是另一套 —— 页面上的承诺就成了
@@ -1093,6 +1100,7 @@ def v_upload():
             "b_cap": _b_cap(h), "b_unlimited": _b_cap(h) < 0,
             "collector": collector_info()["label"],
             "poll_minutes": u["poll_minutes"], "keep_days": u["keep_days"],
+            "vt_per_pass": u["max_vt_per_pass"],
             "archive_expand": u["archive_expand"],
             "archive_passwords": u["archive_passwords"],
             "spool_mb": round(sp_bytes / 1048576.0, 1),
@@ -1108,6 +1116,40 @@ def v_upload():
         "wm": wm,
     })
     return d
+
+
+def _pace(block, default_qpm):
+    """限速换算成「多久一个样本」,而不是「每分钟几次查询」。
+
+    queries_per_minute 限的是【槽】,不是样本。一个 VT 未收录的样本要占两个槽:查一次
+    (lookup)、传一次(upload)。qpm=1 时每个样本就是 2 分钟 —— 而下载页列出来的全都是
+    未收录样本,所以「2 分钟 1 个」才是那一页上看得见的真实节奏。说「每分钟 1 次查询」
+    不算错但会被当成「每分钟 1 个样本」,说「一轮」更糟,会被当成一批。
+
+    标签在这里(Python 侧)拼好再交给页面:数字取整和单位换算放在模板里,迟早会出现
+    「每 0.03 分钟」或者 NaN 这种东西。
+    """
+    qpm = block.get("queries_per_minute")
+    if not qpm:
+        # sleep_seconds 是老写法,换算成速率,这样页面永远给得出一个真实速率。
+        sl = float(block.get("sleep_seconds", 0) or 0)
+        qpm = (60.0 / sl) if sl else 0.0
+    qpm = float(qpm or 0) or float(default_qpm)
+    # 只查不传的模式下一个样本只占一个槽。
+    slots = 2 if bool(block.get("upload_unknown", True)) else 1
+    sec = slots * 60.0 / qpm
+    if sec < 60:
+        human = "%d 秒" % round(sec)
+    elif abs(sec / 60.0 - round(sec / 60.0)) < 0.01:
+        human = "%d 分钟" % round(sec / 60.0)
+    else:
+        human = "%.1f 分钟" % (sec / 60.0)
+    label = "每 %s 1 个样本" % human
+    if slots > 1:
+        label += "（查 1 次 + 传 1 次，各占一个限速槽；槽速率 %g 次/分钟）" % qpm
+    else:
+        label += "（每个样本 1 次查询）"
+    return {"qpm": qpm, "slots": slots, "sample_sec": round(sec, 1), "label": label}
 
 
 def collector_info():
@@ -1139,6 +1181,7 @@ def collector_info():
                 "vt_remaining": st.get("vt_remaining"),
                 "uploads_today": st.get("uploads_today"),
                 "newest_slot": st.get("newest_slot") or "",
+                "pace": _pace(cfg().get("datalake", {}) or {}, 2),
                 "newest_slot_age_hours": st.get("newest_slot_age_hours")}
     return {"name": "harvest", "label": "MalwareBazaar · 逐时采集",
             "mode": h0.get("download_mode") or "-",
@@ -1146,6 +1189,7 @@ def collector_info():
             "window_days": int(h0.get("download_max_age_days", 30) or 0),
             "last_run": "", "stopped_by": "", "vt_remaining": None,
             "uploads_today": None, "newest_slot": "",
+            "pace": _pace(h0, 4),
             "newest_slot_age_hours": None}
 
 
@@ -1418,6 +1462,33 @@ def v_files(kind):
         good = [x for x in r_today if x["downloaded"]]
         bad = [x for x in r_today if x["zip_bad"] or x["error"]]
 
+    shown_rows = rows[:200]
+    # 上传的【回执】:样本能被取回,前提就是 VT 当时查不到(404);所以这里回答的是
+    # 「传上去之后 VT 收录了没」。这是这一页上唯一能直接看出 VT 侧在正常工作的地方。
+    # 三态,不是两态:None = 没查到(库读不了),渲染成空白。把它并进 False 会在 sqlite
+    # 一忙的时候给每一行都盖上「待出报告」,凭一次读失败编出一个积压。
+    vt_now = set()
+    if shown_rows:
+        shas = [str(x.get("sha256", "")).lower() for x in shown_rows if x.get("sha256")]
+        try:
+            conn = db()
+            try:
+                # 分批:SQLITE_MAX_VARIABLE_NUMBER 在老版本上是 999。
+                for i in range(0, len(shas), 400):
+                    chunk = shas[i:i + 400]
+                    qs = ",".join("?" * len(chunk))
+                    for r in conn.execute(
+                            "SELECT sha256 FROM vt_reports WHERE lower(sha256) IN (%s)" % qs,
+                            chunk):
+                        vt_now.add(str(r[0]).lower())
+            finally:
+                conn.close()
+        except Exception:
+            vt_now = None
+    for x in shown_rows:
+        x["vt_now"] = (None if vt_now is None
+                       else (str(x.get("sha256", "")).lower() in vt_now))
+
     res = residue_info()
     col = collector_info()
     d = head_ctx()
@@ -1425,7 +1496,7 @@ def v_files(kind):
         "db_error": "",
         "kind": kind,
         "f": {
-            "rows": rows[:200],
+            "rows": shown_rows,
             "shown": min(len(rows), 200),
             "matched": len(rows),
             "ledger": total,
@@ -1454,6 +1525,7 @@ def v_files(kind):
             "window_hours": col["window_hours"],
             "collector": col["name"],
             "collector_label": col["label"],
+            "pace": col["pace"],
             "last_run": col["last_run"],
             "stopped_by": col["stopped_by"],
             "newest_slot": col["newest_slot"],
@@ -1950,7 +2022,7 @@ var VIEWS=[
   {p:'/transfers', k:'transfers', t:'回传',  api:'/api/transfers', lead:'把本节点新增的 vt_reports 推送到主服务器的每一批。'},
   {p:'/benign',    k:'benign',    t:'白样本',api:'/api/benign',    lead:'正常样本语料。一个干净判定只代表当下，所以每个样本先隔离 24 小时再复查一次，仍然干净才允许回传主服务器；已被 VT 追认为恶意的当场从语料里删除。VT 早已收录很久、近期复扫过且零检出的直接放行，不花配额。'},
   {p:'/vtkeys',    k:'vtkeys',    t:'密钥',  api:'/api/vtkeys',    lead:'VirusTotal API 密钥池与账号状态。状态是问 VT 本人拿到的：401 UserNotActiveError 才算封禁，429 只是配额用完会自己恢复。已封禁或无效的可以直接删除，删除前会重新探测确认。'},
-  {p:'/submit',    k:'submit',    t:'送检',  api:'/api/submit',    lead:'手工上传文件或整个文件夹，数量不限。上传即入队，每 3 分钟复查一轮：先问主服务器是否已收录，再问 VT；出结论立刻回传主服务器，样本字节随即删除。进度记在服务端，切走再回来还在。'}
+  {p:'/submit',    k:'submit',    t:'送检',  api:'/api/submit',    lead:'手工上传文件或整个文件夹，数量不限。上传即入队，之后按 VT 限速逐个查——每 3 分钟 1 个，不是每 3 分钟一批：先问主服务器是否已收录，再问 VT；出结论立刻回传主服务器，样本字节随即删除。切换标签页不会中断上传；关掉或刷新页面才会中断，未传完的要重新添加。已出结论的记在服务端，随时回来都能看。'}
 ];
 var PATH=location.pathname.replace(/\/index\.html$/,'/');
 var CUR=VIEWS[0];
@@ -2273,6 +2345,7 @@ function rDownloads(d){
         (f.ledger_short
           ? ' <span class="tag mid">台账少 '+n(f.run_dl-f.ok_today)+' 条</span>'
           : ''))+
+      row('VT 限速',esc((f.pace&&f.pace.label)||'')||'<span class="z">-</span>')+
       row('超出窗口跳过',(f.run_stale||f.stale_today)
             ? '<span class="tag mid">'+n(f.run_stale||f.stale_today)+'</span>'
             : '<span class="tag on">0</span>')+
@@ -2284,7 +2357,12 @@ function rDownloads(d){
       '真正花钱的是下载带宽和 VT 上传预算。队列会跨过零点，所以这个判断按样本自己的 '+
       'first_seen 日期算，不是按处理时间；元数据缺日期时按当天处理，宁可多下一个旧样本，'+
       '也不静默丢掉一个新样本。<br>'+
-      '只收当天会在产量不足的时段浪费掉当日 VT 额度，所以当天优先、不够才回溯补量。</div>')+
+      '只收当天会在产量不足的时段浪费掉当日 VT 额度，所以当天优先、不够才回溯补量。<br>'+
+      '下面这张表只列真的取回了二进制的样本，而取回的前提就是 VT 查不到（404）—— '+
+      '所以这里每一行都是 VT 未收录的样本。VT 已经收录的只查、不下载，'+
+      '不会出现在这张表里，它们计入「查询」页的数字。<br>'+
+      '「提交 VT」列第二行是回执：传上去之后 VT 有没有为它出报告 —— '+
+      '这一格是 VT 侧确实在工作的直接证据。空白表示这次没能读库，不是没报告。</div>')+
     box('留存',
       row('台账总条数',n(f.ledger)+
         (f.ledger>=f.ledger_keep?' <span class="tag mid">已到滚动上限 '+
@@ -2309,7 +2387,7 @@ function rDownloads(d){
     '</div>';
   html+='<div class="sec">下载记录</div>'+table(
     '<th>时间</th><th>文件名</th><th>类型</th><th>原始大小</th><th>压缩包</th>'+
-    '<th>家族</th><th>样本日期</th><th>VT 收录</th><th>结果</th><th>SHA-256</th>',
+    '<th>家族</th><th>样本日期</th><th>提交 VT</th><th>结果</th><th>SHA-256</th>',
     (f.rows||[]).map(function(x){
       var res = x.error ? '<span class="tag off">出错</span>'
               : x.zip_bad ? '<span class="tag off">非 zip</span>'
@@ -2320,14 +2398,30 @@ function rDownloads(d){
         ? (x.day===f.day ? '<span class="tag on">'+esc(x.day)+'</span>'
                          : '<span class="tag mid">'+esc(x.day)+'</span>')
         : '<span class="z">未知</span>';
+      /* 这一列以前是「VT 收录」,而它恒等于「未收录」:unknown 模式只在 VT 查不到时才
+         取回二进制,这张表又只列取回了二进制的行 —— 两条一叠加,能出现在这里的每一行
+         按定义都是未收录。一列只有一个值不算信息,还会被读成「VT 没查」。换成真正会变
+         的那件事:传上去了没有,没传是为什么。 */
+      var up = x.uploaded
+              ? (x.upload_ok
+                  ? '<span class="tag on">已提交</span>'+
+                    (x.vt_now===true  ? '<div class="qn">VT 已出报告</div>'
+                     : x.vt_now===false ? '<div class="qn">待 VT 出报告</div>'
+                     : '')
+                  : '<span class="tag off">提交失败</span>')
+              : x.hash_mismatch ? '<span class="tag off">哈希不符</span>'
+              : x.too_big ? '<span class="tag mid">超 VT 上限</span>'
+              : x.skipped_budget ? '<span class="tag mid">预算已用完</span>'
+              : x.skipped_stale ? '<span class="tag gray">未取回</span>'
+              : x.downloaded ? '<span class="tag mid">未提交</span>'
+              : '<span class="z">-</span>';
       return '<tr><td class="z">'+esc(x.ts)+'</td>'+nameCell(x)+
         '<td>'+(esc(x.type)||'<span class="z">-</span>')+'</td>'+
         '<td>'+sz(x.size)+'</td>'+
         '<td>'+(x.zip_kb?x.zip_kb+' KB':'<span class="z">-</span>')+'</td>'+
         '<td>'+(esc(x.sig)||'<span class="z">-</span>')+'</td>'+
         '<td>'+dayCell+'</td>'+
-        '<td>'+(x.vt_unknown?'<span class="tag mid">未收录</span>'
-                            :'<span class="tag on">已收录</span>')+'</td>'+
+        '<td>'+up+'</td>'+
         '<td>'+res+'</td>'+shaCell(x.sha256)+'</tr>';
     }).join(''),
     /* 空表有两种完全不同的原因,给同一句话会把「记录被挤掉」说成「没下载」。 */
@@ -2794,17 +2888,17 @@ function rSubmit(d){
     box('队列整体',
       bar(agg.done||0,agg.total||0)+
       row('已出结论',n(agg.done||0)+' / '+n(agg.total||0)+'（'+pct+'%）')+
-      row('复查节奏','每 '+n(u.poll_minutes)+' 分钟一轮')+
+      row('复查节奏','每 '+n(u.poll_minutes)+' 分钟查 '+n(u.vt_per_pass)+' 个')+
       row('队列服务',u.worker==='active'?'<span class="tag on">已启用</span>'
                    :'<span class="tag off">'+esc(u.worker||'未安装')+'</span>')+
-      row('下一轮',esc(u.worker_next)||'<span class="z">-</span>')+
+      row('下次查询',esc(u.worker_next)||'<span class="z">-</span>')+
       '<div class="note">上传完就可以离开这一页，甚至关掉浏览器：进度记在服务端，'+
       '回来还在。</div>')+
     box('本次上传',
       '<div id="upbar"></div>'+
       '<div id="uprow"></div>'+
       '<div class="note">上传只是把字节送到本节点，<b>不等查询结果</b>。'+
-      '送到后立刻进队列，第一轮查询在几秒内开始。</div>')+
+      '送到后立刻进队列，这一批全部上传完成后才开始查询（上传期间查询会让路）。</div>')+
     box('体积与磁盘',
       bar(u.spool_mb,u.spool_max_mb)+
       row('排队区占用',n(u.spool_mb)+' MB / '+n(u.spool_max_mb)+' MB')+
@@ -3012,15 +3106,22 @@ function rSubmit(d){
       '</div>';
   }
   function upaint(){
+    /* 面板不在文档里就直接返回。切到别的标签页之后 #upbar / #uprow 都不存在,而这里
+       原本直接往 $('#upbar').innerHTML 上写 —— 必然抛 null。而 sendOne 末尾是
+       .then(upaint),一抛就把它返回的 promise 变成 rejected,调用方那条 .then 又没有
+       失败分支:active 永远不减、pump() 永远不再被调用,整批上传静默卡死,UP.active
+       还停在 true。所以这个判空不是防御性冗余,它是切页面不断上传的前提。 */
+    var pbar=$('#upbar'), prow=$('#uprow');
+    if(!pbar||!prow) return;
     var tot=UP.pend.length+UP.done+UP.fails.length;
     if(!tot&&!UP.skip.length){
-      $('#upbar').innerHTML='<div class="z">还没有待上传的文件</div>';
-      $('#uprow').innerHTML='';
+      pbar.innerHTML='<div class="z">还没有待上传的文件</div>';
+      prow.innerHTML='';
       return;
     }
     var fin=UP.done+UP.fails.length;
-    $('#upbar').innerHTML=tot?bar(fin,tot):'';
-    $('#uprow').innerHTML=
+    pbar.innerHTML=tot?bar(fin,tot):'';
+    prow.innerHTML=
       row('待上传',n(UP.pend.length)+' 个')+
       row('已送达',n(UP.done)+' 个'+(UP.sent?'（'+sz(UP.sent)+'）':''))+
       row('已跳过',UP.skip.length?'<span class="tag mid">'+n(UP.skip.length)+
@@ -3168,7 +3269,10 @@ function rSubmit(d){
       }
       while(active<LIM&&UP.pend.length){
         active++;
-        sendOne(UP.pend.shift()).then(function(){ active--; pump(); });
+        // 成功和失败都要走 settle。队列能不能继续,不该取决于「这一次绘制成功了」——
+        // 只挂成功分支的话,sendOne 尾部任何一次异常都会让 active 永远不减。
+        var settle=function(){ active--; pump(); };
+        sendOne(UP.pend.shift()).then(settle,settle);
       }
     }
     pump();
@@ -3474,6 +3578,50 @@ function load(){
   });
 }
 nav(null);
+
+/* ---- 标签切换改成前端路由 -------------------------------------------------
+   以前顶栏是普通链接,点一下就是整页重载。代价不是「上传状态没显示」,而是正在传的
+   请求被浏览器掐断、还没轮到的排队文件全丢 —— UP.pend 里装的是 File 对象,只活在这
+   一份文档里,sessionStorage 之类一个也存不住。
+
+   四个路径返回的 HTML 完全相同,CUR 本来就是按 location.pathname 选出来的,所以切视
+   图只需要改 CUR 再 load()。document 不重载,UP 和正在跑的 pump 原样活着。 */
+function goView(path,push){
+  var v=null;
+  for(var i=0;i<VIEWS.length;i++) if(VIEWS[i].p===path) v=VIEWS[i];
+  if(!v) return false;                 // 不认识的路径交回浏览器,别把 404 也吞掉
+  if(push){ try{ history.pushState({p:path},'',path); }catch(e){} }
+  CUR=v;
+  stopLiveProgress();                  // 该不该重开由 load() 按新视图决定
+  FIRST=true;                          // 入场动画照旧跑一次,和整页重载时观感一致
+  nav(null);                           // 先把高亮切过去,计数等 load() 回来再补
+  load();
+  return true;
+}
+document.addEventListener('click',function(e){
+  // 只接管普通左键点击。中键、Ctrl/Shift/Alt/Meta 一律放行,否则「在新标签页打开」
+  // 这种操作会被路由吃掉。
+  if(e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey) return;
+  var a=(e.target&&e.target.closest)?e.target.closest('a'):null;
+  if(!a||a.target||a.hasAttribute('download')) return;
+  var href=a.getAttribute('href')||'';
+  // 只认站内绝对路径:外链、协议相对链接、锚点、下载链接都不属于视图切换。
+  if(href.charAt(0)!=='/'||href.charAt(1)==='/') return;
+  if(goView(href,true)) e.preventDefault();
+});
+window.addEventListener('popstate',function(){
+  goView(location.pathname.replace(/\/index\.html$/,'/'),false);
+});
+window.addEventListener('beforeunload',function(e){
+  /* 切标签页已经不中断上传了,但真正离开这个文档 —— 关标签、刷新、地址栏跳转 —— 还是
+     会:File 对象随文档消失,没有任何办法留住。所以这里只在确实还有东西在传的时候拦
+     一下;队列空着就绝不弹,不然就是纯骚扰。 */
+  if(!UP.active&&!UP.pend.length) return;
+  e.preventDefault();
+  e.returnValue='还有文件正在上传，离开会中断，未传完的需要重新添加。';
+  return e.returnValue;
+});
+
 var t=5;
 setInterval(function(){
   t--;
@@ -3670,10 +3818,11 @@ class Handler(BaseHTTPRequestHandler):
     def _do_submit(self, qs):
         """收一个样本:流式落 inbox 边算哈希 -> 写一条排队记录 -> 立刻返回。
 
-        这个请求【不再查询任何东西】。查询归 bulwark-submit.py:它每 3 分钟一轮,并且
+        这个请求【不再查询任何东西】。查询归 bulwark-submit.py:它每 3 分钟查 1 个
+        —— 不是每 3 分钟一批,每轮的 VT 预算就是 max_vt_per_pass(线上配的是 1)—— 并且
         在记录落地的那一刻被 bulwark-submit.path 立刻唤醒一次。这样分工的理由:
-          · 一个文件夹几百个文件,内联查询会把几百个浏览器连接挂住几小时(VT 在本节点
-            被限速到每分钟两次)。
+          · 一个文件夹几百个文件,内联查询会把几百个浏览器连接挂住几小时:按每 3 分钟
+            1 个算,300 个文件就是 15 小时。
           · VT 没收录的样本要先提交再等分析,分析本身几分钟 —— 上传这一刻根本没有结论
             可回,内联就只能阻塞或者撒谎。
           · 切页面必须不丢进度。导航是真链接、整页重载,进度只有落在磁盘上才活得下来。
@@ -3778,6 +3927,15 @@ class Handler(BaseHTTPRequestHandler):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(rec, f, ensure_ascii=False)
             os.replace(tmp, os.path.join(SUBMIT_INBOX, item_id + ".json"))
+            # 上传活动标记:worker 靠它判断「浏览器还在传吗」,从而把查询让到上传之后。
+            # 只更新时间戳,不写内容 —— 它表达的全部信息就是「刚刚还在收文件」。
+            # 失败不影响这次上传:标记缺失时 worker 视为空闲,最坏情况是恢复成旧行为
+            # (边传边查),而不是把队列卡死。
+            try:
+                with open(os.path.join(SUBMIT_SPOOL, ".upload-active"), "w") as _m:
+                    _m.write("")
+            except OSError:
+                pass
             return self._send(200, {"ok": True, "id": item_id, "sha256": sha,
                                     "size": got, "name": rec["name"],
                                     "path": rel, "state": "queued"})

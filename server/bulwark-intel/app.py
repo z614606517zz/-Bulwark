@@ -866,8 +866,25 @@ class Store:
         可用语料从 63 掉到 13,低于 BENIGN_MIN_CORPUS(50),整个区分度环节因此空转。
         要命的是这三个字段在存库那一刻【是有的】,是被这里削掉的 —— 那 39 行的平台
         信息已经不可恢复,只能从现在起不再丢。每行多存不到一百字节。
+
+        【imphash / vhash / tlsh / ssdeep / size 也是补上来的,同一类坑的第二次】。
+        云查引擎(scan_engine.py)拿这几个字段做「这个文件像不像已知家族」的判定,
+        而【误报率的分母只能来自正常语料】。实测量化过一次:benign_reports 543 行,
+        这四个字段全部为 0 覆盖 ——
+            imphash 0   vhash 0   tlsh 0   ssdeep 0   (signature_info 265)
+        于是 imphash 轴上 ben_n=1,误报闸门的分母恒为 0,那 48 条 imphash 指标
+        一条都没经过误报检验(引擎因此自动把它们全部降到 ask,详见
+        scan_engine.BEN_MIN_CORPUS 处的说明)。签名者轴之所以能达到 hard 档,
+        恰恰只是因为 signature_info 当初被保留了下来。
+
+        与 type_tag 那次完全同构:字段在存库那一刻是有的,是被这里削掉的,而且
+        【削掉即不可恢复】—— 归档不留样本字节,重算不出来,只能重新去 VT 拉一遍。
+        所以每收一个白样本就永久丢一次。每行多存约两百字节。
         """
         sig = attr.get("signature_info") or {}
+        pe = attr.get("pe_info") or {}
+        if not isinstance(pe, dict):
+            pe = {}
         return {
             "id": sha256,
             "file": {
@@ -876,8 +893,15 @@ class Store:
                 "type_extension": attr.get("type_extension") or "",
                 "magic": (attr.get("magic") or "")[:160],
                 "meaningful_name": attr.get("meaningful_name") or "",
+                "size": attr.get("size") or 0,
                 "last_analysis_stats": attr.get("last_analysis_stats") or {},
                 "popular_threat_classification": {},
+                # 结构指纹。只留 imphash 这一个 pe_info 子字段 —— 完整的 pe_info
+                # 带节区表和导入表全文,一行能到几十 KB,而语料是滚动 20000 行。
+                "pe_info": ({"imphash": pe.get("imphash")} if pe.get("imphash") else {}),
+                "vhash": attr.get("vhash") or "",
+                "tlsh": attr.get("tlsh") or "",
+                "ssdeep": attr.get("ssdeep") or "",
                 "signature_info": {k: sig.get(k) for k in
                                    ("verified", "signers", "product", "description")
                                    if sig.get(k)},
@@ -2318,8 +2342,75 @@ class IntelService:
             return now_utc() + timedelta(hours=int(t.get("suspicious_hours", 24)))
         return now_utc() + timedelta(hours=int(t.get("unknown_hours", 24)))
 
+    def _archive_verdict(self, sha):
+        """用 vt_reports 里已有的判决回答一次 cache-only 查询;没把握就回 None。
+
+        只认 malicious / suspicious。这台主库【只收恶意样本】(vt_reports 现在是
+        malicious 13110 + suspicious 795,一条 clean 都没有),所以「档案库里没有」不构成
+        清白的证据 —— 能从档案库得出的唯一结论就是「我确实知道它是坏的」。其余一律照旧回
+        unknown,让调用方自己去查:这是保守的那一侧,也是 lookupOnly 对客户端的承诺。
+
+        新鲜度沿用 cache_ttl 同一套规矩,只把基准从「现在」换成报告入库时间 —— _expiry_for()
+        是从 now() 算的,对档案里的旧报告没有意义。malicious 3650 天(等于永不过期),
+        suspicious 24 小时:一个当时只是可疑的样本,过了一天通常已经能定性,那正是这条
+        TTL 存在的理由,所以旧的 suspicious 让它重新去查。
+        """
+        try:
+            row = self.store.get_vt_report(sha)
+        except Exception:
+            # 读档案库失败绝不能让这次查询变成 500:退回原来的 unknown 分支即可。
+            return None
+        if not row:
+            return None
+        verdict = str(row.get("verdict") or "").lower()
+        if verdict not in ("malicious", "suspicious"):
+            return None
+        stored = parse_iso(row.get("stored_at") or "")
+        if not stored:
+            return None
+        if verdict == "malicious":
+            exp = stored + timedelta(days=int(self.ttl.get("malicious_days", 3650)))
+        else:
+            exp = stored + timedelta(hours=int(self.ttl.get("suspicious_hours", 24)))
+        if exp < now_utc():
+            return None
+        rec = {"sha256": sha, "verdict": verdict,
+               "malicious": int(row.get("malicious") or 0),
+               "total_engines": int(row.get("total_engines") or 0),
+               "threat_label": row.get("threat_label") or "",
+               "source": "master-archive",
+               "fetched_at": row.get("stored_at") or iso(now_utc()),
+               "expires_at": iso(exp), "raw": ""}
+        # 回填短期缓存:同一个哈希下次直接走 hash_cache 快路径,不必再摸档案库。写失败不
+        # 影响本次作答 —— 它只是加速层,不是结论的来源。
+        try:
+            self.store.put_hash(rec)
+        except Exception:
+            pass
+        resp = self._hash_response(rec, cached=True)
+        # 维持 lookupOnly 契约:调用方要能看出这次没有动过任何付费上游。
+        resp.update({"recorded": False, "lookupOnly": True})
+        return resp
+
     def reputation_hash(self, sha, lookup_only=False):
         sha = sha.lower()
+        # 退化哈希一律不作答。SHA256_RE 只管「64 个十六进制字符」,0*64 是合法格式却不是
+        # 任何文件的摘要 —— 它是调用方【算哈希失败】时会发上来的东西。档案库里真有一条
+        # 0*64 的记录(malicious 39/39,标签来自 MalwareBazaar 的用户备注),在档案库回落
+        # 上线之前没人读它,现在会被当成真判决下发给机队:客户端一旦哈希失败就会被告知
+        # 「这文件是恶意的」,在 HIPS 上就是一次拦截。
+        #
+        # 闸门放在两条查询路径【之前】—— hash_cache 和档案库都挡住。只挡档案库不够:回填
+        # 过的缓存行会继续把它端出来。
+        #
+        # 用熵而不是硬编码 0*64:全 f、全 a 同样不是摘要。实测 13905 条档案里只有 1 条哈希
+        # 的不同字符数 <= 2,就是这一条;真实摘要撞上这个判据不会发生。
+        if len(set(sha)) <= 2:
+            self.store.counter_incr("degenerate_hash_refused")
+            return {"sha256": sha, "verdict": "unknown", "malicious": 0, "totalEngines": 0,
+                    "threatLabel": "", "source": "rejected-degenerate-hash",
+                    "querySucceeded": True, "cached": False, "recorded": False,
+                    "lookupOnly": bool(lookup_only), "fetchedAt": iso(now_utc())}
         cached = self.store.get_hash(sha)
         if cached:
             self.store.counter_incr("hash_cache_hit")
@@ -2336,6 +2427,16 @@ class IntelService:
         # 没有」(它据 serverHasRecord 判定无实据 -> 转本地直连),区别于「没问到」(HTTP 失败/
         # 熔断/预算用尽)。两者混同的话,日志里就再也分不清这次到底走没走服务器。
         if lookup_only:
+            # 先问自己的档案库,再说「没有」。上面的 get_hash() 只看 hash_cache —— 那是带
+            # TTL 的短期缓存(线上 529 行、最新一条 6 天前、未过期 406 行),而 vt_reports
+            # 才是档案库(13,905 行,还在长)。此前未命中 hash_cache 就直接回 unknown,于是
+            # 主库握着上万条判决对外说「我没有」:lookup_only_miss 累计 2414 次,节点送检
+            # 队列 518 个样本全部拿到「master has no record」再落到 VT —— 这一步本来就是为
+            # 了省 VT 配额,结果一分没省。
+            arch = self._archive_verdict(sha)
+            if arch:
+                self.store.counter_incr("lookup_only_archive_hit")
+                return arch
             self.store.counter_incr("lookup_only_miss")
             return {"sha256": sha, "verdict": "unknown", "malicious": 0, "totalEngines": 0,
                     "threatLabel": "", "source": "lookup-only", "querySucceeded": True,
@@ -2678,11 +2779,28 @@ class IntelService:
             # collect_benign 按 behaviour_available 过滤,BenignCorpus.n 只数跑过沙箱的,
             # 所以没跑过沙箱的行不会把 BENIGN_MIN_CORPUS 那道门槛骗开。淘汰顺序也已经
             # 改成优先丢这些行(见 BENIGN_MAX_ROWS)。
-            try:
-                self.store.save_benign_report(sha256, attr, beh,
-                                              has_behaviour=(bst == 200))
-            except Exception:
-                pass        # 语料是锦上添花,绝不能因为它失败而影响一次信誉查询
+            # 【只收录恶意样本】store_benign_samples 为 false(默认)时,干净样本不再入语料库。
+            #
+            # 为什么做成开关、而不是把上面那段逻辑删掉:benign_reports 是 engine_build
+            # 唯一的误报分母 —— BENIGN_MIN_CORPUS / BENIGN_ASK_RATIO / BENIGN_DROP_RATIO
+            # 与 _cap_by_benign 全都读它。删掉代码就把这一维永久废掉了,而这是个部署选择,
+            # 不是设计错误,应当能一行改回来。
+            #
+            # 关掉的后果要说准:已入库的行【仍然保留、仍然参与定级】,所以语料是【冻结】
+            # 而不是消失 —— 冻结时行数 598 远高于 BENIGN_MIN_CORPUS(50),误报控制照常
+            # 工作。真正的代价是它不再跟进新出现的正常软件,随时间变陈旧。
+            #
+            # 为什么部署方选择关掉:VT 判不出的恶意样本会从这条路径被当成「干净」写进正常
+            # 语料。实测 2026-08-21 那批 471 个已知恶意样本中,有 12 个正是这样进的
+            # benign_reports(其中若干还带着 Trojuan.apk / stego_*.png 这类名字)。
+            # 语料被污染比语料陈旧危险得多:前者是在教系统把恶意特征当成正常,
+            # 也就是主动制造漏报。
+            if self.cfg.get("store_benign_samples", False):
+                try:
+                    self.store.save_benign_report(sha256, attr, beh,
+                                                  has_behaviour=(bst == 200))
+                except Exception:
+                    pass    # 语料是锦上添花,绝不能因为它失败而影响一次信誉查询
         if not is_threat:
             # 非威胁不进威胁归档 -> 必须有别的地方记住"已经问过了",否则每次重复查询
             # 都要再花两次上游调用。TTL 默认 7 天:文件哈希是不变的,一个干净判定不会
@@ -4283,6 +4401,30 @@ class Handler(BaseHTTPRequestHandler):
                 if kv[1].strip() == expected:
                     return True
         return False
+
+    def _authed_ui(self):
+        """看板/报表类路由的闸门。
+
+        为什么不能沿用 _authed():auth_token 必须留空 —— 发布出去的客户端里
+        ReputationProxy.BearerToken 是空字符串,一设令牌它们每次查询都变 401 —— 而
+        _authed() 在 token 为空时一律放行。两件事叠起来的结果是「只给人看」的数据在
+        公网上完全敞开。实测过:未登录 GET /stats 回 200,内容包括各情报源是否配了
+        key、掩码后的客户端与访客列表、今日配额用量、特征库版本。
+
+        更要紧的是其中几条会真的花掉共享上游配额 —— /ha/behaviour/ 打
+        HybridAnalysis、/v1/reputation/ip/ 打微步、/vt/lookup 与 /vt/upload 打
+        VirusTotal。敞开不只是泄露,是把付费额度交给任何人烧。
+
+        没配 webui_password 时退回 _authed() 的老行为:那种部署整个网页本来就是敞开
+        的,再要求一个不可能存在的 cookie 只会让页面自己也用不了。
+        """
+        if not self._webui_password():
+            return self._authed()
+        if self._check_webui_cookie():
+            return True
+        # 仍然放行持 auth_token 的调用方(运维脚本 / 外部集成)。必须先确认 token
+        # 非空:_authed() 在空 token 时一律返回 True,少了这一层这道门就又白设了。
+        return bool(CONFIG.get("auth_token", "")) and self._authed()
 
     def _serve_login_page(self, error=""):
         # 错误提示用状态色而不是字面 red:后者比页面上任何一个红都更刺眼,
@@ -6660,6 +6802,7 @@ button:hover{filter:brightness(1.1)}
             except OSError:
                 pass
             return
+
         # ---- 在线客服 -----------------------------------------------------
         # 顺序是承重的:更长的前缀必须先判,否则 /support/admin/api/* 会被
         # /support/admin 吃掉、/support/media/* 会被 /support 吃掉。
@@ -6743,7 +6886,21 @@ button:hover{filter:brightness(1.1)}
             return self._serve_update_manifest(u)
         if u.path.startswith("/v1/update/file/"):
             return self._serve_update_file(u)
-        if not self._authed():
+        # 闸门从这里开始分两道。
+        #
+        # 看板类路由走 _authed_ui():它们只给人看,而且有几条会花掉共享上游配额,
+        # 所以不能像 _authed() 那样在 auth_token 为空时放行(而 token 又必须为空,
+        # 见 _authed_ui 的说明)。其余路由行为不变,仍走 _authed()。
+        #
+        # /v1/reputation/ip/ 也归看板:客户端至今没接那条路(见 BulwarkOptions.h 里
+        # ServerOnly 的注释「服务端虽有 /v1/reputation/ip/<ip>,但客户端尚未接」),
+        # 真正在调它的是 webui.html 里那个 .ipq 点击,而它每次都花微步配额。
+        if (u.path in ("/stats", "/vt/reports", "/benign/reports")
+                or u.path.startswith(("/ha/behaviour/", "/vt/report/",
+                                      "/vt/analysis/", "/v1/reputation/ip/"))):
+            if not self._authed_ui():
+                return self._send(401, {"error": "unauthorized"})
+        elif not self._authed():
             return self._send(401, {"error": "unauthorized"})
         if u.path == "/stats":
             sources = []
@@ -6935,7 +7092,16 @@ button:hover{filter:brightness(1.1)}
                 # 里清空,所以不会留下指向不存在文件的记录。
                 return self._send(200, {"ok": ok, "images_removed": self._drop_fb_images(drop)})
             return self._send(400, {"ok": False, "error": "unknown action"})
-        if not self._authed():
+        # 同 do_GET,闸门分两道。
+        #
+        # /vt/upload 与 /vt/lookup 是网页自己用的,而且直接花 VirusTotal 配额 ——
+        # 走 _authed_ui()。
+        # /v1/reputation/{hash,submit} 必须留在 _authed() 上:发布出去的客户端既没有
+        # BearerToken 也不可能有网页 cookie,挪过去等于把整个机队的云查一次性打死。
+        if u.path in ("/vt/upload", "/vt/lookup"):
+            if not self._authed_ui():
+                return self._send(401, {"error": "unauthorized"})
+        elif not self._authed():
             return self._send(401, {"error": "unauthorized"})
         # 会真的花掉共享上游配额的两条路照旧先过 per-IP 滑窗。
         # /v1/reputation/hash 【不在这里判】—— 它的闸门推迟到读出 lookupOnly 之后(见下),

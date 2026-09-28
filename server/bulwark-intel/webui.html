@@ -11,16 +11,42 @@
     --brand:#6366f1; --brand2:#8b5cf6;
     --mal:#e5484d; --malbg:#fdecec; --susp:#e08600; --suspbg:#fdf3e2;
     --clean:#0f9d58; --cleanbg:#e7f6ec; --unk:#8a94a6; --unkbg:#eef1f6;
+    /* 行为报告按「域」着色:进程 / 文件 / 注册表 / 网络 / 系统。原来这十个色值是散在
+       .beh-chip.* 和 .beh-sec.* 两处的字面量,而且进程域两边不是同一个紫
+       (#f2f0ff vs #f4f2ff)—— 单看谁也发现不了,合在一页上就是调色板发灰。 */
+    --t-proc:#f3f1ff; --t-proc-b:#e6e1ff;
+    --t-file:#eefaf1; --t-file-b:#d6f0dd;
+    --t-reg:#fff7e8;  --t-reg-b:#fbe8c4;
+    --t-net:#eef4ff;  --t-net-b:#d9e6ff;
+    --t-sys:#f3f5f8;  --t-sys-b:#e3e8f0;
     --mono:"SFMono-Regular","Cascadia Mono","Consolas",Menlo,monospace;
     --sans:-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",system-ui,sans-serif;
+    /* --sh0 = 静置态的底噪。--sh 是 hover / 抬起态,--sh2 是弹窗。
+       三级都存在,是为了让「抬起」永远是同一个属性换值,而不是从 none 变出来。 */
+    --sh0:0 1px 2px rgba(16,24,40,.04);
     --sh:0 1px 2px rgba(16,24,40,.05),0 8px 24px rgba(16,24,40,.06);
     --sh2:0 12px 40px rgba(16,24,40,.14);
   }
   *{box-sizing:border-box}
   html,body{margin:0}
+  /* 滚动条槽位常留。弹窗打开时要把背景锁住(下面的 .modal-open),不预留这一条的话
+     滚动条消失的瞬间整页内容会朝右跳十几像素,连顶栏一起抖一下。 */
+  html{scrollbar-gutter:stable}
   body{background:var(--bg);color:var(--ink);font:14.5px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+  /* 弹窗打开时锁住背景滚动:档案列表滚到底之后,滚轮本来会接着滚身后的主页面,
+     关掉弹窗时才发现页面已经跑到了别的位置。 */
+  body.modal-open{overflow:hidden}
   a{color:var(--brand);text-decoration:none}
   ::selection{background:rgba(99,102,241,.18)}
+  /* 键盘焦点。页面上大半控件是 div/span,拿到 tabindex 之后浏览器给的默认焦点框
+     是一条细黑线,压在圆角上会露出直角。统一换成品牌色外圈,形状跟着元素自己的
+     border-radius 走。用 :focus-visible 而不是 :focus —— 后者会让鼠标点一下也留个圈。 */
+  :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  /* 实心渐变按钮上,紫圈落在紫底上看不清,改成白圈 + 外面一层深色描边兜底 */
+  .btn:focus-visible,.navi.cta:focus-visible{outline-color:#fff;box-shadow:0 0 0 4px rgba(99,102,241,.45)}
+  /* 这几类是 div/span 冒充的按钮。连点两下会把里面的文字选中一片蓝 —— 真 <button>
+     不会有这个毛病。.hrow / .hmeta 这些要靠选中复制哈希的地方不在名单里。 */
+  .seg .s,.fbtn,.hchip,.fbtab,.dmore,.navi,.iconbtn,.g-btn,.brand{-webkit-user-select:none;user-select:none}
   /* ── 顶栏:两层 ──────────────────────────────────────────────
      第一层 = 品牌 + 今日额度 + 反馈;第二层 = 导航。
      之前八个元素挤在同一个 flex 行里,总宽超过 1080 容器,flex 就去压缩
@@ -51,10 +77,26 @@
   .iconbtn b{display:inline-block;font-weight:700;font-size:11.5px;color:#fff;background:var(--mal);
     border-radius:999px;padding:1px 6px;min-width:18px;text-align:center;line-height:1.5}
   .iconbtn b[hidden]{display:none}
-  .nav{border-top:1px solid var(--line2)}
+  .nav{border-top:1px solid var(--line2);position:relative}
   .navin{max-width:1080px;margin:0 auto;padding:8px 20px 9px;display:flex;align-items:center;gap:8px;
-    overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none}
+    overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;-ms-overflow-style:none}
   .navin::-webkit-scrollbar{display:none}
+  /* 横向滚动的可见性。滚动条是藏起来的,窄屏时七个入口有一半在视口外,
+     不给提示就等于那几个功能不存在。这里在还能继续滚的那一侧把导航项本身
+     渐隐掉,由下面的 JS 按实际滚动位置挂 data-ovf="l" / "r" / "l r",
+     两头都到底时不挂 —— 恒亮的提示会在内容本来就放得下时凭空啃掉最后一项。
+
+     用 mask 而不是盖一层渐变色块:顶栏是 rgba(255,255,255,.86) + 毛玻璃,
+     背后的页面内容会透上来,任何写死颜色的色块在深色内容滚过时都会露出一块
+     浅斑。mask 只淡化内容自己,不需要知道背景是什么颜色。
+     mask 作用在滚动容器自己的盒子上,不随内容滚动,所以它始终贴在两端。 */
+  .nav[data-ovf="r"] .navin{-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 34px),transparent);
+    mask-image:linear-gradient(90deg,#000 calc(100% - 34px),transparent)}
+  .nav[data-ovf="l"] .navin{-webkit-mask-image:linear-gradient(90deg,transparent,#000 34px);
+    mask-image:linear-gradient(90deg,transparent,#000 34px)}
+  .nav[data-ovf="l r"] .navin{
+    -webkit-mask-image:linear-gradient(90deg,transparent,#000 34px,#000 calc(100% - 34px),transparent);
+    mask-image:linear-gradient(90deg,transparent,#000 34px,#000 calc(100% - 34px),transparent)}
   .navi{flex:0 0 auto;white-space:nowrap;display:inline-flex;align-items:center;gap:7px;
     border:1px solid var(--line);background:var(--card);color:var(--ink2);border-radius:10px;
     padding:7px 12px;font:inherit;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;
@@ -64,6 +106,16 @@
   .navi b{display:inline-block;font-weight:700;font-size:12px;color:var(--muted);background:var(--soft);
     border-radius:6px;padding:1px 6px;min-width:20px;text-align:center}
   .navi:hover b{background:rgba(99,102,241,.10);color:var(--brand)}
+  /* 下载入口 = 这一排里唯一的主行动,所以给实心渐变;其余都是并列的查看入口,保持描边。
+     它以前是一个 JS 注入的 position:fixed 胶囊(right:18px;top:16px;z-index:50),
+     而 .top 只有 z-index:30 —— 视口宽度低于约 1400px 时它就压在「今日额度」和
+     「反馈」上,窄于 700px 时把反馈按钮整个盖住。app.py 里其它几个页面的导航
+     本来就是 <a href="/about">📥 下载</a>,所以这里回到同一种形态,而不是浮层。 */
+  .navi.cta{background:linear-gradient(135deg,var(--brand),var(--brand2));border-color:transparent;color:#fff;
+    box-shadow:0 4px 12px rgba(99,102,241,.28)}
+  .navi.cta:hover{color:#fff;border-color:transparent;filter:brightness(1.06);box-shadow:0 6px 16px rgba(99,102,241,.34)}
+  /* 靠右摆:视觉上仍在「其它入口之后」,又不会因为前面加了导航项就被挤走 */
+  .navi.cta{margin-left:auto}
   @media(max-width:700px){
     .metrics{display:none}
     .iconbtn .lbl{display:none}
@@ -153,11 +205,17 @@
   .htitle .hsub{font-size:12.5px;color:var(--muted);font-weight:500}
   .hhead .x{border:none;background:var(--soft);border-radius:9px;width:32px;height:32px;cursor:pointer;font-size:16px;color:var(--muted)}
   .hhead .x:hover{background:var(--line);color:var(--ink)}
-  .hstats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:18px 22px 4px}
+  /* auto-fit 而不是写死 repeat(4,1fr):.hstat 这个卡片被四处复用,数量并不总是 4 个
+     —— renderSecondaryOnly() 只放三张,固定四列会在右边留一个空格子,看着像少渲染了
+     一块。auto-fit 让任意张数都均分整行,窄屏也自己换行,不必再靠断点兜。 */
+  .hstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:12px;padding:18px 22px 4px}
   .hstat{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:12px 15px}
-  .hstat .v{font-size:23px;font-weight:800;line-height:1.1}
+  .hstat .v{font-size:23px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
+  /* 「命中 3/64」里的分母。<small> 的浏览器默认只是 smaller(≈19px),在 800 字重下
+     跟分子几乎一样大,读起来像两个并列的数。压到分子的一半并去掉粗体,让分子先被看到。 */
+  .hstat .v small{font-size:.58em;font-weight:600;color:var(--muted);margin-left:1px}
   .hstat .k{font-size:12px;color:var(--muted);margin-top:3px}
-  .hstat.mal .v{color:var(--mal)}.hstat.susp .v{color:var(--susp)}
+  .hstat.mal .v{color:var(--mal)}.hstat.susp .v{color:var(--susp)}.hstat.clean .v{color:var(--clean)}
   .hbar{display:flex;align-items:center;gap:10px;padding:14px 22px 10px;flex-wrap:wrap}
   .hfilters{display:flex;gap:7px}
   .hchip{padding:7px 14px;border-radius:9px;background:var(--card);border:1px solid var(--line);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer;transition:.12s}
@@ -169,7 +227,10 @@
   .hsearch{padding:8px 13px;border:1px solid var(--line);border-radius:9px;font:inherit;font-size:13px;background:var(--card);width:230px;max-width:46vw}
   .hsearch:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
   .hlist{overflow:auto;padding:4px 22px 22px;display:flex;flex-direction:column;gap:9px}
-  .hcard{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:12px 15px;cursor:pointer;transition:.12s;flex:none}
+  /* 底噪阴影 --sh0 是刻意留的:原来卡片平贴、hover 时才第一次出现 var(--sh),
+     阴影是从「完全没有」跳到「12px 扩散」,transition 补不出中间态,看着像啪一下弹出来。
+     给一层几乎看不见的底噪之后,hover 变成同一个属性在两个值之间过渡。 */
+  .hcard{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--line);border-left-width:4px;border-radius:12px;padding:12px 15px;cursor:pointer;transition:.12s;flex:none;box-shadow:var(--sh0)}
   .hcard:hover{box-shadow:var(--sh);transform:translateY(-1px)}
   .hcard.malicious{border-left-color:var(--mal)}.hcard.suspicious{border-left-color:var(--susp)}
   .hcard .hv{flex:none;width:56px;text-align:center}
@@ -187,9 +248,11 @@
   .hcard .hbarfill{height:100%;border-radius:3px}
   .hcard.malicious .hbarfill{background:var(--mal)}.hcard.suspicious .hbarfill{background:var(--susp)}
   .hcard .hdate{font-size:11px;color:var(--dim);margin-top:6px}
-  @media(max-width:640px){.hstats{grid-template-columns:repeat(2,1fr)}.hcard .hdet{display:none}.hsearch{width:140px}}
+  /* .hstats 的列数同样由 auto-fit 决定,这里只保留窄屏该藏该缩的两项 */
+  @media(max-width:640px){.hcard .hdet{display:none}.hsearch{width:140px}}
   /* landing dashboard (idle state) */
-  .dstats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
+  /* 同 .hstats:装的是同一种 .hstat 卡片,张数按调用点变(3 或 4),所以同样交给 auto-fit */
+  .dstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:14px;margin-bottom:16px}
   .dgrid{display:grid;grid-template-columns:1fr 322px;gap:16px;align-items:start}
   .dsec{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--sh);padding:16px 18px;margin-bottom:16px}
   .dsec:last-child{margin-bottom:0}
@@ -210,7 +273,9 @@
   .dfam-i{display:flex;align-items:center;justify-content:space-between;padding:5px 0;cursor:pointer;border-radius:8px}
   .dfam-i:hover{background:var(--soft)}
   .dfam-i b{font-weight:800;color:var(--muted);font-size:12.5px;padding-right:2px}
-  @media(max-width:820px){.dstats{grid-template-columns:repeat(2,1fr)}.dgrid{grid-template-columns:1fr}}
+  /* .dstats 的换行已经由 auto-fit 处理,这里只剩「侧栏落到主栏下面」这一件事;
+     再写一条 .dstats 的列数就有了两个真相来源,改一处不改另一处必出鬼。 */
+  @media(max-width:820px){.dgrid{grid-template-columns:1fr}}
   /* 银狐情报 page */
   .sfhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
   .sftitle{font-size:19px;font-weight:750;display:flex;align-items:center;gap:10px}
@@ -222,11 +287,11 @@
   .beh-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;background:var(--soft);border:1px solid var(--line);font-size:12.5px;font-weight:600;color:var(--ink2)}
   .beh-chip .i{font-size:13px}
   .beh-chip b{font-weight:800;color:var(--ink);margin-left:2px}
-  .beh-chip.proc{background:#f2f0ff;border-color:#e6e1ff}
-  .beh-chip.file{background:#eefaf1;border-color:#d6f0dd}
-  .beh-chip.reg{background:#fff7e8;border-color:#fbe8c4}
-  .beh-chip.net{background:#eef4ff;border-color:#d9e6ff}
-  .beh-chip.sys{background:#f3f5f8;border-color:#e3e8f0}
+  .beh-chip.proc{background:var(--t-proc);border-color:var(--t-proc-b)}
+  .beh-chip.file{background:var(--t-file);border-color:var(--t-file-b)}
+  .beh-chip.reg{background:var(--t-reg);border-color:var(--t-reg-b)}
+  .beh-chip.net{background:var(--t-net);border-color:var(--t-net-b)}
+  .beh-chip.sys{background:var(--t-sys);border-color:var(--t-sys-b)}
   .beh-chip.mitre{background:var(--malbg);border-color:transparent;color:var(--mal)}.beh-chip.mitre b{color:var(--mal)}
   .beh-tags{margin-bottom:14px;line-height:2}
   .beh-sec{border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:14px}
@@ -234,7 +299,9 @@
   .beh-h .t{display:flex;align-items:center;gap:8px;font-weight:700;font-size:13.5px}
   .beh-h .i{font-size:15px}
   .beh-h .cbadge{font-size:12px;font-weight:800;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:20px;padding:2px 11px}
-  .beh-sec.proc .beh-h{background:#f4f2ff}.beh-sec.file .beh-h{background:#eefaf1}.beh-sec.reg .beh-h{background:#fff7e8}.beh-sec.net .beh-h{background:#eef4ff}
+  .beh-sec.proc .beh-h{background:var(--t-proc)}.beh-sec.file .beh-h{background:var(--t-file)}
+  .beh-sec.reg .beh-h{background:var(--t-reg)}.beh-sec.net .beh-h{background:var(--t-net)}
+  .beh-sec.sys .beh-h{background:var(--t-sys)}
   .beh-sec.proc{border-left:3px solid var(--brand2)}.beh-sec.file{border-left:3px solid var(--clean)}.beh-sec.reg{border-left:3px solid var(--susp)}.beh-sec.net{border-left:3px solid var(--brand)}.beh-sec.sys{border-left:3px solid var(--unk)}
   .beh-body{padding:4px 15px 13px}
   .beh-cat{margin-top:11px}
@@ -333,7 +400,10 @@
   </div>
   <nav class="nav" aria-label="主导航"><div class="navin">
     <button class="navi" id="sfbtn"><span class="i" aria-hidden="true">🦊</span>银狐情报<b id="sfcount">0</b></button>
-    <button class="navi" id="normalbtn"><span class="i" aria-hidden="true">&#9989;</span>正常样本<b id="normalcount">0</b></button>
+    <!-- 「正常样本」入口已移除:服务端改为只收录恶意样本(app.py 的 store_benign_samples
+         默认 false),这个徽标的数字再也不会增长,而 renderNormal / loadBenign 的定义还留在
+         下面 —— 它们已无任何调用点。删按钮时必须连带删掉 $("#normalbtn").onclick,
+         否则初始化阶段对 null 取属性会把后面整段脚本一起带崩。 -->
     <a class="navi" href="/engine"><span class="i" aria-hidden="true">🧬</span>攻击链引擎<b id="enginecount">0</b></a>
     <a class="navi" href="/online"><span class="i" aria-hidden="true">📡</span>在线客户端<b id="onlinecount">0</b></a>
     <!-- 在线客服。刻意不挂徽标:另外三个 .navi 的 <b> 是从 /stats 拉来的计数,
@@ -343,15 +413,20 @@
     <button class="navi" id="histbtn"><span class="i" aria-hidden="true">🗄️</span>威胁档案<b id="rcount">0</b></button>
     <!-- 🔌 写成数字实体:这个码位是代理对,直接写字面量在编辑链路上被替换成过 U+FFFD -->
     <a class="navi" href="/api/docs" target="_blank" rel="noopener"><span class="i" aria-hidden="true">&#128268;</span>API 文档</a>
+    <!-- 下载页面。原来是文档末尾一段脚本注入的固定定位胶囊,会盖住顶栏右侧的
+         「反馈」;改成正常导航项后它跟着顶栏一起滚动、一起换行,也和 app.py
+         其它页面的导航保持一致。&#128229; = 📥,同样用数字实体避开代理对。 -->
+    <a class="navi cta" id="bwAboutLink" href="/about" title="Bulwark 磐垒主动防御 下载页面"><span class="i" aria-hidden="true">&#128229;</span>下载</a>
   </div></nav>
 </div>
 
 <!-- 问题反馈。提交口 POST /feedback 是公开的(普通用户没有 token),
      所以服务端配了 per-IP 限流 + 每日条数上限 + 字段长度上限。 -->
-<div class="hmodal" id="fbmodal"><div class="hpanel" style="max-width:580px">
+<div class="hmodal" id="fbmodal"><div class="hpanel" style="max-width:580px"
+     role="dialog" aria-modal="true" aria-labelledby="fbtitle">
   <div class="hhead">
-    <div class="htitle">💬 问题反馈</div>
-    <button class="x" id="fbclose">✕</button>
+    <div class="htitle" id="fbtitle">💬 问题反馈</div>
+    <button class="x" id="fbclose" aria-label="关闭反馈窗口">✕</button>
   </div>
   <div style="padding:18px 22px;overflow:auto">
     <div id="fbtabs" style="display:flex;gap:8px;margin-bottom:16px;border-bottom:1px solid var(--line)">
@@ -424,14 +499,14 @@
 </div>
 
 <div class="hmodal" id="hmodal">
-  <div class="hpanel">
+  <div class="hpanel" role="dialog" aria-modal="true" aria-labelledby="htitle">
     <div class="hhead">
-      <div class="htitle">🗄️ 威胁档案库 <span class="hsub" id="hsub"></span></div>
-      <button class="x" id="hclose">✕</button>
+      <div class="htitle" id="htitle">🗄️ 威胁档案库 <span class="hsub" id="hsub"></span></div>
+      <button class="x" id="hclose" aria-label="关闭威胁档案库">✕</button>
     </div>
     <div class="hstats" id="hstats"></div>
     <div class="hbar">
-      <div class="hfilters" id="hfilters">
+      <div class="hfilters" id="hfilters" role="group" aria-label="按判定筛选">
         <span class="hchip on" data-f="all">全部 <b>0</b></span>
         <span class="hchip" data-f="malicious">恶意 <b>0</b></span>
         <span class="hchip" data-f="suspicious">可疑 <b>0</b></span>
@@ -455,6 +530,51 @@ const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;"
 const VMAP={malicious:"恶意",suspicious:"可疑",clean:"安全",unknown:"未知"};
 const CATMAP={trojan:"木马",ransomware:"勒索软件",worm:"蠕虫",backdoor:"后门",virus:"病毒",adware:"广告软件",pua:"潜在有害",grayware:"灰色软件",downloader:"下载器",dropper:"释放器",spyware:"间谍软件",banker:"银行木马",coinminer:"挖矿木马",miner:"挖矿木马",rootkit:"Rootkit",exploit:"漏洞利用",keylogger:"键盘记录",rat:"远控木马",stealer:"窃密木马",botnet:"僵尸网络",phishing:"钓鱼",installer:"捆绑安装",packed:"加壳",virtool:"病毒工具",hacktool:"黑客工具"};
 const catName=c=>CATMAP[c]||c||"未分类";
+
+/* ── div/span 控件的键盘可达性 ──────────────────────────────────────────
+   这一页的可点元素大半是 div/span + onclick:.hcard、.hchip、.fbtn、.seg .s、
+   .hrow、.dfam-i、.dmore、.brand。鼠标能点,键盘一个都到不了 —— 既不是 Tab
+   停靠点,也不认 Enter / 空格。而这些绑定点本来就已经在 forEach 里逐个挂
+   onclick,所以就在同一处顺手补上语义,而不是另起一套全局委托去猜哪个 div
+   是按钮:猜法早晚会把不该按的按下去。
+
+   role 一律报 button 而不是 tab —— 这几组控件视觉上确实是「一排可切换的按钮」,
+   而 role=tab 有一整套 APG 契约(roving tabindex、方向键换焦点),只贴 role 不做
+   那些反而比没有 ARIA 更误导读屏。
+   pressed 传进来时写 aria-pressed:一组筛选里哪个在生效,读屏才说得出来。 */
+function clickable(el,fn,pressed){
+  if(!el)return el;
+  el.onclick=fn;
+  if(!el.getAttribute("role"))el.setAttribute("role","button");
+  if(!el.hasAttribute("tabindex"))el.tabIndex=0;
+  if(pressed!==undefined)el.setAttribute("aria-pressed",pressed?"true":"false");
+  // Enter / 空格 = 点击,是 role=button 的既定契约。空格必须 preventDefault,
+  // 否则在触发点击之外还会把页面往下翻一屏。
+  el.onkeydown=e=>{
+    if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
+    e.preventDefault();el.click();
+  };
+  return el;
+}
+/* 「当前选中」有两个表达:一个给眼睛(.on),一个给读屏(aria-pressed)。分两行写
+   迟早有人只改一行,所以捆在一处。只给已经带 aria-pressed 的元素写 —— .pane 也用
+   .on 表示当前,但它是内容面板,不是按下状态。 */
+function setOn(el,on){
+  el.classList.toggle("on",!!on);
+  if(el.hasAttribute("aria-pressed"))el.setAttribute("aria-pressed",on?"true":"false");
+}
+/* 委托版。#reports 一次可以摆几百张卡片,而且 drawReports 是整块 innerHTML 重写,
+   逐个绑事件会在每次重画时全部重建 —— 那里的 click 本来就是委托的,键盘也跟着走
+   委托,role/tabindex 写在模板里。 */
+function kbdDelegate(host,sel){
+  if(!host)return;
+  host.addEventListener("keydown",e=>{
+    if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar")return;
+    const t=e.target.closest&&e.target.closest(sel);
+    if(!t)return;
+    e.preventDefault();t.click();
+  });
+}
 let allReports=[];
 let MAXUP=650;  // max upload MB; refreshed from /stats
 let hFilter="all",hSort="recent";  // threat-archive view state
@@ -472,37 +592,62 @@ function verdictOf(f){const s=f.last_analysis_stats||{};const m=s.malicious||0,s
 async function jget(p){const r=await fetch(p);return r.json();}
 async function jpost(p,o){const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});return r.json();}
 
+/* 两个弹窗共用的开关。原来两处各自 classList.toggle 一行,漏掉了三件事:
+   1) 背景页面照旧能滚 —— 档案列表滚到底后继续滚,身后的主页面跟着动起来;
+   2) 关掉之后焦点掉回 <body>,用键盘的人要从头 Tab 一遍才能回到刚点的那个按钮;
+   3) 两个弹窗可以同时开着。两者 z-index 都是 40,靠 DOM 先后决胜,于是「威胁档案」
+      会不出声地盖在「问题反馈」上,关掉上面那个才发现下面还有一个。
+   这里统一处理:开之前先关掉另一个(全屏遮罩不叠着用),锁住背景滚动,记下来路,
+   全关掉时把焦点还回去。 */
+const MODALS=["#fbmodal","#hmodal"];
+let _modalFrom=null;
+function modalIsOpen(sel){const el=$(sel);return !!el&&el.classList.contains("open");}
+function modalOpen(sel,v){
+  const el=$(sel);if(!el)return;
+  if(v){
+    MODALS.forEach(s=>{if(s!==sel&&$(s))$(s).classList.remove("open");});
+    if(!_modalFrom)_modalFrom=document.activeElement;
+  }
+  el.classList.toggle("open",v);
+  const any=MODALS.some(modalIsOpen);
+  document.body.classList.toggle("modal-open",any);
+  if(!any&&_modalFrom){const back=_modalFrom;_modalFrom=null;if(back&&back.focus)back.focus();}
+}
+
 // history modal — threat archive
-function openHistory(v){$("#hmodal").classList.toggle("open",v);if(v)drawReports();}
-$("#histbtn").onclick=()=>openHistory(!$("#hmodal").classList.contains("open"));
+function openHistory(v){modalOpen("#hmodal",v);if(v)drawReports();}
+$("#histbtn").onclick=()=>openHistory(!modalIsOpen("#hmodal"));
 $("#sfbtn").onclick=()=>renderSilverfox();
-$("#normalbtn").onclick=()=>{renderNormal();loadBenign();};
 $("#hclose").onclick=()=>openHistory(false);
 $("#hmodal").addEventListener("click",e=>{if(e.target===$("#hmodal"))openHistory(false);});
 $("#hsort").addEventListener("change",e=>{hSort=e.target.value;drawReports();});
-document.querySelectorAll("#hfilters .hchip").forEach(c=>c.onclick=()=>{hFilter=c.dataset.f;drawReports();});
-document.addEventListener("keydown",e=>{if(e.key==="Escape")openHistory(false);});
+document.querySelectorAll("#hfilters .hchip").forEach(c=>clickable(c,()=>{hFilter=c.dataset.f;drawReports();},c.classList.contains("on")));
+kbdDelegate($("#reports"),".hcard");   // 列表是委托绑定的,键盘也走委托,见 kbdDelegate
 
 // ---- 问题反馈 ----
 function openFeedback(v){
-  $("#fbmodal").classList.toggle("open",v);
+  modalOpen("#fbmodal",v);
   if(v){$("#fbstatus").textContent="";fbSwitch("new");$("#fbmsg").focus();loadMine();}
 }
 // ---- 我的反馈 ----
 // 服务端按调用方 IP 认领,不需要账号。返回里没有 contact/ip/agent —— IP 会被
 // NAT 共享,同一出口下的另一个人不该看到别人留的联系方式。
-const FBST={new:["待处理","var(--warn,#d97706)"],done:["已处理","var(--clean)"]};
+// 「待处理」用 --susp,不是 --warn:调色板里从来没有 --warn 这个变量,原来那句
+// var(--warn,#d97706) 每次都落到回退色上,于是页面上出现了第二种橙(#d97706 ≠ --susp
+// #e08600)—— 同一个「需要留意」的语义,徽标却和「可疑」判定不是一个颜色。
+const FBST={new:["待处理","var(--susp)"],done:["已处理","var(--clean)"]};
 function fbSwitch(t){
   document.querySelectorAll(".fbtab").forEach(el=>{
     const on=el.dataset.t===t;
     el.style.borderBottomColor=on?"var(--brand)":"transparent";
     el.style.color=on?"var(--brand)":"var(--muted)";
+    if(el.hasAttribute("aria-pressed"))el.setAttribute("aria-pressed",on?"true":"false");
   });
   $("#fbform").hidden=(t!=="new");
   $("#fbmine").hidden=(t!=="mine");
 }
-document.querySelectorAll(".fbtab").forEach(el=>el.onclick=()=>{
-  fbSwitch(el.dataset.t); if(el.dataset.t==="mine")loadMine();});
+document.querySelectorAll(".fbtab").forEach(el=>clickable(el,()=>{
+  fbSwitch(el.dataset.t); if(el.dataset.t==="mine")loadMine();},el.classList.contains("on")));
 async function loadMine(){
   const box=$("#fbmine");
   try{
@@ -543,10 +688,17 @@ async function loadMine(){
       +'读取失败:'+esc(e.message||"连接不上服务器")+'</div>';
   }
 }
-$("#fbbtn").onclick=()=>openFeedback(!$("#fbmodal").classList.contains("open"));
+$("#fbbtn").onclick=()=>openFeedback(!modalIsOpen("#fbmodal"));
 $("#fbclose").onclick=()=>openFeedback(false);
 $("#fbmodal").addEventListener("click",e=>{if(e.target===$("#fbmodal"))openFeedback(false);});
-document.addEventListener("keydown",e=>{if(e.key==="Escape")openFeedback(false);});
+/* 全页只有这一个 Esc 监听。原来 openHistory 和 openFeedback 各挂了一个,任何一次
+   Esc 都会同时调到两个,而且都是无条件 openXxx(false) —— 页面上一个弹窗都没开时
+   也照样跑一遍。现在先看有没有开着的,再只关那一个;modalOpen 保证同时最多一个。 */
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape")return;
+  if(modalIsOpen("#hmodal"))openHistory(false);
+  else if(modalIsOpen("#fbmodal"))openFeedback(false);
+});
 $("#fbmsg").addEventListener("input",()=>{$("#fbcount").textContent=$("#fbmsg").value.length;});
 // ---- 反馈截图 ----
 // 走 JSON 里的 base64:提交口本来就是 JSON,不为了带图另开一条 multipart 通道 ——
@@ -659,6 +811,7 @@ async function refreshMetrics(){try{const d=await jget("/stats");statsData=d;con
   }
   const ec=$("#enginecount");if(ec&&d.engine)ec.textContent=(d.engine.patterns||0);
   if(viewMode==="dashboard")renderDashboard();}catch(e){}}
+
 async function loadReports(){try{const d=await jget("/vt/reports");allReports=d.reports||[];
   archStats=d.stats||null;sfReports=d.silverfox||[];
   $("#rcount").textContent=((archStats&&archStats.total)||d.count||0);
@@ -683,7 +836,7 @@ function drawReports(){
      <div class="hstat susp"><div class="v">${nSusp}</div><div class="k">可疑</div></div>
      <div class="hstat"><div class="v">${nRecent}</div><div class="k">近 7 天新增</div></div>`;
   const fc={all:winTotal,malicious:allReports.filter(x=>x.verdict==="malicious").length,suspicious:allReports.filter(x=>x.verdict==="suspicious").length};
-  document.querySelectorAll("#hfilters .hchip").forEach(c=>{const f=c.dataset.f;c.classList.toggle("on",f===hFilter);
+  document.querySelectorAll("#hfilters .hchip").forEach(c=>{const f=c.dataset.f;setOn(c,f===hFilter);
     const b=c.querySelector("b");if(b)b.textContent=(fc[f]!=null?fc[f]:0);});
   const q=($("#rfilter").value||"").toLowerCase().trim();
   let l=allReports.slice();
@@ -698,7 +851,9 @@ function drawReports(){
   box.innerHTML=l.map(x=>{const v=x.verdict||"unknown";const t=x.total_engines||0,m=x.malicious||0;const pct=t?Math.round(m/t*100):0;
     const catTag=x.category?`<span class="pill susp" style="margin-right:5px">${esc(catName(x.category))}</span>`:"";
     const fam=(x.threat_label||x.category)?`<div class="hfam">${catTag}${x.threat_label?`<span class="pill ${v==='malicious'?'mal':'susp'}">${esc(x.threat_label)}</span>`:""}</div>`:"";
-    return `<div class="hcard ${esc(v)}" data-id="${esc(x.sha256)}">
+    // role/tabindex 写死在模板里,而不是渲染后逐个 clickable():这一份列表可以有几百张卡,
+    // 而它的 click 一直是委托在 #reports 上的,键盘同样走委托(kbdDelegate)。
+    return `<div class="hcard ${esc(v)}" data-id="${esc(x.sha256)}" role="button" tabindex="0">
       <div class="hv"><span class="chip">${esc(VMAP[v]||v)}</span></div>
       <div class="hmain"><div class="hnm">${esc(x.name||x.sha256.slice(0,32))}</div>${fam}<div class="hmeta">${esc(x.sha256)}</div></div>
       <div class="hdet"><div class="hratio">${m}<small>/${t}</small></div>
@@ -761,10 +916,10 @@ function renderDashboard(){
     </div>
   </div>`;
   const rep=$("#report");
-  rep.querySelectorAll(".drecent .hcard").forEach(el=>el.onclick=()=>openStored(el.dataset.id));
-  const da=$("#dallthreats");if(da)da.onclick=()=>openHistory(true);
-  rep.querySelectorAll(".dfam-i[data-fam]").forEach(el=>el.onclick=()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.fam;drawReports();});
-  rep.querySelectorAll(".dfam-i[data-cat]").forEach(el=>el.onclick=()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.cat;drawReports();});
+  rep.querySelectorAll(".drecent .hcard").forEach(el=>clickable(el,()=>openStored(el.dataset.id)));
+  const da=$("#dallthreats");if(da)clickable(da,()=>openHistory(true));
+  rep.querySelectorAll(".dfam-i[data-fam]").forEach(el=>clickable(el,()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.fam;drawReports();}));
+  rep.querySelectorAll(".dfam-i[data-cat]").forEach(el=>clickable(el,()=>{hFilter="all";openHistory(true);const rf=$("#rfilter");if(rf)rf.value=el.dataset.cat;drawReports();}));
 }
 
 // ---- 银狐情报 page ----
@@ -800,8 +955,8 @@ function renderSilverfox(){
     <div class="sflist">${rows}</div>
   </div>`;
   const rep=$("#report");
-  rep.querySelectorAll(".sfbar .hchip").forEach(c=>c.onclick=()=>{sfFilter=c.dataset.sf;renderSilverfox();});
-  rep.querySelectorAll(".sflist .hcard").forEach(el=>el.onclick=()=>openStored(el.dataset.id));
+  rep.querySelectorAll(".sfbar .hchip").forEach(c=>clickable(c,()=>{sfFilter=c.dataset.sf;renderSilverfox();},c.classList.contains("on")));
+  rep.querySelectorAll(".sflist .hcard").forEach(el=>clickable(el,()=>openStored(el.dataset.id)));
 }
 // ---- 正常样本 page ----
 // 干净文件不进威胁库(会污染家族/分类统计),单独存在服务端 benign_reports。
@@ -846,8 +1001,8 @@ function renderNormal(){
     <div class="sflist">${rows}</div>
   </div>`;
   const rep=$("#report");
-  rep.querySelectorAll(".sfbar .hchip").forEach(c=>c.onclick=()=>{bnFilter=c.dataset.bn;renderNormal();});
-  rep.querySelectorAll(".sflist .hcard").forEach(el=>el.onclick=()=>{const id=el.dataset.id;if(id&&navigator.clipboard){navigator.clipboard.writeText(id);toast("已复制哈希");}});
+  rep.querySelectorAll(".sfbar .hchip").forEach(c=>clickable(c,()=>{bnFilter=c.dataset.bn;renderNormal();},c.classList.contains("on")));
+  rep.querySelectorAll(".sflist .hcard").forEach(el=>clickable(el,()=>{const id=el.dataset.id;if(id&&navigator.clipboard){navigator.clipboard.writeText(id);toast("已复制哈希");}}));
 }
 // VT 没这个文件,但别的云认识它。以前这里只显示一句「VT 未收录」就结束了,
 // 其他云已经拿到的结论被整个丢掉 —— 而这些云恰恰是 VT 盲区的补充。
@@ -889,7 +1044,7 @@ async function doLookup(){const h=$("#hash").value.trim().toLowerCase();
   if(!/^([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$/.test(h)){setStatus("请输入合法的 MD5 / SHA-1 / SHA-256 哈希。","err");return;}
   $("#go").disabled=true;setStatus("正在查询 VirusTotal(含沙箱行为报告)…","busy");
   try{const d=await lookupHash(h,false);
-    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,已收录到正常样本"),"ok");loadReports();loadBenign();}
+    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,未收录"),"ok");loadReports();}
     else if(d.vt_unknown&&(d.sources_ok||0)>0){renderSecondaryOnly(h,d);
       setStatus("VirusTotal 无此文件记录 · 以下结论来自其他 "+d.sources_ok+" 个情报源","err");}
     else setStatus(d.error||"查询失败","err");}catch(e){setStatus("查询失败:"+e.message,"err");}finally{$("#go").disabled=false;}
@@ -996,11 +1151,11 @@ function render(report,storedAt,cached){
   </div>`;
 
   const rep=$("#report");
-  rep.querySelectorAll(".seg .s").forEach(s=>s.onclick=()=>{rep.querySelectorAll(".seg .s").forEach(x=>x.classList.toggle("on",x===s));
-    rep.querySelectorAll(".pane").forEach(p=>p.classList.toggle("on",p.dataset.p===s.dataset.t));});
-  rep.querySelectorAll(".hrow").forEach(h=>h.onclick=()=>{navigator.clipboard&&navigator.clipboard.writeText(h.dataset.copy);toast("已复制哈希");});
-  const fb=rep.querySelectorAll(".fbtn");fb.forEach(x=>x.onclick=()=>{fb.forEach(y=>y.classList.toggle("on",y===x));
-    const m=x.dataset.f;rep.querySelectorAll("tr[data-cat]").forEach(r=>{r.style.display=(m==="all"||r.dataset.cat==="malicious"||r.dataset.cat==="suspicious")?"":"none";});});
+  rep.querySelectorAll(".seg .s").forEach(s=>clickable(s,()=>{rep.querySelectorAll(".seg .s").forEach(x=>setOn(x,x===s));
+    rep.querySelectorAll(".pane").forEach(p=>p.classList.toggle("on",p.dataset.p===s.dataset.t));},s.classList.contains("on")));
+  rep.querySelectorAll(".hrow").forEach(h=>clickable(h,()=>{navigator.clipboard&&navigator.clipboard.writeText(h.dataset.copy);toast("已复制哈希");}));
+  const fb=rep.querySelectorAll(".fbtn");fb.forEach(x=>clickable(x,()=>{fb.forEach(y=>setOn(y,y===x));
+    const m=x.dataset.f;rep.querySelectorAll("tr[data-cat]").forEach(r=>{r.style.display=(m==="all"||r.dataset.cat==="malicious"||r.dataset.cat==="suspicious")?"":"none";});},x.classList.contains("on")));
   // graph: single-click toggles one level, double-click toggles the whole branch
   rep.querySelectorAll(".g-tree li").forEach(li=>{
     const node=li.querySelector(":scope > .g-node"),sub=li.querySelector(":scope > ul");
@@ -1186,10 +1341,37 @@ const dz=$("#drop");
 ["dragenter","dragover"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add("drag");}));
 ["dragleave","drop"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove("drag");}));
 dz.addEventListener("drop",e=>{const ff=e.dataTransfer.files;if(ff&&ff.length)onFiles(ff);});
-const brand=$(".brand");if(brand){brand.style.cursor="pointer";brand.title="返回首页";brand.onclick=()=>{setStatus("","");renderDashboard();};}
+// 品牌区兼「回首页」按钮 —— 既然它可点,就得能被 Tab 到、能用 Enter 按,
+// 光有 cursor:pointer 只是给鼠标看的。
+const brand=$(".brand");
+if(brand){brand.style.cursor="pointer";brand.title="返回首页";brand.setAttribute("aria-label","返回首页");
+  clickable(brand,()=>{setStatus("","");renderDashboard();});}
+
+// 导航横向滚动提示。窄屏时七个入口放不下,而滚动条是刻意藏掉的 —— 只靠 CSS
+// 没法知道「还能不能再滚」,所以由这里量一次再把状态写到 .nav[data-ovf] 上,
+// 遮罩规则挂在那个属性上。写成 ""/"l"/"r"/"l r" 四个确定值,CSS 用 = 精确匹配。
+// 阈值 2px 而不是 0:缩放比例不是整数时 scrollLeft 会带小数,严格比较会让遮罩
+// 在两端反复闪。
+(function(){
+  const nav=document.querySelector(".nav"),box=$(".navin");
+  if(!nav||!box)return;
+  const sync=()=>{
+    const room=box.scrollWidth-box.clientWidth;
+    if(room<=2){nav.removeAttribute("data-ovf");return;}
+    const l=box.scrollLeft>2,r=box.scrollLeft<room-2;
+    nav.dataset.ovf=[l?"l":"",r?"r":""].filter(Boolean).join(" ");
+  };
+  box.addEventListener("scroll",sync,{passive:true});
+  addEventListener("resize",sync);
+  // 徽标数字是 /stats 回来之后才填的,"0" 变成 "1234" 会把导航撑宽。
+  // 这里必须用 MutationObserver 而不是 ResizeObserver:滚动容器自己的宽度没变,
+  // 变的是 scrollWidth,ResizeObserver 对此不会回调。
+  new MutationObserver(sync).observe(box,{childList:true,characterData:true,subtree:true});
+  sync();
+})();
+
 renderDashboard();
 loadReports();
-loadBenign();
 </script>
 <script>
 /* Degraded-mode banner: when VirusTotal is unavailable the backend answers from
@@ -1389,25 +1571,6 @@ loadBenign();
   if (!RM) stagger(D.querySelectorAll(".card"), "bwa-anim", 60, 8);
 })();
 </script>
-<script>
-/* Nav entry to the project intro page. Label uses \u escapes to keep this
-   appended block pure ASCII (the file is edited over a mixed-encoding link). */
-(function(){
-  if (document.getElementById("bwAboutLink")) return;
-  var a = document.createElement("a");
-  a.id = "bwAboutLink";
-  a.href = "/about";
-  a.textContent = "\u78d0\u5792\u4e3b\u52a8\u9632\u5fa1 \u4e0b\u8f7d\u9875\u9762";   /* download page */
-  a.title = "Bulwark \u78d0\u5792\u4e3b\u52a8\u9632\u5fa1 \u4e0b\u8f7d\u9875\u9762";
-  a.style.cssText = "position:fixed;right:18px;top:16px;z-index:50;"
-    + "padding:8px 15px;border-radius:10px;font-size:13px;font-weight:700;"
-    + "color:#fff;text-decoration:none;background:linear-gradient(135deg,#4f46e5,#7c3aed);"
-    + "box-shadow:0 4px 14px rgba(79,70,229,.32);transition:.15s";
-  a.addEventListener("mouseenter", function(){ a.style.transform = "translateY(-2px)"; });
-  a.addEventListener("mouseleave", function(){ a.style.transform = "none"; });
-  document.body.appendChild(a);
-})();
-</script>
 <style>
 /* ---- per-feature click effects (appended; no rule above is modified) --------
    The motion layer added earlier gives every control the SAME white ripple, so
@@ -1449,6 +1612,9 @@ a.navi[href="/online"]{--bwx-rip:rgba(15,157,88,.30)}
    而不是各挑一个。缺这一行不会报错,只会静默回落到默认色,是那种没人会去查的差异。 */
 a.navi[href="/support"]{--bwx-rip:rgba(13,148,136,.30)}
 a.navi[href="/api/docs"]{--bwx-rip:rgba(107,118,136,.26)}
+/* 下载是这一排唯一的实心按钮,底色已经是品牌渐变 —— 涟漪跟着改成白色,
+   否则紫色涟漪落在紫色底上等于没有反馈。 */
+a.navi[href="/about"]{--bwx-rip:rgba(255,255,255,.5)}
 #fbsend{--bwx-rip:rgba(255,255,255,.5)}
 #bretry,[data-retry]{--bwx-rip:rgba(224,134,0,.32)}
 .fbdel{--bwx-rip:rgba(255,255,255,.55)}
@@ -1476,8 +1642,9 @@ a.navi[href="/api/docs"]{--bwx-rip:rgba(107,118,136,.26)}
 .fbtab:active,.dmore:active,.hhead .x:active,#fbdrop:active,.brand:active{
   transform:translateY(1px) scale(.99)}
 
-/* 3. the overlay. z-index 58 clears the modals (40) and the download link (50)
-      while staying under the toast (60), so a toast is never hidden by sparks.
+/* 3. the overlay. z-index 58 clears the modals (40) while staying under the
+      toast (60), so a toast is never hidden by sparks. (It used to also have to
+      clear a fixed download link at 50; that link is a normal nav item now.)
       contain is layout+paint only: `strict` would add size containment, which
       this element does not want to reason about. overflow:hidden keeps an effect
       near the viewport edge from ever producing a scrollbar. */

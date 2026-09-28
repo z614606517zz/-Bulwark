@@ -20,6 +20,19 @@ Environment=BULWARK_SYNC_KEY=/root/.ssh/id_sync23
 # Fill in your own master before enabling this unit. bulwark-sync.py refuses to run
 # (exit 2) rather than ssh to an empty destination, so a forgotten value fails
 # loudly instead of silently doing nothing.
+#
+# Keep the real address OUT of this file: it is tracked in a public repo, so a
+# baked-in host is an infrastructure disclosure (same reasoning as the module
+# docstring in bulwark-sync.py). Set it per-machine with a drop-in instead, which
+# also survives replacing this unit file:
+#
+#   /etc/systemd/system/bulwark-sync.service.d/10-master.conf
+#     [Service]
+#     Environment=BULWARK_MASTER=root@<master-ip>
+#
+# Use an IP there rather than the public domain: this is an SSH target, so it gains
+# nothing from DNS, and it must keep working while a DNS change is propagating --
+# which is exactly the moment the master has moved.
 Environment=BULWARK_MASTER=root@master.example
 ExecStart=/usr/bin/python3 /usr/local/sbin/bulwark-sync.py
 Nice=10

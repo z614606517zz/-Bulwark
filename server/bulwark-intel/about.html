@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>磐垒主动防御 Bulwark · 下载页面</title>
+<title>磐垒主动防御 Bulwark · 产品介绍与使用方法</title>
 <!-- 必须放在 <style> 之前、且是内联同步脚本:.bwjs 决定进场动画的初始隐藏是否生效
      (见 .bwjs .rv 规则)。在首次绘制前打上这个类，才不会「先显示再闪一下藏起来」。
      JS 没跑通时这个类不存在，内容默认可见 —— 下载入口不建立在 JS 必须成功之上。 -->
@@ -290,6 +290,9 @@
     </a>
     <div class="nav-links" id="navlinks">
       <a href="#get">获取</a>
+      <a href="#usage">使用方法</a>
+      <a href="#driver">驱动加载</a>
+      <a href="#console">分析台</a>
       <a href="#keys">密钥</a>
       <a href="#arch">架构</a>
       <a href="#sources">事件源</a>
@@ -299,7 +302,6 @@
       <a href="#response">处置</a>
       <a href="#principles">原则</a>
       <a href="#structure">结构</a>
-      <a href="#security">安全</a>
     </div>
     <div class="nav-cta">
       <a class="icon-btn" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer" title="GitHub 开源仓库" aria-label="GitHub">
@@ -329,6 +331,7 @@
     </div>
     <div class="btns">
       <a class="ab pri" href="/download">⬇ 下载打包完整版</a>
+      <a class="ab sec" href="#usage">📖 使用方法</a>
       <a class="ab sec" href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">
         <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.23.41-2.81-.54-2.99-1.04-.1-.26-.54-1.04-.92-1.25-.31-.17-.76-.58-.01-.59.7-.01 1.2.64 1.37.91.8 1.35 2.08.97 2.59.74.08-.58.31-.98.57-1.2-1.99-.23-3.26-.99-3.26-4.4 0-.97.35-1.77.92-2.39-.09-.23-.4-1.14.09-2.37 0 0 .75-.24 2.46.91a6.5 6.5 0 0 1 1.68-.23c.57 0 1.14.08 1.68.23 1.71-1.16 2.46-.91 2.46-.91.49 1.23.18 2.14.09 2.37.57.62.92 1.42.92 2.39 0 3.42-1.28 4.17-3.27 4.4.33.28.62.83.62 1.68 0 1.21-.01 2.19-.01 2.49 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
         GitHub 开源仓库
@@ -342,7 +345,7 @@
   <div class="strip">
     <div class="stat rv"><b>3 层</b><span>内核驱动 / 用户态服务 / Qt 桌面 UI</span></div>
     <div class="stat rv"><b>6 维</b><span>进程 · 文件 · 注册表 · 网络 · 映像 · 线程</span></div>
-    <div class="stat rv"><b>11 步</b><span>RuleEngine 决策流水线</span></div>
+    <div class="stat rv"><b>12 步</b><span>RuleEngine 决策流水线</span></div>
     <div class="stat rv"><b>6 源</b><span>多引擎哈希信誉聚合</span></div>
     <div class="stat rv"><b>C++20</b><span>Qt6 / CMake / WDK</span></div>
   </div>
@@ -375,6 +378,392 @@ cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release</pre>
       <div class="note good"><span class="em">🔑</span><div>点「<b>下载打包完整版</b>」即可获取打包好的构建产物(服务 + UI + 驱动 + Qt6 运行时)。
         压缩包已加密,<b>解压密码:<code style="font-size:15px">123</code></b>。</div></div>
+    </div>
+  </section>
+
+  <section id="usage">
+    <div class="sec-head rv">
+      <span class="kicker">How To Use</span>
+      <div class="sec-title"><span class="ic">📖</span><h2>使用方法</h2></div>
+      <p class="sub">配置文件是 <code>bulwark_service.exe</code> 同目录下的 <code>appsettings.json</code>;
+        在 UI 里改的设置存到 <code>%ProgramData%\Bulwark\settings.json</code>。
+        两者冲突时<b>以 UI 里的选择为准</b> —— <code>appsettings.json</code> 只提供部署初值。</p>
+    </div>
+
+    <div class="card rv">
+      <h3>第一次跑起来:其实就一件事</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0 0 4px">解压(密码 <code>123</code>),然后
+        <b>双击 <code>启动Bulwark.bat</code></b> —— 它会自动提权,并<b>自己判断该做什么</b>。
+        脚本<b>全程幂等</b>:每一步都先查状态,已经做好的直接跳过。所以<b>第一次运行 = 安装 + 启动,
+        以后每次运行 = 只是启动</b>,不需要记住自己上次做到哪一步。</p>
+      <ol class="pipe">
+        <li><b>信任随包驱动的签名证书</b><em> —— 导入 LocalMachine 的 <code>Root</code> 与 <code>TrustedPublisher</code></em></li>
+        <li><b>体检 Secure Boot / HVCI</b><em> —— 这两项开着,测试签名一定无效</em></li>
+        <li><b>开启测试签名</b><em> —— <code>bcdedit</code>,<b>需重启一次</b>。重启前会问你「重启后自动继续吗」,
+          选 <code>Y</code> 就不用再管,登录后自动接着装完</em></li>
+        <li><b>复制 Bulwark.sys</b><em> —— 到 <code>%SystemRoot%\System32\drivers\</code></em></li>
+        <li><b>以 Minifilter 语义注册服务</b><em> —— <code>type=filesys</code> + <code>FltMgr</code> 依赖 +
+          <code>Instances\DefaultInstance</code> + <code>Altitude=385201</code> + <code>Flags=0</code></em></li>
+        <li><b>fltmc load 加载并验证</b></li>
+        <li><b>拉起后台服务与界面</b><em> —— 便携模式下,关掉界面就一起收摊</em></li>
+      </ol>
+      <div class="note info"><span class="em">ℹ</span><div>想只看状态不动系统:<code>启动Bulwark.bat -Check</code>。
+        它<b>只体检、不改动任何东西</b>,逐项列出「装到哪一步了、当前是内核前拦截还是用户态观测」,
+        每条失败都写明该怎么办。卸载:双击 <code>卸载.bat</code>。</div></div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card rv">
+        <h3>两种事件源怎么选</h3>
+        <ul class="list">
+          <li><code>Wmi</code> —— 纯 ETW 用户态观测(取值名沿用历史命名)。不加载驱动、不需要测试签名、不会蓝屏。
+            <b>无法事前拦截</b>,靠事后结束作恶进程树补偿。日常先用这个。</li>
+          <li><code>Driver</code> —— 加载 Minifilter,硬拦名单 / 受保护项 / 网络黑名单 / 自我保护在动作发生前<b>原地拒绝</b>;
+            进程创建走「遥测 + 启动后结束」补偿模型。</li>
+        </ul>
+        <div class="note good"><span class="em">✓</span><div><b>内核里有一份自足基线。</b>
+          硬拦名单、进程禁运名单、被封禁主体的子进程拒绝、自我保护、本地已知恶意 SHA-256 集合
+          全部在内核内判定 —— <b>用户态服务没在跑,这些照样生效</b>。热路径从不做同步 IPC。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>弹窗怎么处理</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">日常最主要的交互就这一个框。</p>
+        <ul class="list">
+          <li>三个选择:<b>允许</b> / <b>阻止</b> / <b>记住这次选择</b>(把裁决落成一条规则,以后同样行为不再问)</li>
+          <li>有超时:<code>PromptTimeoutSeconds</code> 默认 <b>30</b> 秒,超时走 <code>DefaultAction</code>(默认 <code>Allow</code>)</li>
+          <li>只有<b>灰区且存在硬恶意指标</b>才会弹。未签名、可疑路径、首见、新证书这类软信号单独出现时<b>不弹</b></li>
+        </ul>
+        <div class="note info"><span class="em">ℹ</span><div>超时兜底<b>刻意不下发内核持久禁运名单</b> ——
+          你离开键盘一会儿,不该让某个程序被永久拦死。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>加白:信任文件 / 文件夹</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">这是整页<b>最容易误解</b>的一处,值得单独读一遍。</p>
+        <ul class="list">
+          <li>在「信任名单」里加白 = 流水线<b>第 1 步</b>无条件放行,<b>跳过后面全部检测</b> —— 含云信誉、VT、AI 与时序检测</li>
+          <li>批量部署用 <code>TrustedDirectories</code> 预置整目录,语义与在 UI 里手动加白一个文件夹<b>完全相同</b></li>
+          <li>它在第 1 步、规则在第 7 步 —— 所以<b>你写的「阻止」规则盖不住加白</b></li>
+        </ul>
+        <div class="note warn"><span class="em">⚠</span><div>加白是本软件里<b>最强的一条放行通道</b>,
+          只信任你确实清楚来源的东西。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>规则能盖住什么</h3>
+        <ul class="list">
+          <li>命中排序:<b>层级 &gt; 具体度 &gt; 动作强度 &gt; 最近创建</b></li>
+          <li><b>盖不住</b>第 1~3 步:自身组件与用户信任项、已安装的第三方安全软件、知名 IM 客户端的<b>网络与 DNS</b> 事件</li>
+          <li>举例:给某个 IM 写「禁止外联」不会生效(第 3 步已放行);但对它的<b>其他</b>行为 ——
+            侧载、群控模块加载 —— 规则照常生效,因为第 3 步只对网络 / DNS 那两类事件开口</li>
+          <li>也可以在 UI 里用自然语言让 AI 生成 1~5 条规则,<b>生成后需你复核采纳</b>,不会自动上线</li>
+        </ul>
+      </div>
+
+      <div class="card rv">
+        <h3>云查毒与情报共享</h3>
+        <ul class="list">
+          <li><code>ReputationProxy</code> 指向本站:<b>不填自己的 Key 也能用上聚合信誉</b>,由服务端持有上游密钥;
+            任何失败自动回退本地直连,防护不退化</li>
+          <li><code>LookupOnly</code> 管<b>服务端</b>要不要去问它的付费上游 —— <code>true</code> = 只查它库里已收录的</li>
+          <li><code>ServerOnly</code> 管<b>本机</b>要不要用自己的密钥直连第三方 —— <code>true</code> 时本机一个第三方源都不动,
+            也<b>绝不上传文件</b>到 VT;代价是服务器没收录的文件就没有云端结论</li>
+          <li>两者是<b>不同的两条轴</b>,别搞混</li>
+        </ul>
+        <div class="note good"><span class="em">🔐</span><div>回传<b>只含结论本身</b>(哈希 / 判定 / 引擎计数 / 威胁名),
+          <b>不含文件内容、不含路径、不含机器标识</b>。「威胁情报共享」总开关在设置界面,<b>默认关闭</b>;
+          开启后每天在 <code>ContributionUploadHour</code> 整点上传(带 0~5 分钟错峰)。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>攻击链组合引擎</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">纯查表,无模型无训练。服务器从每日样本沙箱记录里
+          数出「哪几个动作凑在一起就足以定性」,客户端下载组合表并给每个进程记账,凑齐即作为硬指标喂给裁决流水线。</p>
+        <ul class="list">
+          <li><code>DryRun=true</code> —— <b>只记录不影响裁决</b></li>
+          <li><code>MinGrade</code> —— <code>hard</code>(仅最强)/ <code>strong</code> / <code>ask</code>(全部)</li>
+          <li>端点留空则复用 <code>ReputationProxy</code> 的地址(同一台服务器)</li>
+        </ul>
+        <div class="note warn"><span class="em">⚠</span><div>组合特征来自<b>纯恶意样本库,没有正常文件作对照</b>。
+          务必先用 <code>DryRun=true</code> 在真机跑几天、确认没冤枉正常软件,再转入强制。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>自我保护与卸载</h3>
+        <ul class="list">
+          <li>自我保护挡的是<b>外部进程</b>对本软件文件 / 注册表 / 进程的篡改</li>
+          <li>可配 <code>ProtectedPaths</code>(默认含启动文件夹与 <code>hosts</code>)、
+            <code>ProtectedRegistryKeys</code>(默认含 <code>Run</code> / <code>RunOnce</code>)、
+            <code>MemoryProtectionTargets</code>(默认 <code>lsass.exe</code>,防凭据转储)</li>
+          <li>UI 客户端除映像路径校验外,还可用 <code>UiClientAllowedPublishers</code> 追加签名发布者约束</li>
+        </ul>
+        <div class="note good"><span class="em">✓</span><div><b>始终保留正常卸载路径:</b>
+          在 UI 里关闭自我保护 → 停止服务 → 正常卸载。这是设计原则,<b>绝不做成「卸不掉」</b>。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>排查常见问题</h3>
+        <ul class="list">
+          <li><b>界面连不上服务</b> —— <code>bulwark_ui.exe</code> 不在安装目录内会被拒连,放回原目录</li>
+          <li><b>没有任何拦截</b> —— 服务没启动,或没以管理员身份运行,ETW 与驱动链路都起不来</li>
+          <li><b>选了 Driver 却没有事前拦截</b> —— 驱动加载失败会回落到 ETW 观测,此时只有事后补偿</li>
+          <li><b>填了 Key 不生效</b> —— 服务以 SYSTEM 运行时读不到<b>用户级</b>环境变量,须设为<b>系统级</b></li>
+          <li><b>某程序被反复拦</b> —— 先看事件记录里的证据链和裁决来源,再决定是加规则还是加白</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="driver">
+    <div class="sec-head rv">
+      <span class="kicker">Kernel Driver</span>
+      <div class="sec-title"><span class="ic">⚙</span><h2>内核驱动怎么加载</h2></div>
+      <p class="sub"><code>启动Bulwark.bat</code> 已经把这一整套自动做完了,这一节是讲<b>它到底做了什么、
+        为什么必须做、以及哪一步没做成会怎样</b>。想手动核对或排查时看这里。</p>
+    </div>
+
+    <div class="card rv">
+      <h3>为什么必须有「安装」这一步</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px"><code>Bulwark.sys</code> 是内核模块,
+        不可能从桌面文件夹里直接跑起来。它必须先满足四个条件:</p>
+      <ul class="list">
+        <li><b>签名证书被本机信任</b> —— 随包驱动用自签测试证书 <code>CN=BulwarkTestCert</code>,
+          导入 <code>Root</code> 与 <code>TrustedPublisher</code></li>
+        <li><b>系统开启测试签名</b> —— <code>bcdedit /set testsigning on</code>,要重启一次</li>
+        <li><b>文件放进</b> <code>%SystemRoot%\System32\drivers\</code></li>
+        <li><b>以 Minifilter 语义注册</b> —— <code>type=filesys</code> + <code>FltMgr</code> 依赖 +
+          <code>Instances\DefaultInstance</code> + <code>Altitude=385201</code> + <code>Flags=0</code></li>
+      </ul>
+      <div class="note warn"><span class="em">⚠</span><div>少了最后那一步的 <code>Instances</code> / <code>Altitude</code>,
+        <b>驱动不会附加到卷</b>,文件与注册表回调一个都不会触发 ——
+        服务能连上内核端口、界面一切正常,但<b>什么都拦不到</b>。
+        这就是为什么不能把它当普通 kernel 服务用 <code>sc create type= kernel</code> 注册。</div></div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card rv">
+        <h3>没装会怎样</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">防护<b>照样能开</b>,界面也正常 ——
+          但事件源会<b>静默降级为用户态观测</b>,只能事后终止进程,拦不住「行为发生前」。</p>
+        <ul class="list">
+          <li>驱动连不上时日志写:<b>「内核驱动暂不可用,已降级为用户态观测,后台将持续重试。」</b>,
+            之后每 <b>10 秒</b>自愈重试一次,恢复后写「内核驱动连接已恢复。」</li>
+          <li>找不到 .sys 时写:<b>「未找到 Bulwark.sys,无法注册内核驱动(将降级为用户态观测)。」</b></li>
+          <li>端口连不上时写:<b>「无法连接内核驱动端口(驱动未加载 / 无管理员权限 / 测试签名未开?)」</b></li>
+        </ul>
+        <div class="note info"><span class="em">ℹ</span><div>这种失败<b>从界面上看不出来</b>,
+          所以启动脚本每次都会把当前形态明确打出来 —— 别只看「防护已开启」就以为内核拦截生效了。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>前置条件:不满足则一定加载不了</h3>
+        <ul class="list">
+          <li><b>Secure Boot 必须关闭</b> —— 开着时测试签名<b>完全无效</b>,<code>bcdedit</code> 那一步会被引导策略拒绝</li>
+          <li><b>内存完整性(HVCI)必须关闭</b> —— Windows 安全中心 &gt; 设备安全性 &gt; 内核隔离</li>
+          <li><b>x64 + Windows 10 1703 或更新</b> —— 覆盖 1703 ~ 22H2、LTSC 2019 与全部 Win11;
+            构建期有导入表护栏,防止用到新版 DDI 导致老系统上 <code>0xC0000139</code> 加载失败</li>
+        </ul>
+        <div class="note good"><span class="em">✓</span><div>这两项<b>脚本会自动检查</b>
+          (<code>Confirm-SecureBootUEFI</code> 与 <code>Win32_DeviceGuard</code>)并告诉你去哪里关,
+          不用自己猜为什么加载不上。</div></div>
+      </div>
+    </div>
+
+    <div class="note warn rv" style="margin-top:14px"><span class="em">⚠</span><div><b>严重警告:</b>
+      内核驱动的回调里一旦出错就是<b>直接蓝屏(BSOD)</b>。首次务必在<b>带快照的测试虚拟机</b>里验证;
+      要在真机上跑,请<b>先建系统还原点</b>。</div></div>
+
+    <div class="card rv" style="margin-top:14px">
+      <h3>便携模式 vs 常驻模式</h3>
+      <ul class="list">
+        <li><b>默认(便携)</b> —— <code>启动Bulwark.bat</code> 拉起服务和驱动,关掉界面就一起收摊。
+          干净,但<b>关掉就没有防护</b>。</li>
+        <li><b>常驻</b> —— <code>启动Bulwark.bat -InstallService</code> 把用户态服务注册为开机自启。
+          此后<b>不要</b>再用 <code>启动Bulwark.bat</code> 托管服务(会另起一个实例抢同一条控制管道),
+          直接双击 <code>bulwark_ui.exe</code> 即可。</li>
+        <li><code>-BootStart</code> 让<b>驱动</b>开机随系统加载,消除「重启后服务先于驱动起来 →
+          降级用户态 → 勒索漏拦」的防护空窗。</li>
+      </ul>
+    </div>
+
+    <div class="table-wrap rv" style="margin-top:14px">
+      <table>
+        <thead><tr><th style="width:270px">命令</th><th>作用</th></tr></thead>
+        <tbody>
+        <tr><td><code>启动Bulwark.bat</code></td><td>默认:缺哪步补哪步,然后启动</td></tr>
+        <tr><td><code>启动Bulwark.bat -Check</code></td><td>只体检,<b>不改动任何东西</b></td></tr>
+        <tr><td><code>启动Bulwark.bat -SetupOnly</code></td><td>只安装,不启动服务和界面</td></tr>
+        <tr><td><code>启动Bulwark.bat -BootStart</code></td><td>驱动改为开机随系统加载</td></tr>
+        <tr><td><code>启动Bulwark.bat -InstallService</code></td><td>服务注册为开机自启(常驻)</td></tr>
+        <tr><td><code>收集日志.bat</code></td><td>打包诊断信息到桌面 zip(<b>自动脱敏</b>)</td></tr>
+        <tr><td><code>卸载.bat</code></td><td>完整卸载,默认就做全套</td></tr>
+        <tr><td><code>卸载.bat -PurgeData</code></td><td>连规则 / 日志 / 隔离区一起删,不再询问</td></tr>
+        <tr><td><code>卸载.bat -KeepData</code></td><td>不询问,直接保留数据目录</td></tr>
+        <tr><td><code>卸载.bat -KeepTestSigning</code></td><td>保留测试签名开启状态</td></tr>
+        <tr><td><code>卸载.bat -KeepCert</code></td><td>保留 <code>BulwarkTestCert</code> 证书</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card rv" style="margin-top:14px">
+      <h3>确认驱动真的挂上了</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0 0 4px">除了 <code>-Check</code>,也可以自己核对。
+        关键是看 <code>fltmc filters</code> 里有没有 <code>Bulwark</code> 以及 Altitude 对不对
+        —— 只看 <code>sc query</code> 是 RUNNING <b>不足以</b>说明它附加到卷了。</p>
+      <div class="term" style="margin-top:14px">
+        <div class="term-bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn">管理员命令提示符</span></div>
+        <pre>&gt; fltmc filters
+
+Filter Name        Num Instances    Altitude    Frame
+-----------------  -------------  ------------  -----
+Bulwark                        3      385201      0     <span class="c">&lt;- 挂上了</span>
+
+&gt; sc query Bulwark
+        STATE              : 4  RUNNING</pre>
+      </div>
+      <ul class="list" style="margin-top:14px">
+        <li><b>两个服务名别搞混</b>:<code>Bulwark</code> 是内核 Minifilter,
+          <code>BulwarkService</code> 是用户态服务(刻意区分,避免冲突)</li>
+        <li>用户态通过 <code>\BulwarkPort</code> 连接内核并做协议握手,连接失败会重试 5 次约 1.5 秒</li>
+        <li>看内核日志:<b>DebugView</b>,勾选 <b>Capture Kernel</b></li>
+        <li>升级驱动的正确顺序:<b>停服务 → <code>fltmc unload Bulwark</code> → 覆盖 .sys → 启动服务</b></li>
+      </ul>
+    </div>
+
+    <div class="card rv" style="margin-top:14px">
+      <h3>出问题了:双击 <code>收集日志.bat</code></h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">把排查需要的东西一次性打包成桌面上的一个 zip。
+        它<b>只读</b>,拿不到管理员权限就降级采集并明确告诉你少了哪部分 ——
+        服务起不来、甚至提权都有问题时也能跑。</p>
+      <ul class="list">
+        <li><b>已替你脱敏</b>:信誉代理端点、所有 API 密钥、Bearer 令牌
+          (<code>service.log</code> 里确实会出现端点地址,所以这步是必要的);
+          Windows 用户名替换成 <code>&lt;用户名&gt;</code>,路径结构保留</li>
+        <li><b>刻意没收</b>:隔离区里的文件内容(那是真实恶意样本,打包会被别的杀软拦下,
+          也等于在传播样本,只给文件名和大小清单)、<code>audit\</code> 与 <code>history\</code>
+          的全量数据(上百 MB,只取最新一个文件的尾部)、内核转储 <code>MEMORY.DMP</code></li>
+      </ul>
+      <div class="note warn"><span class="em">⚠</span><div>日志里<b>仍会包含你机器上的进程命令行和文件路径</b> ——
+        这是排障必须的,但发到公开论坛前建议自己扫一眼,介意的话改成私发。
+        压缩包里的 <code>_必读.txt</code> 写了同样的说明。</div></div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card rv">
+        <h3>卸载得干净</h3>
+        <p style="color:var(--muted);font-size:13.6px;margin:0 0 10px">这是正经安全工具,<b>始终保留用户自主卸载的通路</b>,
+          不存在「装上就删不掉」。<code>卸载.bat</code> 单独放在外面、不藏在参数后面,就是这个原因。
+          默认一次做完全套,不用记任何参数:</p>
+        <ol class="pipe">
+          <li><b>停掉界面和后台服务</b></li>
+          <li><b>卸载内核驱动</b><em> —— <code>fltmc unload</code></em></li>
+          <li><b>删除两个服务注册</b><em> —— <code>Bulwark</code> 内核服务 + <code>BulwarkService</code> 用户态服务</em></li>
+          <li><b>删除</b> <code>System32\drivers\Bulwark.sys</code></li>
+          <li><b>移除 BulwarkTestCert</b><em> —— 从「受信任的根证书颁发机构」和「受信任的发布者」</em></li>
+          <li><b>退出测试模式</b><em> —— <code>bcdedit /set testsigning off</code>,重启后右下角水印消失</em></li>
+          <li><b>清掉「重启后自动继续」和安装标记</b></li>
+          <li><b>问一句要不要删数据目录</b><em>(默认保留)</em></li>
+          <li><b>复查一遍并列出残留</b></li>
+        </ol>
+        <div class="note good"><span class="em">✓</span><div>最后会<b>重新读一遍真实状态</b>。有残留就直说是哪几项 ——
+          几乎都是「文件还被内核占着」,重启一次再跑一遍就干净了。</div></div>
+      </div>
+
+      <div class="card rv">
+        <h3>卸载里两处刻意的设计</h3>
+        <ul class="list">
+          <li><b>测试签名是「机器全局」开关。</b>安装时会记一笔「这是本产品打开的,还是本来就开着」。
+            如果是你自己为别的自签名驱动开的,<b>卸载不会去关它</b>,只会告诉你手动关的命令 ——
+            否则会把你那个驱动一起弄得加载不了,而且<b>没人会想到是卸载干的</b>。
+            没有安装记录时(老版本装的)按关闭处理,并在屏幕上说明怎么再打开。</li>
+          <li><b>数据目录默认保留。</b><code>%ProgramData%\Bulwark</code> 里有你攒下的规则、审计日志,
+            以及隔离区里的<b>真实恶意样本</b>。删掉不可恢复,所以只问一句。
+            无人值守地删用 <code>-PurgeData</code>,明确要留用 <code>-KeepData</code>。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card rv" style="margin-top:14px">
+      <h3>数据与日志位置</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:230px"><code>%ProgramData%\Bulwark\</code></th><th>内容</th></tr></thead>
+          <tbody>
+          <tr><td><code>bootstrap-status.txt</code></td><td>上次自举的人类可读记录 —— <b>起不来时先看这个</b></td></tr>
+          <tr><td><code>service.log</code></td><td>后台服务主日志(轮转为 <code>service.log.1</code>)</td></tr>
+          <tr><td><code>crash.log</code></td><td>崩溃记录</td></tr>
+          <tr><td><code>rules.json</code></td><td>生效的规则</td></tr>
+          <tr><td><code>audit\</code> <code>history\</code></td><td>审计与事件历史(体积最大的两块)</td></tr>
+          <tr><td><code>quarantine\</code></td><td>隔离区(真实样本,收集日志时刻意不打包)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note info"><span class="em">ℹ</span><div>不想手动翻这些:双击 <code>收集日志.bat</code>,
+        它会挑好、脱敏并打包。内核日志在 DebugView 里看(勾选 Capture Kernel)。</div></div>
+    </div>
+  </section>
+
+  <section id="console">
+    <div class="sec-head rv">
+      <span class="kicker">Threat Console</span>
+      <div class="sec-title"><span class="ic">🔎</span><h2>在线威胁分析台用法</h2></div>
+      <p class="sub">你正在看的这个站点就是本项目的云端信誉后端 —— 客户端 <code>ReputationProxy</code> 查的就是它。
+        它同时提供网页分析台,<b>不装客户端也能直接用</b>。</p>
+    </div>
+
+    <div class="grid g2">
+      <div class="card rv">
+        <h3>查一个哈希</h3>
+        <ul class="list">
+          <li>搜索框粘 <b>MD5 / SHA-1 / SHA-256</b>,回车即得多源聚合结论:判定、检出比、家族、类型、各情报源结论</li>
+          <li>恶意与可疑样本的报告<b>永久缓存</b>,重复查询极快;安全文件不缓存</li>
+        </ul>
+      </div>
+      <div class="card rv">
+        <h3>拖一个文件进来</h3>
+        <ul class="list">
+          <li><b>SHA-256 在你自己的浏览器里算</b>,默认只把哈希发出去 —— 文件本身不动</li>
+          <li>本地算哈希依赖 <code>crypto.subtle</code>,<b>必须在 HTTPS 下</b>才可用</li>
+          <li>确实要整文件送检时才会上传,那是一次显式操作</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="table-wrap rv" style="margin-top:14px">
+      <table>
+        <thead><tr><th style="width:150px">页面</th><th>看什么</th></tr></thead>
+        <tbody>
+        <tr><td><b>威胁档案</b></td><td>已收录的恶意样本报告库,可按家族 / 类型 / 时间检索</td></tr>
+        <tr><td><b>银狐情报</b></td><td>针对该攻击团伙的专项跟踪</td></tr>
+        <tr><td><b>正常样本</b></td><td>白样本库。经复检确认干净的样本单独成区 —— 用来量误报、给行为基线做对照</td></tr>
+        <tr><td><b>攻击链引擎</b></td><td>当前下发给客户端的动作组合表,以及每条组合背后的样本证据数</td></tr>
+        <tr><td><b>在线客户端</b></td><td>已接入客户端概览</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card rv" style="margin-top:14px">
+      <h3>HTTP API</h3>
+      <p style="color:var(--muted);font-size:13.6px;margin:0">每个请求都要带 Key:请求头 <code>X-API-Key</code>
+        (也支持 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>?key=</code>)。
+        Key 向管理员申请,每个 Key 有每分钟 / 每天调用上限。</p>
+      <pre class="cmd"><span class="c"># 哈希信誉摘要(多源:判定 / 检出比 / 家族 / 类型 / 各源结论)</span>
+curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/hash/&lt;sha256&gt;
+
+<span class="c"># 完整报告:逐引擎检测 + 沙箱行为 + 多源情报(原始 JSON)</span>
+curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/file/&lt;hash&gt;
+
+<span class="c"># IP 信誉</span>
+curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/ip/8.8.8.8
+
+<span class="c"># 上传文件扫描(原始字节作请求体);已知直接返回报告,未知则返回 analysis_id</span>
+curl -H "X-API-Key: KEY" --data-binary @sample.exe \
+  "https://vt.bulwark.icu:8787/api/v1/scan?name=sample.exe"
+
+<span class="c"># 轮询分析状态 / 查看本 Key 今日用量与限额</span>
+curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/analysis/&lt;id&gt;
+curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
     </div>
   </section>
 
@@ -478,9 +867,9 @@ cmake --build build --config Release</pre>
       </div>
       <div class="card layer ui rv">
         <h3>桌面 UI <span class="tag">Qt Widgets</span></h3>
-        <p><code>bulwark_ui.exe</code>,10 个功能页:仪表盘、拦截记录、活动日志、防护规则、信任名单、
-          隔离区、自启动项、云信誉、AI 研判、设置。另有行为弹窗、角标通知、扫描进度、
-          清理报告与攻击时间线等对话框。</p>
+        <p><code>bulwark_ui.exe</code>,12 个功能页:仪表盘、事件记录、事件时间线、攻击链、进程管理、
+          防护规则、信任名单、隔离区、自启动项、云信誉、AI 研判、设置。另有行为弹窗、角标通知、
+          扫描进度、清理报告、AI 清理向导与攻击时间线等对话框。</p>
       </div>
     </div>
     <div class="note warn rv"><span class="em">⚠</span><div><b>项目状态如实说明:</b>
@@ -523,6 +912,9 @@ cmake --build build --config Release</pre>
       <ol class="pipe">
         <li><b>无条件放行</b><em> —— 本软件自身组件;用户明确信任的文件 / 文件夹(信任 = 完全跳过后续一切检测)</em><span class="hit p">Allow</span></li>
         <li><b>已安装的知名安全软件</b><em> —— 共存放行,避免互相残杀</em><span class="hit p">Allow</span></li>
+        <li><b>已知良性厂商应用</b><em> —— <b>仅限网络 / DNS 事件</b>。即时通讯客户端的保活心跳周期性极强,
+          会被信标检测当成 C2 回连,所以在这一步先放掉。刻意只对这两类事件开口:一旦扩大到其他事件类型,
+          针对 IM 侧载、群控模块加载的规则就会被一并绕过</em><span class="hit p">Allow</span></li>
         <li><b>威胁研判</b><em> —— <code>ThreatDetector</code> 计算风险分并置位「硬恶意指标」</em></li>
         <li><b>有状态时序检测</b><em> —— 勒索行为、C2 信标、DGA 域名、外联速率;触碰蜜罐诱饵直接阻止</em><span class="hit b">Block</span></li>
         <li><b>行为基线偏离</b><em>(可开关) —— 显著偏离程序自身历史画像时产出软信号,须与硬指标互证才升格</em></li>
@@ -533,6 +925,10 @@ cmake --build build --config Release</pre>
         <li><b>仅当存在硬恶意指标才处置</b><em> —— 风险分 ≥ 高危阈值则阻止,否则弹窗询问</em><span class="hit b">Block</span><span class="hit a">Ask</span></li>
         <li><b>无硬指标 → 一律放行</b><em> —— 仅记录。软信号绝不单独定罪</em><span class="hit p">Allow</span></li>
       </ol>
+      <div class="note warn"><span class="em">⚠</span><div><b>这条流水线是有顺序的,不是三选一 —— 顺序本身就是行为。</b>
+        显式规则在<b>第 7 步</b>才被检查,所以一条「阻止」规则<b>盖不住第 1~3 步</b>:本软件自身组件与你手动信任的
+        文件 / 文件夹、已安装的第三方安全软件、以及知名 IM 客户端的网络 / DNS 事件。
+        规则怎么写都不生效时,先去<b>信任名单</b>里找一找。</div></div>
       <div class="note good"><span class="em">✓</span><div>裁决完成后自动追加「最终裁决」证据,
         并由 <code>AttackAnnotator</code> 统一标注 MITRE ATT&amp;CK 技战术。裁决动作为
         <b>Allow / Block / Ask</b>,来源标记为:命中规则 / 行为研判 / 可信放行 / 用户裁决 / 超时默认 / 默认策略。</div></div>
@@ -764,24 +1160,10 @@ Bulwark.Driver/     <span class="tree-c">内核驱动 R0(MSBuild + WDK):Minifilt
     </div>
   </section>
 
-  <section id="security">
-    <div class="sec-head rv">
-      <span class="kicker">Key Security</span>
-      <div class="sec-title"><span class="ic">🔐</span><h2>关于密钥安全</h2></div>
-    </div>
-    <div class="card rv">
-      <p style="margin:0;font-size:14px">开源版<b>不内置任何厂商密钥</b> —— 源码与仓库里各 Key 字段一律为空。
-        你填的 Key 只保存在本机 <code>%ProgramData%\Bulwark\settings.json</code> 或环境变量,
-        <b>绝不写入源码、绝不上传、绝不进版本库</b>。</p>
-      <div class="note warn"><span class="em">⚠</span><div>VirusTotal 服务条款禁止「注册多个免费账号绕过限额」,公开 API 也不得用于商业产品。
-        要长期高频或全量使用,请走 VT Premium API。</div></div>
-    </div>
-  </section>
-
   <footer>
     <span>磐垒主动防御 Bulwark · Windows HIPS · C++20 / Qt6 ·
       <a href="https://github.com/z614606517zz/-Bulwark" target="_blank" rel="noopener noreferrer">GitHub 开源仓库</a></span>
-    <span>本页仅介绍本地项目,不含任何密钥或服务器信息</span>
+    <span>本页不含任何真实密钥 —— 示例中的 <code>KEY</code> 均为占位符</span>
   </footer>
 </div>
 
