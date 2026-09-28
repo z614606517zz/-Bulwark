@@ -20,7 +20,7 @@ It doesn't identify files against a signature database — it watches **what a p
 |-------|----------------|
 | **Kernel driver (R0)** `Bulwark.sys` | "Before-the-action" interception in place. Minifilter + documented callbacks, no SSDT hooking, PatchGuard-friendly |
 | **User-mode service (R3)** `bulwark_service.exe` | All decision and remediation logic; runs as SYSTEM |
-| **Desktop UI** `bulwark_ui.exe` | Status, live logs, behavior prompts, rule / trust / quarantine management, AI research |
+| **Desktop UI** `bulwark_ui.exe` | Status, events and event timeline, behavior prompts, rule / trust / quarantine management, AI research |
 
 The driver and service talk over a Filter Manager communication port; the service and UI over a named pipe. Whatever the source, every event funnels into one `RuleEngine`, backed by threat heuristics, dedicated analyzers (LOLBin abuse / credential access / defense evasion / injection & sideloading / command-line obfuscation, and more), stateful temporal detection (ransomware / C2 beaconing / DGA), the attack-chain combination engine, multi-engine hash reputation, a threat-intel feed and AI research.
 
@@ -55,11 +55,14 @@ Chosen via `EventSource` in `appsettings.json`; the decision logic and UI are id
 
 | | |
 |:---:|:---:|
-| **Dashboard**<br>![Dashboard](docs/screenshots/screenshot-01.png) | **Intercept log**<br>![Intercept log](docs/screenshots/screenshot-02.png) |
-| **Activity log**<br>![Activity log](docs/screenshots/screenshot-03.png) | **Rules**<br>![Rules](docs/screenshots/screenshot-04.png) |
-| **Trust**<br>![Trust](docs/screenshots/screenshot-05.png) | **Quarantine**<br>![Quarantine](docs/screenshots/screenshot-06.png) |
-| **Persistence**<br>![Persistence](docs/screenshots/screenshot-07.png) | **Reputation**<br>![Reputation](docs/screenshots/screenshot-08.png) |
-| **AI research**<br>![AI research](docs/screenshots/screenshot-09.png) | **Settings**<br>![Settings](docs/screenshots/screenshot-10.png) |
+| **Dashboard**<br>![Dashboard](docs/screenshots/screenshot-01.png) | **Events**<br>![Events](docs/screenshots/screenshot-02.png) |
+| **Event timeline**<br>![Event timeline](docs/screenshots/screenshot-03.png) | **Attack chain**<br>![Attack chain](docs/screenshots/screenshot-04.png) |
+| **Processes**<br>![Processes](docs/screenshots/screenshot-05.png) | **Rules**<br>![Rules](docs/screenshots/screenshot-06.png) |
+| **Trust**<br>![Trust](docs/screenshots/screenshot-07.png) | **Quarantine**<br>![Quarantine](docs/screenshots/screenshot-08.png) |
+| **Persistence**<br>![Persistence](docs/screenshots/screenshot-09.png) | **Reputation**<br>![Reputation](docs/screenshots/screenshot-10.png) |
+| **AI research**<br>![AI research](docs/screenshots/screenshot-11.png) | **Settings**<br>![Settings](docs/screenshots/screenshot-12.png) |
+
+> Screenshots show demo data.
 
 ## Solution structure
 
@@ -87,8 +90,10 @@ cpp/                     C++ / Qt implementation (top-level CMake: cpp/CMakeList
 │   ├─ src/PersistenceScanner.cpp  read-only enumeration of 7 autostart persistence classes
 │   └─ src/*Store.cpp              rules / settings / first-seen / baseline / event history / VT history / audit / ECS alerts
 ├─ ui/                Desktop UI (builds bulwark_ui.exe): Qt Widgets, connects to the service over a named pipe
-│   ├─ src/MainWindow.cpp / pages/  13 feature pages
-│   ├─ src/dialogs/                 behavior prompt / toast / scan progress / cleanup report / attack timeline / chain detail
+│   ├─ src/MainWindow.cpp / Nav.cpp  shell: collapsible sidebar + protection-status card, page-header actions, page-to-page navigation
+│   ├─ src/pages/                   12 feature pages, one .cpp each (list pages share PageKit.h + design/ListShell)
+│   ├─ src/design/                  "Bedrock" dark design system: palette & style sheet / backdrop materials / icons / cards / list + inspector / filters / confirm sheet, etc.
+│   ├─ src/dialogs/                 behavior prompt / toast / scan progress / cleanup report / AI cleanup wizard / attack timeline / graph / process & chain detail
 │   └─ src/ai/                      UI-side AI research (static feature extraction + LLM)
 └─ tests/             automated tests (ctest): verdict-snapshot regression + built-in rule id uniqueness — see "Tests"
 
@@ -104,7 +109,6 @@ server/                 Server side (optional, for self-hosting; the client is f
 └─ bulwark-intel/       full intel server (app.py): reputation aggregation + attack-chain mining (engine_build.py)
                         + intel-sharing intake + web front-end (webui.html / about.html / index.html) + systemd units
 packaging/              portable-package build: appsettings.portable.json (key-free template), rule sets, start/uninstall scripts
-Bulwark.Sandbox/        Windows Sandbox (.wsb) configs + sample-drop scripts for running samples in isolation
 ml/                     offline training scripts (LightGBM); not part of the C++ build and **no model is loaded by the product**
 scripts/                build-driver.ps1 (build driver) / deploy-driver-vm.ps1 (sign+load in a test VM)
                         + pack-release.py (release packaging) / merge-rules.py / refine-rules.py (rule-set processing)
@@ -426,27 +430,28 @@ cmake --build cpp\build --config Release
 .\cpp\build\ui\Release\bulwark_ui.exe             # Terminal 2: UI (manifest already declares requireAdministrator)
 ```
 
-A green status dot at the top of the UI means it is connected. On real process launches: strongly-trusted-signed ones are auto-allowed and logged; a gray-zone launch with a hard indicator prompts you to Allow / Block, with an optional "remember" + scope that creates a rule. Rules persist at `%ProgramData%\Bulwark\rules.json`.
+A green status dot at the top of the UI means it is connected. On real process launches: strongly-trusted-signed ones are auto-allowed and recorded under Events; a gray-zone launch with a hard indicator prompts you to Allow / Block, with an optional "remember" + scope that creates a rule. Rules persist at `%ProgramData%\Bulwark\rules.json`.
 
 > A packaged build already exists under `cpp\dist\` (both exes + Qt runtime), runnable directly as administrator. Diagnostic: `bulwark_service.exe --inspect <path>` read-only prints a file's signature / cert profile / hash forensics without starting any monitoring.
 
-## UI features (13 pages)
+## UI features (12 pages)
 
-The sidebar has 13 pages (in this order); a green status dot means connected. Closing the main window minimizes to the system tray and protection keeps running (tray menu: Show / Scan now / Quit).
+The sidebar is grouped into Monitor / Control / Intelligence, with Settings pinned at the bottom. The protection-status card at the foot of the sidebar tells four states apart honestly (not connected = unknown / master switch off / on but kernel not connected / fully on) and never shows "unknown" as protected. Below 1100 px the sidebar collapses to an icon rail on its own (it can also be collapsed by hand; the choice is remembered). Closing the main window minimizes to the system tray and protection keeps running (tray menu: Show / Scan now / Quit).
 
-1. **Dashboard** — protected / disconnected banner, kernel connection status, AI Credits monthly usage, four stat cards ALLOWED / BLOCKED / AI SCANS / TOTAL, a scrolling LIVE LOG.
-2. **Intercept log** — deterministic high-risk actions that were blocked outright; double-click an entry to open the "Attack Timeline" and trace the chain.
-3. **Activity log** — the fuller event stream (allows / asks / blocks with risk score and verdict text), persisted and backfilled on restart; double-click for the timeline.
-4. **Event timeline** — a *query* view over the on-disk history (`events.jsonl`, far deeper than the 500-entry in-memory ring), so you can go back to "what happened around 3pm yesterday". Filter by time window / event type / verdict / minimum risk / PID (optionally the whole process tree) / free text. A dedicated **launch origin** column shows the concrete service or scheduled task behind a host process. Right-click any row to open the attack graph.
-5. **Processes** — a process view with forensics and provenance, not a Task Manager clone: launch origin (which *service* is inside that `svchost.exe`, which *scheduled task* spawned this process), signature / publisher / signature-mismatch, static hints (unsigned, user-writable directory, system-process name outside the system directory), memory / threads / session / elevation / user, and user-initiated actions (terminate, terminate tree, suspend, resume, terminate + quarantine image, add to trust). Every action requires an explicit click and a confirmation; the service refuses to touch Bulwark's own components (self-protection) and critical system processes, and always reports *why* an action did not go through.
-6. **Rules** — view / manage rules. **+ New rule** (actor auto-recognized as exact path / wildcard / bare file name), **🤖 AI generate** (natural language → 1–5 candidate rules to adopt), refresh / delete; ticking "remember" in a prompt also creates a rule.
-7. **Trust** — trusted programs / directories, allowed directly without further detection. **+ Add trust** (pick an executable **or a whole directory**), remove, refresh.
-8. **Quarantine** — quarantined threat files. Columns: file / reason / date; **Restore** (back to original) or **Delete** (permanent).
-9. **Persistence** — scan to read-only enumerate 7 autostart persistence classes (registry Run/RunOnce, Startup folder, Windows services, scheduled tasks, image hijack IFEO, Winlogon, AppInit_DLLs), each heuristically scored + ATT&CK-annotated, color-coded by risk. **Read-only — never modifies any autostart entry.**
-10. **Reputation** — multi-engine hash-reputation center: per-source enable/connection status + test, manual lookup by file/hash, VirusTotal query history; a malicious/suspicious hit auto-opens a behavior-relationship detail window.
-11. **Attack chain** — combination-table status (version / combination count / marker count / processes currently ledgered) and the hit records: which actions completed the combination, how many real samples back it, common families, whether it was in dry-run at the time, and the final verdict. Records can be cleared. See "Attack-chain combination engine".
-12. **AI research** — the LLM judges a file from static features (never executes). Scan & trace / scan file / scan folder / stop; stats SCANNED / CLEAN / SUSPICIOUS / MALICIOUS, results with path + SHA256, verdict, confidence, summary, per-row trace.
-13. **Settings** — see below.
+List pages share one layout: segmented filters with counts + type / risk filters + search on top, the record list on the left, and an inspector on the right with everything about the selected item and what can be done with it; multi-select enables batch actions. Destructive actions go through a confirmation sheet that spells out the consequences.
+
+1. **Dashboard** — protection area (shield emblem, kernel-driver / protection-dimension state, quick actions: view blocks / scan autostarts / check reputation), five clickable stat tiles (blocks this session — real blocks only / events / quarantined files / rules / AI research), the last 24 hours as hourly bars stacked by block / ask / allow, a "Needs attention" list (protection off, kernel not connected, blocks that were not actually enforced, confirmed-malicious chain hits), the live activity feed and the protection dimensions.
+2. **Events** — every security event, blocked / asked / allowed. The disposition shows what *really* happened (kernel pre-blocked / process terminated / alert only / block failed); persisted and backfilled on restart; live insertion can be paused; from the inspector open the Attack Timeline or the behavior graph, or trust the program.
+3. **Event timeline** — a *query* view over the on-disk history (`events.jsonl`, far deeper than the 500-entry in-memory ring), so you can go back to "what happened around 3pm yesterday". Filter by time range / event type / verdict / risk / PID (optionally the whole process tree) / free text. The **launch origin** shows the concrete service or scheduled task behind a host process. Any event can seed the attack graph.
+4. **Attack chain** — a status strip with the combination-table version / combination count / marker count and whether the engine is in record-only (dry-run) mode; hit records segmented into confirmed malicious / highly suspicious / ask, each showing which actions completed the combination, how many real samples back it, common families and the final verdict. Records can be cleared. See "Attack-chain combination engine".
+5. **Processes** — list or tree view, with quick filters for needs-attention / unsigned / services & scheduled tasks. Forensics and provenance, not a Task Manager clone: launch origin (which *service* is inside that `svchost.exe`, which *scheduled task* spawned this process), signature / publisher / signature-mismatch, static hints (unsigned, user-writable directory, system-process name outside the system directory), memory / threads / session / elevation / user, and user-initiated actions (terminate, terminate tree, suspend, resume, terminate + quarantine image, add to trust). Every action requires an explicit click and a confirmation; the service refuses to touch Bulwark's own components (self-protection) and critical system processes, and always reports *why* an action did not go through.
+6. **Rules** — view and manage rules by block / allow / temporary / disabled. **New rule** (actor auto-recognized as exact path / wildcard / bare file name), **AI generate** (natural language → 1–5 candidate rules to adopt one by one), intel refresh; ticking "remember" in a prompt also creates a rule.
+7. **Trust** — trusted programs / directories, allowed directly without further detection. **Trust a program** or **trust a whole folder**; entries can be removed.
+8. **Quarantine** — quarantined threat files (original path / reason / date / SHA-256); **Restore** (back to the original path) or **Delete permanently**, one by one or in batch.
+9. **Persistence** — read-only enumeration of 7 autostart persistence classes (registry Run/RunOnce, Startup folder, Windows services, scheduled tasks, image hijack IFEO, Winlogon, AppInit_DLLs), each heuristically scored + ATT&CK-annotated, filterable by needs-attention / unsigned. **Read-only — never modifies any autostart entry.**
+10. **Reputation** — drop files (up to 10 at a time) or enter a path / SHA-256; the lookup chain is shown as it really is (central server → the intel sources enabled on this machine, or plainly "disabled by deployment policy"); the query history has an inspector, malicious / suspicious files open the behavior graph and offer **AI cleanup** — the behavior profile goes to the LLM, which drafts a PowerShell cleanup plan that you review before it runs elevated (see "Enforcement, quarantine and footprint cleanup").
+11. **AI research** — the LLM judges a file from static features (never executes it); drop files or folders (a folder contributes its top-level exe / dll / scr / sys / com, up to 25 per batch); results segmented into malicious / nothing found / unavailable, and an unavailable result says why; the header shows the model connection and cumulative usage.
+12. **Settings** — see below.
 
 **Prompts and notifications:**
 - **Behavior prompt** — shown when no rule matches and the actor is untrusted. Shows actor + signature/publisher, command line, target, SHA256, risk factors, evidence-chain highlights, ATT&CK tags; bottom "remember" + scope (Permanent / Session / 1 hour / 1 day) + Allow / Block; a countdown auto-decides per `PromptTimeoutSeconds`; can open the Attack Timeline.
@@ -454,20 +459,20 @@ The sidebar has 13 pages (in this order); a green status dot means connected. Cl
 - **Attack-chain hit toast** — a self-dismissing corner toast; click it to jump to the "Attack chain" page. **Independent of silent mode**: silent mode downgrades Ask to Allow, and if it swallowed chain hits too you would get "N actions completed, backed by real samples, silently allowed, user never told". The toast has no action buttons and does not steal focus — it informs rather than asks; a separate switch can still turn it off.
 - **Scan-progress card** — live progress + verdict of a double-click/dropped-payload scan; AI research also finalizes here.
 - **Cleanup report** — pops after malicious-footprint cleanup (quarantined / removed persistence / unhandled items with one-click retry).
-- **Attack graph** — opened from an intercept / activity / timeline row (right-click), from the Attack Timeline window, or from a process row. Given one event (or one PID) as the seed, the *service* reconstructs the events in that time window into a layered directed graph: nodes are processes / files / registry keys / remote endpoints / domains / modules / **services** / **scheduled tasks**; edges are individual actions carrying time, risk score, verdict and the *real* enforcement outcome. Dashed edges are relations *derived* from process parentage or launch origin, visually distinct from observed events. The correlation lives only in the service (`AttackGraphBuilder`) and the whole graph is shipped to the UI, so what the graph shows can never drift from what the engine actually reasoned over.
+- **AI cleanup wizard** — look at the profile → generate a plan → review and run; each of the three steps is confirmed by the user.
+- **Attack graph** — opened from an event or timeline entry (inspector or right-click), from the Attack Timeline window, or from a process. Given one event (or one PID) as the seed, the *service* reconstructs the events in that time window into a layered directed graph: nodes are processes / files / registry keys / remote endpoints / domains / modules / **services** / **scheduled tasks**; edges are individual actions carrying time, risk score, verdict and the *real* enforcement outcome. Dashed edges are relations *derived* from process parentage or launch origin, visually distinct from observed events. The correlation lives only in the service (`AttackGraphBuilder`) and the whole graph is shipped to the UI, so what the graph shows can never drift from what the engine actually reasoned over.
 
 ### Settings page (all real toggles)
 
-- **Master**: active protection (master switch), default-block unknown behavior (stricter on no-rule gray zone), silent mode (auto-allow ask-events, block only deterministic high-risk).
-- **Protection dimensions**: process / file / registry / self-protection / network, each toggleable; memory protection (anti-injection) and its VT re-verify.
-- **Decision policy**: auto-trust signed programs, quarantine-on-block.
-- **Kernel driver**: enable toggle + connection status / kernel status / current event source.
-- **Threat intelligence**: VirusTotal / ThreatBook / MalwareBazaar / OTX / MetaDefender / HybridAnalysis per-source toggle + API key + test connection + ThreatBook network IP-intel toggle.
-- **AI / LLM**: AI scan on double-click, suspend process during analysis, block-on-analysis-failure (strict), gray-zone AI consult, credit-budget guard + monthly budget, API base URL / key / model + test.
-- **Continuous behavior protection**: user-mode continuous behavior monitor, ransomware canary decoys, behavior-baseline anomaly detection.
-- **Attack chain**: hit-toast toggle (on by default, independent of silent mode).
+Category navigation on the left, highlighting the current category as you scroll. Changes are sent immediately and only show "Saved" once the service echoes them back (after 6 s without an echo the page says so); while the service is disconnected the last-read settings are shown read-only; turning off active protection or self-protection asks for confirmation first.
+
+- **Master**: active protection (master switch), default-block unknown behavior (stricter on no-rule gray zone), silent mode (auto-allow ask-events, block only deterministic high-risk), attack-chain hit toast (on by default, independent of silent mode), prompt timeout.
+- **Protection dimensions**: process / file / registry / self-protection / network / memory (anti-injection), each toggleable.
+- **Decision & monitoring**: trust signed programs, behavior baseline, ransomware canary decoys, user-mode behavior monitor, kernel driver, gray-zone AI consult.
+- **Threat-intel sources**: VirusTotal / MalwareBazaar / OTX / ThreatBook / MetaDefender / Hybrid Analysis per-source toggle; "Configure" holds the API key and a connection test. When the deployment policy is central-server-only, the page says plainly that these switches have no effect.
+- **Cloud scan & AI**: cloud scan on double-click, suspend during the scan, block when the scan fails; LLM base URL / API key / model (shared by AI research, AI rule generation and AI cleanup).
 - **Threat-intel sharing**: nightly batch upload of "malware info + behavior data" for cloud-confirmed malicious / suspicious samples (**off by default**; with it off nothing is collected and nothing is uploaded — see the privacy boundary in "Threat-intel sharing").
-- **Scan content limits**: script source cap (KB), binary sample cap (MB), extracted-strings count.
+- **About & updates**: check for updates (downloads are verified for size, SHA-256 and digital signature), current version.
 
 ## Install as a Windows service (administrator)
 

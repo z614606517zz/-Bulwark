@@ -235,6 +235,5 @@ Get-Content "C:\ProgramData\Bulwark\service.log" |
 ## 📚 相关文档
 
 - `CHANGELOG.md` - v2.0.3 更新记录
-- `V2.0.2_TEST_GUIDE.md` - 测试指南
 - `PROACTIVE_DEFENSE.md` - 主动防护技术文档
 - `ThreatRemediator.cpp` - 威胁清理实现代码
