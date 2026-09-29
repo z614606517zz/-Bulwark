@@ -27,7 +27,10 @@
 - 仓库清理(不影响产品):删除 .NET 时期遗留的 `Bulwark.Sandbox/`(沙箱配置原由已不存在的 Bulwark.UI 生成,C++ 代码从未接入);删除失效或重复的构建/部署脚本 `build.bat`、`build_service_v2.ps1`、`cpp/build_ui.bat`、`cpp/.tools/`、`重载v5驱动.bat`(调用的 `__drv_reload.ps1` 不存在)、`tools/bulwark_launcher.cpp` + `build_launcher.bat`、`scripts/_kiro_deploy_service.*` / `_kiro_testload.ps1` / `_kiro_fix_and_load.bat`(指向已不存在的 `cpp\build-fix`);删除 v2.0.x 版本线的过期文档 `SUMMARY.md`、`REAL_TIME_PROTECTION_STATUS.md`、`TESTING_GUIDE.md`、`V2.0.2_TEST_GUIDE.md`、`V2.0.3_RELEASE.md`,以及 `ml/` 下误入库的运行日志和一次性探针脚本。下方旧条目里对这些文件的引用仅作历史记录。
 
 ### 新增
-- 内置规则:从 `DefaultRules.cpp` 拆到 `cpp/shared/src/engine/rules/`(`Rules01`–`Rules08` 共八段),现共 955 条;补遗包括远控工具滥用 / curl·BITS·portproxy 下载隧道 / 凭据窃取 / mimikatz·esentutl·procdump 转储 / cmstp / msdt·forfiles·AMSI 绕过等。
+- 内置规则:从 `DefaultRules.cpp` 拆到 `cpp/shared/src/engine/rules/`(`Rules01`–`Rules08` 共八段),现共 950 条;补遗包括远控工具滥用 / curl·BITS·portproxy 下载隧道 / 凭据窃取 / mimikatz·esentutl·procdump 转储 / cmstp / msdt·forfiles·AMSI 绕过等。
+
+### 变更 🔧
+- **内置规则误拦截治理**:会拦正常系统 / 软件行为的内置规则逐条处理,原则是保留检出、降低处置强度 —— 先让签名健康的系统组件豁免(`exemptOs`,LOLBin 与脚本宿主不在豁免之列),再把模式改精确,都做不到才 Block → Ask。例如 Windows 更新(TrustedInstaller / TiWorker)替换辅助功能程序不再被拦;安装器从 %TEMP% 加载未签名 DLL、仍随合法软件分发的 17 个易受攻击驱动、`sc create type= kernel` 改为询问。规则数 955 → 950。
 
 ---
 

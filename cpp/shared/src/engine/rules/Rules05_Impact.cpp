@@ -60,10 +60,12 @@ void addImpactRules(QVector<DefenseRule>& out) {
     // setzerodata 把文件区间置零 —— 这是 wiper 的实现方式,不是任何正常工具的用法。
     s.proc(Block, "将文件内容置零(fsutil file setzerodata,数据擦除,T1485)").hard()
         .cmd("*setzerodata*");
-    // 【为什么只把 PhysicalDrive0 定为硬拦】裸盘设备名也出现在正常的 U 盘刻录 / 磁盘镜像工具
-    // 命令行里,但那些工具操作的是 1/2 号盘;覆写引导扇区的 wiper 必须打 0 号盘(系统盘)。
-    // 按盘号区分能同时留住检出与正常用途,比一刀切拦 "physicaldrive" 准得多。
-    s.proc(Block, "直接写系统盘裸设备 PhysicalDrive0(覆写 MBR/引导扇区,T1561.002)").hard()
+    // 按盘号区分比一刀切拦 "physicaldrive" 准得多:覆写引导扇区的 wiper 必须打 0 号盘(系统盘)。
+    //
+    // 【但仍降级为 Ask】原注释假定"正常工具操作的是 1/2 号盘",这只覆盖了【写入目标盘】那一半:
+    // 给整机做镜像 / 克隆 / 裸机备份时,要【读】的恰恰是 0 号盘,命令行里照样是 PhysicalDrive0。
+    // 而本条只看设备名,分不出读还是写 —— 分不出方向就不该 hardOverride 结束进程树。
+    s.proc(Ask, "直接写系统盘裸设备 PhysicalDrive0(覆写 MBR/引导扇区,T1561.002)")
         .cmd("*physicaldrive0*");
     s.proc(Ask, "访问其它物理磁盘裸设备(镜像工具也用此形态,T1561)").cmd("*physicaldrive*");
     s.proc(Block, "经 dd/rawcopy 方式写裸卷设备(T1561.001)").hard()
@@ -76,14 +78,21 @@ void addImpactRules(QVector<DefenseRule>& out) {
     // 5.4 备份文件与快照目录
     // ------------------------------------------------------------------
     s.del(Ask, "删除卷影/还原点存放目录内的项(T1490)").target("*\\System Volume Information\\*");
-    static const char* kBackupExt[] = { "*.vhd", "*.vhdx", "*.vbk", "*.vib", "*.bak", "*.bkf", "*.tib" };
+    // 【已移除 *.bak】它不是备份软件的专用扩展名,而是各类工具链"改文件前先留一份"的通用后缀
+    // (编辑器、包管理器、配置生成器、sed -i.bak 之类),日常到处都是。FileDelete 是全量遥测,
+    // 这条会持续弹 Ask。其余 6 个(vhd/vhdx/vbk/vib/bkf/tib)是虚拟磁盘与备份软件的专用格式,
+    // 正常流程里极少被删,保留。
+    static const char* kBackupExt[] = { "*.vhd", "*.vhdx", "*.vbk", "*.vib", "*.bkf", "*.tib" };
     for (const char* ext : kBackupExt) {
         const QString e = QString::fromUtf8(ext).mid(1);
         s.del(Ask, u("未签名程序删除备份文件 ") + e + u("(毁掉离线恢复手段,T1490)"))
             .target(ext).unsignedOnly();
     }
     // 数据库/虚拟机在线文件被未签名程序改写,是勒索加密整台宿主机的典型形态。
-    static const char* kLiveData[] = { "*.vmdk", "*.vmx", "*.vdi", "*.mdf", "*.ldf", "*.edb" };
+    // 【已移除 *.ldf】该后缀在 SQL Server 之外还是 LaTeX 的语言定义文件(language definition),
+    // 任何 TeX 发行版的包目录里都有成百上千个,装包 / 更新 TeX 时被大量改写。
+    // *.mdf 保留:它虽然也撞 Alcohol/Daemon Tools 的光盘镜像格式,但那类文件不会被频繁改写。
+    static const char* kLiveData[] = { "*.vmdk", "*.vmx", "*.vdi", "*.mdf", "*.edb" };
     for (const char* ext : kLiveData) {
         const QString e = QString::fromUtf8(ext).mid(1);
         s.file(Ask, u("未签名程序改写在线数据/虚拟机磁盘文件 ") + e + u("(T1486)"))
@@ -100,11 +109,22 @@ void addImpactRules(QVector<DefenseRule>& out) {
     for (const QString& host : scriptHostActors())
         s.file(Block, u("脚本宿主 ") + imageNameOf(host) + u(" 修改 hosts 文件(劫持域名解析,T1565.001)")).hard()
             .target("*\\drivers\\etc\\hosts").actor(host);
-    // 替换 System32 里的可执行体。正常写入者只有 Windows 更新(段 1 已放行),未签名主体做这件事
-    // 就是白加黑或系统二进制后门。
-    s.file(Block, "未签名程序改写 System32 下的可执行文件(替换系统二进制,T1554)").hard()
+    // 替换 System32 里的可执行体:未签名主体做这件事通常是白加黑或系统二进制后门。
+    //
+    // 【降级为 Ask】这两条的匹配面比字面看起来大得多:wildcardMatch 的 `*` 是【跨 \ 分隔符】的
+    //(见 DefenseRule.cpp 的实现),所以 `*\System32\*.exe` 不止覆盖 System32 本身,还覆盖它下面
+    // 的整棵子树,其中两处是正常的高频写入点:
+    //   · \System32\config\systemprofile\AppData\Local\Temp\  —— SYSTEM 上下文的 %TEMP%,
+    //     以 SYSTEM 运行的厂商安装器 / 更新器会把自解压出来的 exe、dll 落在这里;
+    //   · \System32\spool\drivers\x64\3\  —— 打印驱动安装目录,第三方打印驱动往这里放二进制。
+    // 这两类文件里未签名的很常见,而原来是 Block + hardOverride:FileWrite 命中后走 killMalicious
+    // 结束进程树,等于装个打印机或跑个厂商更新器就被杀。
+    // 用 unsignedOnly + Ask:Worker 的「签名主体降级放行」对未签名主体不生效,所以这里仍会弹窗
+    // 让用户裁决,只是不再直接杀进程。收窄模式这条路走不通 —— 攻击者往 System32 子树里放白加黑
+    // 载荷用的也是同样的路径形态。
+    s.file(Ask, "未签名程序改写 System32 下的可执行文件(替换系统二进制,T1554)")
         .target("*\\System32\\*.exe").unsignedOnly();
-    s.file(Block, "未签名程序改写 System32 下的系统库(T1554)").hard()
+    s.file(Ask, "未签名程序改写 System32 下的系统库(T1554)")
         .target("*\\System32\\*.dll").unsignedOnly();
     s.proc(Ask, "递归接管系统目录所有权(takeown /f /r,为替换系统文件铺路,T1222.001)")
         .cmd("*takeown*/f*/r*");

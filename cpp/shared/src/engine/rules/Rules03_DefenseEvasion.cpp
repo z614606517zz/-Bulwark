@@ -11,6 +11,14 @@
 // 情形的主体都是签名健康的。对签名主体 Block 会拦掉正常操作,故交回 DefenseEvasionAnalyzer 的
 // 45 分硬指标走步骤 10(-> 询问),由用户裁决。
 //
+// 【已知残留:停用安全软件服务的规则会误伤共存的安全软件自身】下面 kSecServices 那组
+// `*stop*<服务名>*` 不带 actor 条件,而 TrustPolicy::isTrustedSecurityProduct 只看 e.actorPath
+//(TrustPolicy.cpp:247-269)。于是安全软件自己的更新器若经 `cmd /c sc stop <自己的服务>` 重启
+// 服务,主体是 cmd.exe,共存放行认不出来,这组规则照样 Block。
+// 刻意不降级:停掉安全软件服务的危害高于这处误伤,而且降 Ask 之后签名主体会被 Worker 的
+// 「信任已签名主体」降级为放行(Worker.cpp:505-512),等于这组规则对签名攻击者彻底失效。
+// 真正的修法是让共存判定能穿透 cmd/powershell 去看实际发起者,那要动 TrustPolicy,不在本次范围。
+//
 #include "RuleDsl.h"
 #include "bulwark/engine/EngineCommon.h"
 
@@ -33,13 +41,20 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
         s.reg(Block, u("脚本宿主 ") + imageNameOf(host) + u(" 向 Defender 添加排除项(免杀,T1562.001)")).hard()
             .target("*\\Windows Defender\\Exclusions\\*").actor(host);
 
+    // 【口径注意】RegistryWrite 的 target 是「键路径 + \ + 值名」,拿不到值数据。所以这 9 条的
+    // 真实语义是「写了 DisableRealtimeMonitoring 这个值」,把它写成 0(也就是【启用】实时防护)
+    // 同样命中。组策略下发加固基线、以及各种安全加固脚本都会显式写这些值,而本条是 Block +
+    // hardOverride,ruleTier 1 恒定压过段 1 的系统维护放行 —— 命中后会结束 gpsvc 所在的 svchost。
+    // 故加 exemptOs:微软签名且位于系统目录的 svchost / MpCmdRun 之类走策略通道时豁免。
+    // 攻击者那一侧不受影响:reg.exe / powershell / wmic 都在 LOLBin 名单里拿不到豁免,未签名样本
+    // 直接过不了签名条件。
     static const char* kDefenderOff[] = {
         "DisableAntiSpyware", "DisableAntiVirus", "DisableRealtimeMonitoring",
         "DisableBehaviorMonitoring", "DisableIOAVProtection", "DisableScriptScanning",
         "DisableBlockAtFirstSeen", "DisableOnAccessProtection", "TamperProtection",
     };
     for (const char* v : kDefenderOff)
-        s.reg(Block, u("注册表关闭 Defender 保护开关 ") + u(v) + u("(T1562.001)")).hard()
+        s.reg(Block, u("注册表关闭 Defender 保护开关 ") + u(v) + u("(T1562.001)")).hard().exemptOs()
             .target(u("*\\Windows Defender*\\") + u(v));
     // 兜底:组策略也从这个键下手,故只 Ask。
     s.reg(Ask, "改写 Defender 组策略配置(可能关闭防护或改上报行为,T1562.001)").exemptOs()
@@ -100,10 +115,14 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
         s.kill(Block, u("未签名程序结束安全软件进程 ") + img + u("(禁用防护,T1562.001)")).hard()
             .target(u("*\\") + img).unsignedOnly();
     }
-    // 卸载文件系统过滤驱动 = 一次性摘掉 EDR 的文件监控,没有任何正常运维理由在终端上做。
-    s.proc(Block, "卸载文件系统过滤驱动(fltmc unload,致盲 EDR,T1562.001)").hard()
+    // 【降级为 Ask】原注释断言"没有任何正常运维理由在终端上做",这个前提在开发机上不成立:
+    // fltmc unload / detach 是文件系统过滤驱动【开发与调试】的标准动作(本产品自己的驱动就是
+    // minifilter,改一版卸一次),备份与虚拟化软件的排障步骤里也有。命令行本身分不出"卸我自己的
+    // 驱动"还是"卸 EDR 的驱动"—— 要分辨得看被卸的驱动归谁,这条规则拿不到那个信息。
+    // 保留告警,把处置交给用户。
+    s.proc(Ask, "卸载文件系统过滤驱动(fltmc unload,致盲 EDR,T1562.001)")
         .cmd("*fltmc*unload*");
-    s.proc(Block, "卸载内核驱动(sc delete / fltmc detach 针对安全驱动,T1562.001)").hard()
+    s.proc(Ask, "卸载内核驱动(sc delete / fltmc detach 针对安全驱动,T1562.001)")
         .cmd("*fltmc*detach*");
 
     // ------------------------------------------------------------------
@@ -120,11 +139,24 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
     for (int i = 0; i < 5; ++i)
         s.proc(Block, u("AMSI 绕过:") + u(kAmsiLabel[i]) + u("(T1562.001)")).hard()
             .cmd(kAmsi[i]);
-    s.proc(Block, "ETW 致盲:EtwEventWrite 补丁(T1562.006)").hard().cmd("*etweventwrite*");
-    s.proc(Block, "ETW 致盲:EtwEventUnregister 注销(T1562.006)").hard().cmd("*etweventunregister*");
-    s.proc(Block, "关闭 PowerShell 脚本块日志(ScriptBlockLogging,T1562.002)").hard()
+    // 【降级为 Ask】这两条是拿 Win32 API 名去匹配命令行,而 API 名出现在命令行里这件事本身没有
+    // 方向性:ETW 相关的诊断脚本、性能分析工具、以及讲解这些 API 的文档/教学脚本都会带上它们。
+    // 真正的 ETW 致盲是在进程内存里改函数入口,根本不经过命令行 —— 也就是说这两条既拦不住真攻击
+    // (它不写命令行),又会被同名字符串误命中,原来还是 Block + hardOverride。
+    s.proc(Ask, "ETW 致盲:EtwEventWrite 补丁(T1562.006)").cmd("*etweventwrite*");
+    s.proc(Ask, "ETW 致盲:EtwEventUnregister 注销(T1562.006)").cmd("*etweventunregister*");
+    // 【降级为 Ask】`*scriptblocklogging*` 只是命令行里出现了这个词,分不出开还是关:
+    // `Set-ItemProperty …\ScriptBlockLogging -Name EnableScriptBlockLogging -Value 1` 是加固基线
+    // 【开启】日志的标准写法,与关闭它的命令行形态完全一致。原来是 Block + hardOverride,
+    // 等于开日志也被拦 + 结束进程树。这条按 API/配置名匹配的规则天生方向不可辨,只能降处置强度。
+    // 备注同时改成方向中性的措辞 —— Ask 的文案要弹给用户看,不能写成"关闭"。
+    s.proc(Ask, "改写 PowerShell 脚本块日志配置(ScriptBlockLogging,T1562.002)")
         .cmd("*scriptblocklogging*");
-    s.reg(Block, "注册表关闭 PowerShell 脚本块日志(T1562.002)").hard()
+    // 注册表侧同理(target 只有键路径 + 值名,看不到值数据),但键路径本身已经很窄,保留
+    // Block + hard,只给 OS 组件留豁免:组策略下发日志配置时 actor 是 svchost(gpsvc),微软签名 +
+    // 系统目录,可豁免;reg.exe / powershell 在 LOLBin 名单里,照旧拦。
+    // 残留:第三方(未签名)配置工具【开启】脚本块日志仍会被 Block —— 这条路上没有可用的方向信号。
+    s.reg(Block, "注册表关闭 PowerShell 脚本块日志(T1562.002)").hard().exemptOs()
         .target("*\\PowerShell\\ScriptBlockLogging\\*");
 
     // ------------------------------------------------------------------
@@ -185,7 +217,10 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
     // 安全模式:攻击者把自己注册成安全模式服务,再重启进安全模式 —— 那里绝大多数安全软件不启动。
     s.reg(Ask, "改写安全模式启动项 SafeBoot(勒索常用:进安全模式后加密,T1562.009)")
         .target("*\\Control\\SafeBoot\\*");
-    s.proc(Block, "把系统配置为下次启动进入安全模式(bcdedit safeboot,T1562.009)").hard()
+    // 【降级为 Ask】方向不可辨:`bcdedit /deletevalue {current} safeboot` 是【退出】安全模式的
+    // 标准命令,也含 "bcdedit" 与 "safeboot" 两个词,同样命中。而排障时进安全模式再出来是极常规的
+    // 操作。要区分进/出得看是 /set 还是 /deletevalue,但那样写模式会越来越脆,故只降处置强度。
+    s.proc(Ask, "把系统配置为下次启动进入安全模式(bcdedit safeboot,T1562.009)")
         .cmd("*bcdedit*safeboot*");
 
     // ------------------------------------------------------------------
@@ -201,7 +236,10 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
         .target("*\\SystemRestore\\DisableSR");
     s.reg(Ask, "关闭系统还原配置 SystemRestore\\DisableConfig(T1490)")
         .target("*\\SystemRestore\\DisableConfig");
-    s.proc(Block, "关闭系统还原(Disable-ComputerRestore,T1490)").hard()
+    // 【降级为 Ask】关系统还原在装机脚本、镜像封装(sysprep 前)、虚拟机模板制作、以及为省磁盘
+    // 空间做的常规调优里都会出现,是运维会主动做的事。上面两条同语义的注册表规则本来就只给 Ask,
+    // 命令行这条却是 Block + hardOverride —— 同一件事两种强度,按较弱的那个统一。
+    s.proc(Ask, "关闭系统还原(Disable-ComputerRestore,T1490)")
         .cmd("*disable-computerrestore*");
 
     // ------------------------------------------------------------------

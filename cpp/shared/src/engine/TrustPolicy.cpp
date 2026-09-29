@@ -93,8 +93,18 @@ const QSet<QString>& trustedVendorApps() {
     };
     return s;
 }
+// isStronglyTrusted 的目录条件(还要叠加微软签名)。
+// 【\windows\servicing\ 的由来】TrustedInstaller.exe 住在这里,它是 Windows 更新 / DISM / sfc 真正
+// 动系统文件的那个 SYSTEM 主体(另一半工作由 \windows\winsxs\...servicingstack...\ 下的 TiWorker.exe
+// 做,那个已被 winsxs 覆盖)。缺了它,带 exemptOs 的 Block 规则(如替换辅助功能映像)会在正常系统
+// 更新替换 System32 文件时命中,后果是拒绝改名 + 结束 TrustedInstaller 进程树。
+// 放宽幅度有限:该目录与 System32 一样归 TrustedInstaller 所有,普通管理员写不进去,且这里仍然
+// 要求微软签名 + 无危险命令行 + 无异常父子链。
 const QStringList& systemDirs() {
-    static const QStringList s = { "\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\winsxs\\" };
+    static const QStringList s = {
+        "\\windows\\system32\\", "\\windows\\syswow64\\", "\\windows\\winsxs\\",
+        "\\windows\\servicing\\",
+    };
     return s;
 }
 const QStringList& trustedDirs() {
@@ -104,6 +114,18 @@ const QStringList& trustedDirs() {
     };
     return s;
 }
+// 这张名单【只】被 isLolBinOrScriptHost -> isTrustedOsComponent 使用,也就是只决定
+// 「带 exemptOs 标记的规则要不要放过这个主体」。往里加名字的方向是【收窄豁免】,不会新增拦截。
+//
+// 后半段那几个复制 / 解包工具是随 exemptOs 用到文件替换类规则一起补的:原先名单里只有注册表和
+// 脚本宿主类工具,因为此前 exemptOs 只出现在 RegistryWrite 规则上。一旦文件替换规则(替换
+// System32 里的辅助功能映像)也带上 exemptOs,「微软签名 + 位于系统目录」这两个条件就会被
+// System32 自带的复制工具原生满足 —— `xcopy evil.exe C:\Windows\System32\sethc.exe` 会拿到
+// OS 组件豁免。它们本身是正常运维工具,但「用它们覆盖 System32 里的登录界面可执行文件」不存在
+// 正常用途,所以在豁免这条路上一律不认。
+//
+// certutil / bitsadmin 一类不必列在这里:它们的滥用形态(-decode、urlcache 等)已经在
+// hardDangerTokens 里,命中即撤销信任档,isStronglyTrusted 提前返回,根本走不到豁免。
 const QSet<QString>& lolBinsAndHosts() {
     static const QSet<QString> s = {
         "reg.exe", "regedit.exe", "regini.exe",
@@ -111,6 +133,8 @@ const QSet<QString>& lolBinsAndHosts() {
         "wscript.exe", "cscript.exe", "mshta.exe",
         "rundll32.exe", "regsvr32.exe", "sc.exe",
         "wmic.exe", "cmstp.exe", "fodhelper.exe",
+        "xcopy.exe", "robocopy.exe", "replace.exe",
+        "expand.exe", "extrac32.exe", "esentutl.exe",
     };
     return s;
 }

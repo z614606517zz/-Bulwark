@@ -61,10 +61,18 @@ void addCredentialAccessRules(QVector<DefenseRule>& out) {
     // ------------------------------------------------------------------
     // 4.2 SAM / SECURITY / SYSTEM 蜂巢
     // ------------------------------------------------------------------
+    // 【模式末尾加空格】原来是 `*save*hklm\system*`,会把「备份某个服务子键」这种常规运维写法
+    // 一起拦掉:`reg save HKLM\SYSTEM\CurrentControlSet\Services\Foo foo.hiv`。区别在于蜂巢名
+    // 【后面跟什么】—— 导整个蜂巢时后面是分隔命令行参数的空格,备份子键时后面是 `\`。
+    // 加一个空格就把两者分开了,同时 `reg save HKLM\SAM sam.hiv` 这类真导出照旧命中。
+    //
+    // 残留:加引号的写法(`reg save "HKLM\SAM" out.hiv`)因为蜂巢名后面是引号而不再命中本条。
+    // 不在这里补形态,因为紧接下面的 `*reg*save*.hiv*` 覆盖了它 —— 除非攻击者把输出文件改成
+    // 非 .hiv 扩展名,那种组合才会漏。
     static const char* kHive[] = { "hklm\\sam", "hklm\\security", "hklm\\system" };
     for (const char* h : kHive)
         s.proc(Block, u("导出注册表蜂巢 ") + u(h) + u("(本地口令哈希窃取,T1003.002)")).hard()
-            .cmd(u("*save*") + u(h) + u("*"));
+            .cmd(u("*save*") + u(h) + u(" *"));
     s.proc(Block, "经 reg.exe 导出全部本地蜂巢(reg save + hiv 落地,T1003.002)").hard()
         .cmd("*reg*save*.hiv*");
     // 蜂巢文件本体。正常改写者只有 Windows 更新(段 1 已放行 TrustedInstaller / TiWorker)。
@@ -87,7 +95,11 @@ void addCredentialAccessRules(QVector<DefenseRule>& out) {
         .actor("*\\vssadmin.exe").cmd("*create*shadow*");
     // 直接按卷影设备名匹配即可,不必把 \\?\GLOBALROOT\Device\ 前缀写进模式 —— 那段里的 '?'
     // 在本引擎的通配语义下是「任意单字符」,写进去只会让模式更难读,匹配结果并无不同。
-    s.proc(Block, "从卷影副本路径复制文件(绕过文件锁取凭据库,T1003.002)").hard()
+    // 【降级为 Ask】走卷影副本读文件正是备份软件的标准工作方式 —— 要在文件被占用时取到一致的
+    // 副本,只能从快照里读,所以备份/归档/磁盘镜像/数据库日志搬运都会出现这个设备名。
+    // 判别性不在"从快照读",而在"读的是哪个文件";而本条只看命令行里的设备名,看不到那一层。
+    // 真正取凭据库的形态由 4.2 节的蜂巢规则与 CredentialAccessAnalyzer 覆盖。
+    s.proc(Ask, "从卷影副本路径复制文件(绕过文件锁取凭据库,T1003.002)")
         .cmd("*harddiskvolumeshadowcopy*");
 
     // ------------------------------------------------------------------
@@ -95,7 +107,11 @@ void addCredentialAccessRules(QVector<DefenseRule>& out) {
     // ------------------------------------------------------------------
     s.proc(Block, "经 ntdsutil IFM 导出域凭据库(T1003.003)").hard().cmd("*ntdsutil*ifm*");
     s.proc(Block, "经 esentutl 复制正在使用的 NTDS.dit(T1003.003)").hard().cmd("*esentutl*ntds*");
-    s.proc(Block, "命令行引用域凭据库 ntds.dit(T1003.003)").hard().cmd("*ntds.dit*");
+    // 【降级为 Ask】"命令行里提到 ntds.dit"不等于在窃取它:域控的备份脚本、健康巡检、容量统计、
+    // 碎片整理(ntdsutil 的离线维护)都会把这个文件名写在命令行里。上面两条带动作词的
+    //(`*ntdsutil*ifm*` / `*esentutl*ntds*`)才是判别性形态,保持 Block + hard 不动;
+    // 这条只有文件名、没有动作,降为询问。
+    s.proc(Ask, "命令行引用域凭据库 ntds.dit(T1003.003)").cmd("*ntds.dit*");
     s.file(Ask, "写入/复制域凭据库文件 ntds.dit(T1003.003)").target("*\\ntds.dit");
     s.del(Ask, "删除域凭据库文件 ntds.dit(破坏域控,T1485)").target("*\\ntds.dit");
     s.proc(Block, "DCSync 式凭据复制工具特征(T1003.006)").hard().cmd("*dcsync*");
@@ -107,7 +123,11 @@ void addCredentialAccessRules(QVector<DefenseRule>& out) {
     // DPAPI 主密钥文件本身:只有 lsass 与本用户的正常解密流程会碰它,未签名主体写它没有理由。
     s.file(Block, "未签名程序改写 DPAPI 主密钥文件(凭据解密,T1003)").hard()
         .target("*\\Microsoft\\Protect\\*").unsignedOnly();
-    s.file(Ask, "改写 Windows 凭据保管库文件(T1555.004)").target("*\\Microsoft\\Credentials\\*");
+    // 【补 unsignedOnly】保管库文件由 Windows 自己在用户登录、保存网络凭据、RDP 记住密码等
+    // 常规流程里改写,原来不分签名一律 Ask,是纯噪音。加签名条件后:签名主体的正常改写不再打扰,
+    // 未签名主体碰保管库仍然询问。
+    s.file(Ask, "改写 Windows 凭据保管库文件(T1555.004)")
+        .target("*\\Microsoft\\Credentials\\*").unsignedOnly();
     s.proc(Ask, "枚举 Windows 凭据保管库(vaultcmd /list,T1555.004)").cmd("*vaultcmd*/list*");
     s.proc(Ask, "枚举已保存的凭据(cmdkey /list,T1555.004)").cmd("*cmdkey*/list*");
     s.proc(Ask, "导出无线网络明文口令(netsh wlan show profile key=clear,T1555)")

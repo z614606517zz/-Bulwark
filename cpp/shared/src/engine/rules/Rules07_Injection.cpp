@@ -69,14 +69,27 @@ void addInjectionRules(QVector<DefenseRule>& out) {
     // ------------------------------------------------------------------
     // 7.3 DLL 侧载(只写 ImageLoad 真会上报的两个目录)
     // ------------------------------------------------------------------
-    s.image(Block, "从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)").hard()
+    // 【这三条降级为 Ask】安装器是 temp 目录里加载未签名 DLL 的大户,而且是主流形态:
+    //   · Inno Setup 把自己解包到 %TEMP%\is-XXXX.tmp\ 再从那里加载 setup.tmp 与 helper DLL;
+    //   · NSIS 把插件 DLL 解到 %TEMP%\nsXXXX.tmp\ 再加载。
+    // 这些中间产物基本都不带签名(厂商只签外层安装包),于是"装个软件"就命中 Block + hardOverride。
+    //
+    // 降 Ask 还解决一个更麻烦的副作用:Block 的 ImageLoad 会走 enforceBlock -> blockModuleLoad,
+    // 把路径写进内核的 FileNoLoad 名单,而那份名单【只有 64 槽且只加不减】(FileMonitor.c:200-212),
+    // 槽位耗尽后此后所有新的恶意裁决都被丢弃。temp 路径里带随机段(is-A1B2C3.tmp),每次安装都是
+    // 一个新路径 —— 等于用一次性路径把这份全局名单烧穿,代价远超这条规则本身的收益。
+    // unsignedOnly 保证签名主体不受影响,Ask 对未签名主体不会被降级放行,仍然弹窗询问。
+    s.image(Ask, "从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)")
         .target("*\\appdata\\local\\temp\\*.dll").unsignedOnly();
-    s.image(Block, "从 Windows\\Temp 加载未签名模块(T1574.002)").hard()
+    s.image(Ask, "从 Windows\\Temp 加载未签名模块(T1574.002)")
         .target("*\\windows\\temp\\*.dll").unsignedOnly();
-    s.image(Block, "从 Users\\Public 加载未签名模块(T1574.002)").hard()
+    s.image(Ask, "从 Users\\Public 加载未签名模块(T1574.002)")
         .target("*\\users\\public\\*.dll").unsignedOnly();
-    // 同样的位置换个扩展名加载(.tmp / .dat / .log 伪装成数据文件的 PE),是规避扩展名检测的常见做法。
-    static const char* kDisguised[] = { "*.tmp", "*.dat", "*.log", "*.bin", "*.txt", "*.jpg" };
+    // 同样的位置换个扩展名加载(.dat / .log 伪装成数据文件的 PE),是规避扩展名检测的常见做法。
+    // 【已移除 *.tmp】它恰好是上面那批安装器的中间产物用的扩展名(is-XXXX.tmp\setup.tmp),
+    // 留着它等于把刚降级掉的误报又从伪装这条路上放回来,而且这批是 Block + hard。
+    // 其余 5 个扩展名不是安装器中间产物的常规形态,保留 Block + hard。
+    static const char* kDisguised[] = { "*.dat", "*.log", "*.bin", "*.txt", "*.jpg" };
     for (const char* ext : kDisguised) {
         const QString e = QString::fromUtf8(ext).mid(1);
         s.image(Block, u("从 %TEMP% 加载伪装成 ") + e + u(" 数据文件的未签名模块(T1574.002/T1027)")).hard()
@@ -91,17 +104,36 @@ void addInjectionRules(QVector<DefenseRule>& out) {
             .target(u("*") + dir + u("*.sys"));
     s.image(Block, "从用户目录加载内核驱动(BYOVD,T1068)").hard()
         .target("*\\users\\*\\downloads\\*.sys");
-    // 已知被 BYOVD 滥用的具名驱动。命中即拦,不看签名 —— 它们【都有】合法签名,那正是被选中的原因。
-    static const char* kByovd[] = {
-        "iqvw64e.sys", "iqvw64.sys", "rtcore64.sys", "gdrv.sys", "gdrv2.sys",
-        "dbutil_2_3.sys", "dbutildrv2.sys", "aswarpot.sys", "procexp152.sys",
-        "truesight.sys", "viragt64.sys", "mhyprot2.sys", "mhyprot3.sys",
+    // 已知被 BYOVD 滥用的具名驱动。不看签名 —— 它们【都有】合法签名,那正是被选中的原因。
+    //
+    // 【按"合法软件是否仍在用"拆成两组】驱动的 ImageLoad 上报口径比本节标题写的宽:
+    // ImageMonitor.c:113-122 对 .sys 的上报范围是 \Temp\ \Users\Public\ \ProgramData\ \AppData\
+    // \Downloads\ \Desktop\。落在这些目录里的既有攻击,也有正常软件:Dell 的更新工具历史上把
+    // dbutil_2_3.sys 放在 C:\Windows\Temp\;WinRing0x64.sys / SpeedFan / 各类硬件监控与超频工具
+    // 常被用户从桌面或下载目录直接运行,驱动就在旁边。对这类驱动直接 Block + hard 会在正常使用
+    // 这些软件时结束进程树。
+    //
+    // A 组 = 仍随合法软件分发、终端上会正常出现的 -> 降 Ask,保留检出与告警,把处置交给用户。
+    // Ask 不会被"签名主体降级放行"吃掉:内核驱动加载事件的 actorPath 是伪串"内核(驱动加载)"
+    //(DriverEventSource.cpp:994-998),不是真实文件,签名核验无从成立,actorSigned 恒假。
+    static const char* kByovdInUse[] = {
+        "rtcore64.sys", "dbutil_2_3.sys", "dbutildrv2.sys", "aswarpot.sys",
+        "procexp152.sys", "truesight.sys", "mhyprot2.sys", "mhyprot3.sys",
         "zamguard64.sys", "zam64.sys", "kprocesshacker.sys", "nvflash.sys",
         "speedfan.sys", "winio64.sys", "winring0x64.sys", "amifldrv64.sys",
-        "atszio.sys", "elrawdsk.sys", "asrdrv101.sys", "piddrv64.sys",
-        "echo_driver.sys", "pcdsrvc.sys",
+        "atszio.sys",
     };
-    for (const char* d : kByovd)
+    for (const char* d : kByovdInUse)
+        s.image(Ask, u("加载可被滥用的易受攻击驱动 ") + u(d) + u("(BYOVD 风险,该驱动仍有合法用途,T1068)"))
+            .target(u("*\\") + u(d));
+    // B 组 = 厂商已弃用 / 签名已吊销 / 只在攻击样本里见过的 -> 保留 Block + hard。
+    // 这组的备注与匹配条件一字未改,id 不变。
+    static const char* kByovdMaliciousOnly[] = {
+        "iqvw64e.sys", "iqvw64.sys", "gdrv.sys", "gdrv2.sys", "viragt64.sys",
+        "elrawdsk.sys", "asrdrv101.sys", "piddrv64.sys", "echo_driver.sys",
+        "pcdsrvc.sys",
+    };
+    for (const char* d : kByovdMaliciousOnly)
         s.image(Block, u("加载已知可被滥用的易受攻击驱动 ") + u(d) + u("(BYOVD,关内核防护,T1068)")).hard()
             .target(u("*\\") + u(d));
 
@@ -113,7 +145,13 @@ void addInjectionRules(QVector<DefenseRule>& out) {
     for (const QString& dir : dropDirFragments())
         s.file(Ask, u("向可写投递目录 ") + dir + u(" 投放内核驱动 .sys(BYOVD 前置,T1068)"))
             .target(u("*") + dir + u("*.sys"));
-    s.proc(Block, "创建内核驱动服务(sc create type= kernel,T1543.003)").hard()
+    // 【降级为 Ask】注册内核服务是【所有】驱动安装的必经一步,不分好坏:显卡/声卡/外设驱动、
+    // 虚拟机与沙箱的网卡与磁盘驱动、抓包工具、硬件监控工具,以及本产品自己的驱动安装脚本
+    //(走 bulwark.ps1 -File 之外的通道时)都会出现这条命令行。原来是 Block + hardOverride,
+    // 等于装任何驱动都被拦并结束进程树。
+    // 保留检出:这条仍然会告警,只是把处置交给用户。真正该硬拦的是「注册的驱动来自可写投递目录」,
+    // 那由紧接下面的 binPath 系列规则负责 —— 那才是 BYOVD 的判别性形态。
+    s.proc(Ask, "创建内核驱动服务(sc create type= kernel,T1543.003)")
         .cmd("*create*type=*kernel*");
     s.proc(Block, "创建指向可写投递目录的服务(sc create binPath= %TEMP%,T1543.003)").hard()
         .cmd("*binpath=*\\appdata\\local\\temp\\*");
@@ -150,7 +188,10 @@ void addInjectionRules(QVector<DefenseRule>& out) {
     // 未签名主体往别人的安装目录塞 DLL 没有正常解释。
     s.file(Ask, "未签名程序向 Program Files 下的安装目录写入 DLL(白加黑侧载准备,T1574.002)")
         .target("*\\Program Files*\\*.dll").unsignedOnly();
-    s.proc(Block, "经 SetThreadContext/QueueUserAPC 注入的工具特征(T1055.004)").hard()
+    // 【降级为 Ask】同 ETW 那两条的问题:拿 Win32 API 名匹配命令行。真正的 APC 注入是在代码里调
+    // 这个 API,不会把名字写进命令行;会把 "QueueUserAPC" 写在命令行里的,反而多是调试脚本、
+    // 讲解注入原理的教学/研究脚本,以及本产品自己的检测用例。既拦不住真注入,又会误命中。
+    s.proc(Ask, "经 SetThreadContext/QueueUserAPC 注入的工具特征(T1055.004)")
         .cmd("*queueuserapc*");
     s.proc(Block, "反射式 DLL 注入(Invoke-ReflectivePEInjection,T1055.001)").hard()
         .cmd("*reflectivepeinjection*");

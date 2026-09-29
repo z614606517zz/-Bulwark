@@ -197,18 +197,31 @@ void addPersistenceRules(QVector<DefenseRule>& out) {
     // schtasks 本体(在内核 LOLBin 名单里,ProcessCreate 会上报)。
     s.proc(Ask, "schtasks 创建计划任务(T1053.005)")
         .actor("*\\schtasks.exe").cmd("*/create*");
-    s.proc(Block, "schtasks 创建以 SYSTEM 身份运行的计划任务(提权持久化,T1053.005)").hard()
+    // 【降级为 Ask】"任务以 SYSTEM 身份跑"是正常部署的主流形态,不是攻击特征:软件安装器注册的
+    // 更新任务、企业的巡检与补丁任务、备份任务,绝大多数都要 /RU SYSTEM 才能在无人登录时执行。
+    // 原来 Block + hardOverride 会把这些装机动作连进程树一起结束。
+    s.proc(Ask, "schtasks 创建以 SYSTEM 身份运行的计划任务(提权持久化,T1053.005)")
         .actor("*\\schtasks.exe").cmd("*/create*/ru*system*");
+    // 【降级为 Ask】"任务的执行体是脚本宿主"同样不足以定性:运维用计划任务跑 PowerShell 巡检/
+    // 清理/报表脚本极其普遍,certutil 与 bitsadmin 也有正常的证书与下载用途。判别性信号不在
+    // "用了什么解释器",而在"脚本从哪来"—— 那由下面的投递目录规则负责。
     static const char* kTaskPayload[] = {
         "powershell", "pwsh", "mshta", "rundll32", "regsvr32", "certutil",
         "wscript", "cscript", "bitsadmin",
     };
     for (const char* p : kTaskPayload)
-        s.proc(Block, u("schtasks 创建的计划任务以 ") + u(p) + u(" 为执行体(脚本宿主驻留,T1053.005)")).hard()
+        s.proc(Ask, u("schtasks 创建的计划任务以 ") + u(p) + u(" 为执行体(脚本宿主驻留,T1053.005)"))
             .actor("*\\schtasks.exe").cmd(u("*/create*") + u(p) + u("*"));
-    for (const QString& dir : dropDirFragments())
+    for (const QString& dir : dropDirFragments()) {
+        // 【排除 \programdata\】它在 dropDirFragments 里是"可写投递目录",但对计划任务来说它同时
+        // 是正规软件放自己数据与脚本的标准位置(ProgramData 本来就是给"所有用户共享的应用数据"用
+        // 的),大量商业软件的更新/维护任务就指向那里。其余 temp / users\public / $recycle.bin /
+        // perflogs 没有"计划任务正常指向那里"的解释,保留 Block + hard。
+        // 只在本条循环里排除 —— dropDirFragments 还有 5 个调用点,那几处的口径不在本次治理范围内。
+        if (dir == QStringLiteral("\\programdata\\")) continue;
         s.proc(Block, u("schtasks 创建的计划任务指向可写投递目录 ") + dir + u("(T1053.005)")).hard()
             .actor("*\\schtasks.exe").cmd(u("*/create*") + dir + u("*"));
+    }
     s.proc(Ask, "schtasks 修改已有计划任务(可能劫持正常任务,T1053.005)")
         .actor("*\\schtasks.exe").cmd("*/change*");
     s.proc(Ask, "schtasks 删除计划任务(可能是清理痕迹或停掉安全巡检,T1070.009)")
@@ -249,13 +262,26 @@ void addPersistenceRules(QVector<DefenseRule>& out) {
     // 2.10 辅助功能劫持(T1546.008)
     // ------------------------------------------------------------------
     // 替换这些映像后,在登录界面按快捷键即可拿到 SYSTEM 外壳 —— 这是不需要任何凭据的后门。
-    // 它们位于 System32,正常只有 Windows 更新会改(段 1 已放行 TrustedInstaller / TiWorker)。
+    // 它们位于 System32,正常只有 Windows 更新 / DISM / sfc 会改。
+    //
+    // 【为什么文件替换那条必须带 exemptOs】不能指望段 1 的「系统维护放行」兜住这里:段 1 那批
+    // Allow 是 actorPattern + signedOnly,没有精确 actorPath,ruleTier 为 0;而这里是 hardOverride,
+    // ruleTier 为 1,排序时恒定压过段 1(见 RuleEngine.cpp 的 ruleTier / 排序两处)。即 Windows
+    // 更新替换 sethc.exe 会命中本条 —— 改名走的是 FileRename,它全量上报且内核阻塞等裁决,
+    // 后果是拒绝改名 + 结束 TrustedInstaller / TiWorker 的进程树。
+    //
+    // exemptOs 不等于放水:isTrustedOsComponent 要求微软签名 + 位于系统目录(含 servicing /
+    // WinSxS,TrustedInstaller 与 TiWorker 各占一个)+ 无危险命令行 + 无异常父子链,并且显式排除
+    // LOLBin / 脚本宿主与 System32 自带的复制工具(见 TrustPolicy 的 lolBinsAndHosts)。所以
+    // cmd / powershell / xcopy 去覆盖 sethc.exe 照旧 Block + hard。
+    //
+    // IFEO 那条【不给】豁免:给辅助功能映像挂调试器没有对应的系统维护场景。
     static const char* kAccessibility[] = {
         "sethc.exe", "utilman.exe", "osk.exe", "magnify.exe", "narrator.exe",
         "displayswitch.exe", "atbroker.exe",
     };
     for (const char* n : kAccessibility) {
-        s.file(Block, u("替换辅助功能程序 ") + u(n) + u("(登录界面后门,T1546.008)")).hard()
+        s.file(Block, u("替换辅助功能程序 ") + u(n) + u("(登录界面后门,T1546.008)")).hard().exemptOs()
             .target(u("*\\System32\\") + u(n));
         s.reg(Block, u("为辅助功能程序 ") + u(n) + u(" 设置映像劫持调试器(登录界面后门,T1546.008)")).hard()
             .target(u("*\\Image File Execution Options\\") + u(n) + u("\\*"));

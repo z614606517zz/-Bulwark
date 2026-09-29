@@ -121,14 +121,19 @@ void addExecutionRules(QVector<DefenseRule>& out) {
     // ------------------------------------------------------------------
     s.proc(Block, "外壳层调用 certutil 远程下载(cmd/powershell 包裹,T1105)").hard()
         .cmd("*certutil*urlcache*http*");
-    s.proc(Block, "外壳层调用 certutil 解码载荷(T1140)").hard()
+    // 【降级为 Ask】`certutil -decode` 是 Windows 上现成的 base64 解码器,脚本里用它还原证书、
+    // 配置文件、打包的文本资源都很常见 —— 在没有 PowerShell 的环境里这几乎是唯一选择。
+    // "解了个 base64"本身不说明在还原恶意载荷,判别性要看解出来的东西被不被执行,本条看不到那层。
+    s.proc(Ask, "外壳层调用 certutil 解码载荷(T1140)")
         .cmd("*certutil*decode*");
     s.proc(Block, "外壳层调用 bitsadmin 后台下载(T1197/T1105)").hard()
         .cmd("*bitsadmin*/transfer*http*");
-    // 【必须带尾随空格】"-enc" 是 "-Encoding" 的前缀,而 `Get-Content -Enc UTF8` 是完全正常的
-    // PowerShell 写法。不带空格的话这条 Block+hardOverride 会把普通脚本连进程一起结束掉。
-    s.proc(Block, "外壳层嵌套调用 PowerShell 编码命令(-enc,T1027)").hard()
-        .cmd("*powershell*-enc *");
+    // 【已删除 `*powershell*-enc *`】原意是用尾随空格把 "-enc"(-EncodedCommand 的缩写)与
+    // "-Encoding" 的缩写区分开,但这道护栏根本不成立:`Get-Content -Enc UTF8` 这类完全正常的写法
+    // 里,"-enc" 后面跟的恰恰就是空格,照样命中 —— 而它是 Block + hardOverride,会把普通脚本连
+    // 进程树一起结束。空格挡不住,又没有别的可用信号,故整条删掉。
+    // 不补替代形态:全称 `-EncodedCommand` 由紧接下面那条覆盖;「隐藏窗口 + 缩写」的组合由
+    // kPsCombo 里的 `*hidden*-enc *` 覆盖。
     s.proc(Block, "外壳层嵌套调用 PowerShell 编码命令(-encodedcommand,T1027)").hard()
         .cmd("*powershell*-encodedcommand*");
     for (const QString& dir : dropDirFragments()) {
@@ -159,7 +164,6 @@ void addExecutionRules(QVector<DefenseRule>& out) {
         "*downloadstring*invoke-expression*", "*iex(*downloadstring*",
         "*frombase64string*iex(*", "*frombase64string*invoke-expression*",
         "*iex(*frombase64string*",
-        "*net.webclient*downloadfile*", "*net.webclient*downloadstring*",
         "*invoke-webrequest*iex(*", "*invoke-webrequest*|iex*",
         "*iwr *iex(*", "*downloadfile*start-process*",
         "*start-bitstransfer*start-process*",
@@ -172,18 +176,37 @@ void addExecutionRules(QVector<DefenseRule>& out) {
         "内存下载 + Invoke-Expression", "动态执行 + 内存下载",
         "Base64 解码 + 动态执行 IEX(", "Base64 解码 + Invoke-Expression",
         "动态执行 + Base64 解码",
-        "WebClient 下载文件", "WebClient 内存下载",
         "Invoke-WebRequest + 动态执行", "Invoke-WebRequest + 管道送入 IEX",
         "iwr + 动态执行", "下载后直接启动",
         "BITS 下载后直接启动",
     };
-    for (int i = 0; i < 21; ++i)
+    // 条数从两张表推导,不再写死:这两张表必须严格一一对应,写死的数字在增删条目时会静默错位,
+    // 把某条模式配上另一条的标签(备注错了,派生出来的 id 也就错了)。
+    static_assert(sizeof(kPsCombo) / sizeof(*kPsCombo) == sizeof(kPsComboLabel) / sizeof(*kPsComboLabel),
+                  "kPsCombo 与 kPsComboLabel 必须一一对应");
+    for (size_t i = 0; i < sizeof(kPsCombo) / sizeof(*kPsCombo); ++i)
         s.proc(Block, u("PowerShell 下载执行组合:") + u(kPsComboLabel[i]) + u("(T1059.001/T1105)")).hard()
             .cmd(kPsCombo[i]);
-    s.proc(Block, "内存加载 .NET 程序集(Reflection.Assembly::Load,无文件执行,T1620)").hard()
-        .cmd("*reflection.assembly*load*");
-    s.proc(Block, "内存加载 .NET 程序集(Load([Convert]::FromBase64String),T1620)").hard()
-        .cmd("*[reflection.assembly]*");
+    // 【这两条从上面的合取表里摘出来,单独降为 Ask】它们原来混在 kPsCombo 里吃 Block + hardOverride,
+    // 但"用 WebClient 下载"【单独出现】不足以定性:Chocolatey 官方安装就是一行
+    // `iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))`,
+    // 大量部署脚本、CI 引导脚本同样是这个形态。表里其余条目都是「下载 + 执行」「隐藏 + 执行」这类
+    // 真合取,单独一个动作说明不了意图的只有这两条,所以只摘这两条,其余一律不动。
+    s.proc(Ask, "PowerShell 用 WebClient 下载文件(Net.WebClient DownloadFile,T1105)")
+        .cmd("*net.webclient*downloadfile*");
+    s.proc(Ask, "PowerShell 用 WebClient 内存下载(Net.WebClient DownloadString,T1105)")
+        .cmd("*net.webclient*downloadstring*");
+    // 【改为与 Base64 互证】原来是 `*reflection.assembly*load*` 单独 Block + hardOverride,而
+    // `[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')` 是 PowerShell 弹 GUI 的
+    // 标准写法(任何带窗口的运维脚本都这么写),命中即结束进程树。另一条 `*[reflection.assembly]*`
+    // 更宽 —— 连方法名都不看,凡是提到这个类型就拦,已删除。
+    // 真正说明「无文件执行」的是「反射加载」与「Base64 解码」同时出现:程序集内容来自内存里的
+    // base64 串,而不是磁盘上的 dll。两条各写一个顺序,因为 commandLinePattern 只有一条、按出现
+    // 顺序匹配。备注必须写得不一样,否则两条派生出同一个 id,后者会静默顶掉前者。
+    s.proc(Block, "内存加载 .NET 程序集(反射加载 + Base64 解码,无文件执行,T1620)").hard()
+        .cmd("*reflection.assembly*frombase64string*");
+    s.proc(Block, "内存加载 .NET 程序集(Base64 解码 + 反射加载,无文件执行,T1620)").hard()
+        .cmd("*frombase64string*reflection.assembly*");
     // 与 ThreatDetector / TrustPolicy 已确立的软信号定性保持一致:绝不 Block。
     s.proc(Ask, "PowerShell 绕过执行策略运行(-ExecutionPolicy Bypass,T1059.001)")
         .cmd("*-executionpolicy*bypass*");

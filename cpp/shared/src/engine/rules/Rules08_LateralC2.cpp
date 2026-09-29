@@ -57,8 +57,11 @@ void addLateralAndC2Rules(QVector<DefenseRule>& out) {
             s.proc(Block, u("远控工具 ") + u(t) + u(" 由脚本宿主 ") +
                           imageNameOf(QString::fromUtf8(p)) + u(" 拉起(无人值守植入,T1219)")).hard()
                 .actor(u("*\\") + u(t) + u("*.exe")).parent(p);
-    // 远控的静默安装参数:正常用户装远控是走界面的。
-    s.proc(Block, "远控工具静默安装(--silent-install / /S 无人值守,T1219)").hard()
+    // 【降级为 Ask】原注释说"正常用户装远控是走界面的",但这条模式【没有 actor 锚定】—— 它拦的是
+    // 任何程序的命令行里出现 --silent-install,而静默安装参数是企业批量部署的通用做法(MDM / SCCM /
+    // Intune / 各家装机脚本),被拦的多数其实是正常部署。而且 IT 远程支持工具本来就常以静默方式
+    // 下发,这也是合规场景。判别性应该来自"装的是哪个远控",那由上面按远控映像名写的规则负责。
+    s.proc(Ask, "远控工具静默安装(--silent-install / /S 无人值守,T1219)")
         .cmd("*--silent-install*");
     s.proc(Ask, "配置远控工具的无人值守密码(T1219)").cmd("*--set-password*");
 
@@ -115,7 +118,10 @@ void addLateralAndC2Rules(QVector<DefenseRule>& out) {
     // ------------------------------------------------------------------
     // 8.4 隧道与反向代理
     // ------------------------------------------------------------------
-    s.proc(Block, "运行 chisel 反向 TCP 隧道(T1572)").hard().cmd("*chisel*");
+    // 【降级为 Ask】"chisel" 这个词并不专属于那个隧道工具:它也是 Chisel 硬件描述语言(Scala 写的
+    // RTL DSL)的名字,芯片/FPGA 方向的工程目录、构建命令、依赖名里到处都是;日常英文词义(凿子)
+    // 也会出现在无关路径里。而本条是子串匹配 + Block + hardOverride,命中即结束进程树。
+    s.proc(Ask, "运行 chisel 反向 TCP 隧道(T1572)").cmd("*chisel*");
     s.proc(Block, "经 plink 建立反向端口转发(plink -R,T1572)").hard().cmd("*plink*-r *");
     // ssh -R 是开发者真会用的正常能力(反向端口转发调试),故只询问 —— plink 在 Windows 终端上
     // 出现基本意味着有人带了 PuTTY 套件进来,那是另一回事。
