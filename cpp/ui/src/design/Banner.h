@@ -4,6 +4,7 @@
 #include <QElapsedTimer>
 #include <QFrame>
 #include <QList>
+#include <QPoint>
 #include <QPointer>
 #include <QString>
 
@@ -17,7 +18,8 @@ class QVBoxLayout;
 
 // An in-page message strip — the replacement for "操作成功" message boxes.
 //
-//   success / info   dismiss themselves after a few seconds (hover pauses);
+//   success / info   dismiss themselves after a few seconds (hover pauses — by
+//                    where the pointer really is, see syncHoverPause());
 //   warning          stays a little longer;
 //   danger           stays until closed: a failure message carries the reason,
 //                    and a reason the user never got to read is a silent failure.
@@ -44,10 +46,10 @@ signals:
 
 protected:
     void paintEvent(QPaintEvent*) override;
-    void enterEvent(QEnterEvent*) override;
-    void leaveEvent(QEvent*) override;
 
 private:
+    void syncHoverPause();
+
     ui::Tone m_tone;
     QLabel* m_text = nullptr;
     QPushButton* m_action = nullptr;
@@ -56,6 +58,12 @@ private:
     int m_remaining = 0;
     QElapsedTimer m_since;
     bool m_closing = false;
+
+    // 悬停暂停(同 CountdownBar:按指针真实位置判定,不用 enter/leave)
+    QTimer* m_hoverWatch = nullptr;
+    QPoint m_lastCursor;
+    bool m_hoverArmed = false; // 指针在这条提示上动过
+    bool m_holding = false;    // 正因悬停而停着
 };
 
 // A vertical stack of banners at the top of a page or sheet. At most three are
@@ -70,7 +78,9 @@ public:
     // timeoutMs < 0 = the tone's default (success 4.5 s · info 5 s · warning 9 s ·
     // danger sticky).
     Banner* post(ui::Tone tone, const QString& text, int timeoutMs = -1);
-    void clear();
+    // Dismisses every banner. `animated` = false removes them at once (a page
+    // transition already fades them out with the page they belonged to).
+    void clear(bool animated = true);
 
     // The host responsible for `from`: the nearest one found by walking up the
     // parent chain (checking each ancestor's direct children), stopping at the

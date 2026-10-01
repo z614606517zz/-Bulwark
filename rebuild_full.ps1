@@ -104,6 +104,44 @@ try {
         Copy-Item $builtExe (Join-Path $DistDir 'bulwark_service.exe') -Force
         Write-Host ('  bulwark_service.exe -> dist  ' +
                     (Get-Item (Join-Path $DistDir 'bulwark_service.exe')).LastWriteTime)
+
+        # ---- 4b. appsettings drift check --------------------------------
+        #
+        # Only the two .exe files are deployed here, on purpose: cpp\dist\appsettings.json
+        # is the LIVE config of the installed service and overwriting it would silently
+        # discard whatever the operator tuned there.
+        #
+        # But silence has its own cost, and it already bit us: dist's appsettings.json was
+        # six weeks stale and had no "Etw" section at all, so every ETW option had been
+        # running on struct defaults -- and a newly added switch simply could not be turned
+        # on from the source file no matter how it was edited. The build looked perfectly
+        # healthy the whole time. So: do not copy, but do say which keys the freshly built
+        # binary knows about that the live config has never heard of.
+        $srcCfg  = Join-Path $BuildDir 'service\Release\appsettings.json'
+        $liveCfg = Join-Path $DistDir  'appsettings.json'
+        if ((Test-Path $srcCfg) -and (Test-Path $liveCfg)) {
+            try {
+                $a = (Get-Content $srcCfg  -Raw -Encoding UTF8 | ConvertFrom-Json).Bulwark
+                $b = (Get-Content $liveCfg -Raw -Encoding UTF8 | ConvertFrom-Json).Bulwark
+                $an = @($a.PSObject.Properties.Name | Where-Object { $_ -notlike '_comment*' })
+                $bn = @($b.PSObject.Properties.Name)
+                $missing = @($an | Where-Object { $bn -notcontains $_ })
+                if ($missing.Count) {
+                    Write-Host ('  WARNING: cpp\dist\appsettings.json is missing ' +
+                                $missing.Count + ' key(s) the new binary reads:') -ForegroundColor Yellow
+                    Write-Host ('           ' + ($missing -join ', ')) -ForegroundColor Yellow
+                    Write-Host ('           Those fall back to built-in defaults. Merge them by hand' +
+                                ' (reference: ' + $srcCfg + ').') -ForegroundColor Yellow
+                    Write-Host '           NOTE: the driver self-protects cpp\dist - stop the service and unload the driver before editing.' -ForegroundColor Yellow
+                } else {
+                    Write-Host '  appsettings: live config knows every key the binary reads' -ForegroundColor Green
+                }
+            } catch {
+                Write-Host ('  appsettings drift check skipped (parse failed): ' + $_.Exception.Message) -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host '  appsettings drift check skipped (one of the files is absent)' -ForegroundColor Gray
+        }
         if (Test-Path $builtUi) {
             Copy-Item $builtUi (Join-Path $DistDir 'bulwark_ui.exe') -Force
             Write-Host ('  bulwark_ui.exe      -> dist  ' +

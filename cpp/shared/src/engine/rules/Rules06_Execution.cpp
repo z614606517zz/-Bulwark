@@ -287,8 +287,15 @@ void addExecutionRules(QVector<DefenseRule>& out) {
                 .parent(p).actor(a);
     }
     // 邮件客户端(非 Office 系)与即时通讯:投递落地后的第一跳。
+    //
+    // whatsapp.exe:银狐 2026 年这条链的中心是 WhatsApp —— 盗号后向联系人发「财务报表」
+    // 「欠款确认」,WhatsApp Web 会话还会自动二次扩散(见 docs/yinhu-threat-intel-2026.md
+    // [12][13])。本组这条【父子链派生】规则是四处 WhatsApp 名单里最有用的一条:它只看
+    // 「谁是父进程」,不受 WhatsApp 装在 WindowsApps(Program Files 子树,普通用户写不进去)
+    // 的影响,而段 7.6 的「向安装目录植入 DLL」那条正因此价值有限。
     static const char* kImParents[] = {
         "*\\foxmail.exe", "*\\wechat.exe", "*\\weixin.exe", "*\\wxwork.exe", "*\\qq.exe",
+        "*\\whatsapp.exe",
     };
     for (const char* p : kImParents) {
         const QString parentName = imageNameOf(QString::fromUtf8(p));

@@ -44,14 +44,13 @@ inline QColor page(const QString& key)
     if (is(nav::Chain) || is(nav::Quarantine))        return theme::purple();     // combined / contained threats
     if (is(nav::Rules))                               return theme::violet();     // policy
     if (is(nav::Trust))                               return theme::olive();      // allow list, not "safe" green
-    if (is(nav::Ai))                                  return theme::accentAlt();  // the AI colour
     return theme::accent(); // 仪表盘 · 进程管理 (the attack graph's process colour) · 设置 — the product itself
 }
 
 inline QColor page(const char* key) { return page(QString::fromLatin1(key)); }
 
 // 设置 is one page with seven sections; each is titled in the hue of what it
-// configures, so 「威胁情报源」 matches 云信誉, 「云查杀与 AI」 matches AI 研判, and
+// configures, so 「威胁情报源」 matches 云信誉, 「云查杀与 AI」 wears the AI colour, and
 // the category column reads like a small rail of its own. Keys are the section
 // keys nav::go("settings", {section}) takes.
 inline QColor settingsSection(const QString& key)
@@ -60,7 +59,7 @@ inline QColor settingsSection(const QString& key)
     if (is("dims"))     return theme::olive();       // the six dimensions carry their own kinds
     if (is("decision")) return page(nav::Rules);     // policy
     if (is("intel"))    return page(nav::Reputation);
-    if (is("ai"))       return page(nav::Ai);
+    if (is("ai"))       return theme::accentAlt();   // the AI colour (大模型接口 lives here)
     if (is("share"))    return theme::pink();
     if (is("about"))    return theme::periwinkle();
     return theme::accent();                          // 防护总控: the product's own switchboard

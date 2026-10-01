@@ -10,7 +10,9 @@ class QVariantAnimation;
 //   idle     glyph faintly tinted with the hue, secondary label
 //   hover    faint lift that fades in/out (~120 ms), glyph brightens
 //   active   wash in the hue fading to the right, brass indicator bar (brass
-//            marks place, whatever the hue), pale glyph in the hue
+//            marks place, whatever the hue), pale glyph in the hue. Becoming
+//            active the wash fades in and the bar grows out of its centre
+//            (~220 ms); the item being left fades back to idle a little faster
 //   focus    keyboard focus draws an accent ring (mouse clicks don't)
 //   compact  (collapsed rail) glyph only, label moves to the tooltip
 //   badge    unread count: a capsule at the right end, or on the glyph's
@@ -42,14 +44,18 @@ protected:
 
 private:
     void fadeHover(qreal to);
+    void animateSelection(bool on);
     void syncAccessible();
 
     QString m_icon;
     qreal m_hover = 0.0;
+    qreal m_select = 0.0;     // 0 idle … 1 active (follows isChecked(), animated)
+    bool m_selecting = false; // direction of the running selection change
     bool m_keyboardFocus = false;
     bool m_compact = false;
     int m_badge = 0;
     QColor m_badgeColor;
     QColor m_identity;
     QVariantAnimation* m_anim = nullptr;
+    QVariantAnimation* m_selAnim = nullptr;
 };

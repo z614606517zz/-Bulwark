@@ -44,7 +44,6 @@ add_library(bulwark_shared STATIC
     src/engine/RuleEngine.cpp
     src/engine/EcsAlertFormatter.cpp
     src/engine/PersistenceAnalyzer.cpp
-    src/engine/AiDecisionPolicy.cpp
 
     # 内置防护规则库,按攻击阶段分 8 段(公共名单在 RulesCommon.cpp)。
     # DefaultRules::build() 直接调用这 8 个 add*Rules 函数 —— 少加一个文件就是一个链接错误,

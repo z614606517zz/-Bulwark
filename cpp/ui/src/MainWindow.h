@@ -7,10 +7,13 @@
 #include <QVariantMap>
 #include <QWidget>
 
+#include "bulwark/models/Enums.h"   // EnforcementOutcome(按值传参,不能只前置声明)
+
 class Backdrop;
 class BannerHost;
 class IconTile;
 class NavButton;
+class QAction;
 class QButtonGroup;
 class QCloseEvent;
 class QHBoxLayout;
@@ -23,6 +26,7 @@ class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class IpcClient;
+class PageTransition;
 class StatusCard;
 class ToastNotifier;
 
@@ -60,9 +64,9 @@ protected:
 private slots:
     void onNavClicked(int index);
     void onPromptReceived(const bulwark::SecurityEvent& event);
-    void onBlockNotification(const bulwark::SecurityEvent& event);
+    void onBlockNotification(const bulwark::SecurityEvent& event,
+                             bulwark::EnforcementOutcome enforcement);
     void onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
-    void onAiScanStarted(const bulwark::SecurityEvent& event);
     void onRemediationReport(const bulwark::ipc::RemediationReportPayload& report);
     void setConnected(bool connected);
     void showFromTray();
@@ -81,6 +85,9 @@ private:
     void pingReputation(); // 探测中央信誉服务是否在线,回填侧栏「防护状态」卡
     // 防护状态(侧栏卡片 + 托盘提示):按「已连接 + 总开关 + 内核」如实显示四态。
     void refreshProtectionPill();
+    // 托盘「退出」项的文案:退出到底会不会连防护一起停,取决于 protectionFollowsUi,
+    // 所以这句话必须随设置重算 —— 固定文案在其中一种模式下一定是错的。
+    void refreshQuitAction();
 
     // ---- rail collapse ----
     void applySidebar(bool animate);
@@ -106,6 +113,7 @@ private:
     QHBoxLayout* m_headerActions = nullptr;
     QList<QWidget*> m_pageActions;        // per page index (nullptr = none)
     BannerHost* m_banners = nullptr;
+    PageTransition* m_pageFx = nullptr;    // cross-fade played over the content area
 
     // rail
     Backdrop* m_sidebar = nullptr;
@@ -133,6 +141,9 @@ private:
     // 防护状态所依赖的真实状态。默认按「未知」呈现,绝不默认说"已开启"。
     bool m_svcConnected = false;
     bool m_protectionEnabled = false;
+    // 「退出界面即停止防护」的当前值(服务推来的)。决定托盘退出项的文案、以及退出前要不要
+    // 先把后果说清楚。默认 false = 按「防护常驻」说话,与服务端的默认一致。
+    bool m_protectionFollowsUi = false;
     bool m_kernelConnected = false;
     bool m_haveSettings = false;   // 是否已收到过一次真实设置(没收到就只能说"未知")
     QString m_kernelStatus;
@@ -140,6 +151,7 @@ private:
     QUuid m_repPingId;             // 当前在途健康探测的 requestId(只认自己发起的响应)
     IpcClient* m_ipc = nullptr;
     QSystemTrayIcon* m_tray = nullptr;
+    QAction* m_actQuit = nullptr;   // 托盘「退出」项(文案随设置变,见 refreshQuitAction)
     ToastNotifier* m_toasts = nullptr;
     QStringList m_titles;
     QStringList m_subtitles;
@@ -147,9 +159,10 @@ private:
     QStringList m_pageIcons;
     QList<QColor> m_pageHues;
     bool m_forceQuit = false;
-    bool m_trayHintShown = false;    // close-to-tray hint (shown once on first close)
-    bool m_trayBalloonShown = false; // startup "here's the tray icon" balloon (once)
-    bool m_updateBalloonShown = false; // "new version available" balloon (once per session)
+    // One-shot corner notices (ToastNotifier::showInfo, no longer tray balloons).
+    bool m_trayHintShown = false;      // close-to-tray hint (shown once on first close)
+    bool m_trayIntroShown = false;     // startup "here's the tray icon" notice (once)
+    bool m_updateNoticeShown = false;  // "new version available" notice (once per session)
     int m_trayRetries = 0;           // setupTray() retry budget while the tray warms up
 
     // Live copies of the service's prompt policy, used to arm the behavior

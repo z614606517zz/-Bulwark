@@ -169,30 +169,44 @@
         {
             "label": "step3-vendor-app-imageload-NOT-exempt",
             "snapshot": {
-                "action": "Allow",
+                "action": "Ask",
                 "evidence": [
                     {
-                        "description": "有效数字签名:Tencent Technology (Shenzhen) Company Limited(健康),直接放行",
-                        "kind": "Trust",
-                        "scoreDelta": 0,
-                        "source": "TrustPolicy"
+                        "description": "IM 进程 wechat.exe 从用户可写目录加载未签名模块(疑似群控白加黑侧载,T1574.002)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 35,
+                        "source": "RemoteControlAnalyzer"
                     },
                     {
-                        "description": "最终裁决:放行(依据:可信放行;风险分 0)",
+                        "description": "从高危可写目录加载未签名模块 evil_hook.dll(疑似 DLL 侧载/搜索顺序劫持,T1574.002)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "InjectionAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] 注入与侧载 · 从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 75)",
                         "kind": "Decision",
                         "scoreDelta": 0,
                         "source": "RuleEngine"
                     }
                 ],
-                "hasThreatIndicator": false,
-                "matchedRuleNote": "",
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 注入与侧载 · 从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)",
                 "memoryInjection": false,
                 "riskReasons": [
-                    "有效数字签名:Tencent Technology (Shenzhen) Company Limited(健康),直接放行"
+                    "IM 进程 wechat.exe 从用户可写目录加载未签名模块(疑似群控白加黑侧载,T1574.002)",
+                    "从高危可写目录加载未签名模块 evil_hook.dll(疑似 DLL 侧载/搜索顺序劫持,T1574.002)"
                 ],
-                "riskScore": 0,
-                "source": "TrustedSigner",
+                "riskScore": 75,
+                "source": "Rule",
                 "techniques": [
+                    "T1574.002"
                 ],
                 "userTrusted": false
             }
@@ -804,6 +818,44 @@
         },
         {
             "label": "step4-sideload-unsigned-dll-from-temp",
+            "snapshot": {
+                "action": "Ask",
+                "evidence": [
+                    {
+                        "description": "从高危可写目录加载未签名模块 version.dll(疑似 DLL 侧载/搜索顺序劫持,T1574.002)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "InjectionAnalyzer"
+                    },
+                    {
+                        "description": "命中规则:[内置] 注入与侧载 · 从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)",
+                        "kind": "Rule",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:询问用户(依据:命中规则;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "[内置] 注入与侧载 · 从 %TEMP% 加载未签名模块(DLL 侧载/搜索顺序劫持,T1574.002)",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "从高危可写目录加载未签名模块 version.dll(疑似 DLL 侧载/搜索顺序劫持,T1574.002)"
+                ],
+                "riskScore": 40,
+                "source": "Rule",
+                "techniques": [
+                    "T1574.002"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "step4-sideload-SIGNED-dll-from-temp-NOT-detected",
             "snapshot": {
                 "action": "Allow",
                 "evidence": [
@@ -1762,6 +1814,1085 @@
                 ],
                 "riskScore": 40,
                 "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-bloat-unsigned-installer-in-downloads",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "异常大的可执行文件(78MB,疑似文件膨胀;按软信号计,需互证)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 30,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 70)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "异常大的可执行文件(78MB,疑似文件膨胀;按软信号计,需互证)",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 70,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-bloat-huge-unsigned-installer-on-desktop",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "超大未签名可执行文件(222MB,疑似文件膨胀规避扫描;体积不是行为证据,按软信号计,需互证)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 65,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "超大未签名可执行文件(222MB,疑似文件膨胀规避扫描;体积不是行为证据,按软信号计,需互证)",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 100,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-bloat-plus-real-behavior-still-blocked",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "超大未签名可执行文件(150MB,疑似文件膨胀规避扫描;体积不是行为证据,按软信号计,需互证)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 65,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "删除卷影副本(勒索前置,T1490)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 100)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "超大未签名可执行文件(150MB,疑似文件膨胀规避扫描;体积不是行为证据,按软信号计,需互证)",
+                    "未签名程序从可疑目录运行",
+                    "删除卷影副本(勒索前置,T1490)"
+                ],
+                "riskScore": 100,
+                "source": "Heuristic",
+                "techniques": [
+                    "T1490 抑制系统恢复(删卷影/备份)"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-signature-unverifiable-not-tampered",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "内嵌了数字签名但本机校验不过(根证书未导入 / 证书过期 / 文件被独占读不出来;摘要并未不符,按软信号计,需互证)",
+                        "kind": "Info",
+                        "scoreDelta": 10,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 25)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "内嵌了数字签名但本机校验不过(根证书未导入 / 证书过期 / 文件被独占读不出来;摘要并未不符,按软信号计,需互证)",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 25,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-signature-digest-mismatch-still-hard",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "数字签名摘要不符:文件在签名之后被改过(篡改/白加黑,T1553.002)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 45,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 85)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "数字签名摘要不符:文件在签名之后被改过(篡改/白加黑,T1553.002)",
+                    "未签名程序从可疑目录运行"
+                ],
+                "riskScore": 85,
+                "source": "Heuristic",
+                "techniques": [
+                    "T1553.002"
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-00",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-01",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-02",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-03",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-04",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-05",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-06",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-07",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-08",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-09",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-10",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-11",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "10秒内批量改写 12 个文件(疑似勒索加密)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 30,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 70)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "10秒内批量改写 12 个文件(疑似勒索加密)",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 70,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-12",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "10秒内批量改写 13 个文件(疑似勒索加密)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 32,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 72)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "10秒内批量改写 13 个文件(疑似勒索加密)",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 72,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "fp-installer-burst-tmp-13",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "10秒内批量改写 14 个文件(疑似勒索加密)",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 34,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 74)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "10秒内批量改写 14 个文件(疑似勒索加密)",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 74,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-ransomware-known-ext-00",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-ransomware-known-ext-01",
+            "snapshot": {
+                "action": "Allow",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "无恶意行为特征(默认放行)",
+                        "kind": "Info",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    },
+                    {
+                        "description": "最终裁决:放行(依据:默认策略;风险分 40)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": false,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "无恶意行为特征(默认放行)"
+                ],
+                "riskScore": 40,
+                "source": "DefaultPolicy",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-ransomware-known-ext-02",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "批量产生已知勒索扩展名 .locked(×3)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 80)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "批量产生已知勒索扩展名 .locked(×3)"
+                ],
+                "riskScore": 80,
+                "source": "Heuristic",
+                "techniques": [
+                ],
+                "userTrusted": false
+            }
+        },
+        {
+            "label": "det-ransomware-known-ext-03",
+            "snapshot": {
+                "action": "Block",
+                "evidence": [
+                    {
+                        "description": "无可信数字签名",
+                        "kind": "Info",
+                        "scoreDelta": 15,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "未签名程序从可疑目录运行",
+                        "kind": "SoftSignal",
+                        "scoreDelta": 25,
+                        "source": "ThreatDetector"
+                    },
+                    {
+                        "description": "批量产生已知勒索扩展名 .locked(×4)",
+                        "kind": "HardIndicator",
+                        "scoreDelta": 40,
+                        "source": "RansomwareBehaviorMonitor"
+                    },
+                    {
+                        "description": "最终裁决:阻止(依据:行为研判;风险分 80)",
+                        "kind": "Decision",
+                        "scoreDelta": 0,
+                        "source": "RuleEngine"
+                    }
+                ],
+                "hasThreatIndicator": true,
+                "matchedRuleNote": "",
+                "memoryInjection": false,
+                "riskReasons": [
+                    "无可信数字签名",
+                    "未签名程序从可疑目录运行",
+                    "批量产生已知勒索扩展名 .locked(×4)"
+                ],
+                "riskScore": 80,
+                "source": "Heuristic",
                 "techniques": [
                 ],
                 "userTrusted": false

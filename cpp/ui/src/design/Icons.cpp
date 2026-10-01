@@ -491,6 +491,9 @@ void AppIcon::draw(QPainter& p, const QString& name, const QRectF& rect,
     } else if (is("check-circle")) {
         ring(12.0, 12.0, 9.2);
         poly({{8.2, 12.3}, {10.9, 14.9}, {15.9, 9.6}});
+    } else if (is("check-square")) {
+        rrect(3.5, 3.5, 17.0, 17.0, 3.6);
+        poly({{7.9, 12.2}, {10.8, 15.0}, {16.3, 9.3}});
     } else if (is("x-circle")) {
         ring(12.0, 12.0, 9.2);
         L(9.2, 9.2, 14.8, 14.8);

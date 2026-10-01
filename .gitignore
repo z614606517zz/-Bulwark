@@ -214,6 +214,19 @@ server/bulwark-intel-backup-*/
 # 更新包的构建产物
 build_update/
 
+# ---- ctest 的运行产物(每次 ctest 都会重建)----
+/Testing/
+
+# ---- 弹窗视觉稿(设计草稿:4 张 PNG + 渲染脚本)----
+# 对应的弹窗本身已经实现,这些只是过程稿,不参与构建也不解释代码。
+# 沿用本仓既有的「下划线前缀 = 草稿/本机产物」约定。
+_popup_mockups/
+
+# ---- 递归扫描测试留下的夹具 ----
+# cpp/service/src/ 下其余都是真实源码,这个 6 字节的 sub/inner.txt 是某次
+# 目录递归测试生成的,跟着源码树一起发出去只会让人困惑。
+cpp/service/src/sub/
+
 # ---- 服务端网页的草稿与备份 ----
 # 实际服务的是 webui.html,样式源是 design-system.css(会被生成进 html)。
 # 下面这些是改版过程中的中间产物和换版前的备份,没有保留价值。

@@ -46,6 +46,16 @@ bool anyContains(const QStringList& needles, const QString& hay) {
     return false;
 }
 
+// 同一个文件?只做大小写与分隔符归一,不碰短名/符号链接 —— 这里的用途是识别
+// 「事件里的模块就是宿主自己的主映像」,而那两个字段来自同一次富化、写的是同一
+// 个规范化路径,不需要更强的等价判断。
+bool samePathCI(const QString& a, const QString& b) {
+    if (a.isEmpty() || b.isEmpty()) return false;
+    QString x = a; x.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    QString y = b; y.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    return x.compare(y, Qt::CaseInsensitive) == 0;
+}
+
 //
 // 注入发起方是否为「Windows 自身的系统组件」:签名健康 + 位于系统目录 + 不是 LOLBin/脚本宿主。
 //
@@ -145,8 +155,43 @@ ScoreResult analyzeImageLoad(const bulwark::SecurityEvent& e) {
     const QString module = e.target;
     if (module.isEmpty()) return r;
 
-    // ImageLoad 事件里 actorSigned 表示【被加载模块】自身的签名。
-    const bool moduleSigned = e.actorSigned;
+    //
+    // 【排除「进程加载自己的主映像」】—— 那不是侧载。
+    //
+    // 侧载说的是「宿主进程加载了另一个模块」。每个进程启动时都必然有一次「加载自己的
+    // exe」的映像加载事件,原实现没有区分这两件事,于是任何从可写目录运行的未签名
+    // 可执行体都会被这条判据判成侧载,而且它置了 hardSignal —— 40 分的硬指标足以让
+    // 裁决流水线在第 4 步(ThreatDetector)就 Block,根本走不到第 7 步的显式规则。
+    //
+    // 实测后果:Inno Setup 做的安装包一个都装不上。它的 SetupLdr 会把真正的安装模块
+    // 解压成 %TEMP%\is-XXXXXXXXXX.tmp\<名字>.tmp(未签名)再运行,那个进程刚起来就被
+    // 判成侧载 -> 下发内核禁止加载 + 冻结全部线程(不自动解冻)+ 断子,一个窗口都不出现。
+    // 用户看到的现象就是「双击安装包没反应」。本产品自己的安装包也在其中,也就是说
+    // 原地升级同样装不上去。三次复现,audit 记录里 actorPath 与 target 是同一个路径。
+    //
+    // 这里的讽刺之处值得记下来:段 7.3 的规则【早就】为安装器做过修正(把 Temp 里加载
+    // 未签名 DLL 降成 Ask,并专门把 *.tmp 从伪装扩展名的 Block 名单里剔掉,理由写的就是
+    // "is-XXXX.tmp\setup.tmp 是安装器中间产物")。但启发式跑在规则之前,于是那番修正
+    // 被这一条整个盖掉了 —— 规则层的收敛,挡不住判据层的过宽。
+    //
+    // 这条豁免不丢覆盖面:进程自己的映像已经在 ProcessCreate 那条路上被完整评估过
+    // (未签名 / 可疑目录 / 本机首见 / 父子链 / 命令行 都在那里),ImageLoad 这一次只是
+    // 同一个文件的重复出现,提供不了任何新证据。同文件里 analyzeRemoteThread 早就用
+    // 同一个判据(target == actorPath)豁免了自注入,这里只是把漏掉的那一半补上。
+    if (samePathCI(module, e.actorPath)) return r;
+
+    //
+    // 【这里原来写的是 e.actorSigned,并注释说「ImageLoad 事件里 actorSigned 表示被加载模块
+    //   自身的签名」—— 那句话是错的,而且这个误解在 HEAD 里就存在。】
+    //
+    // 真实情况:驱动把被加载模块放进 TargetPath(ImageMonitor.c),actorPath 由
+    // Worker::enrich 第 1 步按 PID 回填成【宿主进程】,第 4 步取的 actorSigned 因此是宿主的。
+    // 于是本判据「从高危目录加载未签名模块」实际变成了「未签名的宿主从高危目录加载任意模块」:
+    // 签名宿主侧载未签名 DLL(白加黑的典型形态)一条都报不出来。
+    //
+    // 现在读模块自己的签名(enrich 第 3.9 步富化)。带签名但校验不过的模块(被改过的
+    // 合法 DLL)按未签名算 —— 对侧载判据而言,失配和没签名是同一回事。
+    const bool moduleSigned = e.targetSigned && !e.targetSignatureMismatch;
     const QString moduleLower = module.toLower();
     const bool inHighRiskDir = anyContains(highRiskDirs(), moduleLower);
 

@@ -25,7 +25,6 @@ inline constexpr const char* Trust       = "trust";
 inline constexpr const char* Quarantine  = "quarantine";
 inline constexpr const char* Persistence = "persistence";
 inline constexpr const char* Reputation  = "reputation";
-inline constexpr const char* Ai          = "ai";
 inline constexpr const char* Settings    = "settings";
 } // namespace nav
 

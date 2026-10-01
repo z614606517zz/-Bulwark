@@ -48,10 +48,29 @@ public:
     // 返回命中的本机绝对路径,交由 remediate(profile.locatedLocalPaths) 隔离(绕过签名护栏)。
     static QStringList locateDroppedFilesByHash(const QStringList& maliciousHashes);
 
+    // 位置护栏(不含签名判定):路径是否落在用户可写落地区、且不是系统目录 / 安装目录 /
+    // 系统关键工具。与足迹清理的 isSafeToRemove 共用同一份名单 —— 释放物污点标记用它
+    // 决定「哪些文件有资格被标」,不另抄一份。reason 非空时回填不合格原因。
+    static bool isInUserDropZone(const QString& path, QString* reason = nullptr);
+
+    // 登记本产品自己投放的勒索诱饵文件(2.4)。位置护栏会把它们一律判为「不可清理」。
+    //
+    // 为什么必须有:诱饵是刻意放在 Documents / Desktop / Pictures 里的普通文档,位置护栏
+    // 看它就是「用户可写落地区里的一个文件」,完全合格。0.5 实测中同一次诱饵触碰导致足迹
+    // 清理把【诱饵本身】搬进隔离区 3 次 —— 金库里堆进用户自己的文件、下次启动要重投,
+    // 而且在重投之前蜜罐是空的:恰好是刚检出勒索、最不该失去这道防线的时刻。
+    // 由 UserModeBehaviorSource 在每次投放后调用(整表替换,不累加)。
+    static void setOwnCanaryFiles(const QStringList& paths);
+
 private:
     void removeAutostartPersistence(const QStringList& maliciousFiles, RemediationReport& report);
     void removeIfeoPersistence(const QStringList& maliciousFiles, RemediationReport& report);
     void removeServicePersistence(const QStringList& maliciousFiles, RemediationReport& report);
+    // 计划任务持久化。原先【整类不在自动足迹清理范围内】—— remediate() 只清 Run / IFEO / 服务
+    // 三项,而 deleteScheduledTask 只挂在「用户从 UI 点清理某个持久化条目」那条路上。
+    // 实测(2026-09-30):样本落 %APPDATA%\Microsoft\Windows\pigggggg.exe 后用 schtasks 注册了
+    // 登录时触发的 \pigggggg,载荷被隔离了,任务却一直留着 —— 日志每次都说「移除自启动项 0 个」。
+    void removeScheduledTaskPersistence(const QStringList& maliciousFiles, RemediationReport& report);
 
     void tryQuarantinePayload(const bulwark::PersistenceEntry& entry, RemediationReport& report);
     void removeRunValue(const bulwark::PersistenceEntry& entry, RemediationReport& report);

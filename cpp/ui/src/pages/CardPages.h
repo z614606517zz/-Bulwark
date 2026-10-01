@@ -8,7 +8,6 @@ namespace bulwark { struct VtScanRecord; }
 namespace pages {
 
 QWidget* reputation(IpcClient* ipc); // 云信誉 — query a file (drop / path / SHA-256) + cloud-scan records
-QWidget* aiScan(IpcClient* ipc);     // AI 研判 — model status + manual research + records
 QWidget* settings(IpcClient* ipc);   // 设置 — two columns: categories | sections; changes apply immediately
 
 // 弹出云信誉行为关系图详情窗口(查毒命中后自动弹出)。autoCloseMs>0 时到时自动关闭。

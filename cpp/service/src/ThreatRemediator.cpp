@@ -3,19 +3,38 @@
 #include "bulwark/service/monitoring/ProcessInspector.h"
 
 #include <QDir>
+#include <QDirIterator>
+#include <QFile>
 #include <QFileInfo>
 #include <QProcess>
 #include <QSet>
 
+#include <atomic>
+#include <iterator>
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+// 计划任务的删除走 COM(ITaskService),不 spawn schtasks.exe —— 理由与 SystemHardening 头部
+// 那条「不用 icacls / reg」完全相同:本产品自带命令行硬拦,一个安全产品去起 schtasks 来清
+// 持久化,既会被自己的检测盯上(实测日志里就有一条「执行前拦截已跳过…schtasks.exe」),
+// 又给「劫持 schtasks.exe」这种绕过递上一个现成入口。ole32/oleaut32 已在 CMake 里链着
+// (ProcessOriginResolver 早就在用 ITaskService)。
+#include <oleauto.h>
+#include <taskschd.h>
 
 namespace bulwark::service {
 namespace {
 
 using bulwark::EventType;
 namespace mon = bulwark::service::monitoring;
+
+// 「本进程是否已经报过一次覆盖面」。见 removeAutostartPersistence / removeScheduledTaskPersistence
+// 末尾:第一次用 info(服务默认不落 debug,写成 debug 的可观测性等于没有),之后降到 debug
+// (每次清理都 info 一行会让它自己变成噪声源)。用 atomic 而不是裸 bool:清理路径目前只在
+// 主线程跑,但「目前只在主线程」是个会过期的前提,而这里用 atomic 的代价是零。
+std::atomic<bool> g_loggedAutostartScope{false};
+std::atomic<bool> g_loggedTaskScope{false};
 
 // Chinese literals as UTF-8 (relies on /utf-8), matching the rest of the port.
 inline QString u(const char* s) { return QString::fromUtf8(s); }
@@ -53,6 +72,16 @@ RegView viewForSubKey(const QString& subKey) {
 HKEY openKey(RegHive hive, const QString& subKey, RegView view, REGSAM access) {
     HKEY hk = nullptr;
     if (RegOpenKeyExW(hiveToHkey(hive), wstr(subKey), 0, access | viewToSam(view), &hk) == ERROR_SUCCESS)
+        return hk;
+    return nullptr;
+}
+
+// 同上,但直接给原始 HKEY 根。HKEY_USERS 下按 SID 展开的每用户键没有对应的 RegHive 枚举值,
+// 而下面的每用户自启动清理必须走那条路(理由见 autostartTargets)。
+HKEY openKeyRaw(HKEY root, const QString& subKey, RegView view, REGSAM access) {
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(root, subKey.isEmpty() ? nullptr : wstr(subKey), 0,
+                      access | viewToSam(view), &hk) == ERROR_SUCCESS)
         return hk;
     return nullptr;
 }
@@ -132,25 +161,7 @@ const char* const kSystemExecutables[] = {
 
 struct RegLoc { RegHive hive; const char* subKey; };
 
-// Autostart keys (enumerate values, delete those pointing at malicious files).
-const RegLoc kAutostartKeys[] = {
-    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" },
-    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
-    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run" },
-    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
-    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run" },
-    { RegHive::CurrentUser,  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" },
-    { RegHive::CurrentUser,  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
-    { RegHive::CurrentUser,  "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run" },
-    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" },
-};
-
-// IFEO roots: a child's Debugger value pointing at a malicious file is a hijack.
-const RegLoc kIfeoRoots[] = {
-    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options" },
-    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options" },
-};
-
+// 提到这里(原先在 kIfeoRoots 之后):下面的 autostartTargets() 要用它拼显示名。
 QString hiveName(RegHive h) {
     switch (h) {
         case RegHive::LocalMachine: return QStringLiteral("HKLM");
@@ -159,6 +170,83 @@ QString hiveName(RegHive h) {
         default:                    return QStringLiteral("HKLM");
     }
 }
+
+// 机器范围的自启动键(枚举值,删掉指向恶意文件的那些)。
+//
+// 【这里刻意【没有】HKEY_CURRENT_USER】原来有 3 条 RegHive::CurrentUser 的条目,而本服务以
+// LocalSystem 运行 —— HKCU 在这个身份下解析到 S-1-5-18(服务账户的 hive),那里的 Run 键
+// 几乎永远是空的。于是这 3 条不是「没找到恶意项」,是【压根没看那个用户的 hive】,而日志
+// 每次都如实打出「移除自启动项 0 个」,看上去和「确实没有持久化」一模一样。
+//
+// 实测(2026-09-30):powershell 往真实用户 hive 写了
+// HKU\S-1-5-21-…\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\MicrosoftUpdate
+// (值 = conhost.exe --headless "%APPDATA%\Microsoft\Windows.bat"),载荷被隔离掉了,
+// 但这个 Run 值在 11 次足迹清理之后依然在注册表里。
+//
+// 这与 nodriver-hardening 第 11 条是同一个错误:那一次修的是【扫描侧】
+// (UserModeBehaviorSource::autorunRegLocations 改为枚举 HKEY_USERS),清理侧漏了。
+const RegLoc kAutostartKeys[] = {
+    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" },
+    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run" },
+    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run" },
+    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" },
+};
+
+// 每用户自启动键(相对某个用户 hive 的子路径)。会在 HKEY_USERS 下【每个已加载的 hive】上各查一遍。
+const char* const kPerUserAutostartSubKeys[] = {
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+};
+
+// 一个待清理的自启动位置。root 用原始 HKEY 是必须的:HKEY_USERS 下按 SID 展开的路径
+// 没有对应的 RegHive 枚举值。
+struct AutostartTarget {
+    HKEY root = HKEY_LOCAL_MACHINE;
+    QString subKey;    // 相对 root 的完整子路径(每用户时含 SID 前缀)
+    QString display;   // 人读 / 日志用的完整路径("HKLM\…" / "HKU\<SID>\…")
+};
+
+// 每轮重新枚举 HKEY_USERS —— 不缓存。服务启动之后才登录的用户,他的 hive 是那之后才挂上来的;
+// 缓存一次就会把这些用户永久漏掉(与 nodriver-hardening 第 11 条同一条理由)。
+QList<AutostartTarget> autostartTargets() {
+    QList<AutostartTarget> out;
+    for (const RegLoc& loc : kAutostartKeys) {
+        AutostartTarget t;
+        t.root = hiveToHkey(loc.hive);
+        t.subKey = QString::fromLatin1(loc.subKey);
+        t.display = hiveName(loc.hive) + QLatin1Char('\\') + t.subKey;
+        out.append(t);
+    }
+
+    HKEY usersRoot = openKeyRaw(HKEY_USERS, QString(), RegView::Default, KEY_READ);
+    if (!usersRoot)
+        return out;
+    for (const QString& sid : enumSubKeyNames(usersRoot)) {
+        // *_Classes 是同一个用户 hive 的类注册分支,不含 Run 项,跳过可省掉一半的无效打开。
+        // 【.DEFAULT 与 S-1-5-18/19/20 刻意保留】:往默认用户模板或服务账户 hive 里写 Run 项
+        // 同样是持久化手段,把它们当成「不是真人所以不用管」会留下一个干净的空子。
+        if (sid.endsWith(QStringLiteral("_Classes"), Qt::CaseInsensitive))
+            continue;
+        for (const char* sub : kPerUserAutostartSubKeys) {
+            AutostartTarget t;
+            t.root = HKEY_USERS;
+            t.subKey = sid + QLatin1Char('\\') + QString::fromLatin1(sub);
+            t.display = QStringLiteral("HKU\\") + t.subKey;
+            out.append(t);
+        }
+    }
+    RegCloseKey(usersRoot);
+    return out;
+}
+
+// IFEO roots: a child's Debugger value pointing at a malicious file is a hijack.
+const RegLoc kIfeoRoots[] = {
+    { RegHive::LocalMachine, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options" },
+    { RegHive::LocalMachine, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options" },
+};
 
 } // namespace
 } // namespace bulwark::service
@@ -269,15 +357,46 @@ bool isSystemExecutable(const QString& path) {
 
 // Safe to clean iff in a user-writable drop zone, not a system/install dir, and
 // (unless the signature guard is bypassed) not trusted-signed.
-bool isSafeToRemove(const QString& path, bool bypassSignatureGuard, QString& reason) {
-    reason.clear();
-    
-    // 1) 系统可执行文件白名单 - 绝对不能删（即使被 VT 报告为释放物）
-    if (isSystemExecutable(path)) { 
-        reason = u("系统关键工具,绝对保护"); 
-        return false; 
+// 位置护栏(不含签名):非系统关键工具、不在系统/安装目录、且落在用户可写落地区。
+// isSafeToRemove 与释放物污点(ThreatRemediator::isInUserDropZone)共用这一份,名单只有一处。
+// 本产品自己投放的勒索诱饵文件。由 UserModeBehaviorSource 在投放后登记。
+//
+// 【为什么需要这道护栏(2.4)】诱饵就是刻意放在 Documents / Desktop / Pictures 里的普通
+// 文档,位置护栏看它是「用户可写落地区里的一个文件」,完全合格。于是勒索诱饵一被触碰,
+// 足迹清理把【诱饵本身】当成恶意释放物搬进了隔离区 —— 0.5 的实测里同一次触碰发生了 3 次。
+// 后果有三层:金库里堆进本来属于用户的文件、下次启动要重新投放、而且蜜罐在重投之前是空的
+// (刚检出勒索的那一刻,恰好是蜜罐防线最不该消失的时候)。
+QStringList g_canaryFiles;
+QMutex g_canaryMx;
+
+bool isOwnCanaryFile(const QString& path) {
+    const QString p = path.trimmed().toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
+    if (p.isEmpty())
+        return false;
+    QMutexLocker lk(&g_canaryMx);
+    for (const QString& c : g_canaryFiles) {
+        if (c == p)
+            return true;
     }
-    
+    return false;
+}
+
+bool passesLocationGuard(const QString& path, QString& reason) {
+    reason.clear();
+
+    // 0) 本产品自己的勒索诱饵 —— 绝不清理。放在最前面:它比下面任何一条都更不该被误判,
+    //    而且诱饵路径天生满足「用户可写落地区」。
+    if (isOwnCanaryFile(path)) {
+        reason = u("这是本产品自己投放的勒索诱饵文件,不是释放物(清掉它等于自毁蜜罐)");
+        return false;
+    }
+
+    // 1) 系统可执行文件白名单 - 绝对不能删（即使被 VT 报告为释放物）
+    if (isSystemExecutable(path)) {
+        reason = u("系统关键工具,绝对保护");
+        return false;
+    }
+
     const QString lower = path.toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
     for (const char* z : kProtectedZones)
         if (lower.contains(QLatin1String(z))) { reason = u("位于系统/安装目录,保护不动"); return false; }
@@ -285,6 +404,12 @@ bool isSafeToRemove(const QString& path, bool bypassSignatureGuard, QString& rea
     for (const char* z : kDropZones)
         if (lower.contains(QLatin1String(z))) { inDrop = true; break; }
     if (!inDrop) { reason = u("不在用户可写落地区,谨慎起见不清理"); return false; }
+    return true;
+}
+
+bool isSafeToRemove(const QString& path, bool bypassSignatureGuard, QString& reason) {
+    if (!passesLocationGuard(path, reason))
+        return false;
     if (!bypassSignatureGuard) {
         if (mon::ProcessInspector::isSigned(path)) { reason = u("带可信数字签名,保护不动"); return false; }
     }
@@ -307,6 +432,99 @@ bool tryParseHive(const QString& location, RegHive& hive, QString& subKey) {
     return false;
 }
 
+// ============================ 计划任务(ScheduledTask)============================
+
+// 从任务 XML 里取一对标签之间的内容。任务 XML 的 <Exec> 段结构固定,用不着拉 QXmlStreamReader:
+// 与 ProcessOriginResolver 的任务索引同一手法(那边已经这么读了几个月)。
+QString xmlBetween(const QString& s, const QString& a, const QString& b) {
+    const int i = s.indexOf(a, 0, Qt::CaseInsensitive);
+    if (i < 0) return QString();
+    const int from = i + a.size();
+    const int j = s.indexOf(b, from, Qt::CaseInsensitive);
+    return j < 0 ? QString() : s.mid(from, j - from).trimmed();
+}
+
+// %VAR% 展开。任务 XML 的 <Command> 常写成 %windir%\... 这类形态,不展开就与我们手里的绝对
+// 路径对不上。
+//
+// 【诚实的边界】本服务是 LocalSystem,所以 %LOCALAPPDATA% / %APPDATA% 会展开到
+// C:\Windows\system32\config\systemprofile\… 而不是真实用户目录 —— 一个把恶意体写成
+// %APPDATA%\x.exe 的任务,这里展开出来的路径不会命中,只能靠原始串直接包含绝对路径时匹配上。
+// 这是已知缺口,不是「展开了就覆盖到了」;要真正覆盖得按每个用户 hive 逐一展开,那与
+// removeAutostartPersistence 的每用户展开是同一件事,留作后续。
+QString expandEnvVars(const QString& s) {
+    if (!s.contains(QLatin1Char('%')))
+        return s;
+    wchar_t buf[2048] = {};
+    const DWORD n = ExpandEnvironmentStringsW(reinterpret_cast<const wchar_t*>(s.utf16()), buf,
+                                              static_cast<DWORD>(std::size(buf)));
+    if (n == 0 || n > std::size(buf))
+        return s;   // 展开失败 / 缓冲不够 -> 保持原样,绝不返回半截串
+    return QString::fromWCharArray(buf, static_cast<int>(n - 1)); // n 含结尾的 NUL
+}
+
+// 每线程一次 COM 初始化,且【绝不 CoUninitialize】——与 ProcessOriginResolver::ensureCom 同一
+// 理由:反复 init/uninit 会把同线程上其它 COM 用法(IShellLink / ITaskService)拆掉。
+bool ensureComForTasks() {
+    thread_local int state = 0; // 0=未试 1=可用 2=不可用
+    if (state != 0)
+        return state == 1;
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    state = (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) ? 1 : 2;
+    return state == 1;
+}
+
+// 删除一个计划任务。fullPath 形如 "\Folder\Name" 或 "\Name"。
+// 失败时 err 回填原因(HRESULT 十六进制),由调用方如实记进「未清理」。
+bool deleteScheduledTaskByPath(const QString& fullPath, QString& err) {
+    err.clear();
+    QString p = fullPath;
+    p.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    while (p.startsWith(QLatin1Char('\\'))) p = p.mid(1);
+    if (p.isEmpty()) { err = u("任务路径为空"); return false; }
+
+    const int cut = p.lastIndexOf(QLatin1Char('\\'));
+    const QString folder = cut < 0 ? QStringLiteral("\\") : (QStringLiteral("\\") + p.left(cut));
+    const QString name = cut < 0 ? p : p.mid(cut + 1);
+
+    if (!ensureComForTasks()) { err = u("COM 初始化失败"); return false; }
+
+    ITaskService* svc = nullptr;
+    HRESULT hr = CoCreateInstance(__uuidof(TaskScheduler), nullptr, CLSCTX_INPROC_SERVER,
+                                  __uuidof(ITaskService), reinterpret_cast<void**>(&svc));
+    if (FAILED(hr) || !svc) {
+        err = u("无法创建 TaskScheduler(0x") + QString::number(static_cast<quint32>(hr), 16) + u(")");
+        return false;
+    }
+    VARIANT empty;
+    VariantInit(&empty);
+    hr = svc->Connect(empty, empty, empty, empty);
+    if (FAILED(hr)) {
+        svc->Release();
+        err = u("连接任务计划服务失败(0x") + QString::number(static_cast<quint32>(hr), 16) + u(")");
+        return false;
+    }
+    BSTR bFolder = SysAllocString(reinterpret_cast<const wchar_t*>(folder.utf16()));
+    ITaskFolder* tf = nullptr;
+    hr = svc->GetFolder(bFolder, &tf);
+    if (bFolder) SysFreeString(bFolder);
+    if (FAILED(hr) || !tf) {
+        svc->Release();
+        err = u("找不到任务文件夹 ") + folder + u("(0x") + QString::number(static_cast<quint32>(hr), 16) + u(")");
+        return false;
+    }
+    BSTR bName = SysAllocString(reinterpret_cast<const wchar_t*>(name.utf16()));
+    hr = tf->DeleteTask(bName, 0);
+    if (bName) SysFreeString(bName);
+    tf->Release();
+    svc->Release();
+    if (FAILED(hr)) {
+        err = u("DeleteTask 失败(0x") + QString::number(static_cast<quint32>(hr), 16) + u(")");
+        return false;
+    }
+    return true;
+}
+
 // Run a short command (schtasks/sc); returns (exitCode, stderr). Best-effort.
 std::pair<int, QString> runProcess(const QString& fileName, const QStringList& args) {
     QProcess p;
@@ -324,6 +542,26 @@ namespace bulwark::service {
 
 ThreatRemediator::ThreatRemediator(QuarantineManager& quarantine, Logger logger)
     : quarantine_(quarantine), log_(std::move(logger)) {}
+
+void ThreatRemediator::setOwnCanaryFiles(const QStringList& paths) {
+    QStringList norm;
+    norm.reserve(paths.size());
+    for (const QString& p : paths) {
+        const QString t = p.trimmed().toLower().replace(QLatin1Char('/'), QLatin1Char('\\'));
+        if (!t.isEmpty() && !norm.contains(t))
+            norm << t;
+    }
+    QMutexLocker lk(&g_canaryMx);
+    g_canaryFiles = norm;
+}
+
+bool ThreatRemediator::isInUserDropZone(const QString& path, QString* reason) {
+    QString why;
+    const bool ok = looksLikeFilePath(path.trimmed()) && passesLocationGuard(path.trimmed(), why);
+    if (reason)
+        *reason = why;
+    return ok;
+}
 
 RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& malicious,
                                               const QList<bulwark::ChainEventInfo>& footprint,
@@ -385,8 +623,32 @@ RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& mali
     //   1. 主体自身签名异常(revoked/mismatch/signed-after-expiry)
     //   2. 哈希精确匹配恶意(locatedLocalPaths)
     //   3. VT 沙箱确认的释放物(droppedFilePaths) ⭐ 新增
+    int alreadyVaulted = 0;   // 此前已隔离、本轮无事可做的(见下面那段)
     for (const QString& path : maliciousFiles) {
         if (!QFileInfo::exists(path)) continue;
+        //
+        // 【已经隔离过的路径要在最前面短路掉】
+        //
+        // QuarantineManager::quarantine 开头就有同路径去重(原路径相同且金库副本还在 -> 直接
+        // 返回已有条目),所以重复调用本来就不会重做隔离。问题在于走到那句之前,这里已经无条件
+        // 付了两次全文件开销:
+        //   · isSafeToRemove -> ProcessInspector::isSigned -> WinVerifyTrust(Authenticode 要把
+        //     整个 PE 过一遍哈希);
+        //   · QuarantineManager::tryComputeSha256。
+        // 本机实测:对那个 233MB 的样本,前者 1.22s、后者 0.45s。
+        //
+        // 后果不是「慢一点」,是把事件流水线堵死。2026-09-30 的实测:样本被 kill 之后,它那两个
+        // 已死 PID 还有 20 条事件排在队列里,每条都走一遍完整足迹清理 —— 每条约 2.0 秒,
+        // 21:19:12 到 21:19:54 之间整条流水线只在处理这一个文件,别的进程的事件全堵在后面,
+        // 最后在 21:19:54 一次性涌出。而这 20 次里有 19 次【什么都没做】,却照样每次打一行
+        // 「足迹清理:已隔离恶意释放文件 …」——日志说做了 20 次隔离,实际只有 1 次。
+        //
+        // 这里既省掉那两次哈希,也不再把它算成一次「隔离动作」:report 两侧都不记,于是
+        // publishRemediation 的 totalActions()==0 && skipped.isEmpty() 早退生效,重复事件彻底安静。
+        if (quarantine_.isAlreadyQuarantined(path)) {
+            ++alreadyVaulted;
+            continue;
+        }
         const bool bypass = (actorSignatureUntrusted && path.compare(actorPath, Qt::CaseInsensitive) == 0)
                             || hashConfirmedLower.contains(path.toLower())
                             || vtDroppedLower.contains(path.toLower());
@@ -411,14 +673,24 @@ RemediationReport ThreatRemediator::remediate(const bulwark::SecurityEvent& mali
         }
     }
 
-    // 3) registry persistence pointing at the malicious files.
+    if (alreadyVaulted > 0) {
+        log_.debug(u("足迹清理:") + QString::number(alreadyVaulted)
+                   + u(" 个候选文件此前已隔离(金库副本仍在),本轮跳过 —— 未重复计算签名/哈希。"));
+    }
+
+    // 3) persistence pointing at the malicious files:注册表三类 + 计划任务。
+    //
+    // 计划任务此前【整类缺失】:remediate 只清 Run / IFEO / 服务,deleteScheduledTask 只挂在
+    // 用户手动清理那条路上。实测样本用 schtasks 注册登录触发任务指向 %APPDATA% 下的副本,
+    // 载荷被隔离、任务却留着(日志固定写「移除自启动项 0 个」)。
     removeAutostartPersistence(maliciousFiles, report);
     removeIfeoPersistence(maliciousFiles, report);
     removeServicePersistence(maliciousFiles, report);
+    removeScheduledTaskPersistence(maliciousFiles, report);
 
     if (report.totalActions() > 0)
         log_.warning(u("足迹清理完成:隔离文件 ") + QString::number(report.quarantinedFiles.size())
-                     + u(" 个,移除自启动项 ") + QString::number(report.removedRegistryValues.size()) + u(" 个。"));
+                     + u(" 个,移除持久化 ") + QString::number(report.removedRegistryValues.size()) + u(" 项。"));
     return report;
 }
 
@@ -525,36 +797,57 @@ QStringList ThreatRemediator::locateDroppedFilesByHash(const QStringList& malici
 namespace bulwark::service {
 
 void ThreatRemediator::removeAutostartPersistence(const QStringList& maliciousFiles, RemediationReport& report) {
-    for (const RegLoc& loc : kAutostartKeys) {
-        const QString subKey = QString::fromLatin1(loc.subKey);
-        const RegView view = viewForSubKey(subKey);
-        HKEY hk = openKey(loc.hive, subKey, view, KEY_READ | KEY_SET_VALUE);
+    const QList<AutostartTarget> targets = autostartTargets();
+    for (const AutostartTarget& loc : targets) {
+        const RegView view = viewForSubKey(loc.subKey);
+        HKEY hk = openKeyRaw(loc.root, loc.subKey, view, KEY_READ | KEY_SET_VALUE);
         if (!hk) continue; // not present / not writable -> skip (matches .NET outer catch)
 
         for (const QString& valueName : enumValueNames(hk)) {
             const QString data = readString(hk, valueName);
             if (data.isEmpty() || !referencesMalware(data, maliciousFiles)) continue;
 
-            const QString full = hiveName(loc.hive) + QLatin1Char('\\') + subKey + QLatin1Char('\\') + valueName;
+            const QString full = loc.display + QLatin1Char('\\') + valueName;
             const LSTATUS st = RegDeleteValueW(hk, wstr(valueName));
             if (st == ERROR_SUCCESS) {
                 report.removedRegistryValues.append(full);
-                report.hardenedRegTargets.append(subKey + QLatin1Char('\\') + valueName);
+                report.hardenedRegTargets.append(loc.subKey + QLatin1Char('\\') + valueName);
                 log_.warning(u("足迹清理:已删除自启动持久化项 ") + full);
             } else if (st == ERROR_ACCESS_DENIED) {
-                if (RegSurgery::forceDeleteValue(loc.hive, subKey, valueName, view)) {
+                // RegSurgery 走 RegHive 枚举:HKEY_USERS 下的每用户键对应 RegHive::Users,
+                // 而它的子路径已经带了 SID 前缀,所以直接传 loc.subKey 就是对的。
+                const RegHive surgeryHive =
+                    loc.root == HKEY_USERS ? RegHive::Users : RegHive::LocalMachine;
+                if (RegSurgery::forceDeleteValue(surgeryHive, loc.subKey, valueName, view)) {
                     report.removedRegistryValues.append(full + u("(夺取所有权后删除)"));
-                    report.hardenedRegTargets.append(subKey + QLatin1Char('\\') + valueName);
+                    report.hardenedRegTargets.append(loc.subKey + QLatin1Char('\\') + valueName);
                     log_.warning(u("足迹清理:夺取所有权后删除自启动项 ") + full);
                 } else {
                     report.skipped.append(mkSkip(full, u("受 ACL 保护,夺取所有权仍失败(建议手动删除)"), false));
                 }
             } else {
-                report.skipped.append(mkSkip(subKey + QLatin1Char('\\') + valueName, u("删除失败"), false));
+                report.skipped.append(mkSkip(full, u("删除失败"), false));
             }
         }
         RegCloseKey(hk);
     }
+    // 查了多少个位置必须可观测。原先这个函数只会打「删除了某项」—— 一条都没命中时完全静默,
+    // 于是「没有恶意自启动项」和「压根没看对 hive」在日志上长得一模一样,而后者恰好是这次
+    // 实测踩到的缺陷(修复前固定输出「移除自启动项 0 个」)。
+    //
+    // 【为什么第一次用 info、之后才降到 debug】服务默认不落 debug 级,写成 debug 等于白加一行
+    // 没人看得见的日志 —— 与它要修的那个「沉默」是同一类错误。但每次足迹清理都 info 一行也不行
+    // (会变成新的噪声源)。折中:每个进程生命周期内报一次真实覆盖面,之后转 debug。
+    const QString scope = u("足迹清理:自启动位置共 ") + QString::number(targets.size())
+                          + u(" 处(机器范围 ")
+                          + QString::number(static_cast<int>(std::size(kAutostartKeys)))
+                          + u(" + HKEY_USERS 已加载 hive 展开 ")
+                          + QString::number(targets.size() - static_cast<int>(std::size(kAutostartKeys)))
+                          + u(")。");
+    if (!g_loggedAutostartScope.exchange(true))
+        log_.info(scope);
+    else
+        log_.debug(scope);
 }
 
 void ThreatRemediator::removeIfeoPersistence(const QStringList& maliciousFiles, RemediationReport& report) {
@@ -636,6 +929,76 @@ void ThreatRemediator::removeServicePersistence(const QStringList& maliciousFile
         }
     }
     RegCloseKey(servicesKey);
+}
+
+void ThreatRemediator::removeScheduledTaskPersistence(const QStringList& maliciousFiles,
+                                                     RemediationReport& report) {
+    if (maliciousFiles.isEmpty())
+        return;
+    const QString windir = qEnvironmentVariable("SystemRoot", QStringLiteral("C:\\Windows"));
+    const QString tasksRoot = windir + QStringLiteral("\\System32\\Tasks");
+    QDir rootDir(tasksRoot);
+    if (!rootDir.exists())
+        return;
+
+    // 上限护栏:极端环境下任务目录可能被塞进上万个文件,足迹清理不能因此变成一次全盘遍历。
+    // 4000 与 ProcessOriginResolver 的任务索引取同一个数,两处口径一致。
+    constexpr int kMaxTaskFiles = 4000;
+    int seen = 0, hit = 0;
+    QDirIterator it(tasksRoot, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext() && seen < kMaxTaskFiles) {
+        const QString file = it.next();
+        ++seen;
+        QFile f(file);
+        if (!f.open(QIODevice::ReadOnly))
+            continue;
+        // 任务 XML 通常几 KB;读前 64KB 足够覆盖 <Exec><Command>/<Arguments>。
+        const QString xml = QString::fromUtf8(f.read(64 * 1024));
+        f.close();
+        if (xml.isEmpty() || !xml.contains(QStringLiteral("<Exec"), Qt::CaseInsensitive))
+            continue;
+
+        // 判据要同时看 Command 与 Arguments:样本常把恶意体写在参数里,
+        // Command 反而是 cmd.exe / conhost.exe / powershell.exe 这类系统程序
+        //(实测的 Run 项就是 `conhost.exe --headless "…\Windows.bat"` 这个形态)。
+        const QString cmd = xmlBetween(xml, QStringLiteral("<Command>"), QStringLiteral("</Command>"));
+        const QString args = xmlBetween(xml, QStringLiteral("<Arguments>"), QStringLiteral("</Arguments>"));
+        const QString expanded = expandEnvVars(QString(cmd).remove(QLatin1Char('"')));
+        if (!referencesMalware(cmd, maliciousFiles) && !referencesMalware(args, maliciousFiles)
+            && !referencesMalware(expanded, maliciousFiles))
+            continue;
+
+        ++hit;
+        const QString taskPath = QStringLiteral("\\") + rootDir.relativeFilePath(file);
+        const QString display = u("计划任务 ") + taskPath;
+        QString err;
+        if (deleteScheduledTaskByPath(taskPath, err)) {
+            report.removedRegistryValues.append(display + u("(已删除)"));
+            // 反重建:任务名在 TaskCache\Tree 下是它独占的一个键,挡住这个键就挡住了
+            // 「用同一个名字立刻把任务注册回来」。与 Run 值同一个目的(补清理→重写的竞态),
+            // 但比 Run 安全得多 —— Run 是所有安装程序共享的键,这个不是。
+            QString leaf = taskPath;
+            while (leaf.startsWith(QLatin1Char('\\'))) leaf = leaf.mid(1);
+            if (!leaf.isEmpty())
+                report.hardenedRegTargets.append(u("\\TaskCache\\Tree\\") + leaf);
+            log_.warning(u("足迹清理:已删除指向恶意文件的计划任务 ") + taskPath);
+        } else {
+            report.skipped.append(mkSkip(display, err, false));
+            log_.warning(u("足迹清理:计划任务删除失败 ") + taskPath + u(" —— ") + err);
+        }
+    }
+    if (seen >= kMaxTaskFiles) {
+        log_.warning(u("足迹清理:计划任务目录文件数已达上限 ") + QString::number(kMaxTaskFiles)
+                     + u(" 个,本轮未看完 —— 可能有指向恶意文件的任务被漏过。"));
+    }
+    // 与上面同理:整类此前【压根不在清理范围内】,所以「检查了多少个任务」必须至少报一次,
+    // 否则没人能区分「没有恶意任务」与「这一维根本没跑」。
+    const QString scope = u("足迹清理:已检查计划任务 ") + QString::number(seen) + u(" 个,命中 ")
+                          + QString::number(hit) + u(" 个。");
+    if (!g_loggedTaskScope.exchange(true))
+        log_.info(scope);
+    else
+        log_.debug(scope);
 }
 
 } // namespace bulwark::service

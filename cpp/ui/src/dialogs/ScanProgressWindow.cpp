@@ -1,5 +1,5 @@
 #include "dialogs/ScanProgressWindow.h"
-#include "ai/AiScanner.h" // AiScanResult
+#include "dialogs/EventFormat.h" // evtfmt::disposition / dispositionDetail(措辞唯一来源)
 #include "design/Components.h"
 #include "design/GlowCard.h"
 #include "design/IconTile.h"
@@ -8,8 +8,6 @@
 #include "design/Stepper.h"
 #include "design/Theme.h"
 #include "widgets/ElidingLabel.h"
-
-#include "bulwark/models/SecurityEvent.h"
 
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -115,17 +113,6 @@ ScanProgressWindow::ScanProgressWindow(const QString& key, const QString& fileNa
                                   9, 600, theme::textMuted());
     statusRow->addWidget(m_countdown, 0, Qt::AlignRight | Qt::AlignTop);
     v->addLayout(statusRow);
-
-    m_aiRow = new QWidget;
-    auto* ar = new QHBoxLayout(m_aiRow);
-    ar->setContentsMargins(0, 0, 0, 0);
-    ar->setSpacing(8);
-    ar->addWidget(new IconTile(QStringLiteral("sparkles"), theme::accentAlt(), 24, 13), 0, Qt::AlignTop);
-    m_aiText = ui::label(QString(), "secondary");
-    m_aiText->setWordWrap(true);
-    ar->addWidget(m_aiText, 1);
-    m_aiRow->hide();
-    v->addWidget(m_aiRow);
     cardLayout->addWidget(m_full);
 
     // ── capsule (转到后台) ─────────────────────────────────────────────────────
@@ -172,7 +159,7 @@ ScanProgressWindow* ScanProgressWindow::obtain(const QString& key, const QString
 {
     const auto it = g_byKey.constFind(key);
     if (it != g_byKey.constEnd())
-        return it.value(); // reuse the card for this file (VT + AI share it)
+        return it.value(); // reuse the card for this file
 
     auto* w = new ScanProgressWindow(key, fileName);
     g_byKey.insert(key, w);
@@ -361,37 +348,87 @@ void ScanProgressWindow::applyVt(const bulwark::VtScanRecord& r)
     const QString icon = malicious ? QStringLiteral("shield-x")
                          : conclusive ? QStringLiteral("check")
                                       : QStringLiteral("alert");
-    const QString title = malicious ? u("检测到威胁,已处置")
+    //
+    // 恶意结论的标题只说【检测结论】,不说处置结果。
+    //
+    // 原来写死「检测到威胁,已处置」—— 可这一刻处置压根还没开始:服务端是在
+    // finalizeVtRecord(推这条终态)之【后】才走 confirmReputationMaliciousAsync 去结束进程树、
+    // 隔离载荷,而且那一步完全可能失败(进程受保护、文件被占用)。卡片先替它宣布成功,
+    // 就是典型的假拦截。真实处置结果随后由 applyDisposition() 补进来(BlockNotification 带回
+    // 真实 EnforcementOutcome),补到之前这里只说「检测到威胁」。
+    const QString title = malicious ? u("检测到威胁")
                           : conclusive ? u("未发现风险,文件安全")
                                        : u("检测未完成");
     // 兜底文案(服务未附 message 时)。同样不点名 VirusTotal:结论可能来自中央服务器的收录、
     // 本机直连 VT,或其他情报源;有 intelSource 就如实标出是谁给的。
     QString status = r.message;
-    if (status.isEmpty()) {
-        const QString by = r.intelSource.trimmed().isEmpty()
-                               ? u("云端多引擎")
-                               : r.intelSource.trimmed();
-        status = malicious ? (by + u(" 判定该文件为恶意,已结束进程并隔离。"))
-                 : conclusive ? (by + u(" 未判定为恶意,文件可放心使用。"))
-                              : u("云查毒未收录 / 无明确结论,已按放行处理。");
+    const QString by = r.intelSource.trimmed().isEmpty()
+                           ? u("云端多引擎")
+                           : r.intelSource.trimmed();
+    if (malicious) {
+        // 结论那一行(服务端文案形如「恶意 · 21/75 · trojan.mint/phil · 来源 X」—— 查出来的
+        // 威胁名就在这里)。留给 applyDisposition():回填处置时保留它,只在下面另起一行。
+        QString verdict = status.isEmpty() ? (by + u(" 判定该文件为恶意")) : status;
+        const QString label = r.threatLabel.trimmed();
+        if (!label.isEmpty() && !verdict.contains(label))
+            verdict += u(" · ") + label;
+        m_verdictText = verdict;
+        // 同理:恶意时只说是谁判的,不替处置阶段宣布「已结束进程并隔离」。
+        status = r.message.isEmpty() ? verdict + u(",正在处置…") : verdict;
+    } else if (status.isEmpty()) {
+        status = conclusive ? (by + u(" 未判定为恶意,文件可放心使用。"))
+                            : u("云查毒未收录 / 无明确结论,已按放行处理。");
     }
+    m_maliciousVerdict = malicious;   // 恶意 -> 等 applyDisposition() 回填真实处置结果
     applyResult(accent, icon, title, status, malicious ? 10 : 6);
 }
 
-void ScanProgressWindow::applyAi(const AiScanResult& result)
+// 处置结果回填:把「检测到威胁」补成「已处置」或「未能完全处置」(见头文件说明)。
+void ScanProgressWindow::applyDisposition(const QString& filePath,
+                                          bulwark::EnforcementOutcome enforcement)
 {
-    const bool available = result.available;
-    const bool malicious = available && (result.malicious
-                                         || result.recommendation == bulwark::VerdictAction::Block);
-    const QString verdict = !available ? u("AI 研判不可用")
-                            : malicious ? u("AI 研判:具有恶意特征")
-                                        : u("AI 研判:未见明显恶意特征");
-    const QString conf = available && !result.confidence.isEmpty() ? u(" · 置信度 ") + result.confidence : QString();
-    m_aiText->setText(verdict + conf);
-    m_aiText->setStyleSheet(QStringLiteral("color:%1;").arg(
-        (!available ? theme::warning() : malicious ? theme::danger() : theme::success()).name()));
-    m_aiRow->show();
-    relayout();
+    using EO = bulwark::EnforcementOutcome;
+    const QString p = filePath.trimmed();
+    if (p.isEmpty() || enforcement == EO::NotApplicable)
+        return;
+    const auto it = g_byKey.constFind(p.toLower());
+    if (it == g_byKey.constEnd())
+        return;                      // 没有对应卡片(已关闭 / 非双击查毒触发)
+    ScanProgressWindow* w = it.value();
+    // 只回填「已给出恶意结论」的卡片:没有结论、或结论是安全的卡片不该被一条拦截通知改写。
+    if (!w || w->m_closing || !w->m_maliciousVerdict || w->m_dispositionShown)
+        return;
+    w->m_dispositionShown = true;
+
+    // 与通知 / 语音同一条界线(evtfmt::needsManualAction):只有真的什么都没拦住才写
+    // 「未能完全处置」。ExecDenied(已禁止启动)、ActorAlreadyGone(主体此前已被结束)
+    // 都是处置到位了,卡片写成「未能完全处置」会把用户支到一件不存在的活儿上。
+    const bool enforced = !evtfmt::needsManualAction(enforcement);
+    const QColor accent = enforced ? theme::danger() : theme::warning();
+    const evtfmt::Badge disp = evtfmt::disposition(bulwark::VerdictAction::Block, enforcement);
+
+    w->m_title->setText(enforced ? u("检测到威胁,已处置") : u("检测到威胁,未能完全处置"));
+    w->m_title->setStyleSheet(
+        QStringLiteral("font-size:13pt; font-weight:700; color:%1;").arg(accent.name()));
+    // 说明行如实写做成了什么 / 为什么没做成(措辞同拦截记录页,来自 EventFormat)。
+    //
+    // 结论那一行【保留】,处置结果另起一行补在后面。原来这里整行覆盖:处置一回填,卡片上就只剩
+    // 「已结束进程 · …」—— 查出来的是什么威胁(威胁名就在结论行里)反而看不到了,
+    // 用户看到的是一张只会说「已处置」的卡。
+    const QString dispLine = disp.text + u(" · ")
+                           + evtfmt::dispositionDetail(bulwark::VerdictAction::Block, enforcement);
+    w->m_status->setText(w->m_verdictText.isEmpty() ? dispLine
+                                                    : w->m_verdictText + QLatin1Char('\n') + dispLine);
+    if (w->m_card)
+        w->m_card->setGlow(accent, QPointF(0.0, 0.0), 0.85, 0.18);
+    w->m_tile->set(enforced ? QStringLiteral("shield-x") : QStringLiteral("shield-alert"), accent);
+    w->m_miniTile->set(enforced ? QStringLiteral("shield-x") : QStringLiteral("shield-alert"), accent);
+    w->m_miniText->setText(enforced ? u("检测到威胁,已处置") : u("检测到威胁,未能完全处置"));
+    w->m_miniText->setStyleSheet(QStringLiteral("color:%1; font-weight:600;").arg(accent.name()));
+    // 没能完全处置的卡片留久一点(20s):这时用户需要看清并自己动手,6/10 秒不够读完。
+    if (!enforced && w->m_autoClose)
+        w->m_autoClose->start(20000);
+    w->relayout();
 }
 
 void ScanProgressWindow::applyResult(const QColor& accent, const QString& iconName,
@@ -475,51 +512,4 @@ void ScanProgressWindow::vtUpdate(const bulwark::VtScanRecord& record)
                              : QFileInfo(record.filePath).fileName();
     ScanProgressWindow* w = obtain(key, name.isEmpty() ? record.filePath : name);
     w->applyVt(record);
-}
-
-void ScanProgressWindow::aiStart(const bulwark::SecurityEvent& event)
-{
-    const QString key = keyFor(event.actorPath, event.id);
-    const QString name = QFileInfo(event.actorPath).fileName();
-    ScanProgressWindow* w = obtain(key, name.isEmpty() ? event.actorPath : name);
-    if (!w->m_resultShown) {
-        w->m_title->setText(u("AI 研判中…"));
-        if (w->m_status->text().isEmpty() || w->m_status->text().startsWith(u("正在查询")))
-            w->m_status->setText(u("大模型正在基于静态特征研判…"));
-    }
-    w->m_aiText->setText(u("AI 研判 · 大模型正在基于静态特征研判…"));
-    w->m_aiText->setStyleSheet(QString());
-    w->m_aiRow->show();
-    w->relayout();
-}
-
-void ScanProgressWindow::aiResult(const AiScanResult& result)
-{
-    // Only update an existing card (auto double-click scans). Manual scans are
-    // shown in the AI research page, not this transient card.
-    const QString key = keyFor(result.filePath, result.eventId);
-    const auto it = g_byKey.constFind(key);
-    if (it == g_byKey.constEnd())
-        return;
-    ScanProgressWindow* w = it.value();
-    w->applyAi(result);
-    if (w->m_resultShown)
-        return;
-
-    const bool available = result.available;
-    const bool malicious = available && (result.malicious
-                                         || result.recommendation == bulwark::VerdictAction::Block);
-    const QColor accent = malicious ? theme::danger() : available ? theme::success() : theme::warning();
-    const QString icon = malicious ? QStringLiteral("shield-x")
-                         : available ? QStringLiteral("check")
-                                     : QStringLiteral("alert");
-    const QString title = !available ? u("检测未完成")
-                          : malicious ? u("检测到威胁,已处置")
-                                      : u("未发现风险,文件安全");
-    QString status = result.summary;
-    if (status.isEmpty())
-        status = !available ? u("AI 引擎不可用 / 超时,已按放行处理。")
-                 : malicious ? u("AI 研判该文件具有恶意特征,已结束进程并隔离。")
-                             : u("AI 研判未发现明显恶意特征,文件可放心使用。");
-    w->applyResult(accent, icon, title, status, malicious ? 10 : 6);
 }

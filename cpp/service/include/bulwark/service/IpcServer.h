@@ -85,7 +85,14 @@ public:
 
     // ---- 服务 -> UI 广播 ----
     void sendPrompt(const bulwark::SecurityEvent& e);   // PromptRequest(payload=事件 JSON)
-    void sendBlock(const bulwark::SecurityEvent& e);    // BlockNotification
+    // BlockNotification。enforcement 必须是【已经执行完处置之后】拿到的真实结果:
+    // 右下角那条通知据它决定措辞(已拦截 / 已结束进程 / 已禁止加载 / 已禁止启动 /
+    // 主体已结束 / 仅告警·未拦截 / 拦截失败),
+    // 所以所有调用点都必须先 enforceBlock / killMalicious,再发这条 —— 反过来就是假拦截。
+    // 本文件内已无一处漏传;缺省值只为兼容老调用形态,不要依赖它。
+    void sendBlock(const bulwark::SecurityEvent& e,
+                   bulwark::EnforcementOutcome enforcement =
+                       bulwark::EnforcementOutcome::NotApplicable);
     // 攻击链命中即时通知。无论最终处置是 Block / Ask / Allow 都发 —— 见 IpcMessageType 处说明。
     void sendAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit);
     void sendLog(const QString& line);                  // LogEntry(纯字符串)
@@ -96,7 +103,6 @@ public:
     void sendRemediationReport(const bulwark::ipc::RemediationReportPayload& report); // RemediationReport
     void sendVtScanUpdate(const bulwark::VtScanRecord& record);                       // VtScanUpdate
     void sendVtDetail(const bulwark::ipc::VtDetailResponsePayload& detail);           // VtDetailResponse(异步)
-    void requestAiScan(const bulwark::SecurityEvent& e);                              // AiScanRequest
     // 取证查询 / 进程管理的异步回推(须在主线程调用;后台线程用 QMetaObject::invokeMethod 编组)。
     void sendTimeline(const bulwark::ipc::TimelineResponsePayload& payload);          // EventTimelineResponse
     void sendAttackGraph(const bulwark::ipc::AttackGraphResponsePayload& payload);    // AttackGraphResponse
@@ -118,7 +124,6 @@ signals:
     void helloReceived(int processId, const QString& role);
     void promptResponse(const QUuid& eventId, bulwark::VerdictAction action,
                         bool remember, bulwark::RememberScope scope);
-    void aiScanResponse(const bulwark::ipc::AiScanResponsePayload& resp);
     void clientCountChanged(int count);
 
 private slots:

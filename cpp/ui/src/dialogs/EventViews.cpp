@@ -414,6 +414,13 @@ void fillInspector(Inspector* in, const bulwark::ipc::EventLogPayload& p, IpcCli
 
     QVBoxLayout* s = in->addSection(u("处置"));
     in->addText(s, evtfmt::dispositionDetail(p.action, p.enforcement));
+    // 与拦截通知同一来源(evtfmt::threatOf):从通知上点「查看详情」进来,看到的是同一个定性。
+    // 放行的记录不写 —— 没拦它,就不该给它贴一个威胁标签。
+    if (p.action != bulwark::VerdictAction::Allow) {
+        const evtfmt::Threat threat = evtfmt::threatOf(e);
+        if (!threat.isEmpty())
+            in->addField(s, u("威胁类型"), threat.text());
+    }
     in->addField(s, u("裁决来源"), evtfmt::verdictSourceLabel(p.source));
     if (!e.matchedRuleNote.trimmed().isEmpty())
         in->addField(s, u("命中规则"), e.matchedRuleNote);
@@ -443,9 +450,7 @@ void fillInspector(Inspector* in, const bulwark::ipc::EventLogPayload& p, IpcCli
     auto* menu = new QMenu;
     fillContextMenu(menu, in, p, ipc, trustSource);
     in->addMenu(menu);
-    if (p.action == bulwark::VerdictAction::Block
-        && (p.enforcement == bulwark::EnforcementOutcome::AlertedOnly
-            || p.enforcement == bulwark::EnforcementOutcome::Failed))
+    if (p.action == bulwark::VerdictAction::Block && evtfmt::needsManualAction(p.enforcement))
         in->setNote(u("这条行为没有被实际阻断,需要人工确认它造成了什么影响。"), theme::warning());
 }
 
@@ -534,7 +539,7 @@ void trust(QWidget* context, IpcClient* ipc, const QString& rawPath, bool isDire
     } else {
         s.risk = ui::Risk::Caution;
         s.title = u("信任此程序");
-        s.summary = u("信任后,该程序的所有行为都将直接放行,并跳过全部检测与后台云查毒 / AI 研判。");
+        s.summary = u("信任后,该程序的所有行为都将直接放行,并跳过全部检测与后台云查毒。");
         s.consequences << u("同名程序很多(如 svchost.exe),请核对下面的完整路径")
                        << u("已经发生的拦截不会撤销,信任只对之后的行为生效");
         s.subjectLabel = u("程序");

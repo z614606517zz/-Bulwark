@@ -29,13 +29,28 @@
 //   FileDelete     全量遥测(fire-and-forget)。
 //   ImageLoad      用户态模块只上报 \Temp\ 与 \Users\Public\;驱动(.sys)只上报用户可写目录,
 //                  此时 actorPath 为「内核(驱动加载)」。
+//                  target = 被加载的模块路径。**actorSigned 是宿主(或那个伪串)的签名,不是
+//                  模块自己的** —— 要判模块自身签名用 targetUnsignedOnly() / targetSignedOnly()
+//                  (Worker::enrich 只对本类型事件富化 targetSigned / targetSignatureMismatch)。
 //   RemoteThread / ProcessTerminate   actor = 发起方,target = 受害进程映像。
 //   NetworkConnect target = "ip:port"(ETW 只上报非可信签名主体)。
 //
 // 【三条硬约束】
 //   1) Allow 规则必须锚定路径或 requireSigned —— 否则 RuleEngine::isUnsafeAllowRule 拒载。
-//   2) ProcessCreate 的 Block 会结束新进程;命中的是签名系统程序的「用法」时,Worker 只结束
-//      进程、不把映像钉进内核禁止执行名单(见 Worker::blacklistExec 的签名护栏)。
+//   2) ProcessCreate 的 Block 会结束新进程,并把主体映像钉进内核「禁止执行」名单
+//      (Worker::enforceBlock -> blacklistExec)。那份名单只有 64 槽、只加不减、由内核写回
+//      注册表跨重启续拦、协议上没有「删除单条」—— 下发的代价极不对称,所以必须知道它的护栏
+//      到底拦住了什么:
+//        · 【是】系统目录护栏:isSweepExemptPath 覆盖 System32 / SysWOW64 / WinSxS 与本产品
+//          目录(按真实路径前缀)。所以按命令行判的规则命中 cmd.exe / powershell.exe /
+//          netsh.exe / sc.exe 这类「拦用法不拦文件」的情形时,只结束进程、不下发。
+//        · 【不是】签名护栏。blacklistExec 里【没有任何签名判断】(只有「已加白」、
+//          「系统目录/本产品目录」、「去盘符后子串 >= 6 字符」三道闸)。
+//      这个区别会直接吃掉一个人:别写「只按 commandLinePattern 匹配的 ProcessCreate Block
+//      规则」去拦某个框架/库的用法 —— 那类命令行的主体通常是 python.exe / node.exe /
+//      pip.exe,它们【不在】System32 下,于是会被按完整路径永久禁运,整台机器再也起不了
+//      Python。真要覆盖这类判据,改用 FileWrite(拦落地)或交给启发式打分,别用
+//      ProcessCreate + Block。段 7.6b 的「不写命令行维度」就是按这一条决定的。
 //   3) 【Ask 规则一定要写窄】。这一条原先写的是「内置规则只加强、不削弱……Ask 可以放心写宽」,
 //      与代码实际行为不符,照着写会造成漏防,故据实改写:
 //        · RuleEngine 步骤 6 里【没有】任何按 builtInTag() 区分内置规则的逻辑。命中即
@@ -83,8 +98,13 @@ public:
     RuleRef& cmd(const QString& pattern)    { r_->commandLinePattern = pattern; return *this; }
     RuleRef& parent(const QString& pattern) { r_->parentPattern = pattern; return *this; }
 
+    // 【主体】签名条件:读 SecurityEvent::actorSigned,也就是发起方。
     RuleRef& unsignedOnly()              { r_->requireUnsigned = true; return *this; }
     RuleRef& signedOnly()                { r_->requireSigned = true; return *this; }
+    // 【目标文件自身】签名条件:读 targetSigned / targetSignatureMismatch。
+    // 只有 ImageLoad 事件会被富化出这两个字段(见下方事件语义表),别用在其它类型上。
+    RuleRef& targetUnsignedOnly()        { r_->requireTargetUnsigned = true; return *this; }
+    RuleRef& targetSignedOnly()          { r_->requireTargetSigned = true; return *this; }
     RuleRef& exemptOs()                  { r_->exemptTrustedOsComponent = true; return *this; }
     RuleRef& hard()                      { r_->hardOverride = true; return *this; }
 

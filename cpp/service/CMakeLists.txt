@@ -62,6 +62,10 @@ qt_add_executable(bulwark_service
     include/bulwark/service/EtwProcessEventSource.h
     include/bulwark/service/DriverEventSource.h
     include/bulwark/service/UserModeBehaviorSource.h
+    include/bulwark/service/UserModeExecBlock.h
+    include/bulwark/service/UserModeNetworkBlock.h
+    include/bulwark/service/UserModeProcessContainment.h
+    include/bulwark/service/SystemHardening.h
     include/bulwark/service/EventSourceCoordinator.h
     include/bulwark/service/IpcServer.h
     include/bulwark/service/Worker.h
@@ -75,6 +79,19 @@ qt_add_executable(bulwark_service
     # user-mode continuous behavior (canary honeypots + autostart delta), source
     # coordinator (multi-source + runtime kernel toggle), service originator tracer
     src/UserModeBehaviorSource.cpp
+    # 无驱动时的执行前拦截原语(长期持有 share-mode-0 独占句柄 -> CreateProcess/加载器打不开)
+    src/UserModeExecBlock.cpp
+    # 无驱动时的出站封禁原语(WFP ALE_AUTH_CONNECT_V4 上的 BLOCK 过滤器 -> connect 返回 WSAEACCES)
+    src/UserModeNetworkBlock.cpp
+    # 读不了/删不掉的文件:备份特权绕 DACL(不绕共享冲突)+ Restart Manager 报出占用者
+    src/OccupiedFileAccess.cpp
+    # 进程收容与处置阶梯:可逆冻结(NtSuspendProcess)+ 不可逆断子(Job ActiveProcessLimit=1)
+    #   + 有次序的终结(先锁映像再冻结再断子再杀,最后 waitForExit 确认)
+    src/UserModeProcessContainment.cpp
+    # 阶段 3 用户确认型加固:跨重启的「拒绝执行」ACE(独占句柄做不到的那一半)、
+    #   恶意独占键的注册表 DENY ACE、RegNotifyChangeKeyValue 即时监视 + 自动回滚、
+    #   以及 RunAsPPL / 自身服务 DACL 的只读体检(默认不擅自应用)
+    src/SystemHardening.cpp
     src/EventSourceCoordinator.cpp
     src/ServiceControlTracer.cpp
     src/Worker.cpp
@@ -110,7 +127,11 @@ if(WIN32)
     # ole32/uuid/oleaut32: COM + IShellLink (UserModeBehaviorSource resolves startup .lnk
     #   targets) + ITaskService (ProcessOriginResolver matches a PID to its scheduled task;
     #   oleaut32 provides VariantInit/SysFreeString used on that path).
-    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32)
+    # fwpuclnt: WFP 用户态过滤引擎 API(UserModeNetworkBlock 在 ALE_AUTH_CONNECT_V4 挂 BLOCK
+    #   过滤器 —— 无内核驱动时唯一的出站前拦截手段)。ws2_32: winsock 类型/字节序。
+    # rstrtmgr: Restart Manager(OccupiedFileAccess 用它查出「是谁占着这个文件」——
+    #   隔离失败时把占用者 PID/映像名写进日志,原先那条路径一个字都不说)。
+    target_link_libraries(bulwark_service PRIVATE advapi32 kernel32 wintrust crypt32 tdh fltlib ole32 uuid oleaut32 fwpuclnt ws2_32 rstrtmgr)
 endif()
 
 target_compile_features(bulwark_service PRIVATE cxx_std_20)

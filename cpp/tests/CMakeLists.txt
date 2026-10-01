@@ -60,3 +60,48 @@ set_tests_properties(attackchain_regression PROPERTIES
     ENVIRONMENT "QT_HASH_SEED=0"
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_blw_qt_bin}"
     LABELS "engine;attackchain")
+
+# ============================================================================
+# driver_match_unit: 内核驱动名单匹配核心的用户态单元测试
+# ============================================================================
+#
+# 驱动【不能在开发机上加载】(内核回调出错直接蓝屏,加载验证只在带快照的测试 VM 里做),
+# 所以在此之前,驱动侧匹配语义的改动只有「编译通过」这一级验证 —— 而项目里已有两次实测
+# 事故正是出在这几个函数上(见 DriverMatchTest.c 头部)。
+#
+# Bulwark.Driver/MatchCore.c 里全是纯函数:不碰 g_Blw、不取锁、不依赖 IRQL,因此可以
+# 在用户态原样编译。这里直接把那个 .c 拉进来,用 BLW_MATCHCORE_HOST 打开 MatchCore.h
+# 的用户态垫片(垫片刻意不含 <windows.h>,避免引入 UNICODE_STRING 由谁定义之类的环境差异)。
+#
+# 刻意不链 Qt:本测试与引擎/规则无关,也就不会踩「运行前得把 Qt bin 加进 PATH」那个坑。
+#
+# 【为什么给这两个 .c 显式指定 LANGUAGE CXX】本工程的 project() 只声明了 CXX
+# (cpp/CMakeLists.txt:6 `project(Bulwark LANGUAGES CXX)`),没有启用 C。若不指定,
+# MSVC 生成器会把 .c 静默跳过 —— 表现是链接期报「找不到 main」,很难一眼看出原因。
+# 在这里指定比去改顶层 project() 更克制:那会牵动整个工程重新配置。
+# 代价仅是 MatchCore.c 在本测试里按 C++ 编译(内核侧仍是 C),而它本身是 C/C++ 双兼容的
+# 纯 C 代码,判定逻辑逐字节相同。
+#
+# 往 MatchCore.c 里加东西时,必须同时在 DriverMatchTest.c 补上对应形态的断言。
+set(BLW_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../Bulwark.Driver")
+
+add_executable(driver_match_unit
+    DriverMatchTest.c
+    "${BLW_DRIVER_DIR}/MatchCore.c")
+set_source_files_properties(
+    DriverMatchTest.c "${BLW_DRIVER_DIR}/MatchCore.c"
+    PROPERTIES LANGUAGE CXX)
+target_include_directories(driver_match_unit PRIVATE "${BLW_DRIVER_DIR}")
+target_compile_definitions(driver_match_unit PRIVATE BLW_MATCHCORE_HOST)
+# 本测试不含任何 Qt 类型,关掉 autogen 省掉一个空的 mocs_compilation 编译单元。
+set_target_properties(driver_match_unit PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+if(MSVC)
+    # 与驱动工程同样的 /W4 + warning-as-error:内核代码里的告警在用户态这一侧也别放过。
+    target_compile_options(driver_match_unit PRIVATE /W4 /WX /utf-8)
+else()
+    target_compile_options(driver_match_unit PRIVATE -Wall -Wextra -Werror)
+endif()
+
+add_test(NAME driver_match_unit COMMAND driver_match_unit)
+set_tests_properties(driver_match_unit PROPERTIES LABELS "driver;match")

@@ -20,16 +20,82 @@
 #include <QScreen>
 #include <QTimer>
 #include <QToolButton>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
+#include <QtMath>
+
+#include <cmath>
 
 namespace {
 constexpr int kShell = 24; // transparent margin around the card (room for its shadow)
+// Gap between a BottomRight sheet's window edge and the screen's work area. Chosen
+// so the card's right and bottom edges line up with the toast cards stacked in the
+// same corner (ToastNotifier: 22 px margin; ToastWindow: 16 px shadow room).
+constexpr int kCornerInset = 15;
+
+constexpr int kEnterMs = 180;
+constexpr int kExitMs = 140; // leaving is quicker than arriving: nothing left to read
+constexpr int kRise = 14;    // how far below its place a centred sheet starts (px)
+// A corner sheet comes in from the right instead. Less than kCornerInset + kShell,
+// so the window never starts outside the work area.
+constexpr int kSlide = 32;
+
+// The picture of a sheet that has just closed, sliding and fading out from where
+// it stood, then deleting itself.
+//
+// The exit is played by this stand-in rather than by holding the dialog open,
+// because a QDialog that lingers past done() changes things that callers rely on:
+// exec() would return late (every caller reads its state on the next line), and a
+// window that is still open when the application asks it to close cancels the
+// quit — QGuiApplication::quit() closes every window and gives up if one of them
+// stays. Closing first and animating after keeps the dialog's semantics exactly as
+// they were, and there is nothing left on screen to click.
+class Ghost final : public QWidget
+{
+public:
+    Ghost(const QPixmap& shot, const QPoint& at, const QPoint& travel, int ms)
+        : QWidget(nullptr, Qt::FramelessWindowHint | Qt::Tool | Qt::WindowStaysOnTopHint), m_shot(shot)
+    {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setAttribute(Qt::WA_DeleteOnClose);
+        setFocusPolicy(Qt::NoFocus);
+        setFixedSize(shot.deviceIndependentSize().toSize());
+        move(at);
+        show();
+
+        auto* fade = new QPropertyAnimation(this, "windowOpacity", this);
+        fade->setDuration(ms);
+        fade->setStartValue(1.0);
+        fade->setEndValue(0.0);
+        auto* slide = new QPropertyAnimation(this, "pos", this);
+        slide->setDuration(ms);
+        slide->setEasingCurve(QEasingCurve::InCubic);
+        slide->setStartValue(at);
+        slide->setEndValue(at + travel);
+        connect(fade, &QPropertyAnimation::finished, this, &QObject::deleteLater);
+        fade->start();
+        slide->start();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.drawPixmap(0, 0, m_shot);
+    }
+
+private:
+    QPixmap m_shot;
+};
 
 class Strip : public QWidget
 {
 public:
     explicit Strip(QWidget* parent = nullptr) : QWidget(parent) { setFixedSize(4, 14); }
     QColor color = theme::accent();
+    qreal glow = 0.0; // 0 = the plain tone, 1 = its pale highlight (Sheet::setPulse)
 
 protected:
     void paintEvent(QPaintEvent*) override
@@ -37,7 +103,7 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setPen(Qt::NoPen);
-        p.setBrush(color);
+        p.setBrush(glow > 0.0 ? theme::blend(theme::soft(color), color, glow) : color);
         p.drawRoundedRect(QRectF(rect()), 2, 2);
     }
 };
@@ -110,6 +176,11 @@ Sheet::Sheet(QWidget* parent) : QDialog(parent)
     m_footer->addStretch(1);
     v->addWidget(m_footerHost);
 
+    // Enter / exit: opacity and position move together (see done(), startEnter()).
+    m_fade = new QPropertyAnimation(this, "windowOpacity", this);
+    m_move = new QPropertyAnimation(this, "pos", this);
+    m_move->setEasingCurve(QEasingCurve::OutCubic);
+
     setSheetWidth(520);
 }
 
@@ -134,6 +205,42 @@ void Sheet::setEyebrow(const QString& text, const QColor& color)
     static_cast<Strip*>(m_strip)->color = color;
     m_strip->update();
     m_eyebrowRow->setVisible(!text.isEmpty());
+}
+
+void Sheet::setPulse(bool on)
+{
+    m_pulseWanted = on;
+    if (on && !m_pulse) {
+        // One slow breath, shaped by a cosine so the loop has no seam.
+        m_pulse = new QVariantAnimation(this);
+        m_pulse->setStartValue(0.0);
+        m_pulse->setEndValue(1.0);
+        m_pulse->setDuration(1600);
+        m_pulse->setLoopCount(-1);
+        connect(m_pulse, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+            static_cast<Strip*>(m_strip)->glow = 0.5 - 0.5 * std::cos(v.toReal() * 2.0 * M_PI);
+            m_strip->update();
+        });
+    }
+    syncPulse();
+}
+
+void Sheet::syncPulse()
+{
+    if (!m_pulse)
+        return;
+    // Parked whenever nobody can see it (behind, minimised, on its way out) —
+    // a repaint inside the card re-renders its shadow, and that is not free.
+    const bool run = m_pulseWanted && motion::enabled() && motion::onScreen(this);
+    if (run == (m_pulse->state() == QAbstractAnimation::Running))
+        return;
+    if (run) {
+        m_pulse->start();
+        return;
+    }
+    m_pulse->stop();
+    static_cast<Strip*>(m_strip)->glow = 0.0;
+    m_strip->update();
 }
 
 void Sheet::setTitle(const QString& title)
@@ -175,7 +282,15 @@ void Sheet::setCloseButtonVisible(bool visible)
 
 void Sheet::refit()
 {
-    QTimer::singleShot(0, this, [this] {
+    // Not while the sheet is still arriving: the anchor below has to be read off
+    // its resting place, not off a spot it is passing through.
+    settleEnter();
+    // A corner sheet is anchored by its bottom edge (wherever it sits now, the user
+    // may have dragged it). Read it here, before the pending relayout gets a chance
+    // to resize the window; only meaningful once the sheet has been placed.
+    const bool anchorBottom = m_placed && m_placement == Placement::BottomRight;
+    const int bottom = frameGeometry().bottom();
+    QTimer::singleShot(0, this, [this, anchorBottom, bottom] {
         // Let every pending relayout (shown/hidden sections, scroll areas that
         // re-measured their content) propagate up to this window first —
         // otherwise adjustSize() measures the previous layout.
@@ -189,11 +304,14 @@ void Sheet::refit()
             return;
         const QRect avail = scr->availableGeometry();
         QRect g = frameGeometry();
+        if (anchorBottom)
+            g.moveBottom(bottom); // grow / shrink upward
         if (g.bottom() > avail.bottom())
             g.moveBottom(avail.bottom());
         if (g.top() < avail.top())
             g.moveTop(avail.top());
         move(g.topLeft());
+        m_restPos = pos();
     });
 }
 
@@ -251,6 +369,23 @@ int Sheet::screenHeightFor(const QWidget* anchor, qreal fraction)
 void Sheet::placeOnScreen()
 {
     fitHeight();
+    if (m_placement == Placement::BottomRight) {
+        // Same screen as the toast stack (ToastNotifier uses the primary screen too),
+        // so the prompt and the notifications share one corner.
+        const QScreen* scr = QGuiApplication::primaryScreen();
+        if (!scr)
+            return;
+        const QRect avail = scr->availableGeometry();
+        // Never taller than the screen: the footer (the answer buttons) must stay reachable.
+        if (height() > avail.height())
+            resize(width(), avail.height());
+        QRect g(QPoint(0, 0), size());
+        g.moveBottomRight(QPoint(avail.right() - kCornerInset, avail.bottom() - kCornerInset));
+        g.moveLeft(qMax(avail.left(), g.left()));
+        g.moveTop(qMax(avail.top(), g.top()));
+        move(g.topLeft());
+        return;
+    }
     const QWidget* anchor = parentWidget() ? parentWidget()->window() : nullptr;
     QScreen* scr = nullptr;
     QRect target;
@@ -299,16 +434,78 @@ void Sheet::showEvent(QShowEvent* e)
                 target->setFocus(Qt::OtherFocusReason);
         }
         placeOnScreen();
-        if (const int ms = motion::duration(150); ms > 0) {
-            setWindowOpacity(0.0);
-            auto* a = new QPropertyAnimation(this, "windowOpacity", this);
-            a->setDuration(ms);
-            a->setStartValue(0.0);
-            a->setEndValue(1.0);
-            a->start(QAbstractAnimation::DeleteWhenStopped);
-        }
+        startEnter();
     }
     QDialog::showEvent(e);
+    syncPulse();
+}
+
+void Sheet::hideEvent(QHideEvent* e)
+{
+    QDialog::hideEvent(e);
+    syncPulse();
+}
+
+QPoint Sheet::travel() const
+{
+    // A corner sheet slides in from the right — the corner it is parked in is also
+    // the toast stack's, and sliding up into it would cross them. Anything centred
+    // rises into place.
+    return m_placement == Placement::BottomRight ? QPoint(kSlide, 0) : QPoint(0, kRise);
+}
+
+void Sheet::startEnter()
+{
+    m_restPos = pos();
+    const int ms = motion::duration(kEnterMs);
+    if (ms <= 0)
+        return;
+    m_entering = true;
+    setWindowOpacity(0.0);
+    move(m_restPos + travel());
+    m_fade->stop();
+    m_fade->setDuration(ms);
+    m_fade->setStartValue(0.0);
+    m_fade->setEndValue(1.0);
+    m_fade->start();
+    m_move->stop();
+    m_move->setDuration(ms);
+    m_move->setStartValue(pos());
+    m_move->setEndValue(m_restPos);
+    m_move->start();
+}
+
+void Sheet::settleEnter()
+{
+    if (!m_entering)
+        return;
+    m_entering = false;
+    m_fade->stop();
+    m_move->stop();
+    setWindowOpacity(1.0);
+    move(m_restPos);
+}
+
+void Sheet::done(int result)
+{
+    playExit();
+    QDialog::done(result);
+}
+
+void Sheet::playExit()
+{
+    settleEnter();
+    const int ms = motion::duration(kExitMs);
+    if (ms <= 0 || !isVisible() || !motion::onScreen(this))
+        return;
+    // Everything the sheet shows right now, over a transparent background (the
+    // window is translucent: the card and its shadow are the only pixels).
+    const qreal dpr = devicePixelRatioF();
+    QPixmap shot(int(std::ceil(width() * dpr)), int(std::ceil(height() * dpr)));
+    shot.setDevicePixelRatio(dpr);
+    shot.fill(Qt::transparent);
+    render(&shot, QPoint(), QRegion(), QWidget::DrawChildren);
+    new Ghost(shot, pos(), travel(), ms); // owns itself; gone when it has faded
 }
 
 void Sheet::keyPressEvent(QKeyEvent* e)
@@ -323,6 +520,7 @@ void Sheet::keyPressEvent(QKeyEvent* e)
 void Sheet::mousePressEvent(QMouseEvent* e)
 {
     if (e->button() == Qt::LeftButton) {
+        settleEnter(); // a drag takes over from the entry animation
         m_dragging = true;
         m_dragOffset = e->globalPosition().toPoint() - frameGeometry().topLeft();
         e->accept();
@@ -335,6 +533,7 @@ void Sheet::mouseMoveEvent(QMouseEvent* e)
 {
     if (m_dragging && (e->buttons() & Qt::LeftButton)) {
         move(e->globalPosition().toPoint() - m_dragOffset);
+        m_restPos = pos(); // dragged: this is where it sits now (refit, exit)
         e->accept();
         return;
     }

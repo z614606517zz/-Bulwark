@@ -35,10 +35,6 @@ public:
     RemediationReportDialog(const bulwark::ipc::RemediationReportPayload& report,
                             IpcClient* ipc, AiScanner* ai, QWidget* parent = nullptr);
 
-protected:
-    void enterEvent(QEnterEvent* e) override;
-    void leaveEvent(QEvent* e) override;
-
 private:
     QWidget* group(QVBoxLayout* into, const QString& key, const QString& title, const QColor& color, int count);
     void scrollToGroup(const QString& key);

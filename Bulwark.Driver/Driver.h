@@ -10,6 +10,18 @@
 #include <wdm.h>
 #include "Protocol.h"
 
+//
+// 名单匹配核心(纯函数,无内核依赖,可在用户态编译跑单测)。
+// 必须在上面那几个内核头【之后】include —— MatchCore.h 刻意不自带任何内核头,
+// 理由与两种编译环境的约定见该文件顶部。它提供:
+//   BLW_MAX_PROTECTED / BLW_PROTECTED_PATH / BLW_MATCH_CTX / BLW_NAME_ENTRY
+//   BlwUpcaseChar / BlwStartsWithCI / BlwVolumeRelativeOffset / BLW_VOLPATH_STARTS
+//   BlwPrepareMatch / BlwMatchInListCtx / BlwMatchInListAnchoredCtx / BlwAddToList /
+//   BlwRemoveFromList / BlwPatternHasDriveLetter / BlwWideContainsCI / BlwImageNameIn /
+//   BlwCmdPatternMatches / BlwLogPattern
+//
+#include "MatchCore.h"
+
 #define BLW_TAG 'dhSI'   // 'IShd' 池标记
 
 //
@@ -80,7 +92,16 @@ BlwAllocPool(_In_ POOL_TYPE PoolType, _In_ SIZE_T NumberOfBytes, _In_ ULONG Tag)
 //
 // 因此本头文件不再有任何「裁决超时」常量 —— 内核永不等待用户态。
 //
-#define BLW_MAX_PROTECTED 64   // 最多保护的路径条数
+// (名单容量 BLW_MAX_PROTECTED 已移至 MatchCore.h —— 定长数组的尺寸与匹配实现同属一处。)
+
+//
+// 网络防护覆盖的 WFP 层数(每层一个内核 callout + 一条 filter)。
+// 当前:ALE_AUTH_CONNECT_V4(出站 IPv4)+ ALE_AUTH_CONNECT_V6(出站 IPv6)。
+// 层表在 NetMonitor.c 的 kBlwWfpLayers,那里有 C_ASSERT 保证两者一致。
+// 后续要补入站(ALE_AUTH_RECV_ACCEPT_V4/V6)与监听端口(ALE_RESOURCE_ASSIGNMENT_V4/V6,
+// 防后门 bind)时,只需在表里加行并把这个数字加上 —— 拉起 / 回滚 / 卸载三条路径都是循环。
+//
+#define BLW_WFP_LAYER_COUNT 2
 
 // 卸载时注销 WFP callout 的退让重试:关引擎之后,在途 classify 排空需要一点时间,
 // 期间 FwpsCalloutUnregisterById 会返回 STATUS_DEVICE_BUSY。总等待上限 = 5 × 50ms = 250ms,
@@ -94,6 +115,12 @@ BlwAllocPool(_In_ POOL_TYPE PoolType, _In_ SIZE_T NumberOfBytes, _In_ ULONG Tag)
 // 必须是 2 的幂:下标推进用位与而非取模(下标为有符号 LONG,编译器无法把 % 优化成位与)。
 #define BLW_HASH_QUEUE_MASK (BLW_HASH_QUEUE_CAP - 1)
 C_ASSERT((BLW_HASH_QUEUE_CAP & BLW_HASH_QUEUE_MASK) == 0);
+
+// 写采样槽数(按 PID 散列,见 BLW_GLOBALS::WriteSampleSlots)。必须是 2 的幂:下标用位与。
+// 64 槽对「同时在做首块写的进程数」而言足够宽 —— 真实系统上这个数通常是个位数。
+#define BLW_WRITE_SLOTS 64
+#define BLW_WRITE_SLOT_MASK (BLW_WRITE_SLOTS - 1)
+C_ASSERT((BLW_WRITE_SLOTS & BLW_WRITE_SLOT_MASK) == 0);
 
 //
 // ============ PID 集合的「无锁布隆快速否决」位 ============
@@ -125,163 +152,10 @@ C_ASSERT((BLW_HASH_QUEUE_CAP & BLW_HASH_QUEUE_MASK) == 0);
 #define BLW_IP_BIT(ip)    (1ULL << ((((ip) >> 13) ^ (ip)) & 63))
 
 //
-// 一条受保护路径(子串匹配,大小写不敏感)。
+// 受保护路径条目 BLW_PROTECTED_PATH、匹配上下文 BLW_MATCH_CTX、以及大小写不敏感匹配 /
+// 卷前缀剥离的全部基元,都已移到 MatchCore.h / MatchCore.c —— 它们是纯函数,挪出去之后
+// 可以在用户态编译并由 cpp/tests/DriverMatchTest.cpp 做单元测试。搬移时一个字节都没改语义。
 //
-// 【存储约定】Path 里保存的是【已大写化】的模式串(由 BlwAddToList 在加入时归一化一次)。
-// 匹配始终是大小写不敏感的,预先归一化模式串使热路径上的比较退化为纯宽字符比较,不必再
-// 对每个滑动窗口做一次大小写不敏感的整串比较(见 BLW_MATCH_CTX)。
-// 副作用仅是「写回注册表 \Policy 的名单是大写形式」—— 这些值只被本驱动自己读回(读回后
-// 再次归一化,幂等),用户态从不比较它们,故无任何行为影响。
-//
-typedef struct _BLW_PROTECTED_PATH {
-    WCHAR   Path[BLW_MAX_PATH];   // 已大写化的模式串
-    USHORT  Length;            // 字符数
-    BOOLEAN InUse;
-} BLW_PROTECTED_PATH, *PBLW_PROTECTED_PATH;
-
-//
-// ============ 大小写不敏感子串匹配的公共基元 ============
-//
-// 归一化单个宽字符,与 RtlCompareUnicodeString(..., TRUE) 共用同一套 Unicode 大写表,
-// 因此基于它的比较与原来的「大小写不敏感整串比较」结果逐字符等价。
-// ASCII(路径里的绝大多数字符)走内联快路,只有非 ASCII 才调 RtlUpcaseUnicodeChar。
-// 可在任意 IRQL 调用。
-//
-FORCEINLINE WCHAR
-BlwUpcaseChar(_In_ WCHAR c)
-{
-    if (c >= L'a' && c <= L'z') {
-        return (WCHAR)(c - L'a' + L'A');
-    }
-    if (c < 0x80) {
-        return c;   // 其余 ASCII 的大写形式就是自身
-    }
-    return RtlUpcaseUnicodeChar(c);
-}
-
-//
-// ============ 卷前缀剥离:把「子串包含」升级为「锚定前缀」的基础 ============
-//
-// 【为什么必须有这个函数】
-//
-// 内核里同一个文件会以多种前缀出现:
-//     \??\C:\Windows\System32\x.exe                  (进程创建回调的 CreateInfo->ImageFileName)
-//     \Device\HarddiskVolume3\Windows\System32\x.exe (SeLocateProcessImageName / 规范化文件名)
-// 原实现为了同时覆盖这两种形式,把「这个映像是不是系统组件」写成了【子串包含】判断
-// (BlwWideContainsCI(path, L"\\Windows\\System32\\") 之类)。那是错的,而且是可直接利用的错:
-//
-//     C:\Users\<u>\Program Files\evil.exe        含有 "\Program Files\"
-//     C:\temp\Windows\System32\csrss.exe         含有 "\Windows\System32\"
-//
-// 第一条让样本进了「可信系统路径」快速白名单 —— 进程创建既不拦也不上报,用户态根本看不到它。
-// 第二条更严重:它同时满足 BlwIsCriticalSystemProcess 的两个条件(文件名命中关键进程名单 +
-// 「位于系统目录」),于是那个样本获得了关键系统进程的全部豁免 —— 执行前拦截不拦它、
-// BlwKillProcessById 拒绝结束它。而这两个目录用户都能自己创建,不需要任何权限。
-//
-// 正确做法是先剥掉卷标识,再对【剩余路径】做锚定前缀比较。本函数返回剩余路径的起始下标。
-//
-// 识别不出卷前缀时返回 0,调用方一律按「不匹配」处理 —— 方向是 fail-safe:白名单不命中意味着
-// 多一次上报/多一层审查,而不是多一次放行。
-//
-FORCEINLINE BOOLEAN
-BlwStartsWithCI(_In_reads_(Chars) PCWSTR Path, _In_ USHORT Chars,
-                _In_ PCWSTR Literal, _In_ USHORT LiteralChars)
-{
-    USHORT i;
-
-    if (Path == NULL || Chars < LiteralChars) {
-        return FALSE;
-    }
-    for (i = 0; i < LiteralChars; i++) {
-        if (BlwUpcaseChar(Path[i]) != BlwUpcaseChar(Literal[i])) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-FORCEINLINE USHORT
-BlwVolumeRelativeOffset(_In_reads_(Chars) PCWSTR Path, _In_ USHORT Chars)
-{
-    if (Path == NULL || Chars < 3) {
-        return 0;
-    }
-
-    // \??\C:\...  -> 剩余从下标 6 开始(即 "\Windows\...")
-    if (BlwStartsWithCI(Path, Chars, L"\\??\\", 4)) {
-        // \??\UNC\... 是网络路径,不可能是本机系统目录 -> 不识别(返回 0 = 不匹配)。
-        if (BlwStartsWithCI(Path, Chars, L"\\??\\UNC\\", 8)) {
-            return 0;
-        }
-        if (Chars >= 7 && Path[5] == L':' && Path[6] == L'\\') {
-            return 6;
-        }
-        return 0;
-    }
-
-    // \Device\HarddiskVolumeN\...  -> 跳过数字,剩余从其后开始
-    if (BlwStartsWithCI(Path, Chars, L"\\Device\\HarddiskVolume", 22)) {
-        USHORT i = 22;
-        while (i < Chars && Path[i] >= L'0' && Path[i] <= L'9') {
-            i++;
-        }
-        // 必须真的读到过数字,且其后紧跟 '\'
-        if (i > 22 && i < Chars && Path[i] == L'\\') {
-            return i;
-        }
-        return 0;
-    }
-
-    // C:\...(极少见:内核路径通常带前缀,但归一化过的输入可能是这种形式)
-    if (Chars >= 3 && Path[1] == L':' && Path[2] == L'\\') {
-        return 2;
-    }
-
-    return 0;
-}
-
-//
-// 「剥掉卷前缀后,剩余路径是否以 Literal 开头」。这是替代 BlwWideContainsCI 做系统目录判定的
-// 唯一正确形式。Literal 必须以 '\' 开头(如 L"\\Windows\\System32\\")。
-//
-FORCEINLINE BOOLEAN
-BlwVolumePathStartsWith(_In_opt_ PCWSTR Path, _In_ USHORT Chars,
-                        _In_ PCWSTR Literal, _In_ USHORT LiteralChars)
-{
-    USHORT off;
-
-    if (Path == NULL || Chars == 0) {
-        return FALSE;
-    }
-    off = BlwVolumeRelativeOffset(Path, Chars);
-    if (off == 0) {
-        return FALSE;   // 认不出卷前缀 -> 不匹配(fail-safe)
-    }
-    return BlwStartsWithCI(Path + off, (USHORT)(Chars - off), Literal, LiteralChars);
-}
-
-// 便于书写:对宽字符串字面量自动算长度。
-#define BLW_VOLPATH_STARTS(path, chars, lit) \
-    BlwVolumePathStartsWith((path), (chars), (lit), (USHORT)(sizeof(lit) / sizeof(WCHAR) - 1))
-
-//
-// 预归一化的匹配目标。
-//
-// 一次文件 IRP_MJ_CREATE 最多要对 4 个名单做子串匹配,一次注册表写要对 2 个。原实现每个
-// 名单、每个模式、每个窗口偏移都要重新做大小写归一化,同一条路径被反复归一化几十上百次。
-// 现在改为:回调里把目标串【一次性】大写化进 Up[],之后所有名单匹配都只是宽字符比较
-// (命中首尾字符后直接 RtlEqualMemory 整段),归一化成本从 O(名单数 × 模式长 × 路径长)
-// 降到 O(路径长)。
-//
-// 目标超过 BLW_MAX_PATH 字符时不做预归一化(Chars=0),改由 Original 走「即时归一化」的
-// 回退路径 —— 语义与快路径完全一致,只是不缓存归一化结果。这样绝不会因为路径过长而
-// 漏掉本该命中的名单项(超长路径正是攻击者可能用来绕过的手法)。
-//
-typedef struct _BLW_MATCH_CTX {
-    PCUNICODE_STRING Original;      // 原始目标(仅在 Chars==0 的回退路径使用,须在 ctx 生命周期内有效)
-    USHORT           Chars;         // Up 中的有效字符数;0 = 未预归一化(走 Original 回退)
-    WCHAR            Up[BLW_MAX_PATH];   // 已大写化的目标
-} BLW_MATCH_CTX, *PBLW_MATCH_CTX;
 
 // 一条网络黑名单(IPv4 + 端口,端口 0 表示任意)
 typedef struct _BLW_BLOCK_IP {
@@ -398,14 +272,37 @@ typedef struct _BLW_GLOBALS {
     // 不上报普通写(普通写量极大,会拖垮上报通道)。
     volatile LONG   FileTelemetryEnabled;
 
-    // 写采样计数器(就地加密检测):IRP_MJ_WRITE 钩子对"偏移 0 起写"按
-    // BLW_WRITE_SAMPLE_RATE 取模采样,避免对每次写都解析文件名。仅诊断/节流用。
     //
-    // 【独占一条缓存行】它是真正被多核并发写的原子量(每次「偏移 0 起写」一次带锁 xadd),
-    // 而紧挨着的 FileTelemetryEnabled 是每次 CREATE / SET_INFO / WRITE 都要读的门闸。
-    // 若同处一行,勒索式批量改写会让这条被全系统文件 I/O 高频读取的行不断在各核间作废。
-    // 故给它单独一行:前面用 DECLSPEC_CACHEALIGN 对齐,后面紧跟的成员也对齐以隔断尾部。
-    DECLSPEC_CACHEALIGN volatile LONG WriteSampleCounter;
+    // ============ 写采样(就地加密检测)============
+    //
+    // IRP_MJ_WRITE 钩子对「偏移 0 起写」按 BLW_WRITE_SAMPLE_RATE 取模采样,避免对每次写都
+    // 解析文件名(FltGetFileNameInformation 昂贵)。
+    //
+    // 【为什么从一个全局计数器改成按 PID 散列的一组计数器】
+    //
+    // 原实现是【一个】全局计数器:全系统所有进程的「偏移 0 起写」共享同一个 1/32 预算。
+    // 于是任何一个写得很密的正常进程(编译器写 .obj、浏览器写缓存、数据库刷盘)都会把采样
+    // 预算吃掉,真正在批量加密的那个进程只能分到其中一小部分 —— 而用户态勒索聚合恰恰是按
+    // 【发起进程】算改写速率的。也就是说:噪声越大,越拦不住勒索。这是一处真实的检出损失,
+    // 不只是精度问题。(顺带:原注释写的是「进程级采样」,而代码是全局的,两者本就不符。)
+    //
+    // 现在:按 PID 散列到 BLW_WRITE_SLOTS 个槽,每个槽一个独立计数器。Windows 的 PID 恒为 4 的
+    // 倍数,故 >>2 后取低位分布均匀。不同 PID 撞到同一槽时,语义退化为「这两个进程合起来每
+    // 32 次报一次」—— 仍然远好于全局共享一个计数器,且完全无锁(一次 InterlockedIncrement)。
+    // 计数从 1 开始,判据取 n % 32 == 1,因此【每个进程的第一次首块写必定上报】:只改几个文件
+    // 的样本也能被看见,不会整批落在采样间隙里。
+    //
+    // WriteSeenFile 是同一组槽上的「上一次计入的文件」备忘:同一个文件被反复从偏移 0 覆写
+    // (日志轮转、数据库回写、进度文件)不再重复吃采样预算。键是 FILE_OBJECT 指针值,
+    // 【只当不透明整数用,绝不解引用】—— 它可能早已被释放,我们只需要它作为身份标签的一次性
+    // 比较;比错了的后果仅仅是多上报或少上报一条遥测。
+    //
+    // 【独占缓存行】这两组数组是真正被多核并发写的,而紧挨着的 FileTelemetryEnabled 是每次
+    // CREATE / SET_INFO / WRITE 都要读的门闸。若同处一行,勒索式批量改写会让这条被全系统
+    // 文件 I/O 高频读取的行不断在各核间作废。故用 DECLSPEC_CACHEALIGN 隔开。
+    //
+    DECLSPEC_CACHEALIGN volatile LONG   WriteSampleSlots[BLW_WRITE_SLOTS];
+    DECLSPEC_CACHEALIGN volatile LONG64 WriteSeenFile[BLW_WRITE_SLOTS];
 
     // 注册表防护
     DECLSPEC_CACHEALIGN LARGE_INTEGER RegCookie;  // CmRegisterCallbackEx 返回的 cookie
@@ -475,14 +372,27 @@ typedef struct _BLW_GLOBALS {
     // 网络防护(WFP)
     //
     // 状态机(全部在 WfpLock 下变更,见 NetMonitor.c):
-    //   WfpCalloutId != 0     内核 callout 已注册(在 netio 里,不随 BFE 消失)
-    //   WfpEngine    != NULL  引擎已开 + 管理层 callout/sublayer/filter 已加(随 BFE 消失)
-    //   WfpRegistered         上面两半都就绪 = 网络防护真正生效
+    //   WfpCalloutIds[i] != 0  第 i 层的内核 callout 已注册(在 netio 里,不随 BFE 消失)
+    //   WfpEngine    != NULL   引擎已开 + 管理层 callout/sublayer/filter 已加(随 BFE 消失)
+    //   WfpRegistered          上面两半都就绪 = 网络防护真正生效
     // 这三者【必须分开看】:BFE 未就绪时可能出现"callout 有、引擎没有"的半就绪态,
-    // 只看 WfpRegistered 会在卸载时漏拆那个已注册的 callout —— 悬空指针。
+    // 只看 WfpRegistered 会在卸载时漏拆那些已注册的 callout —— 悬空指针。
     HANDLE          WfpEngine;       // WFP 引擎句柄(动态会话:关闭即移除本驱动加的对象)
-    UINT32          WfpCalloutId;    // 已注册 callout 的运行时 id
-    UINT64          WfpFilterId;     // 已添加 filter 的 id
+    //
+    // 【为什么是数组】一个内核 callout 只能绑定到【一个】WFP 层:层是由管理层对象
+    // FWPM_CALLOUT0::applicableLayer 指定的,而 calloutKey 必须唯一 —— 所以要覆盖 N 个层就得
+    // 注册 N 个 callout(各自一个 GUID、各自一个运行时 id)、加 N 条 filter。
+    //
+    // 原实现是单例(一个 id / 一个 filterId),于是网络防护只有 IPv4 出站这一个层:
+    // 一个已被情报确认恶意的进程改走 IPv6 就完全不受阻(而 Windows 上 IPv6 默认启用,
+    // 很多域名会优先解析到 AAAA)。改成表驱动后新增一个层只是往 kBlwWfpLayers 加一行,
+    // 而拉起 / 回滚 / 卸载三条路径自动对称 —— 这一点很要紧:WFP 拆除路径写错就是蓝屏
+    //(callout 没注销掉而镜像被卸载,下一条连接跳进已释放内存)。
+    //
+    // 下标含义由 NetMonitor.c 的 kBlwWfpLayers 表定义;id 为 0 表示该层未注册。
+    //
+    UINT32          WfpCalloutIds[BLW_WFP_LAYER_COUNT];  // 各层已注册 callout 的运行时 id
+    UINT64          WfpFilterIds[BLW_WFP_LAYER_COUNT];   // 各层已添加 filter 的 id
     BOOLEAN         WfpRegistered;
     PDEVICE_OBJECT  WfpDeviceObject; // 注册 callout 需要的设备对象
     HANDLE          WfpBfeSubscription; // BFE 状态变更订阅句柄(延迟拉起 + BFE 重启后重建)
@@ -535,6 +445,23 @@ typedef struct _BLW_GLOBALS {
     PETHREAD        PolicyThread;     // 后台写回线程对象
     volatile LONG   PolicyStop;       // 写回线程停止标志
 
+    //
+    // 「开机载入时丢弃过死条目」的名单位图(同样用 BLW_POLICY_DIRTY_*)。
+    //
+    // 为什么需要单独一个:带盘符的条目(C:\...)对文件路径名单是【永久死条目】——
+    // 匹配目标恒为规范名 \Device\HarddiskVolumeN\...,里面不可能出现 "<字母>:\"。
+    // 这类条目一条都不会命中,却各占 64 槽之一并被内核写回注册表跨重启续留;槽位耗尽后
+    // 【此后所有新裁决都被静默丢弃】。现场实测:\Policy\FileNoLoad 里有 3 条这样的条目。
+    //
+    // 入口处拒收只能让它们不进内存名单,磁盘上那份还在。而「开机载入」这条路径本身
+    // 不标脏(它是读,不是配置变更),所以要另记一笔:DriverEntry 在写回线程就绪后调用
+    // BlwPersistDeadEntryDrops(),把受影响的名单各写回一次,磁盘基线就自愈了。
+    //
+    // 刻意不在载入过程中直接 BlwMarkPolicyDirty:那时写回线程还没起来,会退化成在
+    // DriverEntry 里同步写注册表 —— boot-start 场景下没必要在那么早的时刻做这件事。
+    //
+    volatile LONG   PolicyDeadDropMask;
+
     // 服务注册表键(DriverEntry 的 RegistryPath 副本),供内核把「已学习裁决」写回 \Policy 子键,
     // 实现裁决缓存跨【杀服务】与【重启】持久化。仅 DriverEntry 保存一次,之后只读。
     WCHAR           RegistryPathBuffer[300];
@@ -577,9 +504,10 @@ typedef struct _BLW_GLOBALS {
 #define BLW_EVENT_QUEUE_MASK (BLW_EVENT_QUEUE_CAP - 1)
 C_ASSERT((BLW_EVENT_QUEUE_CAP & BLW_EVENT_QUEUE_MASK) == 0);
 
-// 写采样率(就地加密检测):每 N 次"偏移 0 起写"才解析文件名并上报一次。
+// 写采样率(就地加密检测):同一个 PID 槽上每 N 次"偏移 0 起写"才解析文件名并上报一次。
 // 取较大值以保证热路径开销极低;勒索批量加密会产生大量首块写,采样仍足以
 // 让用户态在滑窗内聚合出高改写速率。普通程序极少高频从偏移 0 重写,几乎不被采到。
+// (槽数 BLW_WRITE_SLOTS 定义在 BLW_GLOBALS 之前,因为结构体里要用它开数组。)
 #define BLW_WRITE_SAMPLE_RATE 32
 
 extern BLW_GLOBALS g_Blw;
@@ -593,6 +521,7 @@ NTSTATUS BlwKillProcessById(_In_ ULONG Pid);
 // 「命令行硬拦」名单管理(进程创建命中即内核本地拒绝创建)。模式为 '+' 分隔的 token 合取。
 void     BlwClearCmdHardBlock(void);
 void     BlwAddCmdHardBlock(_In_ PCWSTR Pattern, _In_ USHORT Length);
+BOOLEAN  BlwDelCmdHardBlock(_In_ PCWSTR Pattern, _In_ USHORT Length);
 // 判定一条命令行是否命中名单。直接吃原始 UNICODE_STRING(不截断、不预归一化)——
 // 命令行可长达 32767 字符,若先截到 BLW_MAX_PATH 再匹配,攻击者只要在前面填充垫料
 // 就能把真正的危险 token 推到截断点之外从而绕过。故这里逐字符即时大写化比较,宁可
@@ -624,9 +553,6 @@ FLT_PREOP_CALLBACK_STATUS BlwPreWrite(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext);
 
-// 把目标串预归一化进 Ctx(每个回调对每个目标只做一次),供下面所有名单查询复用。
-void     BlwPrepareMatch(_Out_ PBLW_MATCH_CTX Ctx, _In_opt_ PCUNICODE_STRING Target);
-
 // 配置:受保护文件路径管理(线程安全)
 void     BlwClearProtectedPaths(void);
 void     BlwAddProtectedPath(_In_ PCWSTR Path, _In_ USHORT Length);
@@ -648,39 +574,30 @@ void     BlwClearFileExecBlock(void);
 void     BlwAddFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length);
 BOOLEAN  BlwFileIsExecBlocked(_In_ PBLW_MATCH_CTX Ctx);
 
-// 通用:在受保护项数组中做子串匹配(大小写不敏感)。线程安全由调用方持锁。
-//   Count    - 名单中在用项数(必须与 List 内容在同一把锁下读取);用于扫完即止,
-//              不再无谓地遍历剩余空槽。
-//   UseChars - 只匹配 Ctx 目标的前 UseChars 个字符;0 = 匹配整个目标。
-//              (注册表回调用它在同一个 "键\值" ctx 上分别做「整串」与「仅键部分」两种匹配。)
-BOOLEAN  BlwMatchInListCtx(_In_ BLW_PROTECTED_PATH* List, _In_ LONG Count,
-                           _In_ PBLW_MATCH_CTX Ctx, _In_ USHORT UseChars);
-// 向名单追加一项(内部会把模式串大写化后存入,见 BLW_PROTECTED_PATH 的存储约定)。
-void     BlwAddToList(_In_ BLW_PROTECTED_PATH* List, _In_ PCWSTR Path, _In_ USHORT Length);
-// 宽字符串子串匹配(大小写不敏感)。供多模块复用。
-BOOLEAN  BlwWideContainsCI(_In_ PCWSTR Str, _In_ USHORT StrChars, _In_ PCWSTR Sub);
+//
+// ============ 名单精确删除单条(BLW_CMD_DEL_*)============
+//
+// 返回 TRUE 表示确实删掉了一条 —— 调用方(Comms.c)据此决定是否标脏写回。这一点很要紧:
+// 「删除即标脏」正是精确删除相对于「CLEAR + 重下发保留项」的关键差异,详见 Protocol.h
+// 里 BLW_CMD_DEL_* 那段(保留项为空时旧路径不会标脏,重启后被删条目会复活)。
+//
+// BlwRemoveFromGuardedList 是持锁 + 重算计数的公共外壳,三个模块共用(纯匹配部分在
+// MatchCore.c 的 BlwRemoveFromList)。
+//
+BOOLEAN  BlwRemoveFromGuardedList(_In_ BLW_PROTECTED_PATH* List, _In_ PFAST_MUTEX Lock,
+                                  _Inout_ volatile LONG* Count,
+                                  _In_ PCWSTR Path, _In_ USHORT Length);
+BOOLEAN  BlwDelProtectedPath(_In_ PCWSTR Path, _In_ USHORT Length);
+BOOLEAN  BlwDelFileHardBlock(_In_ PCWSTR Path, _In_ USHORT Length);
+BOOLEAN  BlwDelFileNoLoad(_In_ PCWSTR Path, _In_ USHORT Length);
+BOOLEAN  BlwDelFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length);
 
 //
-// ============ 「路径以 \<文件名> 结尾」类名单的公共判定 ============
+// 通用匹配基元(BlwPrepareMatch / BlwMatchInListCtx / BlwMatchInListAnchoredCtx /
+// BlwAddToList / BlwRemoveFromList / BlwPatternHasDriveLetter / BlwWideContainsCI /
+// BlwImageNameIn / BlwCmdPatternMatches / BlwLogPattern)与 BLW_NAME_ENTRY 一并声明在
+// MatchCore.h —— 本头已在顶部 include 它,此处不再重复声明。
 //
-// 关键系统进程(14 条)、LOLBin(28 条)、高价值注入目标(10 条)都是这种「按文件名匹配」的
-// 常量名单。原实现对每一条都做一次 RtlInitUnicodeString(内含 wcslen)+ RtlCompareUnicodeString
-// 尾部比较 —— 一次进程创建要跑 42 次带 wcslen 的整串比较,一次跨进程建线程要跑 10 次。
-//
-// 现在:先【一次】反向扫描取出文件名,再用「长度 + 首字符」筛掉名单里绝大多数条目,只有极少数
-// 候选才逐字符比较;条目长度在编译期由 BLW_NAME 算出,运行时不再有 wcslen。
-// 语义与原尾部匹配一致,包括「路径中必须真的出现过 '\'」这一点。
-//
-typedef struct _BLW_NAME_ENTRY {
-    PCWSTR Name;    // 文件名(不含前导 '\')
-    USHORT Chars;   // Name 的字符数(编译期常量)
-} BLW_NAME_ENTRY;
-
-#define BLW_NAME(s) { (s), (USHORT)(sizeof(s) / sizeof(WCHAR) - 1) }
-
-BOOLEAN  BlwImageNameIn(_In_reads_(TableCount) const BLW_NAME_ENTRY* Table,
-                        _In_ ULONG TableCount,
-                        _In_opt_ PCWSTR Path, _In_ USHORT Chars);
 
 // RegistryMonitor.c
 NTSTATUS BlwRegisterRegistryCallback(_In_ PDRIVER_OBJECT DriverObject);
@@ -690,6 +607,7 @@ void     BlwAddProtectedRegKey(_In_ PCWSTR Key, _In_ USHORT Length);
 // 注册表「内核硬拦截」名单管理(精确子串,命中即内核本地拒绝写入)。
 void     BlwClearRegHardBlock(void);
 void     BlwAddRegHardBlock(_In_ PCWSTR Key, _In_ USHORT Length);
+BOOLEAN  BlwDelRegHardBlock(_In_ PCWSTR Key, _In_ USHORT Length);
 
 // SelfProtect.c
 NTSTATUS BlwRegisterObCallbacks(void);
@@ -726,6 +644,9 @@ NTSTATUS BlwWfpStart(_In_ PDEVICE_OBJECT DeviceObject);
 // 此时【绝不能】让镜像卸载,否则下一条外发连接就会跳进已释放内存。见 BlwFilterUnload。
 _Must_inspect_result_
 NTSTATUS BlwUnregisterWfp(void);
+// 是否还有【任何】层的内核 callout 处于已注册状态。callout 依附于网络设备对象,
+// 残留一个就绝不能删那个设备对象(否则 WFP 会引用一个已释放的对象 -> 蓝屏)。
+BOOLEAN  BlwWfpHasCallouts(void);
 void     BlwClearBlockList(void);
 void     BlwAddBlockIp(_In_ ULONG IpV4, _In_ USHORT Port);
 
@@ -750,6 +671,11 @@ void     BlwLoadPolicyFromRegistry(void);                            // 从 \Pol
 NTSTATUS BlwStartPolicyPersist(void);                    // DriverEntry 启动写回线程
 void     BlwStopPolicyPersist(void);                     // Unload:刷完脏位并等线程退出
 void     BlwMarkPolicyDirty(_In_ LONG DirtyBits);        // 标脏(可在 PASSIVE_LEVEL 调用)
+
+// 记下「某份名单在载入/下发时丢弃了死条目」(见 BLW_GLOBALS::PolicyDeadDropMask)。
+void     BlwMarkDeadEntryDrop(_In_ LONG DirtyBit);
+// DriverEntry 在写回线程就绪后调用:把丢弃过死条目的名单各写回一次,让磁盘基线自愈。
+void     BlwPersistDeadEntryDrops(void);
 
 // 期望的服务映像路径:载入 / 写回 \Policy\ServiceImagePath。用于连接方身份校验
 // (见 BLW_GLOBALS::ServiceImageChars 与 Comms.c 的 BlwClientIsTrusted)。

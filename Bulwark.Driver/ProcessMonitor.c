@@ -14,121 +14,9 @@
 #include "Driver.h"
 
 //
-// 大小写不敏感:判断 Str 是否包含子串 Sub(均为以 NUL 结尾的宽字符)。
-// 用于按"路径子串"匹配系统目录,覆盖 \??\C:\... 与 \Device\HarddiskVolumeN\...
-// 等各种前缀形式,避免严格前缀漏判导致关键系统进程意外走 IPC 裁决。
+// BlwWideContainsCI / BlwImageNameIn 已移到 MatchCore.c(纯函数,可在用户态跑单测,
+// 见 MatchCore.h 顶部说明)。本文件保留的是需要 g_Blw 与锁的那一层。
 //
-//
-// 大小写不敏感子串匹配(Sub 为 NUL 结尾的短常量)。
-//
-// 原实现对每个滑动窗口偏移都调一次 RtlCompareUnicodeString(...TRUE) —— 该调用内部会对两侧
-// 逐字符做 Unicode 大写化,成本是 O(子串长度)。「可信系统目录」白名单有 11 条,一次进程创建
-// 就是 11 × 路径长度 次这样的调用。
-//
-// 现在用「首字符 + 末字符」双锚点先筛:两端都对上才比中间,且全部用内联的 BlwUpcaseChar
-// (ASCII 快路,无函数调用)。判定结果与原来完全一致 —— 同一套 Unicode 大写表。
-//
-BOOLEAN
-BlwWideContainsCI(_In_ PCWSTR Str, _In_ USHORT StrChars, _In_ PCWSTR Sub)
-{
-    USHORT subChars = 0;
-    USHORT limit;
-    USHORT s;
-    WCHAR  first;
-    WCHAR  last;
-
-    if (Str == NULL || Sub == NULL || StrChars == 0) {
-        return FALSE;
-    }
-
-    while (subChars < BLW_MAX_PATH && Sub[subChars] != L'\0') {
-        subChars++;
-    }
-    if (subChars == 0 || subChars > StrChars) {
-        return FALSE;
-    }
-
-    first = BlwUpcaseChar(Sub[0]);
-    last = BlwUpcaseChar(Sub[subChars - 1]);
-    limit = (USHORT)(StrChars - subChars);
-
-    for (s = 0; s <= limit; s++) {
-        USHORT k;
-
-        if (BlwUpcaseChar(Str[s]) != first) {
-            continue;
-        }
-        if (BlwUpcaseChar(Str[s + subChars - 1]) != last) {
-            continue;
-        }
-        for (k = 1; (USHORT)(k + 1) < subChars; k++) {
-            if (BlwUpcaseChar(Str[s + k]) != BlwUpcaseChar(Sub[k])) {
-                break;
-            }
-        }
-        if ((USHORT)(k + 1) >= subChars) {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
-//
-// 「路径以 \<文件名> 结尾」类常量名单的公共判定(见 Driver.h 的 BLW_NAME_ENTRY 说明)。
-//
-BOOLEAN
-BlwImageNameIn(
-    _In_reads_(TableCount) const BLW_NAME_ENTRY* Table,
-    _In_ ULONG TableCount,
-    _In_opt_ PCWSTR Path,
-    _In_ USHORT Chars)
-{
-    USHORT nameStart;
-    USHORT nameChars;
-    ULONG  i;
-    WCHAR  firstUp;
-
-    if (Path == NULL || Chars == 0) {
-        return FALSE;
-    }
-
-    // 反向定位最后一个 '\',其后即文件名。整条路径里没有 '\' 时不匹配 ——
-    // 与原来「尾部匹配 \<名字>」的语义一致(那种写法也要求路径里出现 '\')。
-    nameStart = Chars;
-    while (nameStart > 0 && Path[nameStart - 1] != L'\\') {
-        nameStart--;
-    }
-    if (nameStart == 0) {
-        return FALSE;
-    }
-
-    nameChars = (USHORT)(Chars - nameStart);
-    if (nameChars == 0) {
-        return FALSE;
-    }
-
-    firstUp = BlwUpcaseChar(Path[nameStart]);
-
-    for (i = 0; i < TableCount; i++) {
-        USHORT k;
-
-        if (Table[i].Chars != nameChars) {
-            continue;   // 长度不同,不可能相等
-        }
-        if (BlwUpcaseChar(Table[i].Name[0]) != firstUp) {
-            continue;   // 首字符不同,不可能相等
-        }
-        for (k = 1; k < nameChars; k++) {
-            if (BlwUpcaseChar(Path[nameStart + k]) != BlwUpcaseChar(Table[i].Name[k])) {
-                break;
-            }
-        }
-        if (k == nameChars) {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
 
 //
 // ================== 命令行硬拦(执行前拦截·按用法而非按身份)==================
@@ -165,94 +53,23 @@ BlwAddCmdHardBlock(_In_ PCWSTR Pattern, _In_ USHORT Length)
 }
 
 //
-// 单个 token 是否作为大小写不敏感子串出现在命令行中。
+// 精确删除一条命令行硬拦模式(BLW_CMD_DEL_CMDBLOCK)。返回是否真的删掉了一条。
 //
-// Tok 已在加入名单时大写化;Target 是【原始命令行】,逐字符即时大写化后比较 —— 不预归一化
-// 是刻意的:命令行可长达 32767 字符,预归一化就要么开大缓冲、要么截断,而截断会直接造成
-// 「填充垫料把危险 token 推出截断范围」的绕过。逐字符比较的代价只在进程创建这条低频路径上。
+// 同样【不】套「带盘符即死条目」的准入校验:命令行硬拦匹配的是原始命令行,
+// 模式里出现 C:\ 是完全正常的(判据只对文件路径名单成立)。
 //
-// 窗口过滤沿用项目里其它匹配器的「首字符 + 末字符」双锚点:两端都对上才比中间段,
-// 把绝大多数必然失败的比较剪掉。判定结果与逐窗口整串比较完全一致(同一套 Unicode 大写表)。
-//
-static BOOLEAN
-BlwTokenInCmdLine(
-    _In_reads_(TargetChars) PCWSTR Target,
-    _In_ ULONG TargetChars,
-    _In_reads_(TokChars) PCWSTR Tok,
-    _In_ USHORT TokChars)
+BOOLEAN
+BlwDelCmdHardBlock(_In_ PCWSTR Pattern, _In_ USHORT Length)
 {
-    ULONG limit;
-    ULONG s;
-    WCHAR first;
-    WCHAR last;
-
-    if (TokChars == 0 || (ULONG)TokChars > TargetChars) {
-        return FALSE;
-    }
-
-    first = Tok[0];
-    last = Tok[TokChars - 1];
-    limit = TargetChars - TokChars;
-
-    for (s = 0; s <= limit; s++) {
-        USHORT k;
-
-        if (BlwUpcaseChar(Target[s]) != first) {
-            continue;
-        }
-        if (BlwUpcaseChar(Target[s + TokChars - 1]) != last) {
-            continue;
-        }
-        for (k = 1; (USHORT)(k + 1) < TokChars; k++) {
-            if (BlwUpcaseChar(Target[s + k]) != Tok[k]) {
-                break;
-            }
-        }
-        if ((USHORT)(k + 1) >= TokChars) {
-            return TRUE;
-        }
-    }
-    return FALSE;
+    return BlwRemoveFromGuardedList(g_Blw.CmdHardBlock, &g_Blw.CmdHardLock,
+                                    &g_Blw.CmdHardCount, Pattern, Length);
 }
 
 //
-// 一条模式是否命中命令行:模式按 BLW_CMD_TOKEN_SEP('+')切分为多个 token,
-// 【全部 token 都出现】才算命中(合取 / AND 语义)。
+// 单条模式的 token 合取匹配(BlwCmdPatternMatches)与单 token 子串搜索都在 MatchCore.c ——
+// 纯函数,由 cpp/tests/DriverMatchTest.cpp 把「参数顺序 / 空格数量 / 大小写 / 全路径」
+// 这几种变体逐一钉死。本文件只保留需要持 CmdHardLock 遍历名单的这一层。
 //
-// 为什么是合取而不是整串子串:整串子串对参数顺序和空格数量敏感,
-// `vssadmin delete shadows /all` 与 `vssadmin /for=c: delete shadows` 只有前者能被
-// 一条固定子串覆盖,攻击者调个顺序就绕过了。合取则与顺序、空格、大小写、是否带全路径无关。
-//
-// 空模式(全是分隔符、没有任何有效 token)返回 FALSE —— 绝不让一条配置错误的空模式
-// 变成「匹配一切命令行」从而拦死整个系统。
-//
-static BOOLEAN
-BlwCmdPatternMatches(
-    _In_ const BLW_PROTECTED_PATH* Entry,
-    _In_reads_(TargetChars) PCWSTR Target,
-    _In_ ULONG TargetChars)
-{
-    USHORT start = 0;
-    USHORT i;
-    BOOLEAN haveToken = FALSE;
-
-    // i == Length 时收尾处理最后一段,故循环到 <= Length。
-    for (i = 0; i <= Entry->Length; i++) {
-        if (i == Entry->Length || Entry->Path[i] == BLW_CMD_TOKEN_SEP) {
-            USHORT tokChars = (USHORT)(i - start);
-
-            if (tokChars > 0) {
-                haveToken = TRUE;
-                if (!BlwTokenInCmdLine(Target, TargetChars, &Entry->Path[start], tokChars)) {
-                    return FALSE;   // 有一个 token 不在命令行里 -> 整条模式不命中
-                }
-            }
-            start = (USHORT)(i + 1);
-        }
-    }
-
-    return haveToken;
-}
 
 BOOLEAN
 BlwCmdLineIsBlocked(_In_opt_ PCUNICODE_STRING CommandLine)

@@ -21,12 +21,15 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSet>
 #include <QTimer>
+#include <QToolButton>
 #include <QVariantAnimation>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace {
 
@@ -71,21 +74,42 @@ BatchBar::BatchBar(QWidget* parent) : GlowCard(parent)
     h->setSpacing(8);
     m_count = ui::label(QString(), "title");
     h->addWidget(m_count);
-    h->addSpacing(6);
+    h->addSpacing(2);
+    m_all = ui::button(u("全选"), "ghost", QString(), true);
+    connect(m_all, &QPushButton::clicked, this, [this] { emit selectAllRequested(!m_allSelected); });
+    h->addWidget(m_all);
+    auto* sep = new QFrame;
+    sep->setObjectName(QStringLiteral("Divider"));
+    sep->setFixedSize(1, 20);
+    h->addWidget(sep);
     m_row = new QHBoxLayout;
     m_row->setSpacing(8);
     h->addLayout(m_row);
-    auto* x = ui::iconButton(QStringLiteral("close"), u("取消选择"), theme::textMuted(), 14);
-    connect(x, &QToolButton::clicked, this, &BatchBar::clearRequested);
-    h->addWidget(x);
+    m_close = ui::iconButton(QStringLiteral("close"), u("取消选择"), theme::textMuted(), 14);
+    connect(m_close, &QToolButton::clicked, this, &BatchBar::clearRequested);
+    h->addWidget(m_close);
     ui::elevate(this, 22, 6, 150);
     setAccessibleName(u("批量操作"));
+    setCount(0, 0);
 }
 
-void BatchBar::setCount(int n)
+void BatchBar::setCount(int selected, int listed)
 {
-    m_count->setText(u("已选 %1 项").arg(n));
+    m_count->setText(u("已选 %1 项").arg(selected));
+    m_allSelected = listed > 0 && selected >= listed;
+    m_all->setText(m_allSelected ? u("取消全选") : u("全选"));
+    m_all->setToolTip(m_allSelected ? u("清除全部选择") : u("选中列表里当前显示的全部记录"));
+    m_all->setEnabled(listed > 0);
+    for (QPushButton* b : std::as_const(m_buttons))
+        b->setEnabled(selected > 0);
     adjustSize();
+}
+
+void BatchBar::setCheckMode(bool on)
+{
+    const QString tip = on ? u("退出批量选择") : u("取消选择");
+    m_close->setToolTip(tip);
+    m_close->setAccessibleName(tip);
 }
 
 QPushButton* BatchBar::addAction(const QString& icon, const QString& text, const char* variant,
@@ -97,7 +121,7 @@ QPushButton* BatchBar::addAction(const QString& icon, const QString& text, const
             fn();
     });
     m_row->addWidget(b);
-    ++m_actions;
+    m_buttons.append(b);
     adjustSize();
     return b;
 }
@@ -414,12 +438,11 @@ RecordBrowser::RecordBrowser(QWidget* parent) : ListShell(parent)
     connect(sel, &QItemSelectionModel::currentChanged, this,
             [this](const QModelIndex& cur, const QModelIndex&) { onCurrentChanged(cur); });
     connect(sel, &QItemSelectionModel::selectionChanged, this, [this] {
-        const int n = int(selectedSourceRows().size());
-        batchBar()->setCount(n);
-        setBatchVisible(n >= 2);
-        emit selectionCountChanged(n);
+        emit selectionCountChanged(syncBatch());
     });
     connect(m_list, &QAbstractItemView::clicked, this, [this](const QModelIndex& i) {
+        if (m_checkMode)
+            return; // the click toggled the record's check box, nothing more
         if (!i.isValid() || i.data(rec::Header).toBool() || !m_buildInspector)
             return;
         if (selectedSourceRows().size() > 1)
@@ -428,6 +451,8 @@ RecordBrowser::RecordBrowser(QWidget* parent) : ListShell(parent)
             showInspectorFor(m_filter->mapToSource(i).row());
     });
     connect(m_list, &QAbstractItemView::activated, this, [this](const QModelIndex& i) {
+        if (m_checkMode)
+            return; // Space toggles; there is no single record to open
         if (!i.isValid() || i.data(rec::Header).toBool())
             return;
         const int src = m_filter->mapToSource(i).row();
@@ -443,7 +468,23 @@ RecordBrowser::RecordBrowser(QWidget* parent) : ListShell(parent)
         m_list->viewport()->update();
     });
     connect(m_list, &QWidget::customContextMenuRequested, this, &RecordBrowser::showContextMenu);
-    connect(batchBar(), &BatchBar::clearRequested, this, &RecordBrowser::clearSelection);
+    connect(batchBar(), &BatchBar::clearRequested, this, [this] {
+        if (m_checkMode)
+            setCheckMode(false);
+        else
+            clearSelection();
+    });
+    connect(batchBar(), &BatchBar::selectAllRequested, this, [this](bool select) {
+        if (select)
+            m_list->selectAll();
+        else
+            m_list->clearSelection();
+    });
+    // Esc peels off the inspector, then the search (ListShell), then check mode.
+    connect(this, &ListShell::escapePressed, this, [this] {
+        if (m_checkMode)
+            setCheckMode(false);
+    });
 
     connect(this, &ListShell::newItemsClicked, this, [this] {
         m_newCount = 0;
@@ -457,17 +498,32 @@ RecordBrowser::RecordBrowser(QWidget* parent) : ListShell(parent)
         }
     });
 
-    // Keep the selection (and an open inspector) across a full refresh.
+    // Keep the selection (and an open inspector) across a full refresh. A
+    // multi-selection — and anything in check mode — is kept whole, by key: a
+    // service snapshot landing mid-selection must not throw the user's ticks away.
     connect(m_model, &QAbstractItemModel::modelAboutToBeReset, this, [this] {
         m_keptKey = currentKey();
+        m_keptKeys.clear();
+        const QList<int> rows = selectedSourceRows();
+        if (m_checkMode || rows.size() > 1)
+            for (int src : rows)
+                m_keptKeys.append(m_model->at(src).key);
         m_keptInspector = isInspectorOpen();
         m_keptScroll = m_list->verticalScrollBar()->value();
     });
     connect(m_model, &QAbstractItemModel::modelReset, this, [this] {
         updateCounts();
-        const QVariant key = m_keptKey;
-        m_keptKey = QVariant();
-        if (key.isValid()) {
+        const QVariant key = std::exchange(m_keptKey, QVariant());
+        const QList<QVariant> keys = std::exchange(m_keptKeys, QList<QVariant>());
+        if (m_checkMode || !keys.isEmpty()) {
+            const bool haveCurrent = restoreSelection(keys, key);
+            if (m_keptInspector) {
+                if (haveCurrent && !m_checkMode)
+                    showInspectorFor(currentSourceRow());
+                else
+                    setInspectorOpen(false);
+            }
+        } else if (key.isValid()) {
             if (!selectKey(key, m_keptInspector, /*reveal*/ false) && m_keptInspector)
                 setInspectorOpen(false);
         } else if (m_keptInspector) {
@@ -542,8 +598,31 @@ void RecordBrowser::setIdentity(const QColor& hue)
 
 void RecordBrowser::setMultiSelect(bool on)
 {
-    m_list->setSelectionMode(on ? QAbstractItemView::ExtendedSelection
-                                : QAbstractItemView::SingleSelection);
+    m_multi = on;
+    if (!m_checkMode)
+        m_list->setSelectionMode(on ? QAbstractItemView::ExtendedSelection
+                                    : QAbstractItemView::SingleSelection);
+}
+
+void RecordBrowser::setCheckMode(bool on)
+{
+    if (on == m_checkMode)
+        return;
+    m_checkMode = on;
+    if (on && isInspectorOpen())
+        setInspectorOpen(false);
+    m_list->clearSelection();
+    // MultiSelection: a click / Space toggles one row and leaves the others alone.
+    m_list->setSelectionMode(on ? QAbstractItemView::MultiSelection
+                             : m_multi ? QAbstractItemView::ExtendedSelection
+                                       : QAbstractItemView::SingleSelection);
+    m_list->recordDelegate()->setCheckable(on);
+    m_list->viewport()->update();
+    batchBar()->setCheckMode(on);
+    syncBatch();
+    if (on)
+        m_list->setFocus(Qt::OtherFocusReason); // Space / ↑↓ work straight away
+    emit checkModeChanged(on);
 }
 
 void RecordBrowser::setPredicate(std::function<bool(int)> pred)
@@ -606,6 +685,68 @@ void RecordBrowser::updateCounts()
 {
     setMatch(m_filter->matchedRecords(), m_filter->totalRecords());
     refreshEmpty();
+    syncBatch(); // rows came or went: the count and 全选 / 取消全选 may be stale
+}
+
+int RecordBrowser::syncBatch()
+{
+    const int n = int(selectedSourceRows().size());
+    if (!batchBar()->hasActions())
+        return n; // nothing to do in bulk on this page: the bar never shows
+    int listed = 0;
+    for (int r = 0, rows = m_filter->rowCount(); r < rows; ++r)
+        if (!m_filter->index(r, 0).data(rec::Header).toBool())
+            ++listed;
+    batchBar()->setCount(n, listed);
+    const bool show = m_checkMode || n >= 2;
+    setBatchVisible(show);
+    // The bar floats over the bottom of the list: keep the last record reachable above it.
+    m_list->setBottomInset(show ? batchBar()->height() + 18 : 0);
+    return n;
+}
+
+bool RecordBrowser::restoreSelection(const QList<QVariant>& keys, const QVariant& current)
+{
+    QSet<QString> wanted;
+    for (const QVariant& k : keys) {
+        const QString s = k.toString();
+        if (!s.isEmpty())
+            wanted.insert(s);
+    }
+    // One range per run of adjacent rows (select-all stays a single range).
+    QItemSelection sel;
+    QModelIndex cur;
+    int runStart = -1;
+    const int rows = m_filter->rowCount();
+    for (int r = 0; r <= rows; ++r) {
+        bool hit = false;
+        if (r < rows) {
+            const QModelIndex pi = m_filter->index(r, 0);
+            const int src = m_filter->mapToSource(pi).row();
+            if (src >= 0 && !m_model->isHeader(src)) {
+                const QVariant& k = m_model->at(src).key;
+                if (!wanted.isEmpty()) {
+                    const QString s = k.toString();
+                    hit = !s.isEmpty() && wanted.contains(s);
+                }
+                if (!cur.isValid() && current.isValid() && k == current)
+                    cur = pi;
+            }
+        }
+        if (hit && runStart < 0) {
+            runStart = r;
+        } else if (!hit && runStart >= 0) {
+            sel.select(m_filter->index(runStart, 0), m_filter->index(r - 1, 0));
+            runStart = -1;
+        }
+    }
+    QItemSelectionModel* sm = m_list->selectionModel();
+    m_selecting = true;
+    if (cur.isValid())
+        sm->setCurrentIndex(cur, QItemSelectionModel::NoUpdate);
+    sm->select(sel, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    m_selecting = false;
+    return cur.isValid();
 }
 
 void RecordBrowser::refreshEmpty()
@@ -739,6 +880,8 @@ bool RecordBrowser::selectKey(const QVariant& key, bool openInspector, bool reve
     }
     if (!pi.isValid())
         return false;
+    if (m_checkMode)
+        setCheckMode(false); // going to one record: the batch selection is over
     m_selecting = true;
     m_list->selectionModel()->setCurrentIndex(pi, QItemSelectionModel::ClearAndSelect);
     m_selecting = false;
@@ -751,7 +894,7 @@ bool RecordBrowser::selectKey(const QVariant& key, bool openInspector, bool reve
 void RecordBrowser::clearSelection()
 {
     m_list->clearSelection();
-    setBatchVisible(false);
+    syncBatch(); // hides the bar — unless in check mode, where it stays with its actions disabled
 }
 
 void RecordBrowser::showContextMenu(const QPoint& pos)
@@ -761,8 +904,14 @@ void RecordBrowser::showContextMenu(const QPoint& pos)
     const QModelIndex i = m_list->indexAt(pos);
     if (!i.isValid() || i.data(rec::Header).toBool())
         return;
-    if (!m_list->selectionModel()->isSelected(i))
-        m_list->selectionModel()->setCurrentIndex(i, QItemSelectionModel::ClearAndSelect);
+    if (!m_list->selectionModel()->isSelected(i)) {
+        // Check mode: right-clicking an unticked record ticks it too (the menu acts
+        // on everything ticked) instead of throwing the ticked set away.
+        const QItemSelectionModel::SelectionFlags how =
+            m_checkMode ? (QItemSelectionModel::Select | QItemSelectionModel::Rows)
+                        : QItemSelectionModel::SelectionFlags(QItemSelectionModel::ClearAndSelect);
+        m_list->selectionModel()->setCurrentIndex(i, how);
+    }
     QMenu menu(this);
     m_contextMenu(&menu, selectedSourceRows());
     if (!menu.isEmpty())

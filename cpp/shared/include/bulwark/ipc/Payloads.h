@@ -42,6 +42,39 @@ struct PromptResponsePayload {
     static PromptResponsePayload fromJson(const QJsonObject& o);
 };
 
+// 服务 -> UI:已拦截通知(BlockNotification)。
+//
+// 【为什么必须带 enforcement】此前这条消息的负载就是裸的 SecurityEvent,里面没有任何字段说明
+// 「到底拦下了没有」—— 于是 UI 的拦截 toast 只能一律显示「已拦截」。而裁决为 Block 并不等于
+// 真的拦住了:内核无法前拦且没有可结束的进程时是 AlertedOnly(仅告警·未拦截),尝试结束但
+// 目标仍在运行时是 Failed(拦截失败)。两种情况下那句「已拦截」都是在骗用户,而用户恰恰是
+// 在这两种情况下才必须自己动手。EventLogPayload 早就如实带了 enforcement(拦截记录页因此是
+// 对的),只有最显眼的那个右下角通知在说谎。
+//
+// 【线协议兼容】刻意做成【扁平】的:toJson() 就是 event.toJson() 再加一个 "enforcement" 键。
+// 消息号 BlockNotification=3 是上线契约,旧 UI 仍按 SecurityEvent::fromJson 解析同一个对象,
+// 多出来的键被忽略。
+//
+// 新 UI 遇到老服务(在线更新后界面还没重启的那段混跑期)读不到该键,落到 NotApplicable ——
+// 它经 evtfmt::disposition() 仍显示「已拦截」,与拦截记录页对同一条事件的显示【保持一致】
+// (那里对缺字段的历史记录也是这个兜底)。两块界面对同一件事说两套话比说错更糟,所以这里
+// 不另造第三种「未知」措辞。本服务的所有调用点都必然传真实结果:enforceBlock() 只会返回
+// KernelBlocked / Terminated / ModuleBlacklisted / ExecDenied / ActorAlreadyGone / AlertedOnly,
+// 永远不会返回 NotApplicable。
+//
+// 【新增枚举值必须追加在末尾】本字段在线上是 int。ExecDenied / ActorAlreadyGone 就是这么加的:
+// 混跑期的旧 UI 读到它们不认识的值会落到 evtfmt::disposition() 的兜底「已拦截」——
+// 这两种结果都确实构成真实拦截,所以兜底不会把没拦下的说成拦下了。反过来(把新值插在
+// AlertedOnly 之前)会让旧 UI 把它们读成别的处置,那是真正的谎报。
+struct BlockNotificationPayload {
+    bulwark::SecurityEvent event;
+    // 真实执行结果。与 VerdictAction 严格区分:那个是裁决意图,这个是真的做成了什么。
+    bulwark::EnforcementOutcome enforcement = bulwark::EnforcementOutcome::NotApplicable;
+
+    QJsonObject toJson() const;
+    static BlockNotificationPayload fromJson(const QJsonObject& o);
+};
+
 // 服务 -> UI:结构化事件日志(完整 SecurityEvent + 裁决),供活动日志/时间线回溯任意事件。
 struct EventLogPayload {
     bulwark::SecurityEvent event;
@@ -339,18 +372,6 @@ struct UpdateApplyResponsePayload {
     bool needsRestart = true;
     QJsonObject toJson() const;
     static UpdateApplyResponsePayload fromJson(const QJsonObject& o);
-};
-
-// ===== AI 病毒扫描 =====
-// UI -> 服务:AI 病毒扫描结果(以事件 Id 关联请求)。
-struct AiScanResponsePayload {
-    QUuid eventId;
-    bool available = false;
-    bulwark::VerdictAction recommendation = bulwark::VerdictAction::Allow;
-    QString summary;
-    QString confidence;
-    QJsonObject toJson() const;
-    static AiScanResponsePayload fromJson(const QJsonObject& o);
 };
 
 // ===== 足迹清理报告 =====

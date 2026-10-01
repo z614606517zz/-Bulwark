@@ -88,6 +88,12 @@ QUuid stableIdFor(const DefenseRule& r) {
     key += r.requireSigned ? QLatin1Char('1') : QLatin1Char('0');
     key += r.hardOverride ? QLatin1Char('1') : QLatin1Char('0');
     key += r.exemptTrustedOsComponent ? QLatin1Char('1') : QLatin1Char('0');
+    // 目标签名条件【只在置位时】进 key。
+    // 刻意不写成上面那种「恒定追加一位 0/1」:那会让全部 950 条内置规则的 id 一起变,而这两个
+    // 条件加入之前它们的判别性内容一个字节都没动 —— id 变了等于已存规则库里的内置条目全部换身份
+    // (loadRules 以 id 为键),用户按 id 存下的启停 / 到期状态会全部失配。
+    if (r.requireTargetUnsigned) key += QLatin1String("|TU");
+    if (r.requireTargetSigned)   key += QLatin1String("|TS");
     QStringList hashes(r.actorHashes.cbegin(), r.actorHashes.cend());
     hashes.sort(Qt::CaseInsensitive);
     key += sep;

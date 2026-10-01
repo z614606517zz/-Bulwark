@@ -9,6 +9,7 @@
 #include "bulwark/engine/CommandObfuscationAnalyzer.h"
 #include "bulwark/engine/ScriptAnalyzer.h"
 #include "bulwark/engine/KillChainAnalyzer.h"
+#include "bulwark/engine/TrustPolicy.h"
 #include <QSet>
 #include <QHash>
 #include <QStringList>
@@ -469,9 +470,29 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     if (!e.actorSigned)
         Add(15, u("无可信数字签名"), false, EvidenceKind::Info);
 
-    // 1b) 签名失配
-    if (e.signatureMismatch)
-        Add(45, u("数字签名校验失败(疑似篡改或盗用证书)"), true);
+    // 1b) 签名失配 —— 必须分成「真篡改」与「只是校验不过」两档。
+    //
+    // 【原实现是一处高频误报的源头】原先只看 signatureMismatch,一律 45 分【硬指标】,理由串
+    // 写的是「疑似篡改或盗用证书」。但 signatureMismatch 的含义只是「内嵌了签名、本机验不过」,
+    // 它把三件完全不同的事混成一个答案:
+    //   ① 文件被改过(TRUST_E_BAD_DIGEST)—— 这才是恶意证据;
+    //   ② 本机没有签发者的根证书(企业内部 CA / 自签 / 部分厂商链);
+    //   ③ 文件读不出来 —— 自保护的安全软件不让别人读自己的映像,验签必然失败。
+    //
+    // 实测:卡巴斯基的 avp.exe / avpsus.exe 落在 ③,两天里产生 7434 次询问(占全部询问的
+    // 绝大多数),而那两个文件一个字节都没被改过。硬指标还有连带后果 —— 它让
+    // isHealthySigned / isCleanSigned 直接失效,并让静默模式把 >=50 分升级为拦截。
+    //
+    // 现在:① 照旧 45 分硬指标;②③ 只记 10 分软信号,并在理由里如实说明「没验过,不等于被改过」。
+    // 检出不丢:真正的篡改样本摘要必然不符,走的仍是 ① 那一支;盗用证书另有 certRevoked /
+    // isAbusedSigner / signedAfterCertExpiry 三条专门判据(各 45~60 分硬)。
+    if (e.signatureTampered) {
+        Add(45, u("数字签名摘要不符:文件在签名之后被改过(篡改/白加黑,T1553.002)"), true);
+    } else if (e.signatureMismatch) {
+        Add(10, u("内嵌了数字签名但本机校验不过(根证书未导入 / 证书过期 / 文件被独占读不出来;"
+                  "摘要并未不符,按软信号计,需互证)"),
+            false, EvidenceKind::Info);
+    }
 
     // 1b-1) 侧载模块篡改(「白加黑」):主体签名健康,但它目录里有模块【签名后被改过】。
     //
@@ -483,11 +504,54 @@ void ThreatDetector::analyze(SecurityEvent& e) {
         Add(50, u("同目录模块签名后被篡改(签名壳侧载恶意模块,T1574.002):") +
                 e.tamperedModulePath, true);
 
+    // 1b-1' 白加黑侧载(未签名模块形态)。这是银狐 2026 年的主流落法:签名壳旁边放一个
+    // 【完全没有签名】的系统同名 DLL(powrprof / wsc / version …),上面那条要求「内嵌签名
+    // 校验不过」,对它一条都不命中(详见 SecurityEvent::sideloadedUnsignedModulePath)。
+    //
+    // 按硬指标计,但分值 45 —— 低于 HighRisk(80),所以单这一条的结论是【询问】而不是拦截。
+    // 刻意如此:对签名主体判 Block 会走 blacklistExec 把映像钉进内核禁运名单(只加不减、
+    // 加白也解不开),一次误判就是「这个正规程序永久起不来」。互证已经把绿色软件挡在外面,
+    // 但还不足以担保到可以永久钉死的程度,所以把最终处置交给用户。
+    // 硬指标本身已经足够:它会让流水线第 9 步的「签名健康直接放行」失效(isHealthySigned
+    // 开头就查 hasThreatIndicator),Worker 侧也为它单列了一条不降级(见 onEvent)。
+    if (!e.sideloadedUnsignedModulePath.isEmpty()) {
+        const QString why = e.sideloadedUnsignedModuleWhy.isEmpty()
+                                ? QString()
+                                : (u("(") + e.sideloadedUnsignedModuleWhy + u(")"));
+        Add(45, u("签名程序同目录存在未签名的系统同名模块,疑似白加黑侧载(T1574.001/002)") +
+                why + u(":") + e.sideloadedUnsignedModulePath, true);
+    }
+
     // 1b-2) 吊销 / 过期后签名
     if (e.certRevoked)
         Add(60, u("签名证书已被吊销(疑似盗用证书)"), true);
     if (e.signedAfterCertExpiry)
         Add(45, u("使用过期证书签名(疑似盗用旧证书)"), true);
+
+    // 1b-2') 签名者在【被盗用证书】名单内。
+    //
+    // 与上面 certRevoked 说的是同一件事(这张证书不该再被信任),区别只在消息来源:那条等
+    // CA 吊销 + CRL 下发到本机,这条来自本地/情报侧下发的名单。本机默认只读缓存 CRL
+    // (OnlineCertRevocationCheck=false),所以从「私钥被偷」到「certRevoked 变真」之间有一段
+    // 很长的空窗期,而银狐这类团伙的投递恰好都发生在这段窗口里。同分值(60)、同样按硬指标计。
+    {
+        const TrustDecision abused = TrustPolicy::isAbusedSigner(e);
+        if (abused.ok)
+            Add(60, abused.reason, true);
+    }
+
+    // 1b-2'') 证书【已过期】但签名仍然有效(签名时带了时间戳)。
+    //
+    // 单独出现时【绝大多数是正常的老软件】,所以这里 0 分、只记一条 Info:按本项目原则,软
+    // 信号不单独定罪,更不该让一个「证书到期」把正常程序推去弹窗。真正的收紧在
+    // TrustPolicy::isHealthySigned 里,且要求「已过期 + 本机首见 + 不在标准安装目录」三者互证
+    // 才取消快速放行(仍不等于拦截)。这条记录的作用是让证据链如实显示证书状态 —— 排查盗用
+    // 旧证书时,「签名有效」和「签名有效但证书早过期了」是两个完全不同的结论。
+    if (e.actorSigned && e.certNotAfterUtc.has_value() && *e.certNotAfterUtc < nowUtc()) {
+        Add(0, u("签名证书已于 ") + e.certNotAfterUtc->toString(Qt::ISODate) +
+                u(" 过期(签名靠时间戳仍有效;留意是否为盗用旧证书)"),
+            false, EvidenceKind::Info);
+    }
 
     // 1b-3) 首见 + 新证书
     if (e.actorSigned && e.isFirstSeen) {
@@ -505,25 +569,31 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     // Tauri / PyInstaller 打包的正常应用天生就是 150~200MB —— 实测 35 次误拦(占全部拦截 43%)
     // 全部出自这里:Clash for Windows 150MB、kiro-account-manager 171MB,两者都是 Electron。
     //
-    // 真正的「文件膨胀规避扫描」是把载荷填充到超过杀软扫描上限,而这类样本的落点特征很稳定:
-    // 投递到用户可写目录(Temp / Downloads / AppData\Roaming / Public / ProgramData / Desktop)。
-    // 反之位于 Program Files / AppData\Local\Programs 之类安装目录的大文件,是安装器(需要管理员
-    // 或走标准安装流程)放进去的,几乎不可能是投递载荷。
+    // 上一轮的修法是「只在投递型可写目录(Temp / Downloads / Desktop / AppData / ProgramData /
+    // Public)里才算硬指标」,理由是安装目录里的大文件必然是安装器放进去的。那半步不够。
     //
-    // 故:仅当文件位于投递型可写目录时才算硬指标;否则保留分数但降为软信号,交由互证升格 ——
-    // 与本项目「软信号绝不单独定罪」的既定原则一致。
+    // 【本轮:体积永远不单独定罪】那个区分不成立 ——
+    // 用户下载的安装包本来就落在 Downloads / Desktop / Temp。而「未签名」「体积大」「在可写目录」
+    // 三项【全是软信号】,凑在一起依然没有任何一项说得出「它干了什么坏事」。硬指标的代价却极重:
+    //   15(未签名) + 25(可疑目录运行) + 65(体积) = 105 -> 封顶 100 -> 管线第 10 步直接 Block,
+    //   随后 blacklistExec 钉进内核禁运名单(只加不减) + 跨重启拒绝执行 ACE + 隔离载荷。
+    // 实测:C:\Users\1\Downloads\决战千年260944.exe(78MB 的自解压游戏安装包)被判 100 分拦截、
+    // 搬进隔离区、并留下跨重启的拒绝执行 ACE;222MB 的 NSIS 音乐安装包同样如此 —— 两者的证据
+    // 链里一条行为证据都没有,全是「未签名 / 大 / 在桌面」。
+    //
+    // 现在一律软信号。检出不丢:膨胀只是规避扫描的包装,载荷要起作用总得做点什么(注入 /
+    // 持久化 / 关杀软 / 侧载 / C2 外联 / 落地可执行体),这些各自都有硬判据;另有哈希信誉、
+    // 云扫描、兜底扫描三条与体积无关的确认路径(lclcache.exe 21/75 就是这么逮住的)。
     constexpr qint64 kBloatThreshold = 60LL * 1024 * 1024;
     constexpr qint64 kBloatThresholdHi = 90LL * 1024 * 1024;
     if (e.actorFileSize >= kBloatThresholdHi && !e.actorSigned) {
         Add(65, u("超大未签名可执行文件(") + QString::number(e.actorFileSize / (1024 * 1024)) +
-                u("MB,几乎必为文件膨胀规避扫描)") +
-                (inSuspiciousDir ? QString() : u("〔位于安装目录,按软信号计,需互证〕")),
-            inSuspiciousDir);
+                u("MB,疑似文件膨胀规避扫描;体积不是行为证据,按软信号计,需互证)"),
+            false);
     } else if (e.actorFileSize >= kBloatThreshold && !e.actorSigned) {
         Add(30, u("异常大的可执行文件(") + QString::number(e.actorFileSize / (1024 * 1024)) +
-                u("MB,疑似文件膨胀)") +
-                (inSuspiciousDir ? QString() : u("〔位于安装目录,按软信号计,需互证〕")),
-            inSuspiciousDir);
+                u("MB,疑似文件膨胀;按软信号计,需互证)"),
+            false);
     }
 
     // 2) 可疑目录运行(仅未签名显著加分)
@@ -542,6 +612,70 @@ void ThreatDetector::analyze(SecurityEvent& e) {
     const bool actorIsLolBin = lolBins().contains(actorName);
     if (parentIsOfficeOrBrowser && actorIsLolBin) {
         Add(45, u("异常进程链:") + parentName + u(" 派生 ") + actorName + u("(疑似宏病毒/钓鱼)"), true);
+    }
+
+    // 3b) MSI 自定义动作拉起脚本宿主(银狐伪装安装包投递的必经一步)。
+    //
+    // 银狐把载荷塞进 MSI 的 custom action:msiexec 起来后由它拉起 VBScript / PowerShell / cmd
+    // 去解包并跑下一阶段(伪装 Telegram 中文语言包那条链就是 MSI custom action -> VBScript ->
+    // zpaqfranz 解 ZPAQ -> PowerShell 做 XOR 解密)。
+    //
+    // 【只给软信号,刻意不置硬指标】正常 MSI 也会用脚本型 custom action(装驱动前停服务、
+    // 写配置、注册组件),数量不多但确实存在。置硬指标等于「装这类软件就弹窗甚至被拦」。
+    // 作为软信号它与未签名 / 可疑目录 / 命令行混淆 / 首见等信号叠加,链路真恶意时自然够分。
+    //
+    // 【为什么不写成内置规则】规则命中即短路启发式(RuleEngine 步骤 6 直接 return),
+    // 一条宽 Ask 规则会把 `msiexec -> powershell -enc <base64>` 这种高危事件降级成询问。
+    // 详见 Rules07_Injection.cpp 段 7.5b 的说明。
+    if (parentName == QLatin1String("msiexec.exe") && actorIsLolBin) {
+        Add(30, u("MSI 自定义动作拉起脚本宿主 ") + actorName +
+                u("(伪装安装包投递的常见形态,T1218.007)"));
+    }
+
+    // 3c) 系统宿主进程的父进程不对(注入落点:进程镂空 / 线程上下文劫持)。
+    //
+    // 银狐最后一跳就是这个形态:loader 自己起一个【全新的 svchost.exe】,再把 shellcode 用
+    // 线程上下文劫持塞进去,ValleyRAT 于是跑在一个「微软签名 + System32」的进程里。
+    // 上面 systemProcessDirs / 伪装检测只管「svchost 是不是从错误的目录跑起来的」;这一条管
+    // 「它在正确的位置,但【不是 services.exe 生的】」—— 两者互补,原先没有任何判据覆盖后者。
+    //
+    // 【为什么必须叠加「父进程可疑」才置硬指标】svchost.exe 不在 ProcessInspector::criticalNames()
+    // 里,也就是说它【可以被结束】。而静默模式会把「硬指标 + 风险 >= 50」直接升级为拦截并结束
+    // 进程树 —— 只凭「父进程不是 services.exe」就置硬指标,一次误判就可能结束一个正常的服务宿主
+    // (Schedule / DcomLaunch 那几个组),把机器搞得半残。所以硬指标要求父进程【自己就已经可疑】:
+    // 落在投递目录,或者是脚本宿主 / LOLBin。「未签名程序在 ProgramData 里直接起 svchost」没有任何
+    // 正常解释,而正常的 services.exe -> svchost 与 svchost -> dllhost 一条都不会命中。
+    // 父进程不可疑时只留 20 分软信号,不定罪(留痕即可,靠别的指标互证)。
+    //
+    // 只在【进程创建】这一刻判:那时父子关系是权威的。其它事件类型的 parentPath 是按 PID 事后
+    // 反查的,PID 复用会让它指向错误的进程(本项目没有进程退出事件,见 ProcessChainTracker 的说明)。
+    if (e.type == EventType::ProcessCreate && !parentName.isEmpty()) {
+        // sihost.exe(Shell Infrastructure Host)正常由 svchost.exe 拉起(UserManager 那一组),
+        // 与 dllhost / taskhostw 同一形态。银狐 2026 年的另一条链把 sRDI 载荷注进它
+        //(见 docs/yinhu-threat-intel-2026.md [7]),故按同一判据收进来。
+        static const QHash<QString, QString> kExpectedParent = {
+            { QStringLiteral("svchost.exe"),   QStringLiteral("services.exe") },
+            { QStringLiteral("dllhost.exe"),   QStringLiteral("svchost.exe")  },
+            { QStringLiteral("taskhostw.exe"), QStringLiteral("svchost.exe")  },
+            { QStringLiteral("sihost.exe"),    QStringLiteral("svchost.exe")  },
+        };
+        const auto expect = kExpectedParent.constFind(actorName);
+        if (expect != kExpectedParent.constEnd()
+            && isInSystemDirFor(actorName, pathLower)   // 它确实是系统目录里那一份(否则归伪装检测)
+            && parentName.compare(expect.value(), Qt::CaseInsensitive) != 0) {
+            const QString parentLower = e.parentPath.toLower();
+            const bool parentSuspicious =
+                isSuspiciousDropDir(e.parentPath) || lolBins().contains(parentName)
+                || anyContains(highSuspiciousDirs(), parentLower);
+            if (parentSuspicious) {
+                Add(45, u("系统宿主进程 ") + actorName + u(" 由可疑父进程 ") + parentName +
+                        u(" 直接拉起(应为 ") + expect.value() +
+                        u(";疑似进程镂空 / 线程上下文劫持的注入落点,T1055.012)"), true);
+            } else {
+                Add(20, u("系统宿主进程 ") + actorName + u(" 的父进程是 ") + parentName +
+                        u("(通常应为 ") + expect.value() + u(")"), false);
+            }
+        }
     }
 
     // 4) 命令行高危特征(硬/软由 Sig.hard 决定;弱特征仅加分,靠互证升格)
@@ -715,6 +849,27 @@ void ThreatDetector::analyze(SecurityEvent& e) {
         }
     }
 
+    // 7c) 脚本【文件正文】判据
+    //
+    // 与 7b 的区别:7b 只能看到命令行里抠出来的脚本文本(实际上只有 -EncodedCommand
+    // 和 mshta 内联这两种拿得到),而脚本宿主的常态是「命令行里只有一个文件路径」——
+    // 那条路径下的正文由 Worker::scanScriptFileBody 在富化阶段读入并评过分,结论在
+    // e.scriptFile* 里。这里只负责把它并进本次评分与证据链。
+    //
+    // 硬 / 软由分析器给,不在这里二次判断:它的行为级判据在 4069 个良性脚本语料上零命中,
+    // 统计类判据则一律要互证才升硬(取舍与实测数字见 ScriptAnalyzer::analyzeScriptFile)。
+    if (e.scriptFileScore > 0 || e.scriptFileHardIndicator) {
+        score += e.scriptFileScore;
+        bool first = true;
+        for (const QString& r : e.scriptFileReasons) {
+            e.addEvidence(QStringLiteral("ScriptFileAnalyzer"),
+                e.scriptFileHardIndicator ? EvidenceKind::HardIndicator : EvidenceKind::SoftSignal,
+                r, first ? e.scriptFileScore : 0);
+            first = false;
+        }
+        if (e.scriptFileHardIndicator) e.hasThreatIndicator = true;
+    }
+
     // 8) 杀伤链阶段分析
     if (!e.chainContext.isEmpty()) {
         const KillChainAnalyzer::Result chain = KillChainAnalyzer::analyze(e.chainContext);
@@ -803,6 +958,58 @@ bool ThreatDetector::isSuspiciousDropDir(const QString& path) {
     return anyContains(highSuspiciousDirs(), pathLower)
         || anyContains(mediumSuspiciousDirs(), pathLower)
         || isNonStandardWindowsSubdir(pathLower);
+}
+
+bool ThreatDetector::isSideloadProneModuleName(const QString& pathOrName) {
+    //
+    // 只收【系统 DLL 的名字】。判据是「正常应用不会在自己目录里放一个私有的同名模块」——
+    // 这些都由 Windows 提供,应用直接从 System32 加载即可;把同名文件放到 exe 旁边的唯一
+    // 效果就是让它先被找到(DLL 搜索顺序劫持 T1574.001/002)。
+    //
+    // 【刻意不收的】libcurl.dll / sqlite3.dll / zlib.dll / Qt*.dll / *.node 这类第三方库:
+    // 应用自带它们是完全正常的,而且多数不签名 —— 收进来等于把绿色软件全判成侧载。
+    // 同理不收 msvcp*.dll / vcruntime*.dll / ucrtbase.dll:VC++ 运行时本来就允许应用本地部署
+    // (app-local deployment 是微软自己推荐的做法),它们是误报大户。
+    //
+    // powrprof / wsc 两个是银狐 2026 年实际用过的(伪装 Telegram 中文语言包那条链,
+    // 侧载宿主是带字节跳动签名的 SodaMusicLauncher.exe)。
+    //
+    static const QSet<QString> kNames = {
+        // 电源 / 系统信息 —— 银狐实际使用
+        QStringLiteral("powrprof.dll"), QStringLiteral("wsc.dll"),
+        QStringLiteral("wscapi.dll"),
+        // 版本 / 多媒体 / 图形:侧载最经典的三个
+        QStringLiteral("version.dll"), QStringLiteral("winmm.dll"),
+        QStringLiteral("msimg32.dll"), QStringLiteral("dwmapi.dll"),
+        QStringLiteral("uxtheme.dll"), QStringLiteral("dbghelp.dll"),
+        QStringLiteral("dbgcore.dll"), QStringLiteral("textinputframework.dll"),
+        // 加密 / 凭据 / 身份
+        QStringLiteral("cryptsp.dll"), QStringLiteral("cryptbase.dll"),
+        QStringLiteral("secur32.dll"), QStringLiteral("sspicli.dll"),
+        QStringLiteral("bcrypt.dll"), QStringLiteral("ncrypt.dll"),
+        QStringLiteral("wintrust.dll"),
+        // 用户配置 / 环境
+        QStringLiteral("profapi.dll"), QStringLiteral("userenv.dll"),
+        QStringLiteral("dwrite.dll"), QStringLiteral("textshaping.dll"),
+        // 网络 / 代理
+        QStringLiteral("winhttp.dll"), QStringLiteral("wininet.dll"),
+        QStringLiteral("iphlpapi.dll"), QStringLiteral("dnsapi.dll"),
+        QStringLiteral("winsta.dll"), QStringLiteral("mswsock.dll"),
+        // 外壳 / COM
+        QStringLiteral("propsys.dll"), QStringLiteral("shcore.dll"),
+        QStringLiteral("apphelp.dll"), QStringLiteral("dxgi.dll"),
+        QStringLiteral("d3d9.dll"), QStringLiteral("oleacc.dll"),
+        QStringLiteral("comctl32.dll"), QStringLiteral("riched20.dll"),
+        // 输入法 / 辅助
+        QStringLiteral("msctf.dll"), QStringLiteral("mfc42loc.dll"),
+        QStringLiteral("srvcli.dll"), QStringLiteral("netapi32.dll"),
+        QStringLiteral("logoncli.dll"), QStringLiteral("samcli.dll"),
+    };
+    QString name = pathOrName.trimmed();
+    name.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    const int slash = name.lastIndexOf(QLatin1Char('\\'));
+    if (slash >= 0) name = name.mid(slash + 1);
+    return kNames.contains(name.toLower());
 }
 
 } // namespace bulwark::engine

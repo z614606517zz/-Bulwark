@@ -140,11 +140,6 @@ void IpcServer::handleLine(QLocalSocket* /*sock*/, const QString& line) {
                 emit promptResponse(p.eventId, p.action, p.remember, p.scope);
                 break;
             }
-            case IpcMessageType::AiScanResponse: {
-                emit aiScanResponse(AiScanResponsePayload::fromJson(msg->payloadObject()));
-                break;
-            }
-
             // ---- 规则管理 ----
             case IpcMessageType::RulesRequest:
                 sendRules();
@@ -447,8 +442,14 @@ void IpcServer::sendPrompt(const bulwark::SecurityEvent& e) {
     broadcast(IpcMessage::create(IpcMessageType::PromptRequest, e.toJson()));
 }
 
-void IpcServer::sendBlock(const bulwark::SecurityEvent& e) {
-    broadcast(IpcMessage::create(IpcMessageType::BlockNotification, e.toJson()));
+void IpcServer::sendBlock(const bulwark::SecurityEvent& e,
+                          bulwark::EnforcementOutcome enforcement) {
+    // 负载与旧版「裸事件 JSON」同形,只多一个 enforcement 键(BlockNotificationPayload),
+    // 所以新旧两端混跑期间互相都读得懂。
+    BlockNotificationPayload p;
+    p.event = e;
+    p.enforcement = enforcement;
+    broadcast(IpcMessage::create(IpcMessageType::BlockNotification, p.toJson()));
 }
 
 void IpcServer::sendAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit) {
@@ -480,10 +481,6 @@ void IpcServer::sendVtScanUpdate(const bulwark::VtScanRecord& record) {
 
 void IpcServer::sendVtDetail(const bulwark::ipc::VtDetailResponsePayload& detail) {
     broadcast(IpcMessage::from(IpcMessageType::VtDetailResponse, detail));
-}
-
-void IpcServer::requestAiScan(const bulwark::SecurityEvent& e) {
-    broadcast(IpcMessage::create(IpcMessageType::AiScanRequest, e.toJson()));
 }
 
 void IpcServer::sendTimeline(const TimelineResponsePayload& payload) {

@@ -176,8 +176,26 @@ void bindEtw(const QJsonObject& o, EtwOptions& e) {
     bindBool(o, "Enabled", e.Enabled);
     bindBool(o, "DnsClient", e.DnsClient);
     bindBool(o, "KernelNetwork", e.KernelNetwork);
+    //
+    // KernelRegistry / KernelFile / PerProcessRegPerMinute / PerProcessFilePerMinute 这四项
+    // 【原先漏绑】:结构体里声明了、appsettings.json 里也明明白白写着 "KernelRegistry": true /
+    // "KernelFile": true,但这里从来没解析过 —— 也就是说部署方把它们改成 false 是完全无效的,
+    // 想靠关掉文件遥测来降负载的人得到的是「改了配置、行为一点没变」,这是最难排查的一类失效。
+    // 当前 appsettings 里的值与结构体默认值一致(都是 true),所以补上绑定不改变现有行为。
+    //
+    bindBool(o, "KernelRegistry", e.KernelRegistry);
+    bindBool(o, "KernelFile", e.KernelFile);
+    bindBool(o, "KernelImageLoad", e.KernelImageLoad);
+    bindBool(o, "KernelRemoteThread", e.KernelRemoteThread);
+    bindBool(o, "KernelFileWriteAttribution", e.KernelFileWriteAttribution);
+    bindInt(o, "AttributionPathMax", e.AttributionPathMax);
     bindBool(o, "NetworkUntrustedOnly", e.NetworkUntrustedOnly);
     bindInt(o, "PerProcessNetPerMinute", e.PerProcessNetPerMinute);
+    bindInt(o, "PerProcessRegPerMinute", e.PerProcessRegPerMinute);
+    bindInt(o, "PerProcessFilePerMinute", e.PerProcessFilePerMinute);
+    bindInt(o, "PerProcessImagePerMinute", e.PerProcessImagePerMinute);
+    bindInt(o, "PerProcessThreadPerMinute", e.PerProcessThreadPerMinute);
+    bindInt(o, "RemoteThreadMinTargetAgeMs", e.RemoteThreadMinTargetAgeMs);
     bindBool(o, "SuspiciousOnly", e.SuspiciousOnly);
     bindStr(o, "SessionName", e.SessionName);
     bindInt(o, "RawChannelCapacity", e.RawChannelCapacity);
@@ -343,6 +361,8 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindStrList(o, "UiClientAllowedThumbprints", UiClientAllowedThumbprints);
     bindStrList(o, "UiClientAllowedPublishers", UiClientAllowedPublishers);
     bindBool(o, "OnlineCertRevocationCheck", OnlineCertRevocationCheck);
+    bindStrList(o, "AbusedSignerThumbprints", AbusedSignerThumbprints);
+    bindStrList(o, "AbusedSignerPublishers", AbusedSignerPublishers);
     bindInt(o, "EventDrainIntervalMs", EventDrainIntervalMs);
     bindInt(o, "InlineReputationBudgetMs", InlineReputationBudgetMs);
     bindStrList(o, "ProtectedPaths", ProtectedPaths);
@@ -356,6 +376,17 @@ bool BulwarkOptions::loadFromFile(const QString& appsettingsPath) {
     bindStrList(o, "BlockedRemoteEndpoints", BlockedRemoteEndpoints);
     bindStr(o, "ProxyUrl", ProxyUrl);
     bindStrList(o, "TrustedDirectories", TrustedDirectories);
+    bindBool(o, "UserModeExecBlockEnabled", UserModeExecBlockEnabled);
+    bindInt(o, "UserModeExecBlockMax", UserModeExecBlockMax);
+    bindInt(o, "UserModeContainmentMax", UserModeContainmentMax);
+    bindInt(o, "UserModeFreezeTtlMs", UserModeFreezeTtlMs);
+    bindBool(o, "UserModeFreezeOnDetect", UserModeFreezeOnDetect);
+    bindBool(o, "FileDenyExecuteEnabled", FileDenyExecuteEnabled);
+    bindBool(o, "RegistryInstantRollbackEnabled", RegistryInstantRollbackEnabled);
+    bindBool(o, "ApplyLsaRunAsPpl", ApplyLsaRunAsPpl);
+    bindBool(o, "ApplySelfServiceDacl", ApplySelfServiceDacl);
+    bindBool(o, "UserModeNetworkBlockEnabled", UserModeNetworkBlockEnabled);
+    bindInt(o, "UserModeNetworkBlockMax", UserModeNetworkBlockMax);
 
     // Nested sections (case-insensitive object lookup; absent -> empty -> keep defaults).
     const auto sub = [&](const char* key) -> QJsonObject {

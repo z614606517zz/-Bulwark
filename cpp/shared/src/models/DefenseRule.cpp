@@ -18,12 +18,45 @@ bool DefenseRule::matches(const SecurityEvent& e) const {
 
     if (type.has_value() && *type != e.type) return false;
 
-    if (requireUnsigned && e.actorSigned) return false;
+    //
+    // ---- requireUnsigned / requireSigned 到底判谁的签名(6b 的核心,改前请读完)----
+    //
+    // 对绝大多数事件类型,「主体」就是发起动作的那个程序,requireUnsigned 判它没有歧义。
+    // ImageLoad 是唯一的例外:驱动把【被加载的模块】放进 TargetPath,而 actorPath 经
+    // Worker::enrich 第 1 步按 PID 回填成【宿主进程】。于是一条写着 unsignedOnly() 的
+    // ImageLoad 规则,本意是「被加载的这个 DLL 没有可信签名」(白加黑的正面特征),
+    // 实际判的却是宿主签名 —— 语义整个反了:
+    //   · 签名宿主 + Temp 下未签名 DLL(典型白加黑)【不命中】 —— 真实漏检;
+    //   · 未签名宿主加载任意 DLL(未签名安装包加载自带插件)【命中】 —— 误报面。
+    // golden 里那两例 Ask→Allow 正是前者,所以当时的结论是「不能靠改语料掩盖」。
+    //
+    // 故用户态 ImageLoad(actorPid > 0)的 requireUnsigned / requireSigned 改判【模块自身】。
+    // 内核驱动加载(actorPid <= 0,actorPath 是伪串「内核(驱动加载)」)**保持主体语义**:
+    // 那条路上 actorSigned 恒假,具名 BYOVD 名单的 Ask 档依赖这一点(见 rules-fp-fix 第 6 节
+    // 批 3 的链路核实)。想按驱动自身签名分档的规则要显式写 targetUnsignedOnly() /
+    // targetSignedOnly() —— 段 7.4 的两组通用 .sys 规则就是这么做的。
+    //
+    const bool judgeModule = (e.type == EventType::ImageLoad && e.actorPid > 0);
+    // 「有可信签名」这一位。
+    const bool sigPresent = judgeModule ? e.targetSigned : e.actorSigned;
+    // 「签名不健康」这一位。主体侧能拿到完整证书画像(失配 / 吊销 / 证书过期后补签);
+    // 目标侧富化只求「可信签名」与「内嵌签名但校验不过」两件事,不建证书画像(那是主体
+    // 才付得起的成本),故这里只有 targetSignatureMismatch 可判。
+    const bool sigUnhealthy = judgeModule
+                                  ? e.targetSignatureMismatch
+                                  : (e.signatureMismatch || e.certRevoked ||
+                                     e.signedAfterCertExpiry);
+
+    if (requireUnsigned && sigPresent) return false;
     // requireSigned 要求的是【健康】签名,不只是「有签名」:被吊销的证书、签名失配、
     // 用过期证书补签的样本都算不上可信主体,否则「按厂商名放行」这条路又被盗证书打开了。
-    if (requireSigned && (!e.actorSigned || e.signatureMismatch || e.certRevoked ||
-                          e.signedAfterCertExpiry))
-        return false;
+    if (requireSigned && (!sigPresent || sigUnhealthy)) return false;
+
+    // 目标文件自身的签名(ImageLoad 的被加载模块)。与主体侧分开的理由见声明处。
+    // 这里没有 certRevoked / signedAfterCertExpiry 可判 —— 富化只对目标文件求「可信签名」与
+    // 「内嵌签名但校验不过」两件事,不建证书画像(那是主体才付得起的成本)。
+    if (requireTargetUnsigned && e.targetSigned) return false;
+    if (requireTargetSigned && (!e.targetSigned || e.targetSignatureMismatch)) return false;
 
     if (!actorHashes.isEmpty()) {
         if (e.actorHash.isEmpty()) return false;
@@ -71,6 +104,8 @@ int DefenseRule::specificityScore() const {
     if (type.has_value()) s += 1;
     if (requireUnsigned) s += 1;
     if (requireSigned) s += 1;
+    if (requireTargetUnsigned) s += 1;
+    if (requireTargetSigned) s += 1;
     if (!actorHashes.isEmpty()) s += 4; // 哈希精确匹配,最具体
     return s;
 }
@@ -157,6 +192,8 @@ QJsonObject DefenseRule::toJson() const {
     o["parentPattern"] = parentPattern;
     o["requireUnsigned"] = requireUnsigned;
     o["requireSigned"] = requireSigned;
+    o["requireTargetUnsigned"] = requireTargetUnsigned;
+    o["requireTargetSigned"] = requireTargetSigned;
     o["exemptTrustedOsComponent"] = exemptTrustedOsComponent;
     o["hardOverride"] = hardOverride;
     QJsonArray hashes;
@@ -185,6 +222,8 @@ DefenseRule DefenseRule::fromJson(const QJsonObject& o) {
     r.parentPattern = getStr(o, "parentPattern");
     r.requireUnsigned = getBool(o, "requireUnsigned");
     r.requireSigned = getBool(o, "requireSigned");
+    r.requireTargetUnsigned = getBool(o, "requireTargetUnsigned");
+    r.requireTargetSigned = getBool(o, "requireTargetSigned");
     r.exemptTrustedOsComponent = getBool(o, "exemptTrustedOsComponent");
     r.hardOverride = getBool(o, "hardOverride");
     r.actorHashes.clear();

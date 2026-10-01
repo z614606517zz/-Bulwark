@@ -522,6 +522,34 @@ BlwPolicyPersistThread(_In_ PVOID Context)
 }
 
 //
+// 记下「某份名单丢弃过死条目」。由各名单的 Add 入口在拒收时调用(见 BlwPatternHasDriveLetter)。
+// 只置位,不触发写回 —— 载入阶段写回线程还没起来。
+//
+void
+BlwMarkDeadEntryDrop(_In_ LONG DirtyBit)
+{
+    if (DirtyBit != 0) {
+        InterlockedOr(&g_Blw.PolicyDeadDropMask, DirtyBit);
+    }
+}
+
+//
+// 把丢弃过死条目的名单各写回一次,使磁盘基线自愈(死条目从注册表里消失、腾出槽位)。
+// 由 DriverEntry 在写回线程就绪【之后】调用一次。
+//
+void
+BlwPersistDeadEntryDrops(void)
+{
+    const LONG mask = InterlockedExchange(&g_Blw.PolicyDeadDropMask, 0);
+
+    if (mask == 0) {
+        return;
+    }
+    KdPrint(("[Bulwark] Policy: rewriting lists 0x%x to purge dead (drive-letter) entries.\n", mask));
+    BlwMarkPolicyDirty(mask);
+}
+
+//
 // 标脏并唤醒写回线程。命令处理路径唯一需要调用的持久化接口。
 // 线程未就绪(启动失败)时退化为同步写回,保证「已学习裁决」仍能落地。
 //

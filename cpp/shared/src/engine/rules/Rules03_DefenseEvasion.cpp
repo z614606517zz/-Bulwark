@@ -101,6 +101,28 @@ void addDefenseEvasionRules(QVector<DefenseRule>& out) {
         s.proc(Block, u("命令行删除安全软件服务 ") + u(svc) + u("(T1562.001)")).hard()
             .cmd(u("*delete*") + u(svc) + u("*"));
     }
+
+    // 银狐 2026:停用 Windows Update 链路,让系统再也拿不到 Defender 情报与补丁(来源见
+    // docs/yinhu-threat-intel-2026.md [1])。uhssvc 同时是某条链的看门狗宿主([7])。
+    //
+    // 【给 Ask 不给 Block】停 wuauserv 是真实存在的运维与个人操作(排障、按流量计费网络、
+    // 第三方更新管理器、大量「关闭自动更新」工具),Block + hard 会直接结束正常进程树。
+    // 判别性不在「停了更新服务」,而在「停更新服务 + 加 Defender 排除项 + 建计划任务」的组合,
+    // 那一层属于 AttackChainEngine。
+    //
+    // 四个名字都 >= 6 字符,满足本文件头「不收短名」的约束,不会撞普通英文子串。
+    static const char* kUpdateServices[] = {
+        "wuauserv", "usosvc", "uhssvc", "waasmedicsvc",
+    };
+    for (const char* svc : kUpdateServices) {
+        s.proc(Ask, u("命令行停止 Windows 更新服务 ") + u(svc) + u("(阻断补丁与安全情报,T1562.001)"))
+            .cmd(u("*stop*") + u(svc) + u("*"));
+        s.proc(Ask, u("命令行禁用 Windows 更新服务 ") + u(svc) + u(" 的启动类型(T1562.001)"))
+            .cmd(u("*config*") + u(svc) + u("*disabled*"));
+        s.proc(Ask, u("命令行删除 Windows 更新服务 ") + u(svc) + u("(T1562.001)"))
+            .cmd(u("*delete*") + u(svc) + u("*"));
+    }
+
     for (const QString& img : securityImageNames()) {
         // taskkill 一律按【完整映像名】匹配(攻击脚本写的就是 /IM msmpeng.exe),避免短名撞车。
         s.proc(Block, u("命令行强杀安全软件进程 ") + img + u("(taskkill,T1562.001)")).hard()

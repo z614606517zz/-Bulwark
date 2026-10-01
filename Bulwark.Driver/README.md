@@ -12,10 +12,21 @@
 - 用 **`PsSetCreateProcessNotifyRoutineEx`** 拦截每个进程创建。
 - **命令行硬拦(执行前拦截·按用法而非按身份)**:在同一个进程创建回调里直接读 `PS_CREATE_NOTIFY_INFO.CommandLine`,命中「命令行硬拦名单」即内核本地 `CreationStatus = STATUS_ACCESS_DENIED`,**危险命令一次都不会执行**。这一维专治 LOLBin 滥用 —— `vssadmin` / `wmic` / `bcdedit` / `wbadmin` / `fsutil` / `reg` 本体在 System32、签名可信,按任何「身份」判定都拦不住,威胁全在用法;而 `vssadmin delete shadows` 这类命令毫秒级就完成不可逆破坏,「事后 kill」根本来不及。判定刻意排在可信系统路径快速放行**之前**(目标全住在可信路径里),唯一护栏是「关键系统进程绝不拦」。
 - 用 **`IRP_MJ_CREATE`(FILE_DELETE_ON_CLOSE)** 与 **`IRP_MJ_SET_INFORMATION`(FileDispositionInformation / FileRenameInformation)** 预操作回调拦截**受保护文件**的删除与重命名。
+- **释放物可见面(观测,不拦截)**:遥测开启时,`IRP_MJ_CREATE` 额外上报「**落地区新建/覆盖出一个
+  可执行或脚本文件**」—— 两层门槛(落地区卷相对锚定前缀 + 24 种可执行/脚本扩展名)把事件量压到与
+  ETW 那条同量级,本产品自身进程豁免。这是驱动模式下「dropper 刚把 payload 写出来」的唯一触发点;
+  在此之前驱动只报 delete-on-close,新建文件完全不可见,而无驱动的 ETW 模式反倒有(`kFileCreateNew`)。
+  已知代价:pre-create 不知道创建最终是否成功,会有少量「其实没创建成」的上报(消掉它要新注册
+  post-create 回调,风险不划算)。
+- **`IRP_MJ_WRITE` 就地加密检测**:只看「偏移 0 起写」,按 **PID 散列到 64 个槽**各自取模采样
+  (`BLW_WRITE_SAMPLE_RATE`),每个槽的第一次首块写必报;同一文件被反复从头覆写不重复计入。
+  原实现是**一个全局计数器**,全系统共享 1/32 预算 —— 任何写得密的正常进程(编译器、浏览器缓存、
+  数据库刷盘)都会把它吃掉,而用户态勒索聚合恰恰是按**发起进程**算改写速率的,于是噪声越大越拦不住
+  勒索。分槽后这条检出损失没了,且仍然全程无锁。
 - 用 **`CmRegisterCallbackEx`** 拦截对**受保护注册表键**的八类危险操作:写值(`RegNtPreSetValueKey`,如启动项)、删值(`RegNtPreDeleteValueKey`)、删键(`RegNtPreDeleteKey`)、**改名**(`RegNtPreRenameKey` —— 改个名字就能让所有路径型匹配整体失效)、**hive 导出**(`RegNtPreSaveKey` —— `reg save HKLM\SAM` 绕开 lsass 偷凭据)、**hive 挂载**(`RegNtPreLoadKey`)、**改 ACL**(`RegNtPreSetKeySecurity` —— 先放开权限,后续写入即「合法」)、**建键**(`RegNtPreCreateKeyEx` —— IFEO 劫持要先新建子键)。
 - **内置凭据 hive 硬拦(零配置、恒生效)**:对 `\REGISTRY\MACHINE\SAM` 与 `\REGISTRY\MACHINE\SECURITY` 之下的 `SaveKey` 一律内核本地拒绝,不依赖用户态下发任何名单。刻意不放进通用注册表硬拦名单 —— 那会连带拦下对 SAM 的写值,而创建用户 / 改密码正是 lsass 走写值完成的。
 - 用 **`ObRegisterCallbacks`** 实现**自我保护**:其他进程试图以危险权限(结束/写内存/远程线程/挂起)打开本软件的受保护进程时,**剥离这些权限**,使攻击失效。
-- 用 **WFP(Windows Filtering Platform)** 在 `FWPM_LAYER_ALE_AUTH_CONNECT_V4` 层注册 callout + filter,**阻断命中黑名单的外发连接**。
+- 用 **WFP(Windows Filtering Platform)** 在 `FWPM_LAYER_ALE_AUTH_CONNECT_V4` 与 `..._V6` 两层各注册一个 callout + filter,**阻断命中黑名单的外发连接**(IPv4 黑名单按 IP/端口精确匹配;两层都拦「已封禁主体」的任何外联 —— 此前恶意进程改走 IPv6 即完全不受阻)。层表在 `NetMonitor.c` 的 `kBlwWfpLayers`,加层只需加一行。
 - **处置模型(稳定性优先)**:进程创建走 **fire-and-forget 遥测**——`FltSendMessage` 用 0 超时、绝不阻塞在用户态裁决上(由后台发送线程 + 预分配环形缓冲统一发送,队列满即丢弃遥测);内核对系统目录 / 关键进程走白名单零延迟放行;裁决为 `Block` 时由用户态即时 `TerminateProcess` 结束该进程树(启动后补偿),**不在内核挂起进程创建**。
 - 文件 / 注册表 / **命令行**硬拦名单与禁止加载、禁止执行名单命中即**内核本地直接返回 `STATUS_ACCESS_DENIED`**(不发 IPC、不等用户态);自我保护 / 反注入 / 网络拦截运行在高 IRQL **不阻塞**,直接剥离危险权限 / `FWP_ACTION_BLOCK` + 异步记录。
 - 连接时先做**协议握手**(校验版本号 + 各结构体大小),不一致则用户态一律降级、绝不拦截。
@@ -69,6 +80,11 @@ VSSADMIN+DELETE+SHADOWS
 > 新增自定义模式时请记住这一点:能在内核按对象判定的,就不要只依赖命令行模式。
 
 源文件:
+- `MatchCore.h` / `MatchCore.c` — **名单匹配核心**。全部是纯函数(不碰 `g_Blw`、不取锁、不依赖 IRQL),
+  因此【可以在用户态原样编译】并由 `cpp/tests/DriverMatchTest.c` 跑单元测试(ctest 的
+  `driver_match_unit`)。驱动不能在开发机上加载,这是目前唯一能对内核判定做出证伪的手段 ——
+  往里加判定时必须同时补断言。内含:大小写不敏感子串扫描、卷前缀剥离与锚定前缀、名单增删
+  (含去重 / 满槽丢弃 / 精确删除)、带盘符死条目判据、命令行 token 合取匹配。
 - `Driver.c` — DriverEntry / 卸载 / Minifilter 注册(I/O 回调 + 实例附加)+ 网络设备对象
 - `ProcessMonitor.c` — 进程创建回调与拦截 + 命令行硬拦(token 合取匹配 + 名单管理)+ 驱动级结束进程
 - `FileMonitor.c` — 文件删除/重命名拦截 + 受保护项通用匹配
@@ -151,10 +167,61 @@ ProcessMonitor 组装事件 ──FltSendMessage(遥测,0 超时,不等待)─�
 - 已实现全部六个里程碑:进程创建拦截(M2)、文件删除/重命名拦截(M3)、注册表拦截(M4)、自我保护(M5)、网络外联黑名单拦截(M6)。
 - 自我保护默认保护**服务进程自身**;UI 连接服务时会上报其 PID,服务再下发内核一并保护。
 - 自保用 `ObRegisterCallbacks`,**驱动必须带 `/INTEGRITYCHECK` 链接**(已配置)且镜像须有有效签名,否则注册返回 `STATUS_ACCESS_DENIED`。
-- 网络防护当前为 IPv4 + 黑名单(精确 IP/端口);可扩展为域名解析黑名单、IPv6(ALE_AUTH_CONNECT_V6)、入站(`ALE_AUTH_RECV_ACCEPT`)、监听端口(`ALE_RESOURCE_ASSIGNMENT`,防后门 bind)、按进程放行等。
-- 文件/注册表防护用"子串匹配"判断受保护项,简单但够用;后续可换成更精确的前缀/规范化匹配(现状:`D:\Program Files\` 也会命中可信目录判定)。
+- 网络防护已覆盖**出站 IPv4 + 出站 IPv6** 两层(表驱动,见 `kBlwWfpLayers`)。仍缺:
+  **IPv6 黑名单**(`BLW_BLOCK_IP` 是 32 位 IPv4,装不下 128 位地址 —— V6 层当前只拦「已封禁主体」,
+  不做地址匹配)、**入站**(`ALE_AUTH_RECV_ACCEPT_V4/V6`)、**监听端口**(`ALE_RESOURCE_ASSIGNMENT_V4/V6`,
+  防后门 bind)、**按进程放行**(`FWPM_CONDITION_ALE_APP_ID`)、域名解析黑名单。
+  这些都是「往层表里加行 + 补条目结构/命令」,拉起 / 回滚 / 卸载三条路径已经是循环,不必再动结构。
+- **名单匹配分两种语义,不要混用**(实现与判据见 `MatchCore.c` 的 `BLW_MATCH_MODE`):
+  - 「保护」类名单(`ProtectedPaths` / `FileHardBlock` / `SelfGuard` / 两份注册表名单)保持**子串匹配** ——
+    它们里面本来就有 `\START MENU\PROGRAMS\STARTUP\` 这类出现在路径**中段**的目录片段。
+  - 「拒绝」类名单(`FileNoLoad` / `FileExecBlock`)用**锚定匹配**:必须「从目录边界起、到串尾
+    (或数据流分隔符 `:`)止」。误判的代价是「某个程序永久起不来」,判据必须更紧。这条收紧掉的是
+    `\USERS\U\TEMP\A.EXE` 连带拦下 `a.exe.bak`、`a.exe\sub\x.dll` 这类误伤,同时保住两种真实用法:
+    用户态下发的去盘符完整路径,以及 `set-baseline-policy.ps1` 文档里的文件名片段写法(`\evil.exe`)。
+    刻意**不用**「卷相对锚定前缀」—— 那会直接废掉文件名片段写法,也会在卷前缀认不出来时
+    (`\Device\Mup\` 网络路径、影子卷)整条失效。
+- **带盘符的名单条目在入口被拒收**(`BlwPatternHasDriveLetter`)。匹配目标恒为
+  `FLT_FILE_NAME_NORMALIZED` 规范名(`\Device\HarddiskVolumeN\…`),其中不可能出现 `<字母>:\`,
+  所以 `C:\…` 这种条目永远不会命中,却各占 64 槽之一并被内核写回注册表跨重启续留 —— 槽位耗尽后
+  **此后所有新裁决都被静默丢弃**。开机载入时丢弃过死条目的名单会在写回线程就绪后各重写一次,
+  磁盘基线自愈(`BlwPersistDeadEntryDrops`)。`CmdHardBlock` / `RegHardBlock` **刻意不套**这条判据:
+  命令行里出现 `C:\` 完全正常,注册表值名也允许含 `:`。
 - **刻意未处理 `RegNtPreLoadKeyEx`**:`REG_LOAD_KEY_INFORMATION_V2` 首成员是 `Size` 而非 `Object`,与 V1 布局不同。合并处理会把一个 `ULONG` 当指针交给 `CmCallbackGetKeyObjectIDEx`,直接蓝屏。宁可少覆盖一条通知,也不引入这种解引用风险。已覆盖 `RegNtPreLoadKey`(V1)。
-- 命令行硬拦命中时**内核直接拒绝、不弹窗**,故名单必须只收「几乎不存在良性用法」的破坏性动作;命中后仍上报 `BlwEventCommandBlocked` 供 UI 如实展示拦了什么。发起方(父进程)本身**不会**被自动结束 —— 事件标记 `kernelBlocked`,按现有语义不再补杀。若要对「刚试过删卷影的进程」直接封禁,需另接 `BLW_CMD_ADD_BANNED`,不在当前实现内。
-- `ImageMonitor.c` / `ThreadMonitor.c` 仍是**通知型**(内核 API 本身不支持阻止),映像加载的实际阻断依赖 `FileNoLoad` 名单在 `IRP_MJ_CREATE` 上拦执行映射;BYOVD 尚无专门的驱动服务注册拦截。
+- 命令行硬拦命中时**内核直接拒绝、不弹窗**,故名单必须只收「几乎不存在良性用法」的破坏性动作;命中后仍上报 `BlwEventCommandBlocked` 供 UI 如实展示拦了什么。**发起方(父进程)本身不会被自动封禁或结束** —— 事件标记 `kernelBlocked`,按现有语义不再补杀。
+  要对「刚试过删卷影的进程」直接封禁,内核这侧**不需要新机制**:事件的 `ParentPid` 字段里就是父 PID,
+  用户态据此发一条 `BLW_CMD_ADD_BANNED` 即可,缺的是用户态那一侧的联动。
+  **刻意不在内核本地自动封禁**:发起方通常就是管理员自己在用的 cmd.exe / powershell.exe,封禁后它的
+  文件写 / 注册表写 / 外联 / 建子进程全被拒,一条正常运维脚本里混进一句 `vssadmin delete shadows`
+  就会让整个会话瘫掉,而 `BannedPids` 只在进程退出时解除、没有别的撤销口。
+- `ImageMonitor.c` / `ThreadMonitor.c` 仍是**通知型**(内核 API 本身不支持阻止),用户态模块加载的实际阻断依赖 `FileNoLoad` 名单在 `IRP_MJ_CREATE` 上拦执行映射。
+- **BYOVD 目前只有检测,没有阻断。** `FileNoLoad` 对 `.sys` **恒不生效**:驱动映像由内核自己
+  (`MmLoadSystemImage`)打开,`Data->RequestorMode == KernelMode`,而 `BlwPreCreate` 第一句就对内核态
+  I/O 放行 —— 那条判定压根不会执行。用户态那侧也已按此改为「内核驱动加载不下发 FileNoLoad」
+  (`Worker.cpp` 的 `enforceBlock`),否则只会白占槽位。
+  现在补上的是**加载之前的观测点**:`RegNtPreSetValueKey` 上对
+  `\REGISTRY\MACHINE\SYSTEM\ControlSetNNN\Services\<名字>\ImagePath` 的写入做 fire-and-forget 上报
+  (`BlwRegIsServiceKey`)。要让 `ZwLoadDriver` 能加载一个驱动,必须先写出这个值,所以这是 BYOVD 的
+  必经前置步骤。**只上报、不拦截**是刻意的:合法的驱动安装(杀软、虚拟化、外设)走同一条路,
+  在内核按路径判「该不该注册驱动」必然误伤 —— klids.sys 那次误报就是这么来的。定性归用户态。
+  真要做到内核阻断,得给 `BlwPreCreate` 的内核态放行开一个「仅 FileNoLoad + 仅执行映射意图」的
+  窄口子,那会触碰「内核态 I/O 一律放行」这条既有铁律,**尚未做**。
 - 正式发布需 EV 证书 + 微软 WHQL/附件签名,测试证书仅供本地验证。
-- 驱动目前**没有任何自动化测试**。名单匹配那几个纯函数(`BlwWideContainsCI` / `BlwImageNameIn` / `BlwCmdPatternMatches`)最容易出错也最容易测,抽成可在用户态编译的独立文件跑 host 单测是成本最低的下一步。
+- **自动化测试:名单匹配已有 host 单测,其余仍无。** `MatchCore.c` 里的纯函数由
+  `cpp/tests/DriverMatchTest.c` 覆盖(ctest 第 4 条 `driver_match_unit`,88 条断言,含两起历史事故的
+  回归哨兵)。仍然没有覆盖的是**需要内核环境的部分**:回调本身、锁与 IRQL 语义、WFP 拉起/拆除、
+  策略写回。那些只能在带快照的测试 VM 里验收。
+- **事件路径字段定长 `WCHAR [520]` 会截断。** 改长度会动 `BLW_EVENT_MESSAGE` 布局 → 必须
+  `BLW_PROTOCOL_VERSION` +1 且双端同步,而升版本会让已部署的 v9 驱动/服务因版本不符而**整体降级为
+  不拦截** —— 那比「超长路径被截断」严重得多。NTFS 单个路径组件上限 255 字符,520 足够装绝大多数
+  真实路径。留待下一次确实需要改布局时和别的改动一起做。
+  注意:**命令行硬拦刻意吃原始串、不截断**(见 `BlwCmdPatternMatches`),别顺手给它加截断 ——
+  在前面填充垫料把危险 token 推出截断范围是可直接利用的绕过。
+- **名单已有「删除单条」(`BLW_CMD_DEL_*`),但仍无「自动过期」。** 精确删除让撤销成为一次标脏事件,
+  修掉了旧撤销路径(用户态 `CLEAR` + 重下发保留项)的一个跨重启漏洞:保留项为空时一次 `ADD` 都不
+  发生 → 不标脏 → 磁盘基线保持旧内容 → 重启后被删条目复活。到期自动失效仍归用户态规则
+  (`DefenseRule::expiresUtc`),内核名单没有时间维度,**不确定的处置仍然绝不该进内核持久名单**。
+- **运行期可以往内核喂已知恶意哈希了**(`BLW_CMD_ADD_KNOWNBAD`)。内核本来就有一套可用的 SHA-256
+  查杀引擎(`HashScan.c`),此前只能从注册表在加载时载入,用户态确认恶意的哈希喂不进去。
+  运行期下发的**刻意不持久化**:内核哈希集同样没有「删除单条」,写进跨重启基线,一次误判就是
+  「那个文件永久起不来且加白无效」。离线情报仍走 `cpp\scripts\set-baseline-policy.ps1`。

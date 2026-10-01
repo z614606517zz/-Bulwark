@@ -77,11 +77,11 @@ BlwFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     BlwUnregisterObCallbacks();
 
     //
-    // 设备对象只有在 callout 确实注销掉之后才能删 —— callout 是依附在它上面注册的。
-    // WfpCalloutId != 0 表示注销没成功(只可能出现在上面的强制卸载分支),此时宁可
-    // 泄漏一个设备对象,也绝不删掉 WFP 还在引用的对象。
+    // 设备对象只有在【所有层的】callout 都确实注销掉之后才能删 —— callout 是依附在它上面
+    // 注册的。BlwWfpHasCallouts() 为真表示还有层没注销成功(只可能出现在上面的强制卸载分支),
+    // 此时宁可泄漏一个设备对象,也绝不删掉 WFP 还在引用的对象。
     //
-    if (g_Blw.WfpDeviceObject != NULL && g_Blw.WfpCalloutId == 0) {
+    if (g_Blw.WfpDeviceObject != NULL && !BlwWfpHasCallouts()) {
         IoDeleteDevice(g_Blw.WfpDeviceObject);
         g_Blw.WfpDeviceObject = NULL;
     }
@@ -316,11 +316,11 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
                 //
                 // 但设备对象只有在 callout 确实没有残留注册时才能删 —— callout 依附于它。
                 // BlwWfpStart 的回滚分支在"注销不掉 callout"的极端情况下会保留
-                // WfpCalloutId != 0,此时保留设备对象(泄漏一个对象)远好于删掉
+                // 对应层的 WfpCalloutIds[i] != 0,此时保留设备对象(泄漏一个对象)远好于删掉
                 // WFP 仍在引用的对象;卸载路径也会因此拒绝卸载,不会留下悬空指针。
                 //
                 KdPrint(("[Bulwark] BlwWfpStart failed 0x%x (网络防护不可用)\n", netStatus));
-                if (g_Blw.WfpCalloutId == 0 && g_Blw.WfpBfeSubscription == NULL) {
+                if (!BlwWfpHasCallouts() && g_Blw.WfpBfeSubscription == NULL) {
                     IoDeleteDevice(devObj);
                     g_Blw.WfpDeviceObject = NULL;
                 }
@@ -353,6 +353,11 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         KdPrint(("[Bulwark] BlwStartPolicyPersist failed 0x%x (改为同步写回,功能不受影响)\n", status));
         // 不回滚
     }
+
+    // 8.6) 若第 8 步载入时丢弃过「带盘符的死条目」,在此把受影响的名单各写回一次,让磁盘基线自愈。
+    //      必须排在 8.5 之后:这样写回走去抖线程,而不是在 DriverEntry 里同步写注册表。
+    //      详见 BLW_GLOBALS::PolicyDeadDropMask 处的说明。
+    BlwPersistDeadEntryDrops();
 
     KdPrint(("[Bulwark] Loaded successfully\n"));
     return STATUS_SUCCESS;

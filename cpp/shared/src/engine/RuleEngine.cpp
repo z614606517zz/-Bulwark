@@ -268,6 +268,41 @@ int RuleEngine::rulePriority(VerdictAction a) {
     }
 }
 
+//
+// 步骤 6 的「开发工具自动放行」这条降级,允许作用在哪些事件类型上。
+//
+// 【它为什么需要一道类型闸】DefaultRules::isDevTool 是【纯文件名】匹配(devToolProcessNames
+// 里有 setup.exe / installer.exe / python.exe / node.exe / pip.exe / agent.exe / runner.exe),
+// 所以它给出的那点信任只配用在「正常开发与安装确实会做这件事」的维度上。而注入与结束进程不属于
+// 这一类:构建工具、包管理器、IDE 在正常工作里不会往第三方进程创建远程线程,也不会去结束别人
+// 的进程。在那两个维度上拿文件名当信任依据,等于把整个 Ask 档的门钥匙挂在门外。
+//
+// 【实测的后果】bulwark_snapshot 重放:未签名程序位于 %APPDATA%\Microsoft\Update\setup.exe
+//(银狐的真实落地目录)、向 chrome.exe 创建远程线程 —— riskScore 100、带硬指标,最终裁决却是
+// Allow 且 matchedRuleNote 为空。也就是说改个文件名就能让这一档静默失效。RuleDsl.h 的硬约束 3
+// 与 EtwProcessEventSource.cpp 的 isOsThreadInjector 注释都把这件事记成「同类教训」,
+// 但真正的降级点一直没收 —— 这里补上。
+//
+// 【为什么收这两个类型的代价是零,不是「权衡」】把全部内置规则过一遍:RemoteThread 与
+// ProcessTerminate 维度上一共只有两条 Ask 规则(Rules07 §7.2 的 kHostish 与 kSensitiveApp),
+// 其余同维度规则全是 Block、本就不受本降级影响。而那两条都带 unsignedOnly() —— 主体必须
+// 【未签名】才可能命中。真实的开发工具与安装器都是签名的,压根匹配不上。所以这道收紧不会让
+// 任何一个真开发工具多弹一次窗,只会让「改了名的未签名样本」拿不到豁免。
+//
+// 【其余维度刻意保持原状】ProcessCreate / FileWrite / RegistryWrite / ImageLoad / 网络那几个
+// 维度上,「安装器确实会这么干」是真实存在的(Rules07 §7.3 对 Inno Setup / NSIS 把 %TEMP%
+// 侧载降级为 Ask 的那段说明就是例子),在那里取消豁免会换来一批真误报。
+//
+// 【已知残留,不在本次收敛范围】isDevTool 的另一半是 devToolPathPatterns 的路径子串分支,
+// 其中 \venv\ \.venv\ \env\ \.env\ \packages\ \node_modules\ 是攻击者可自行创建的目录名,
+// 所以在上面那些【仍然豁免】的维度上,「造一个 venv 目录」依旧能拿到降级。要收那一侧必须
+// 面对「venv 里的 pip.exe 等 console-script 垫片是本地生成、天然无签名」这个真实约束,
+// 属于单独一轮。详见 docs/yinhu-threat-intel-2026.md §5.2 缺口 8。
+//
+static bool devToolExemptionApplies(EventType t) {
+    return t != EventType::RemoteThread && t != EventType::ProcessTerminate;
+}
+
 // ---------------------- 规则索引维护(见头文件里的等价性说明)----------------------
 
 void RuleEngine::rebuildIndexLocked() {
@@ -343,6 +378,10 @@ bool RuleEngine::isUnsafeAllowRule(const DefenseRule& r, QString* whyOut) {
     if (r.action != VerdictAction::Allow) return false;
     if (r.requireUnsigned && r.requireSigned) {
         if (whyOut) *whyOut = u("同时要求已签名与未签名,永不命中(配置矛盾)");
+        return true;
+    }
+    if (r.requireTargetUnsigned && r.requireTargetSigned) {
+        if (whyOut) *whyOut = u("同时要求目标文件已签名与未签名,永不命中(配置矛盾)");
         return true;
     }
     // 哈希精确匹配已经把主体钉死到具体文件内容,不受改名影响,无需再限定位置或签名。
@@ -494,7 +533,7 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
         return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::TrustedSigner);
     }
     if (const std::optional<QString> trustNote = matchedUserTrust(e)) {
-        e.userTrusted = true; // 通知 Worker 跳过全部后台扫描(VT/IP/AI)
+        e.userTrusted = true; // 通知 Worker 跳过全部后台扫描(VT/IP)
         e.addEvidence(QStringLiteral("RuleEngine"), EvidenceKind::Trust,
                       u("用户信任放行,已跳过全部检测:") + *trustNote, 0, false);
         return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::Rule);
@@ -588,10 +627,32 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
                         return Verdict::forEvent(e, VerdictAction::Block, VerdictSource::Heuristic);
                 }
             } else {
-                if (!trustedActor) {
-                    e.hasThreatIndicator = true;
-                    if (rm.score >= ThreatDetector::Suspicious)
-                        return Verdict::forEvent(e, VerdictAction::Ask, VerdictSource::Heuristic);
+                //
+                // rm.hardSignal == false 这一支里只剩两个纯【数量】判据:「N 秒内批量改写 M 个
+                // 文件」与「扩展名同化」。两者都说不出任何一件恶意的事,它们唯一的区分力来自
+                // 「谁在做」—— 而原实现拿来做这个区分的恰恰是另一个软信号:主体没有可信签名。
+                //
+                // 用软信号给软信号升格,是本项目明令禁止的那种推理(与 DGA / 外联速率两处已经
+                // 修掉的 `!e.actorSigned` 互证完全同类),而且它在真实系统上必然误报:安装器、
+                // 解压器、编译器、同步工具天生就是短时间写一大片文件,其中绝大多数不签名。
+                //
+                // 实测代价:
+                //   · %TEMP%\is-NTWO3EF9ID.tmp\innosetup-6.7.3.tmp(winget 装的官方 Inno Setup)
+                //     一次写 116 个文件 -> 70 分 + 这里置的硬指标 -> 静默模式升级为 Block ->
+                //     结束进程树,安装包装不上;
+                //   · 卡巴斯基 avp.exe 的隔离区维护(76 个 .klq)-> 7434 次询问;
+                //   · Microsoft 的 WidgetService.exe(AppX,目录签名验不出来)-> 12 个文件即被拦。
+                //
+                // 现在:分数照加、证据照记,但【不置硬指标、不提前返回】。它变成一个需要互证的
+                // 软信号,交给流水线后面的规则与第 10 步处理。
+                //
+                // 检出不丢 —— 勒索的三条真判据都在上面那一支(rm.hardSignal):已知勒索扩展名
+                // (×3)、勒索说明文件、以及蜜罐诱饵(canaryHit,在本函数更前面无条件 Block,
+                // 连签名抑制都不受)。「大量改写」从来只是它们的陪衬,不是定性依据。
+                if (!trustedActor && e.hasThreatIndicator) {
+                    e.addEvidence(QStringLiteral("RansomwareBehaviorMonitor"),
+                        EvidenceKind::Corroboration,
+                        u("批量改写文件与其它恶意指标互证(单独的改写数量不定性)"), 0, false);
                 }
             }
         }
@@ -745,7 +806,10 @@ Verdict RuleEngine::evaluateInternal(SecurityEvent& e) {
                     return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::TrustedSigner);
                 }
             }
-            if (hit.action == VerdictAction::Ask && DefaultRules::isDevTool(e.actorPath)) {
+            // 注入 / 结束进程这两个维度【不】适用「开发工具自动放行」—— 理由与实测证据见
+            // devToolExemptionApplies 的说明。那里也写了为什么这道闸的误报代价是零。
+            if (hit.action == VerdictAction::Ask && devToolExemptionApplies(e.type)
+                && DefaultRules::isDevTool(e.actorPath)) {
                 e.addEvidence(QStringLiteral("RuleEngine"), EvidenceKind::Trust, u("开发工具自动放行(白名单)"));
                 return Verdict::forEvent(e, VerdictAction::Allow, VerdictSource::TrustedSigner);
             }

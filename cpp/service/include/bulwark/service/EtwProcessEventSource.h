@@ -12,7 +12,18 @@ namespace bulwark::service {
 // 基于 krabsetw(微软官方 ETW C++ 封装,MIT 许可,header-only)的实时事件源,
 // 取代原 .NET 的 WMI(Win32_ProcessStartTrace)方案。单个 user_trace 会话上挂载
 // 多个提供程序(回调都在同一消费线程上串行触发):
-//   - Microsoft-Windows-Kernel-Process:进程创建(核心源,始终开启);
+//   - Microsoft-Windows-Kernel-Process:三维共用一个 provider(同一会话对同一 GUID 只能
+//     enable 一次,keyword 必须合并下发,否则后一次覆盖前一次):
+//       · 事件 1 ProcessStart(keyword 0x10)-> ProcessCreate(核心,始终开启);
+//       · 事件 5 ImageLoad(keyword 0x40)-> ImageLoad,字段 ImageName/ProcessID。补的是
+//         【无内核驱动时这一维完全不存在】的盲区:EventType::ImageLoad 原先只有
+//         DriverEventSource 产出,于是 EventSource=Wmi / 驱动掉线时,requireTargetSigned 系
+//         规则、InjectionAnalyzer::analyzeImageLoad、RemoteControlAnalyzer 的模块分支、
+//         KillChainAnalyzer 的 .sys 判定全部空转。过滤在回调内完成(见 isSuspectModulePath);
+//       · 事件 3 ThreadStart(keyword 0x20)-> RemoteThread,仅保留跨进程的那些。判据是
+//         【事件头 ProcessId(发起方)!= 负载 ProcessID(线程归属)】,已实机验证。误报护栏
+//         见 Impl::isLikelyInitialThread —— 子进程的初始线程同样由创建方建立,不排掉它
+//         每一次正常进程创建都会被报成注入。
 //   - Microsoft-Windows-Kernel-Network:出站 TCP 连接(事件 12 = ConnectionAttempted)
 //     -> NetworkConnect 事件,target="ip:port",供网络类规则/情报 IP 规则/外联速率/信标使用;
 //   - Microsoft-Windows-DNS-Client:域名查询(事件 3006,字段 QueryName)-> DnsQuery 事件,
@@ -47,6 +58,20 @@ public:
     // 注册表/文件监视集(受保护键/路径 + 硬拦列表,子串大小写不敏感匹配)。只有命中监视集的
     // 写/删才会上报,避免全量事件洪泛。须在 start() 之前调用(回调在消费线程读取,启动前设置无竞争)。
     void setWatchLists(const QStringList& registryKeys, const QStringList& filePaths);
+
+    //
+    // 登记一条「要知道是谁改写了它」的路径(当前唯一来源:勒索诱饵)。
+    //
+    // 与 setWatchLists 不同,本接口【允许在 start() 之后调用】—— 诱饵是
+    // UserModeBehaviorSource::start() 里才投放的,那时 ETW 会话已经在跑;内部用互斥量保护。
+    //
+    // 只有 Etw.KernelFileWriteAttribution 打开时才有效果(该开关默认关,因为它要额外订阅
+    // Kernel-File 的 CREATE + WRITE,实测把本提供程序的回调频率从约 12/s 抬到约 3000/s)。
+    // 用 writeAttributionEnabled() 可以问出当前到底开没开 —— 调用方据此决定要不要如实告诉
+    // 用户「诱饵命中只能告警、结束不了进程」。
+    //
+    void addAttributionPath(const QString& path);
+    bool writeAttributionEnabled() const;
 
     // 出队间隔(毫秒)。与内核源的 Bulwark:EventDrainIntervalMs 同一个旋钮 —— 两个源都会
     // 把事件先攒在队列里再按节拍搬到主线程,所以延迟地板必须一起调,只调一个等于没调。

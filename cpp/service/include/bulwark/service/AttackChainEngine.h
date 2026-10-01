@@ -172,7 +172,10 @@ struct CoverageProfile {
     QStringList fileWatch;             // ETW 新建文件监视集(ProtectedPaths + FileHardBlocks)
     bool etwFileEvents = true;         // ETW Kernel-File 是否启用(不采样的新建文件来源)
     bool etwDns = true;                // ETW DNS-Client 是否启用(DnsQuery 的唯一来源)
-    bool moduleSignature = false;      // ImageLoad 事件是否带「被加载模块签名」维度
+    // ImageLoad 事件是否带「被加载模块签名」维度(6b 起为真:SecurityEvent::targetSigned /
+    // targetSignatureMismatch + Worker::enrich 第 3.9 步富化)。
+    // ⚠ 目前【无任何判定消费点】—— classifyMarker 不读它。改动前先看 fromOptions 里的长注释。
+    bool moduleSignature = true;
     // 命令行是否【随事件一起到达】。驱动在进程创建回调里把 CreateInfo->CommandLine 放进
     // TargetPath 一并上报,故 Driver 源为真;纯用户态观测源不带命令行,只能按 PID 读 PEB,
     // 与毫秒级退出的 LOLBin 赛跑,依赖命令行的标记因此只能算「稀疏」。

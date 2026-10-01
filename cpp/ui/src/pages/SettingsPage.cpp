@@ -5,6 +5,7 @@
 //
 // 在收到服务的第一份设置之前(以及断开连接之后),全部控件禁用:此刻显示的不是真实状态,
 // 让用户去拨一个不知道真假的开关,等于让他改一份他看不见的配置。
+// 唯一的例外是「语音播报拦截结果」:它只存在本机当前用户、不经服务,状态随时是真的(见该处说明)。
 //
 // 两个开关关闭前先确认:实时防护(关掉后系统不受保护)与自我保护(关掉后防护组件可被结束)。
 // 它们始终可以由用户关闭 —— 这是用户可控的安全工具,只是关之前要让人看清后果。
@@ -26,6 +27,7 @@
 #include "design/Theme.h"
 #include "design/ToggleSwitch.h"
 #include "ipc/IpcClient.h"
+#include "voice/VoiceAnnouncer.h"
 #include "Nav.h"
 
 #include <QButtonGroup>
@@ -222,8 +224,17 @@ QWidget* pages::settings(IpcClient* ipc)
     // 1 防护总控
     QVBoxLayout* s = addSection(QStringLiteral("protection"), QStringLiteral("shield"), u("防护总控"), QString());
     ToggleSwitch* protection = toggle(true, &RuntimeSettings::protectionEnabled);
-    settingRow(s, u("实时防护"), u("监控并拦截敏感系统行为。关闭后系统不受本软件保护(界面关闭不等于防护关闭)。"),
+    settingRow(s, u("实时防护"), u("监控并拦截敏感系统行为。关闭后系统不受本软件保护。"),
                protection, true);
+    // 紧跟实时防护之后:它改变的是「实时防护什么时候算开着」,离得远了读不出这层关系。
+    // 说明里必须同时写清它做到什么、以及代价 —— 这一项会把「结束界面进程」变成关闭整套防护的手段,
+    // 只写前半句就是在推荐一个用户不知道后果的设置。
+    ToggleSwitch* followsUi = toggle(false, &RuntimeSettings::protectionFollowsUi);
+    settingRow(s, u("退出界面即停止防护"),
+               u("开启后防护只在本程序运行时生效:退出界面即停止事件监控与处置,并卸载内核驱动;"
+                 "再打开界面即恢复。最小化到托盘算运行中。"
+                 "代价是界面没在跑的时段(开机到登录、注销后、界面被结束后)主机不受本软件保护"),
+               followsUi);
     settingRow(s, u("默认拦截未知行为"), u("灰区行为无匹配规则时默认拦截(更严格)"),
                toggle(false, &RuntimeSettings::defaultBlock));
     settingRow(s, u("静默模式"), u("不弹窗打扰,询问类自动放行,仅拦确定性高危"), toggle(false, &RuntimeSettings::silentMode));
@@ -233,6 +244,44 @@ QWidget* pages::settings(IpcClient* ipc)
                u("右下角提示并自动消失,不受静默模式影响 —— 静默会把询问降级为放行,这条通知补的正是那种"
                  "「命中了却无声」的情况"),
                toggle(true, &RuntimeSettings::attackChainToast));
+    // 语音播报。纯界面行为,只存在当前 Windows 用户的 QSettings 里(服务端不参与),所以它【不进】
+    // st->toggles / st->controls:「服务回推前一律禁用」是为了不让人改一份看不见的配置,而这一项的
+    // 真实状态就在本机、此刻可见 —— 没连上后台服务时照样能改。
+    {
+        VoiceAnnouncer* voice = VoiceAnnouncer::instance();
+        auto* voiceSw = new ToggleSwitch(voice->isEnabled());
+        voiceSw->setAccessibleName(u("语音播报拦截结果"));
+        settingRow(s, u("语音播报拦截结果"),
+                   u("拦截通知弹出时念出处置结果(已拦截 / 未能拦截),询问、放行等其它通知不播报。"
+                     "不受静默模式影响,只对当前 Windows 用户生效"),
+                   voiceSw);
+        // 开着却念不出来的时候必须说出来:一个拨了没反应的开关,是最难排查的一类「设置不生效」。
+        auto* voiceNote = ui::label(QString(), "secondary");
+        voiceNote->setWordWrap(true);
+        voiceNote->setStyleSheet(QStringLiteral("color:%1;").arg(theme::warning().name()));
+        voiceNote->hide();
+        s->addWidget(voiceNote);
+        const auto syncVoice = [voice, voiceNote] {
+            QString text;
+            switch (voice->status()) {
+            case VoiceAnnouncer::Status::NoChineseVoice:
+                text = u("本机没有中文语音,播报可能没有声音或念不出中文。可在 Windows「设置 > 时间和语言 > 语音」"
+                         "中添加中文(简体)语音。");
+                break;
+            case VoiceAnnouncer::Status::Unavailable:
+                text = u("Windows 语音服务(SAPI)无法初始化,暂时无法播报。");
+                break;
+            case VoiceAnnouncer::Status::Idle:
+            case VoiceAnnouncer::Status::Ready:
+                break;
+            }
+            voiceNote->setText(text);
+            voiceNote->setVisible(!text.isEmpty());
+        };
+        QObject::connect(voiceSw, &QAbstractButton::toggled, voice, [voice](bool on) { voice->setEnabled(on); });
+        QObject::connect(voice, &VoiceAnnouncer::statusChanged, voiceNote, syncVoice);
+        syncVoice();
+    }
     st->timeout = new QSpinBox;
     st->timeout->setRange(5, 300);
     st->timeout->setValue(30);
@@ -307,8 +356,6 @@ QWidget* pages::settings(IpcClient* ipc)
     settingRow(s, u("用户态行为监控"), u("无驱动时的持久化 / 勒索监控"),
                toggle(true, &RuntimeSettings::userModeBehaviorMonitor));
     settingRow(s, u("内核驱动"), u("加载 Bulwark.sys 实现事前拦截"), toggle(false, &RuntimeSettings::kernelDriverEnabled));
-    settingRow(s, u("灰区 AI 会诊"), u("对双击 / 可疑程序额外调用大模型研判(需配置模型,默认关)"),
-               toggle(false, &RuntimeSettings::aiGrayZoneConsultEnabled));
 
     // 4 威胁情报源 — a card per source; 「配置」 opens its key + connection test
     s = addSection(QStringLiteral("intel"), QStringLiteral("cloud"), u("威胁情报源"),
@@ -395,10 +442,8 @@ QWidget* pages::settings(IpcClient* ipc)
     // 不写死 VirusTotal:云查毒是分级链路(中央服务器是否已收录 -> 本机密钥查各情报源 -> 上传)。
     settingRow(s, u("双击云查杀"), u("双击运行的程序自动做云端查毒"), toggle(true, &RuntimeSettings::aiScanDoubleClickEnabled),
                true);
-    settingRow(s, u("查杀期间挂起"), u("查杀 / 研判完成前挂起目标进程"),
+    settingRow(s, u("查杀期间挂起"), u("云查杀完成前挂起目标进程"),
                toggle(true, &RuntimeSettings::aiScanSuspendDuringScan));
-    settingRow(s, u("查杀失败即拦截"), u("云查杀 / AI 无明确结论时从严拦截"),
-               toggle(false, &RuntimeSettings::aiScanBlockOnFailure));
     s->addWidget(ui::hDivider());
     {
         auto* aiHead = new QHBoxLayout;
@@ -408,7 +453,8 @@ QWidget* pages::settings(IpcClient* ipc)
         st->aiState = ui::pill(u("未配置"), theme::textMuted());
         aiHead->addWidget(st->aiState);
         s->addLayout(aiHead);
-        auto* note = ui::label(u("AI 研判、AI 生成规则与 AI 清理都用这里的接口。API Key 只保存在本机服务端。"), "muted");
+        auto* note = ui::label(u("AI 生成规则、AI 清理,以及行为询问与拦截通知的「AI 解读」都用这里的接口。"
+                                 "API Key 只保存在本机服务端。"), "muted");
         note->setWordWrap(true);
         s->addWidget(note);
         auto* form = new QGridLayout;
@@ -440,6 +486,35 @@ QWidget* pages::settings(IpcClient* ipc)
         }
         form->setColumnStretch(1, 1);
         s->addLayout(form);
+    }
+    // 行为询问的「AI 解读」。与语音播报同理:纯界面行为,存当前 Windows 用户的 QSettings(AiScanner),
+    // 所以【不进】st->toggles / st->controls,没连上后台服务时照样能改。
+    // 说明里必须写清发出去的是什么 —— 这一项会在每次询问时自动把事件信息发给第三方接口。
+    {
+        AiScanner* ai = ipc->aiScanner();
+        auto* explainSw = new ToggleSwitch(ai->promptExplainEnabled());
+        explainSw->setAccessibleName(u("行为询问 AI 解读"));
+        settingRow(s, u("行为询问 AI 解读"),
+                   u("弹出行为询问时,由上面的大模型用一两句话解读这次行为并给出建议,仅供参考:不参与裁决,"
+                     "不改变倒计时与默认处置。会把该事件的程序路径、命令行、父进程、目标与检测理由发给大模型接口"
+                     "(路径里的本机用户名先替换掉)。解读结果保存在本机一周以便复用,同一行为期间只问一次、"
+                     "界面重启后依然有效,到期自动清理。未配置大模型时不生效,只对当前 Windows 用户生效"),
+                   explainSw);
+        QObject::connect(explainSw, &QAbstractButton::toggled, ai,
+                         [ai](bool on) { ai->setPromptExplainEnabled(on); });
+
+        // 拦截通知的「AI 解读」单独一个开关:它花钱的节奏和询问不同(每拦下一个新东西就来一条),
+        // 用户可能只想要其中一处。说明同样写清发出去的是什么,以及限速。
+        auto* blockSw = new ToggleSwitch(ai->blockExplainEnabled());
+        blockSw->setAccessibleName(u("拦截通知 AI 解读"));
+        settingRow(s, u("拦截通知 AI 解读"),
+                   u("弹出拦截通知时,同样由上面的大模型用一两句话解读被拦下的程序在做什么、为什么危险,并说明"
+                     "这次拦截站不站得住(还是更像误拦),仅供参考:不改变已经做出的处置。发送的内容与上一项相同"
+                     "(路径里的本机用户名先替换掉);同一行为一周内只问一次,拦截通知每分钟最多解读 3 条,"
+                     "给行为询问留出余量。未配置大模型时不生效,只对当前 Windows 用户生效"),
+                   blockSw);
+        QObject::connect(blockSw, &QAbstractButton::toggled, ai,
+                         [ai](bool on) { ai->setBlockExplainEnabled(on); });
     }
 
     // 6 威胁情报共享(默认关)。「上传什么 / 不上传什么」必须讲清楚 —— 这是用户决定要不要开的唯一依据。
@@ -599,9 +674,31 @@ QWidget* pages::settings(IpcClient* ipc)
     for (const ToggleBind& b : std::as_const(st->toggles)) {
         ToggleSwitch* sw = b.sw;
         const bool guarded = sw == protection || sw == selfProtection;
-        QObject::connect(sw, &QAbstractButton::toggled, page, [st, sw, guarded, protection, page, apply](bool on) {
+        // 「退出界面即停止防护」的确认方向是【反】的:打开它才是降低防护的那一下。
+        // 用同一个 guarded 机制处理不了,因为那个机制固定在「关闭时确认」。
+        const bool guardedOnEnable = sw == followsUi;
+        QObject::connect(sw, &QAbstractButton::toggled, page,
+                         [st, sw, guarded, guardedOnEnable, protection, page, apply](bool on) {
             if (st->loading)
                 return;
+            if (guardedOnEnable && on) {
+                ui::ConfirmSpec c;
+                c.risk = ui::Risk::Caution;
+                c.title = u("退出界面即停止防护");
+                c.summary = u("开启后,防护只在本程序运行时生效 —— 界面一退出就彻底停止,包括卸载内核驱动。");
+                c.consequences
+                    << u("界面没在跑的时段主机不受本软件保护:开机到登录之间、注销之后、界面被结束之后")
+                    << u("于是「结束 bulwark_ui.exe」这一下就等于关掉整套防护")
+                    << u("已隔离的文件和已施加的拦截不会被放回,只是不再做新的处置")
+                    << u("最小化到托盘不算退出,防护照常生效");
+                c.confirmText = u("开启");
+                if (!ui::confirm(page, c)) {
+                    st->loading = true;   // 放回原位,什么都不发
+                    sw->setChecked(false);
+                    st->loading = false;
+                    return;
+                }
+            }
             if (guarded && !on) {
                 ui::ConfirmSpec c;
                 if (sw == protection) {

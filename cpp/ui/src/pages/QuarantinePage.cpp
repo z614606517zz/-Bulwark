@@ -1,4 +1,5 @@
-// 隔离区 —— 被移出原位置的威胁文件:还原 / 永久删除,可多选批量处理。
+// 隔离区 —— 被移出原位置的威胁文件:还原 / 永久删除,可多选批量处理。页头「批量选择」进入勾选模式
+// (行首出现复选框,单击即勾选,不必按住 Ctrl / Shift),底部批量条可全选;提交后自动退出。
 //
 // 每一步都先确认(还原会让文件回到原路径、可能再次运行;删除不可撤销),结果以服务端逐条回执
 // (quarantineActionResult)为准汇总成一条横幅 —— 成功几个、哪几个没成功、为什么。
@@ -144,6 +145,9 @@ QWidget* pages::quarantine(IpcClient* ipc)
             else
                 ipc->quarantineDelete(it.id);
         }
+        // The batch is on its way (the banner reports how it went): the selection — and
+        // check mode, if that is how it was made — has done its job.
+        page->setCheckMode(false);
         page->clearSelection();
     };
 
@@ -214,10 +218,28 @@ QWidget* pages::quarantine(IpcClient* ipc)
                             [runOp, rows] { runOp(Op::Delete, rows); });
     });
 
-    // ---- header: ⋯ refresh ---------------------------------------------------------------------------------
+    // ---- header: 批量选择 · ⋯ refresh -----------------------------------------------------------------------
     QHBoxLayout* actions = pagekit::headerActions(page);
     auto* total = ui::label(QString(), "muted");
     actions->addWidget(total);
+    auto* pick = pagekit::headerButton(actions, QStringLiteral("check-square"), u("批量选择"));
+    pick->setCheckable(true);
+    pick->setEnabled(false); // until there is something to pick
+    const auto syncPick = [pick](bool on) {
+        pick->setText(on ? u("退出批量") : u("批量选择"));
+        pick->setIcon(AppIcon::icon(on ? QStringLiteral("close") : QStringLiteral("check-square"),
+                                    on ? theme::accentSoft() : theme::textSecondary(), 16));
+        pick->setToolTip(on ? u("退出批量选择,清除已勾选的文件")
+                            : u("逐个勾选文件,再一起还原或永久删除(也可以按住 Ctrl / Shift 点选)"));
+    };
+    syncPick(false);
+    QObject::connect(pick, &QPushButton::toggled, page, [page](bool on) { page->setCheckMode(on); });
+    // Check mode also ends from the batch bar (✕), Esc, or after a batch is submitted.
+    QObject::connect(page, &RecordBrowser::checkModeChanged, pick, [pick, syncPick](bool on) {
+        const QSignalBlocker quiet(pick);
+        pick->setChecked(on);
+        syncPick(on);
+    });
     QMenu* more = pagekit::headerMenu(actions);
     const auto reload = [page, ipc] {
         if (!ipc->isConnected())
@@ -228,13 +250,16 @@ QWidget* pages::quarantine(IpcClient* ipc)
     pagekit::menuAction(more, QStringLiteral("refresh"), u("刷新列表"), page, reload);
 
     QObject::connect(ipc, &IpcClient::quarantineReceived, page,
-                     [page, store, total](const QList<QuarantineItemPayload>& items) {
+                     [page, store, total, pick](const QList<QuarantineItemPayload>& items) {
         QList<QuarantineItemPayload> list = items;
         std::stable_sort(list.begin(), list.end(), [](const QuarantineItemPayload& a, const QuarantineItemPayload& b) {
             return a.quarantinedUtc > b.quarantinedUtc;
         });
-        store->reset(list);
+        store->reset(list); // keeps whatever is still ticked (RecordBrowser restores the selection by key)
         page->setLoading(false);
+        if (list.isEmpty())
+            page->setCheckMode(false); // nothing left to pick
+        pick->setEnabled(!list.isEmpty());
         qint64 bytes = 0;
         for (const QuarantineItemPayload& it : items)
             bytes += it.size;

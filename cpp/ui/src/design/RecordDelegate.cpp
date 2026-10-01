@@ -150,9 +150,31 @@ void RecordDelegate::paintRecord(QPainter* p, const QStyleOptionViewItem& opt, c
         p->drawRoundedRect(QRectF(card.left() + 1.5, card.top() + 12, 3.0, card.height() - 24), 1.5, 1.5);
     }
 
+    // ---- check box (check mode): the row's selection, in QCheckBox's indicator recipe ----
+    qreal lead = card.left() + 10;
+    if (m_checkable) {
+        const QRectF cb(card.left() + 12, r.center().y() - 9.0, 18.0, 18.0);
+        const QRectF rim = cb.adjusted(0.5, 0.5, -0.5, -0.5);
+        if (selected) {
+            // Jade rim rather than the indicator's dark one: it has to stand out
+            // against the selected row's own jade-tinted fill.
+            p->setPen(QPen(theme::accent(), 1.0));
+            p->setBrush(QBrush(theme::brandGradient(cb)));
+            p->drawRoundedRect(rim, 6, 6);
+            AppIcon::draw(*p, QStringLiteral("check"), cb.adjusted(3.4, 3.4, -3.4, -3.4), theme::accentInk(), 1.9);
+        } else {
+            // An empty box must still read as a control (>= 3:1 against the row),
+            // which borderStrong() alone does not reach.
+            p->setPen(QPen(hover ? theme::accent() : theme::blend(theme::textMuted(), theme::surface(), 0.66), 1.0));
+            p->setBrush(theme::field());
+            p->drawRoundedRect(rim, 6, 6);
+        }
+        lead = cb.right() + 12;
+    }
+
     // ---- glyph tile (and the timeline rail behind it) ----
     constexpr qreal box = 32;
-    const qreal ix = card.left() + 10;
+    const qreal ix = lead;
     const qreal iy = r.center().y() - box / 2.0;
     if (m_rail) {
         const QAbstractItemModel* m = idx.model();
@@ -325,6 +347,25 @@ void RecordListView::setStickyHeaders(bool on)
     viewport()->update();
 }
 
+void RecordListView::setBottomInset(int px)
+{
+    px = qMax(0, px);
+    if (px == m_bottomInset)
+        return;
+    m_bottomInset = px;
+    setViewportMargins(0, 0, 0, px);
+}
+
+void RecordListView::keyboardSearch(const QString& search)
+{
+    // Check mode: type-ahead lands on its match through setCurrentIndex(), which
+    // in MultiSelection *toggles* that row — a stray letter key would tick (or
+    // untick) a record, possibly one scrolled out of sight. Only Space toggles.
+    if (selectionMode() == QAbstractItemView::MultiSelection)
+        return;
+    QListView::keyboardSearch(search);
+}
+
 QModelIndex RecordListView::headerFor(const QModelIndex& idx) const
 {
     for (QModelIndex i = idx; i.isValid(); i = i.sibling(i.row() - 1, 0)) {
@@ -407,6 +448,16 @@ void RecordListView::mouseDoubleClickEvent(QMouseEvent* e)
     }
     const QModelIndex i = indexAt(pos);
     if (i.isValid() && i.data(rec::Header).toBool()) {
+        e->accept();
+        return;
+    }
+    if (selectionMode() == QAbstractItemView::MultiSelection && e->button() == Qt::LeftButton) {
+        // Check mode: every click toggles its row, so a quick second click is a
+        // second toggle — not an "activate" that swallows it and leaves the row
+        // in the state the user just tried to undo.
+        QMouseEvent press(QEvent::MouseButtonPress, e->position(), e->scenePosition(), e->globalPosition(),
+                          e->button(), e->buttons(), e->modifiers(), e->pointingDevice());
+        mousePressEvent(&press);
         e->accept();
         return;
     }

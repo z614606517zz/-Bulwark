@@ -82,9 +82,14 @@ AttackNodeKind targetKind(EventType t)
     }
 }
 
+// 口径:【主体被消灭】才算这一步被掐断。ActorAlreadyGone 也算 —— 那个进程确实已经不在了,
+// 只不过杀它的是上一条事件的处置(事件源到裁决有延迟,主体死后它生前排队的动作还会走完流水线)。
+// ModuleBlacklisted / ExecDenied 【不算】:那两个说的是「下一次会被拦」,这一步本身还是发生了。
+// AttackGraphWindow::reallyBlocked 必须与本函数同口径。
 bool blockedForReal(EnforcementOutcome o)
 {
-    return o == EnforcementOutcome::KernelBlocked || o == EnforcementOutcome::Terminated;
+    return o == EnforcementOutcome::KernelBlocked || o == EnforcementOutcome::Terminated
+        || o == EnforcementOutcome::ActorAlreadyGone;
 }
 
 // 合并同一 (起点,终点,类型) 的多次行为:保留最严重的那次。

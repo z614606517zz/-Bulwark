@@ -1,5 +1,7 @@
 #include "design/Theme.h"
 #include "design/Icons.h"
+#include "design/Motion.h"
+#include "design/Ripple.h"
 
 #include <QApplication>
 #include <QDir>
@@ -601,6 +603,18 @@ void apply(QApplication& app)
     app.setFont(f);
 
     app.setStyleSheet(styleSheet());
+
+    // Qt's own transitions for the layers it owns: menus, the combo box list and
+    // tooltips fade/slide in instead of appearing hard. Qt 6 leaves these off
+    // unless asked, so the popups were the one part of the UI that never moved.
+    // Off when the system asks for no animations (motion::enabled()), like
+    // everything else in the design.
+    for (const Qt::UIEffect effect : {Qt::UI_AnimateMenu, Qt::UI_FadeMenu, Qt::UI_AnimateCombo,
+                                      Qt::UI_AnimateTooltip, Qt::UI_FadeTooltip})
+        QApplication::setEffectEnabled(effect, motion::enabled());
+
+    // Press feedback for every ordinary button (design/Ripple.h).
+    ui::installRipples(app);
 
 #ifdef Q_OS_WIN
     app.installEventFilter(new NativeChromeFilter(&app));

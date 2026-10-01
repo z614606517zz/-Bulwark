@@ -7,6 +7,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
+
 class QFileSystemWatcher;
 class QTimer;
 namespace bulwark::engine { class RuleEngine; }
@@ -35,6 +37,20 @@ public:
     void setEnabled(bool on) { enabled_ = on; }
     void setCanaryEnabled(bool on) { canaryEnabled_ = on; }
 
+    //
+    // 诱饵路径的第二个去处(可空;当前由 main 接到 ETW 源的写入归因表)。
+    //
+    // 存在的理由就是上面「诚实局限」里那句「用户态拿不到『谁写的』」:诱饵靠
+    // QFileSystemWatcher 发现,那个通知只说「文件变了」。而引擎对 canaryHit 是无条件 Block
+    // 加 100 分硬指标 —— 拿不到写入者 PID,这个 Block 就没有对象,最终只落「仅告警」。
+    // 接上之后,Kernel-File 的 Write 事件(事件头 ProcessId 即写入者)会补出那一位,
+    // 诱饵命中才真的能结束勒索进程树。
+    //
+    // 未接线,或 Etw.KernelFileWriteAttribution 未打开时,行为与从前完全一致。
+    //
+    using CanarySink = std::function<void(const QString& canaryPath)>;
+    void setCanarySink(CanarySink fn) { canarySink_ = std::move(fn); }
+
 private slots:
     void onDirectoryChanged(const QString& dir); // 启动文件夹变更
     void onFileChanged(const QString& path);      // 诱饵被改写/删除
@@ -50,6 +66,7 @@ private:
                         const QString& valueData, const QString& target);
 
     bulwark::engine::RuleEngine& engine_;
+    CanarySink canarySink_;              // 诱饵写入归因的登记去处(可空)
     bool enabled_ = true;
     bool canaryEnabled_ = true;
     bool started_ = false;
@@ -59,6 +76,11 @@ private:
 
     QStringList startupDirs_;
     QSet<QString> canaryFiles_;
+    // 同一次诱饵触碰的去重(见 onFileChanged)。Windows 对一次写生成多个变更通知,
+    // 逐条走完整处置会把同一件事刷成 4 条拦截 + 3 次清理(0.5 实测)。
+    QHash<QString, qint64> canaryLastEventMs_;
+    qint64 canarySuppressed_ = 0;
+    static constexpr qint64 kCanaryDebounceMs = 3000;
     QHash<QString, QSet<QString>> startupBaseline_;       // dir -> {name|size|mtime}
     QHash<QString, QHash<QString, QString>> regBaseline_; // keyId -> (valueName -> data)
 

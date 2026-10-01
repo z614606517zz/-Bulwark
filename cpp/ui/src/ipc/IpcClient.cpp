@@ -1,6 +1,5 @@
 #include "ipc/IpcClient.h"
 
-#include "ai/AiScanHistoryStore.h"
 #include "bulwark/ipc/IpcMessageType.h"
 #include "bulwark/ipc/PipeNames.h"
 
@@ -12,42 +11,14 @@ using namespace bulwark;
 using namespace bulwark::ipc;
 
 IpcClient::IpcClient(QObject* parent)
-    : QObject(parent), m_ai(new AiScanner(this)), m_aiHistory(new AiScanHistoryStore())
+    : QObject(parent), m_ai(new AiScanner(this))
 {
-    // When the UI-side AI research finishes, surface it to the AI page and — for
-    // service-requested scans (non-null event id) — echo the verdict back so the
-    // service can fold it (AiDecisionPolicy) / compensate on malicious.
-    connect(m_ai, &AiScanner::finished, this, [this](const AiScanResult& r) {
-        emit aiScanRecord(r);
-        if (m_aiHistory)
-            m_aiHistory->append(r); // persist every result (auto + manual) so the AI page survives restarts
-        if (r.eventId.isNull())
-            return; // manual scan — display only, nothing to report to the service
-        bulwark::ipc::AiScanResponsePayload p;
-        p.eventId = r.eventId;
-        p.available = r.available;
-        p.recommendation = r.recommendation;
-        p.summary = r.summary;
-        p.confidence = r.confidence;
-        send(IpcMessage::from(IpcMessageType::AiScanResponse, p));
-    });
     // AI-suggested rules (natural language -> rules) are surfaced for user review.
     connect(m_ai, &AiScanner::rulesSuggested, this,
             [this](const QList<AiSuggestedRule>& rules) { emit aiRulesSuggested(rules); });
 }
 
-IpcClient::~IpcClient() { delete m_aiHistory; }
-
-QList<AiScanResult> IpcClient::aiScanHistory() const
-{
-    return m_aiHistory ? m_aiHistory->getAll() : QList<AiScanResult>();
-}
-
-void IpcClient::clearAiScanHistory()
-{
-    if (m_aiHistory)
-        m_aiHistory->clear();
-}
+IpcClient::~IpcClient() = default;
 
 void IpcClient::start()
 {
@@ -127,17 +98,11 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::PromptRequest:
         emit promptReceived(msg->payloadAs<SecurityEvent>());
         break;
-    case IpcMessageType::BlockNotification:
-        emit blockNotification(msg->payloadAs<SecurityEvent>());
-        break;
-    case IpcMessageType::AiScanRequest: {
-        // Raise a lightweight "AI 研判中" toast, then run the UI-side model. The
-        // AiScanner echoes an AiScanResponse back to the service when it finishes
-        // (fail-open: if unconfigured / erroring it replies available=false, so the
-        // service's fail-open timeout path is preserved).
-        const auto ev = msg->payloadAs<SecurityEvent>();
-        emit aiScanStarted(ev);
-        m_ai->scan(ev, QString::fromUtf8("双击"));
+    case IpcMessageType::BlockNotification: {
+        // 负载与旧版的裸 SecurityEvent 同形,只多一个 enforcement 键;老服务不带该键时
+        // 解析为 NotApplicable —— UI 据此【不声称】拦下,而不是默认成功。
+        const auto p = msg->payloadAs<BlockNotificationPayload>();
+        emit blockNotification(p.event, p.enforcement);
         break;
     }
     case IpcMessageType::LogEntry:
@@ -191,11 +156,6 @@ void IpcClient::dispatch(const QString& line)
     case IpcMessageType::SettingsResponse: {
         const auto s = msg->payloadAs<bulwark::RuntimeSettings>();
         m_ai->setConfig(s.aiBaseUrl, s.aiApiKey, s.aiModel);
-        StaticFeatureLimits lim;
-        lim.maxReadBytes   = static_cast<qint64>(s.aiScanBinarySampleLimitMb) * 1024 * 1024;
-        lim.scriptCapBytes = s.aiScanScriptTextLimitKb * 1024;
-        lim.maxStrings     = s.aiScanMaxStrings;
-        m_ai->setStaticLimits(lim);
         m_ai->setCreditGuard(s.aiCreditGuardEnabled, s.aiMonthlyCreditBudget);
         emit settingsReceived(s);
         break;
@@ -434,13 +394,6 @@ void IpcClient::intelApply(const QList<bulwark::DefenseRule>& rules)
     IntelApplyRequestPayload p;
     p.rules = rules;
     send(IpcMessage::from(IpcMessageType::IntelApplyRequest, p));
-}
-
-void IpcClient::aiScanFile(const QString& path)
-{
-    // Manual, user-initiated research (runs entirely in the UI; not reported to
-    // the service). Config was synced from the last SettingsResponse.
-    m_ai->scanFile(path, QString::fromUtf8("手动"));
 }
 
 void IpcClient::aiGenerateRules(const QString& request)

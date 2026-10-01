@@ -131,6 +131,15 @@ void addImpactRules(QVector<DefenseRule>& out) {
     s.proc(Ask, "把系统对象权限开放给 Everyone(icacls grant everyone,T1222.001)")
         .cmd("*icacls*everyone*");
     s.proc(Ask, "递归修改目录权限(cacls/icacls /t /grant,T1222.001)").cmd("*icacls*/t*/grant*");
+    // 上面两条都是【授权】方向。银狐 2026 记录的是反方向:用 icacls 把落地目录【锁住】,
+    // 让用户与清理工具删不掉它(见 docs/yinhu-threat-intel-2026.md [1])。那是 /deny 与
+    // /inheritance:r,既有的 everyone / grant 两条一条都接不住。
+    // 给 Ask 而非 Block:这两种写法同样是企业加固基线的正常手段(收敏感目录的权限、
+    // 切断从上层继承来的宽松 ACL)。
+    s.proc(Ask, "用 icacls 拒绝访问指定对象(锁定落地目录阻止清除,T1222.001)")
+        .cmd("*icacls*/deny*");
+    s.proc(Ask, "用 icacls 剥离权限继承(隔离落地目录,T1222.001)")
+        .cmd("*icacls*/inheritance:r*");
 
     // ------------------------------------------------------------------
     // 5.6 服务与启动破坏

@@ -13,7 +13,6 @@
 #include "widgets/WrapLabel.h"
 
 #include <QClipboard>
-#include <QEnterEvent>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHBoxLayout>
@@ -62,7 +61,9 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
     setModal(false); // informational — never blocks the user's work
     setSheetWidth(kCardW);
 
-    const int quarantined = int(report.quarantinedFiles.size()) + (report.actorQuarantined ? 1 : 0);
+    // quarantinedFiles 已经包含主体本身(服务端的 actorQuarantined 正是据此判定的),不能再 +1:
+    // 以前这里把主体数了两遍,「已隔离」比实际多 1,和右下角通知的数字也对不上。
+    const int quarantined = int(report.quarantinedFiles.size());
     const int removed = int(report.removedRegistryValues.size());
     const int failed = int(report.skipped.size());
     const QString when = report.timestampUtc.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
@@ -118,10 +119,15 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
 
     if (quarantined > 0) {
         group(list, QStringLiteral("quarantined"), u("已隔离(可在隔离区还原)"), theme::success(), quarantined);
+        // 主体排最前并标注「主体载荷」;它本身也在 quarantinedFiles 里,下面跳过,免得列两遍。
+        // 比较口径与服务端判定 actorQuarantined 时一致(不区分大小写)。
         if (report.actorQuarantined)
             list->addWidget(pathRow(report.actorPath, u("主体载荷")));
-        for (const QString& f : report.quarantinedFiles)
+        for (const QString& f : report.quarantinedFiles) {
+            if (report.actorQuarantined && f.compare(report.actorPath, Qt::CaseInsensitive) == 0)
+                continue;
             list->addWidget(pathRow(f));
+        }
     }
     if (removed > 0) {
         group(list, QStringLiteral("removed"), u("已移除自启动 / 注册表项"), theme::info(), removed);
@@ -239,6 +245,10 @@ RemediationReportDialog::RemediationReportDialog(const RemediationReportPayload&
         m_autoClose->setColor(theme::textMuted());
         m_autoClose->setFormatter([](int s) { return u("%1 秒后自动关闭").arg(s); });
         m_autoClose->setToolTip(u("鼠标停在报告上时暂停"));
+        // 「停在报告上暂停」由倒计时条按指针真实位置判定。这张卡片是居中弹出的,很容易正好落在
+        // 静止的指针底下 —— 换成 enter/leave 那一套的话,它会当场把倒计时冻住再也不自动关闭
+        //(详见 CountdownBar::syncHoverPause)。
+        m_autoClose->setHoverPause(card());
         connect(m_autoClose, &CountdownBar::finished, this, &QDialog::accept);
         addFooterLeft(m_autoClose);
         m_pin = ui::button(QString(), "ghost", QStringLiteral("pin"), true);
@@ -371,6 +381,8 @@ QString RemediationReportDialog::reportText() const
 
 void RemediationReportDialog::setPinned(bool pinned)
 {
+    if (pinned == m_pinned)
+        return;
     m_pinned = pinned;
     if (!m_autoClose)
         return;
@@ -383,19 +395,4 @@ void RemediationReportDialog::setPinned(bool pinned)
             m_pin->setIcon(QIcon());
         }
     }
-}
-
-void RemediationReportDialog::enterEvent(QEnterEvent* e)
-{
-    // Reading the report pauses its auto-close.
-    if (m_autoClose && !m_pinned)
-        m_autoClose->pause();
-    Sheet::enterEvent(e);
-}
-
-void RemediationReportDialog::leaveEvent(QEvent* e)
-{
-    if (m_autoClose && !m_pinned)
-        m_autoClose->resume();
-    Sheet::leaveEvent(e);
 }

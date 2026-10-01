@@ -48,11 +48,16 @@
 
 // 本驱动 WFP 标识 GUID
 // {C9A1F7D2-3B6E-4A21-9F8C-1E2D3C4B5A60}
-DEFINE_GUID(BLW_CALLOUT_GUID,
+DEFINE_GUID(BLW_CALLOUT_V4_GUID,
     0xc9a1f7d2, 0x3b6e, 0x4a21, 0x9f, 0x8c, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x60);
 // {C9A1F7D2-3B6E-4A21-9F8C-1E2D3C4B5A61}
 DEFINE_GUID(BLW_SUBLAYER_GUID,
     0xc9a1f7d2, 0x3b6e, 0x4a21, 0x9f, 0x8c, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x61);
+// {C9A1F7D2-3B6E-4A21-9F8C-1E2D3C4B5A62}
+// 每个 WFP 层都需要【自己的】callout GUID:层由管理层对象的 applicableLayer 指定,
+// 而 calloutKey 必须唯一,所以一个 GUID 不可能同时挂在 V4 与 V6 两个层上。
+DEFINE_GUID(BLW_CALLOUT_V6_GUID,
+    0xc9a1f7d2, 0x3b6e, 0x4a21, 0x9f, 0x8c, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x62);
 
 //
 // ===== 黑名单管理(线程安全)=====
@@ -147,6 +152,16 @@ BlwReportNetBlock(_In_ ULONG actorPid, _In_ ULONG remoteIp, _In_ USHORT remotePo
 //
 // WFP classify 回调:决定放行/阻断外发连接。
 //
+// 【同一个 classifyFn 服务多个层】层由 inFixedValues->layerId 区分。两个层的字段下标不同
+// (FWPS_FIELD_ALE_AUTH_CONNECT_V4_* 与 _V6_*),用错下标就是读错内存,所以下面对 layerId
+// 做显式分支,而不是靠「反正前几个字段布局一样」这种假设。
+//
+// 【V6 层当前只做「已封禁主体」拦截,不做 IP 匹配】这是刻意的、也是本次真正补上的缺口:
+// 黑名单条目结构 BLW_BLOCK_IP 是 32 位 IPv4,装不下 128 位地址;而「已封禁主体不许外联」
+// 这一维与地址族无关 —— 在此之前,一个已被情报确认恶意的进程只要改走 IPv6 就完全不受阻,
+// 而 Windows 上 IPv6 默认启用、很多域名会优先解析到 AAAA。先把这一维补齐,IPv6 黑名单
+// (需要新的条目表 + 新命令)留作下一步。
+//
 static void NTAPI
 BlwClassifyFn(
     _In_ const FWPS_INCOMING_VALUES* inFixedValues,
@@ -157,11 +172,10 @@ BlwClassifyFn(
     _In_ UINT64 flowContext,
     _Inout_ FWPS_CLASSIFY_OUT* classifyOut)
 {
-    ULONG remoteIp;
+    ULONG  remoteIp;
     USHORT remotePort;
-    ULONG actorPid = 0;
+    ULONG  actorPid = 0;
 
-    UNREFERENCED_PARAMETER(inMetaValues);
     UNREFERENCED_PARAMETER(layerData);
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
@@ -178,8 +192,9 @@ BlwClassifyFn(
         return;
     }
 
-    // 已封禁主体(情报确认恶意):拒绝其任何外联(不看目标 IP)—— 断其 C2 / 回传 / 下载。
-    // 封禁集非空时才查(空则零开销)。BlwPidIsBanned 为无锁查表,DISPATCH_LEVEL 安全。
+    // 已封禁主体(情报确认恶意):拒绝其任何外联(不看目标 IP、不看地址族)——
+    // 断其 C2 / 回传 / 下载。封禁集非空时才查(空则零开销)。
+    // BlwPidIsBanned 为无锁查表,DISPATCH_LEVEL 安全。
     if (g_Blw.BannedPidCount > 0 && inMetaValues != NULL &&
         FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_PROCESS_ID)) {
         ULONG connPid = (ULONG)inMetaValues->processId;
@@ -188,6 +203,13 @@ BlwClassifyFn(
             classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
             return;
         }
+    }
+
+    //
+    // 以下是 IPv4 黑名单匹配。V6 层到此为止(黑名单是 32 位 IPv4,理由见函数头说明)。
+    //
+    if (inFixedValues->layerId != FWPS_LAYER_ALE_AUTH_CONNECT_V4) {
+        return;
     }
 
     // 取远端 IP(V4,主机字节序)与端口
@@ -227,13 +249,51 @@ BlwNotifyFn(
 }
 
 //
-// 真正把 WFP 拉起来:注册内核 callout -> 打开引擎 -> 添加管理层 callout / sublayer / filter。
+// ===== WFP 层表 =====
+//
+// 每一行 = 一个内核 callout(自己的 GUID)+ 一条挂在该层的 filter。拉起 / 回滚 / 卸载三条
+// 路径全部按这张表循环,所以新增一个层只需加一行 + 把 BLW_WFP_LAYER_COUNT 加一,
+// 而三条路径自动保持对称 —— WFP 拆除路径漏掉一个 callout 就是蓝屏(镜像卸载后 WFP 仍持有
+// 指向 BlwClassifyFn 的函数指针,下一条连接直接跳进已释放内存),对称性比省几行代码重要得多。
+//
+typedef struct _BLW_WFP_LAYER {
+    const GUID* CalloutKey;   // 该层专属的 callout GUID
+    const GUID* LayerKey;     // FWPM_LAYER_*
+    PCWSTR      CalloutName;  // 管理层显示名(仅供 netsh wfp show state 之类工具查看)
+    PCWSTR      FilterName;
+} BLW_WFP_LAYER;
+
+static const BLW_WFP_LAYER kBlwWfpLayers[] = {
+    { &BLW_CALLOUT_V4_GUID, &FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+      L"Bulwark Connect Callout (IPv4)", L"Bulwark Connect Filter (IPv4)" },
+    { &BLW_CALLOUT_V6_GUID, &FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+      L"Bulwark Connect Callout (IPv6)", L"Bulwark Connect Filter (IPv6)" },
+};
+C_ASSERT(RTL_NUMBER_OF(kBlwWfpLayers) == BLW_WFP_LAYER_COUNT);
+
+// 是否还有【任何】层的内核 callout 处于已注册状态。卸载路径据此决定能不能删设备对象:
+// callout 依附于设备对象,残留一个就绝不能删(否则 WFP 引用一个已释放的对象)。
+BOOLEAN
+BlwWfpHasCallouts(void)
+{
+    ULONG i;
+
+    for (i = 0; i < BLW_WFP_LAYER_COUNT; i++) {
+        if (g_Blw.WfpCalloutIds[i] != 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+//
+// 真正把 WFP 拉起来:注册各层内核 callout -> 打开引擎 -> 添加管理层 callout / sublayer / filter。
 //
 // 【调用约定】必须在持有 g_Blw.WfpLock 时调用,且要求 BFE(基础筛选引擎)已在运行 ——
 // 判断与调度由 BlwWfpStart / BlwBfeStateChangeFn 负责,本函数只管做事。
 //
 // 【逐件幂等】两个部件各自看自己的状态位:
-//   * WfpCalloutId == 0 才注册内核 callout(它在 netio 里,BFE 重启不一定带走它);
+//   * WfpCalloutIds[i] == 0 才注册第 i 层的内核 callout(它在 netio 里,BFE 重启不一定带走它);
 //   * WfpEngine  == NULL 才开引擎、加管理层对象(这些一定随 BFE 一起消失)。
 // 这样 BFE 重启后再次进来,只会补回真正缺的那一半,不会重复注册。
 //
@@ -241,14 +301,11 @@ static NTSTATUS
 BlwWfpBringUpLocked(void)
 {
     NTSTATUS status;
-    FWPS_CALLOUT sCallout = { 0 };
-    FWPM_CALLOUT mCallout = { 0 };
     FWPM_SUBLAYER subLayer = { 0 };
-    FWPM_FILTER mFilter = { 0 };
-    FWPM_DISPLAY_DATA disp = { 0 };
     BOOLEAN inTxn = FALSE;
-    BOOLEAN calloutAddedHere = FALSE;
+    BOOLEAN calloutAddedHere[BLW_WFP_LAYER_COUNT] = { 0 };
     FWPM_SESSION session = { 0 };
+    ULONG i;
 
     if (g_Blw.WfpRegistered) {
         return STATUS_SUCCESS;
@@ -257,14 +314,20 @@ BlwWfpBringUpLocked(void)
         return STATUS_DEVICE_NOT_READY;   // 没有设备对象就注册不了 callout
     }
 
-    // 1) 注册 callout 到内核过滤引擎(netio)。
-    if (g_Blw.WfpCalloutId == 0) {
-        sCallout.calloutKey = BLW_CALLOUT_GUID;
+    // 1) 逐层注册 callout 到内核过滤引擎(netio)。
+    for (i = 0; i < BLW_WFP_LAYER_COUNT; i++) {
+        FWPS_CALLOUT sCallout = { 0 };
+
+        if (g_Blw.WfpCalloutIds[i] != 0) {
+            continue;   // 上一轮留下来的,直接复用
+        }
+
+        sCallout.calloutKey = *kBlwWfpLayers[i].CalloutKey;
         sCallout.classifyFn = BlwClassifyFn;
         sCallout.notifyFn = BlwNotifyFn;
         sCallout.flowDeleteFn = NULL;
 
-        status = FwpsCalloutRegister(g_Blw.WfpDeviceObject, &sCallout, &g_Blw.WfpCalloutId);
+        status = FwpsCalloutRegister(g_Blw.WfpDeviceObject, &sCallout, &g_Blw.WfpCalloutIds[i]);
 
         //
         // STATUS_FWP_ALREADY_EXISTS:这个 GUID 的 callout 还注册着,但我们手里没有它的 id
@@ -272,18 +335,20 @@ BlwWfpBringUpLocked(void)
         // 只能按 key 摘掉再重新注册一次,把 id 拿回来。只重试一次,失败就放弃网络防护。
         //
         if (status == STATUS_FWP_ALREADY_EXISTS) {
-            KdPrint(("[Bulwark] Callout GUID already registered; re-registering to recover its id.\n"));
-            (void)FwpsCalloutUnregisterByKey(&BLW_CALLOUT_GUID);
-            g_Blw.WfpCalloutId = 0;
-            status = FwpsCalloutRegister(g_Blw.WfpDeviceObject, &sCallout, &g_Blw.WfpCalloutId);
+            KdPrint(("[Bulwark] Callout GUID (layer %lu) already registered; "
+                     "re-registering to recover its id.\n", i));
+            (void)FwpsCalloutUnregisterByKey(kBlwWfpLayers[i].CalloutKey);
+            g_Blw.WfpCalloutIds[i] = 0;
+            status = FwpsCalloutRegister(g_Blw.WfpDeviceObject, &sCallout,
+                                         &g_Blw.WfpCalloutIds[i]);
         }
 
         if (!NT_SUCCESS(status)) {
-            KdPrint(("[Bulwark] FwpsCalloutRegister failed 0x%x\n", status));
-            g_Blw.WfpCalloutId = 0;
-            return status;
+            KdPrint(("[Bulwark] FwpsCalloutRegister(layer %lu) failed 0x%x\n", i, status));
+            g_Blw.WfpCalloutIds[i] = 0;
+            goto cleanup;   // 已注册成功的那几个由 cleanup 按 calloutAddedHere 回滚
         }
-        calloutAddedHere = TRUE;
+        calloutAddedHere[i] = TRUE;
     }
 
     // 2) 打开引擎(动态会话:句柄关闭时自动清理本会话加的对象)。
@@ -304,18 +369,7 @@ BlwWfpBringUpLocked(void)
     }
     inTxn = TRUE;
 
-    // 3) 注册 callout 到管理引擎
-    disp.name = L"Bulwark Connect Callout";
-    mCallout.calloutKey = BLW_CALLOUT_GUID;
-    mCallout.displayData = disp;
-    mCallout.applicableLayer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-    status = FwpmCalloutAdd(g_Blw.WfpEngine, &mCallout, NULL, NULL);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("[Bulwark] FwpmCalloutAdd failed 0x%x\n", status));
-        goto cleanup;
-    }
-
-    // 4) 添加 sublayer
+    // 3) 添加 sublayer(所有层共用一个 sublayer,只加一次)。
     subLayer.subLayerKey = BLW_SUBLAYER_GUID;
     subLayer.displayData.name = L"Bulwark SubLayer";
     subLayer.flags = 0;
@@ -326,19 +380,33 @@ BlwWfpBringUpLocked(void)
         goto cleanup;
     }
 
-    // 5) 添加 filter:在 ALE_AUTH_CONNECT_V4 层调用我们的 callout
-    mFilter.displayData.name = L"Bulwark Connect Filter";
-    mFilter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-    mFilter.subLayerKey = BLW_SUBLAYER_GUID;
-    mFilter.weight.type = FWP_EMPTY;   // 自动分配权重
-    mFilter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
-    mFilter.action.calloutKey = BLW_CALLOUT_GUID;
-    mFilter.numFilterConditions = 0;   // 无条件:所有外发连接都过我们回调
+    // 4) 逐层:注册管理层 callout + 添加无条件 filter(该层所有连接都过我们的回调)。
+    for (i = 0; i < BLW_WFP_LAYER_COUNT; i++) {
+        FWPM_CALLOUT mCallout = { 0 };
+        FWPM_FILTER  mFilter = { 0 };
 
-    status = FwpmFilterAdd(g_Blw.WfpEngine, &mFilter, NULL, &g_Blw.WfpFilterId);
-    if (!NT_SUCCESS(status)) {
-        KdPrint(("[Bulwark] FwpmFilterAdd failed 0x%x\n", status));
-        goto cleanup;
+        mCallout.calloutKey = *kBlwWfpLayers[i].CalloutKey;
+        mCallout.displayData.name = (PWSTR)kBlwWfpLayers[i].CalloutName;
+        mCallout.applicableLayer = *kBlwWfpLayers[i].LayerKey;
+        status = FwpmCalloutAdd(g_Blw.WfpEngine, &mCallout, NULL, NULL);
+        if (!NT_SUCCESS(status)) {
+            KdPrint(("[Bulwark] FwpmCalloutAdd(layer %lu) failed 0x%x\n", i, status));
+            goto cleanup;
+        }
+
+        mFilter.displayData.name = (PWSTR)kBlwWfpLayers[i].FilterName;
+        mFilter.layerKey = *kBlwWfpLayers[i].LayerKey;
+        mFilter.subLayerKey = BLW_SUBLAYER_GUID;
+        mFilter.weight.type = FWP_EMPTY;   // 自动分配权重
+        mFilter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
+        mFilter.action.calloutKey = *kBlwWfpLayers[i].CalloutKey;
+        mFilter.numFilterConditions = 0;   // 无条件
+
+        status = FwpmFilterAdd(g_Blw.WfpEngine, &mFilter, NULL, &g_Blw.WfpFilterIds[i]);
+        if (!NT_SUCCESS(status)) {
+            KdPrint(("[Bulwark] FwpmFilterAdd(layer %lu) failed 0x%x\n", i, status));
+            goto cleanup;
+        }
     }
 
     status = FwpmTransactionCommit(g_Blw.WfpEngine);
@@ -348,7 +416,7 @@ BlwWfpBringUpLocked(void)
     inTxn = FALSE;
 
     g_Blw.WfpRegistered = TRUE;
-    KdPrint(("[Bulwark] WFP registered (callout id %u).\n", g_Blw.WfpCalloutId));
+    KdPrint(("[Bulwark] WFP registered on %u layer(s).\n", (ULONG)BLW_WFP_LAYER_COUNT));
     return STATUS_SUCCESS;
 
 cleanup:
@@ -365,19 +433,22 @@ cleanup:
     }
 
     //
-    // 【只回滚本次新注册的 callout】。若 callout 是上一轮留下来的(calloutAddedHere == FALSE),
-    // 就原样留着 —— 它此刻没有任何 filter 引用,不会被调用,而下一次 BFE 就绪时
-    // BlwWfpBringUpLocked 能直接复用它。反过来若在这里把别人留下的 callout 摘掉,
-    // 只会白白多一次注册/注销往返。
+    // 【只回滚本次新注册的 callout】。若某层的 callout 是上一轮留下来的
+    //(calloutAddedHere[i] == FALSE),就原样留着 —— 它此刻没有任何 filter 引用,不会被调用,
+    // 而下一次 BFE 就绪时 BlwWfpBringUpLocked 能直接复用它。反过来若在这里把别人留下的
+    // callout 摘掉,只会白白多一次注册/注销往返。
     //
-    if (calloutAddedHere && g_Blw.WfpCalloutId != 0) {
-        if (NT_SUCCESS(FwpsCalloutUnregisterById(g_Blw.WfpCalloutId))) {
-            g_Blw.WfpCalloutId = 0;
+    for (i = 0; i < BLW_WFP_LAYER_COUNT; i++) {
+        if (!calloutAddedHere[i] || g_Blw.WfpCalloutIds[i] == 0) {
+            continue;
+        }
+        if (NT_SUCCESS(FwpsCalloutUnregisterById(g_Blw.WfpCalloutIds[i]))) {
+            g_Blw.WfpCalloutIds[i] = 0;
         } else {
             // 极端情况:callout 注销不掉。保留非 0 的 id —— BlwFilterUnload 里的
-            // "WfpCalloutId == 0" 判断会据此不去删设备对象,后续卸载也会被否决,
+            // BlwWfpHasCallouts() 判断会据此不去删设备对象,后续卸载也会被否决,
             // 不会让 WFP 指向已释放镜像。
-            KdPrint(("[Bulwark] WFP rollback: callout still registered, keeping it pinned.\n"));
+            KdPrint(("[Bulwark] WFP rollback: callout(layer %lu) still registered, keeping it pinned.\n", i));
         }
     }
     return status;
@@ -422,11 +493,11 @@ BlwBfeStateChangeFn(_Inout_ void* context, _In_ FWPM_SERVICE_STATE newState)
         //(包括 FwpmEngineClose)—— 那些对象随 BFE 一起没了,没有东西需要关。
         // 这里只清掉我们自己的记账,让后续的 RUNNING 通知能干净地重建。
         //
-        // 内核 callout(WfpCalloutId)【刻意保留】:它注册在 netio 而不是 BFE 里,
-        // 不随 BFE 消失;留着它,BFE 回来时只需补开引擎、重加 filter。
+        // 内核 callout(WfpCalloutIds)【刻意保留】:它们注册在 netio 而不是 BFE 里,
+        // 不随 BFE 消失;留着它们,BFE 回来时只需补开引擎、重加 filter。
         //
         g_Blw.WfpEngine = NULL;
-        g_Blw.WfpFilterId = 0;
+        RtlZeroMemory(g_Blw.WfpFilterIds, sizeof(g_Blw.WfpFilterIds));
         g_Blw.WfpRegistered = FALSE;
         KdPrint(("[Bulwark] BFE stopped -> WFP objects gone; will rebuild when it returns.\n"));
     }
@@ -509,6 +580,7 @@ BlwUnregisterWfp(void)
 {
     NTSTATUS status = STATUS_SUCCESS;
     ULONG    attempt;
+    ULONG    layer;
 
     //
     // 0) 【第一件事:退订 BFE 状态通知】。不退订就拆,会和 BlwBfeStateChangeFn 打架 ——
@@ -527,10 +599,10 @@ BlwUnregisterWfp(void)
 
     ExAcquireFastMutex(&g_Blw.WfpLock);
 
-    // 没有引擎也没有 callout = 本来就没起来过,直接算成功。
+    // 没有引擎也没有任何 callout = 本来就没起来过,直接算成功。
     // 【不能只看 WfpRegistered】:BFE 未就绪时它一直是 FALSE,但内核 callout 可能已经
     // 注册好了(BlwWfpBringUpLocked 的第 1 步成功、第 2 步失败),漏拆就是悬空指针。
-    if (g_Blw.WfpEngine == NULL && g_Blw.WfpCalloutId == 0) {
+    if (g_Blw.WfpEngine == NULL && !BlwWfpHasCallouts()) {
         g_Blw.WfpRegistered = FALSE;
         ExReleaseFastMutex(&g_Blw.WfpLock);
         return STATUS_SUCCESS;
@@ -543,12 +615,24 @@ BlwUnregisterWfp(void)
         g_Blw.WfpEngine = NULL;
     }
 
-    // 2) 注销内核 callout。引擎关闭后引用不一定立刻归零(在途 classify 需要排空),
+    //
+    // 2) 逐层注销内核 callout。引擎关闭后引用不一定立刻归零(在途 classify 需要排空),
     //    故对 STATUS_DEVICE_BUSY 做有限次退让重试;仍不成功就把失败如实报给调用方。
-    if (g_Blw.WfpCalloutId != 0) {
+    //
+    //    【一层失败也要把其余层继续拆完】:提前 return 会把其它层的 callout 一起留下,
+    //    而调用方只知道"失败了"。继续拆能让残留面尽可能小,留下的那几个由
+    //    BlwWfpHasCallouts() 报告给卸载路径(它会据此拒绝卸载并保留设备对象)。
+    //
+    for (layer = 0; layer < BLW_WFP_LAYER_COUNT; layer++) {
+        NTSTATUS one = STATUS_SUCCESS;
+
+        if (g_Blw.WfpCalloutIds[layer] == 0) {
+            continue;
+        }
+
         for (attempt = 0; ; attempt++) {
-            status = FwpsCalloutUnregisterById(g_Blw.WfpCalloutId);
-            if (status != STATUS_DEVICE_BUSY || attempt >= BLW_WFP_UNREG_RETRIES) {
+            one = FwpsCalloutUnregisterById(g_Blw.WfpCalloutIds[layer]);
+            if (one != STATUS_DEVICE_BUSY || attempt >= BLW_WFP_UNREG_RETRIES) {
                 break;
             }
             {
@@ -559,15 +643,20 @@ BlwUnregisterWfp(void)
             }
         }
 
-        if (!NT_SUCCESS(status)) {
-            // callout 仍在注册状态:上层【必须】拒绝卸载。
-            // WfpCalloutId 保持非 0(上层据此判断"设备对象还不能删")。
-            KdPrint(("[Bulwark] FwpsCalloutUnregisterById failed 0x%x after %u retries; "
-                     "unload must be refused.\n", status, attempt));
-            ExReleaseFastMutex(&g_Blw.WfpLock);
-            return status;
+        if (NT_SUCCESS(one)) {
+            g_Blw.WfpCalloutIds[layer] = 0;
+        } else {
+            // 该层 callout 仍在注册状态:上层【必须】拒绝卸载。
+            // WfpCalloutIds[layer] 保持非 0(上层据此判断"设备对象还不能删")。
+            KdPrint(("[Bulwark] FwpsCalloutUnregisterById(layer %lu) failed 0x%x after %u retries; "
+                     "unload must be refused.\n", layer, one, attempt));
+            status = one;   // 记下第一个/最后一个失败,返回给调用方
         }
-        g_Blw.WfpCalloutId = 0;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        ExReleaseFastMutex(&g_Blw.WfpLock);
+        return status;
     }
 
     g_Blw.WfpRegistered = FALSE;

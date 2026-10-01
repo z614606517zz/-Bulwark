@@ -46,11 +46,17 @@ const QStringList& unattendedFlags() {
     return s;
 }
 
+// IM 进程名(小写完整映像名,按【精确相等】查集合,不做子串匹配)。
+// 它同时是「注入 IM 进程」与「IM 进程从可写目录加载未签名模块」两条判据的前提。
+//
+// whatsapp.exe:银狐 2026 年把 WhatsApp 放在传播链中心(盗号 -> 向联系人发财务主题文件 ->
+// WhatsApp Web 自动二次扩散,见 docs/yinhu-threat-intel-2026.md [12][13])。
 const QSet<QString>& imProcesses() {
     static const QSet<QString> s = {
         "wechat.exe", "weixin.exe", "wechatapp.exe", "wechatappex.exe",
         "wechatocr.exe", "wechatutility.exe", "wxwork.exe", "wxworkweb.exe",
         "qq.exe", "tim.exe", "qqexternal.exe",
+        "whatsapp.exe",
     };
     return s;
 }
@@ -246,7 +252,13 @@ void analyzeImModuleLoad(const SecurityEvent& e, ScoreResult& r) {
     }
 
     const QString actorName = fileNameLower(e.actorPath);
-    if (imProcesses().contains(actorName) && !e.actorSigned && anyContains(suspiciousDirs(), module)) {
+    // 这条判据的本意是「(签名的)IM 宿主 从用户可写目录 加载未签名模块」—— 白加黑侧载的
+    // 标准形态,所以 actorName 白名单要留,签名位判的却必须是【被加载的模块】。
+    // 原来写的是 !e.actorSigned,判的是 IM 宿主自己的签名:微信/QQ 都是签名程序,这一位
+    // 恒为真 → 整条规则永远不可能命中。现在读模块签名(enrich 第 3.9 步富化),
+    // 带签名但校验不过的模块按未签名算。
+    const bool moduleSigned = e.targetSigned && !e.targetSignatureMismatch;
+    if (imProcesses().contains(actorName) && !moduleSigned && anyContains(suspiciousDirs(), module)) {
         r.score += 35;
         r.reasons << (u("IM 进程 ") + actorName + u(" 从用户可写目录加载未签名模块(疑似群控白加黑侧载,T1574.002)"));
     }

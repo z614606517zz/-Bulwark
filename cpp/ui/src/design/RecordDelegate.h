@@ -37,6 +37,11 @@ public:
     // its own (no status, no kind) is set in it. Invalid = muted.
     void setIdentity(const QColor& hue) { m_identity = hue; }
     QColor identity() const { return m_identity; }
+    // Check mode (RecordBrowser::setCheckMode): every record leads with a check
+    // box showing whether it is selected; the rest of the row moves right to
+    // make room for it.
+    void setCheckable(bool on) { m_checkable = on; }
+    bool checkable() const { return m_checkable; }
 
     void paint(QPainter* p, const QStyleOptionViewItem& opt, const QModelIndex& idx) const override;
     QSize sizeHint(const QStyleOptionViewItem& opt, const QModelIndex& idx) const override;
@@ -49,6 +54,7 @@ private:
 
     bool m_rail = false;
     bool m_collapsible = false;
+    bool m_checkable = false;
     QColor m_identity;
     std::function<bool(const QString&)> m_isCollapsed;
 };
@@ -74,6 +80,10 @@ signals:
 public:
     // Run any pending item layout now (so visualRect() is current).
     void settleLayout() { executeDelayedItemsLayout(); }
+    // Keep the bottom `px` of the view free of rows (a floating bar sits there),
+    // so the last record can still be scrolled clear of it. 0 = none.
+    void setBottomInset(int px);
+    void keyboardSearch(const QString& search) override;
 
 protected:
     void paintEvent(QPaintEvent* e) override;
@@ -86,6 +96,7 @@ private:
 
     RecordDelegate* m_delegate = nullptr;
     QTimer* m_clock = nullptr;
+    int m_bottomInset = 0;
     bool m_sticky = false;
     mutable QRect m_stickyRect;
     mutable QString m_stickyGroup;

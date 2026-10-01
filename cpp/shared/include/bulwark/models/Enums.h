@@ -91,6 +91,19 @@ enum class EnforcementOutcome {
     ModuleBlacklisted, // 侧载模块已加入内核禁止加载名单:本次未拦下,但下次加载将被内核前拦
     Failed,            // 尝试处置但未成功(进程已退出 / 受保护 / 关键进程,无法结束)
     AlertedOnly,       // 仅告警:未做任何实际阻断(内核无法前拦且无可结束的进程),需人工关注
+    //
+    // 下面两个【必须追加在末尾】:线协议把本枚举当 int 传(Payloads.cpp),插在中间会让
+    // 混跑期的旧 UI 把处置读成另一种。旧 UI 读到这两个新值会落到 disposition() 的兜底
+    // 「已拦截」—— 二者都确实构成真实拦截,兜底方向不会把没拦下的说成拦下了。
+    //
+    // 这两个值补的是同一个实测谎报:AlertedOnly 的文案是「未做任何实际阻断,需要人工关注」,
+    // 而下面两种情形都做了实事,却都曾被归进 AlertedOnly,于是右下角弹「未能拦截」、
+    // 语音念「请手动处理」。
+    ExecDenied,        // 本次没有可结束的进程,但该映像已被【禁止再次启动】(内核禁止执行名单
+                       // 和/或文件「拒绝执行」ACE)。与 ModuleBlacklisted 同一档:这次没拦下,
+                       // 下次启动会在发生前被拒。
+    ActorAlreadyGone,  // 主体已被【本产品此前的处置】结束,本条是它生前排队的动作(事件源到
+                       // 裁决之间有延迟)。无需再处置,也不该再计一次拦截(那一次已经计过)。
 };
 
 // ---- EvidenceKind <-> string (wire form) ------------------------------------
@@ -177,6 +190,8 @@ inline QString enforcementOutcomeToString(EnforcementOutcome o) {
         case EnforcementOutcome::ModuleBlacklisted: return QStringLiteral("ModuleBlacklisted");
         case EnforcementOutcome::Failed:            return QStringLiteral("Failed");
         case EnforcementOutcome::AlertedOnly:       return QStringLiteral("AlertedOnly");
+        case EnforcementOutcome::ExecDenied:        return QStringLiteral("ExecDenied");
+        case EnforcementOutcome::ActorAlreadyGone:  return QStringLiteral("ActorAlreadyGone");
     }
     return QStringLiteral("NotApplicable");
 }

@@ -23,238 +23,89 @@
 #endif
 
 //
-// ===== 通用受保护项匹配(供文件 / 注册表复用)=====
+// ===== 通用受保护项匹配已移出本文件 =====
+//
+// BlwPrepareMatch / BlwMatchInListCtx / BlwMatchInListAnchoredCtx / BlwAddToList /
+// BlwRemoveFromList / BlwLogPattern 现在都在 MatchCore.c —— 它们是纯函数(不碰 g_Blw、
+// 不取锁、不依赖 IRQL),挪出去之后可以在用户态编译,由 cpp/tests/DriverMatchTest.cpp
+// 做单元测试。驱动不能在开发机上加载,那是唯一能证伪这些判定的地方。
+//
+// 本文件保留的是【需要 g_Blw 与锁】的那一层:各名单的 Clear / Add / Is 包装函数。
 //
 
 //
-// 把目标串一次性大写化进 Ctx。之后同一个回调里对任意多个名单的匹配都复用这份归一化结果。
+// ===== 死条目准入校验:带盘符的模式一律拒收 =====
 //
-// 目标长于 BLW_MAX_PATH 字符时不预归一化(Chars=0),记下原串走回退路径 —— 见
-// BLW_MATCH_CTX 的说明:宁可慢一点也绝不因路径过长而漏判。
+// 五份【文件路径】名单(ProtectedPaths / FileHardBlock / SelfGuard / FileNoLoad /
+// FileExecBlock)匹配的目标恒为 FLT_FILE_NAME_NORMALIZED 规范名,形如
+// \Device\HarddiskVolume3\Users\...。其中【不可能】出现 "<字母>:\" 这个三字符序列
+// (数据流名可以带 ':',但流名里不允许出现 '\')。所以一条带盘符的模式:
 //
-void
-BlwPrepareMatch(_Out_ PBLW_MATCH_CTX Ctx, _In_opt_ PCUNICODE_STRING Target)
-{
-    USHORT chars;
-    USHORT i;
-
-    Ctx->Original = Target;
-    Ctx->Chars = 0;
-
-    if (Target == NULL || Target->Buffer == NULL || Target->Length == 0) {
-        return;
-    }
-
-    chars = (USHORT)(Target->Length / sizeof(WCHAR));
-    if (chars > BLW_MAX_PATH) {
-        return;   // 超长:留给 Original 回退路径处理
-    }
-
-    for (i = 0; i < chars; i++) {
-        Ctx->Up[i] = BlwUpcaseChar(Target->Buffer[i]);
-    }
-    Ctx->Chars = chars;
-}
-
+//   * 永远不会命中 —— 它不是防护,是死代码;
+//   * 却白占 64 槽之一,并被内核写回注册表【跨重启续留】;
+//   * 槽位耗尽后 BlwAddToList 找不到空槽就静默返回 ——【此后所有新裁决都被丢弃】。
 //
-// 名单子串扫描的唯一实现。
+// 这不是假想:\Policy\FileNoLoad 现场实测有 3 条带 C:\ 前缀的条目,全是死的,各占一个槽,
+// 而 reconcileKernelBlocksAfterTrust 会把注册表条目原样重推,所以它永远不会自己变好。
+// 根因在用户态(blacklistExec 做了去盘符,enforceBlock 的 FileNoLoad 分支漏了),但内核
+// 这一侧本来就该有一道门:能判定为「永不可能命中」的输入,不该被收进定长名单。
 //
-// Prepared=TRUE  : Target 已大写化,窗口比较是纯宽字符比较(热路径)。
-// Prepared=FALSE : Target 是原串,逐字符即时大写化后比较(超长目标的回退路径)。
-// 两条分支使用同一套大写表,判定结果完全一致。
+// 【CmdHardBlock 与 RegHardBlock 绝不可套用本判据】
+//   * CmdHardBlock 匹配的是原始命令行,里面出现 C:\ 完全正常(`SAVE+HKLM\SAM` 这类模式
+//     也可能带盘符路径);
+//   * RegHardBlock 匹配的是「键路径\值名」,注册表值名允许含 ':'。
+// 套上去会把真实有效的模式误拒 —— 那比多留几条死条目严重得多。
 //
-// 窗口过滤用「首字符 + 末字符」双锚点:两端都对上才做中间段的整段比较。原实现只比首字符,
-// 而路径里首字符命中(尤其模式串以 '\\' 开头时)相当常见,双锚点把这些必然失败的整段比较
-// 也一并剪掉。中间段用 RtlEqualMemory(编译为向量化 memcmp),比逐字符循环快得多。
+// 返回 TRUE 表示已拒收(调用方直接返回)。DirtyBit 用于记一笔「该名单的磁盘副本需要重写」,
+// 不持久化的名单(SelfGuard)传 0。
 //
 static BOOLEAN
-BlwMatchScan(
-    _In_ BLW_PROTECTED_PATH* List,
-    _In_ LONG Count,
-    _In_reads_(TargetChars) PCWSTR Target,
-    _In_ USHORT TargetChars,
-    _In_ BOOLEAN Prepared)
+BlwRejectDeadPathPattern(
+    _In_ PCSTR ListName,
+    _In_opt_ PCWSTR Path,
+    _In_ USHORT Length,
+    _In_ LONG DirtyBit)
 {
-    ULONG i;
-    LONG  seen = 0;
-
-    if (Target == NULL || TargetChars == 0 || Count <= 0) {
+    if (!BlwPatternHasDriveLetter(Path, Length)) {
         return FALSE;
     }
 
-    // seen < Count:扫到最后一个在用项就收尾,不再遍历剩余空槽(名单通常只有几条,
-    // 原实现无论如何都要走满 64 槽)。Count 与 List 内容由调用方在同一把锁下读取,故一致。
-    for (i = 0; i < BLW_MAX_PROTECTED && seen < Count; i++) {
-        USHORT patChars;
-        USHORT limit;
-        USHORT s;
-        PCWSTR p;
-        WCHAR  first;
-        WCHAR  last;
-
-        if (!List[i].InUse) {
-            continue;
-        }
-        seen++;
-
-        // 模式串比目标长(或为空)绝不可能是其子串 —— 直接跳过,省掉整段滑窗。
-        patChars = List[i].Length;
-        if (patChars == 0 || patChars > TargetChars) {
-            continue;
-        }
-
-        p = List[i].Path;              // 已在加入时大写化
-        first = p[0];
-        last = p[patChars - 1];
-        limit = (USHORT)(TargetChars - patChars);
-
-        if (Prepared) {
-            for (s = 0; s <= limit; s++) {
-                if (Target[s] != first) {
-                    continue;
-                }
-                if (Target[s + patChars - 1] != last) {
-                    continue;
-                }
-                if (patChars <= 2 ||
-                    RtlEqualMemory(&Target[s + 1], &p[1],
-                                   (SIZE_T)(patChars - 2) * sizeof(WCHAR))) {
-                    return TRUE;
-                }
-            }
-        } else {
-            for (s = 0; s <= limit; s++) {
-                USHORT k;
-
-                if (BlwUpcaseChar(Target[s]) != first) {
-                    continue;
-                }
-                if (BlwUpcaseChar(Target[s + patChars - 1]) != last) {
-                    continue;
-                }
-                for (k = 1; (USHORT)(k + 1) < patChars; k++) {
-                    if (BlwUpcaseChar(Target[s + k]) != p[k]) {
-                        break;
-                    }
-                }
-                if ((USHORT)(k + 1) >= patChars) {
-                    return TRUE;
-                }
-            }
-        }
-    }
-    return FALSE;
+    BlwLogPattern(ListName, Path, Length);
+    BlwMarkDeadEntryDrop(DirtyBit);
+    return TRUE;
 }
 
-// 在 List 中查找是否有某项是 Ctx 目标(前 UseChars 个字符)的子串。调用方需自行持锁。
+//
+// ===== 名单精确删除单条的公共外壳(BLW_CMD_DEL_*)=====
+//
+// 持锁 -> 精确删除(MatchCore.c 的 BlwRemoveFromList)-> 只在真删掉时重算在用计数。
+// 计数只在变更时重算,是为了让「删不存在的条目」成为一次完全无副作用的操作 ——
+// Comms.c 据返回值决定是否标脏,不该因为一次空操作触发注册表写。
+//
+// 三个模块(文件 / 注册表 / 命令行)共用本外壳,避免第二份「重算计数」的循环。
+//
 BOOLEAN
-BlwMatchInListCtx(
+BlwRemoveFromGuardedList(
     _In_ BLW_PROTECTED_PATH* List,
-    _In_ LONG Count,
-    _In_ PBLW_MATCH_CTX Ctx,
-    _In_ USHORT UseChars)
+    _In_ PFAST_MUTEX Lock,
+    _Inout_ volatile LONG* Count,
+    _In_ PCWSTR Path,
+    _In_ USHORT Length)
 {
-    if (Ctx == NULL) {
-        return FALSE;
-    }
+    BOOLEAN removed;
 
-    if (Ctx->Chars != 0) {
-        USHORT n = (UseChars == 0 || UseChars > Ctx->Chars) ? Ctx->Chars : UseChars;
-        return BlwMatchScan(List, Count, Ctx->Up, n, TRUE);
-    }
-
-    // 回退:目标超过 BLW_MAX_PATH 字符,未做预归一化(极少见)。
-    if (Ctx->Original != NULL && Ctx->Original->Buffer != NULL && Ctx->Original->Length > 0) {
-        USHORT total = (USHORT)(Ctx->Original->Length / sizeof(WCHAR));
-        USHORT n = (UseChars == 0 || UseChars > total) ? total : UseChars;
-        return BlwMatchScan(List, Count, Ctx->Original->Buffer, n, FALSE);
-    }
-    return FALSE;
-}
-
-//
-// 把一条「未必以 NUL 结尾」的模式串安全地打进调试输出。
-// %wZ 按 UNICODE_STRING::Length 打印,不需要结尾 NUL,正好匹配 (Path, Chars) 这种传参形式。
-//
-static void
-BlwLogPattern(_In_ PCSTR Reason, _In_opt_ PCWSTR Path, _In_ USHORT Chars)
-{
-    UNICODE_STRING s;
-
-    if (Path == NULL || Chars == 0 || Chars >= BLW_MAX_PATH) {
-        RtlInitUnicodeString(&s, L"<invalid>");
-    } else {
-        s.Buffer = (PWCH)Path;
-        s.Length = (USHORT)(Chars * sizeof(WCHAR));
-        s.MaximumLength = s.Length;
-    }
-
-    KdPrint(("[Bulwark] %s: %wZ\n", Reason, &s));
-
-    // Release 构建里 KdPrint 是空宏,这两行避免 C4100/C4189(/WX 下会直接编译失败)。
-    UNREFERENCED_PARAMETER(Reason);
-    UNREFERENCED_PARAMETER(s);
-}
-
-//
-// 向 List 追加一项。调用方需自行持锁。
-// 模式串在此【大写化一次】后存入(见 BLW_PROTECTED_PATH 的存储约定),使热路径上的匹配
-// 不必再做任何大小写归一化。
-//
-// 先去重,再插入 —— 这一点是必需的,不是优化:
-//   各名单都是 BLW_MAX_PROTECTED(64)条的【定长】数组,而「已学习裁决」会在每次服务连接时
-//   整批重新下发一遍,命中时还会再下发一次。原实现只找第一个空槽就插入,于是同一条路径能
-//   重复占掉几十个槽。真实现场:FileNoLoad 里 AUTOIT3.EXE 重复 11 次、64 个槽全部用尽,
-//   FileExecBlock 里同一个 RuntimeBroker.exe 重复 4 次。
-//   槽位一旦耗尽,下面的循环找不到空槽就静默返回,【此后所有新的恶意裁决都被丢弃】——
-//   这是无声的能力退化,比多占一点内存严重得多。
-//   重复项对匹配结果毫无影响(子串匹配命中任一条即返回),所以去重是纯收益。
-//
-void
-BlwAddToList(_In_ BLW_PROTECTED_PATH* List, _In_ PCWSTR Path, _In_ USHORT Length)
-{
-    ULONG  i;
-    ULONG  freeSlot = BLW_MAX_PROTECTED;   // == BLW_MAX_PROTECTED 表示没有空槽
-    USHORT k;
-
-    if (Length == 0 || Length > (BLW_MAX_PATH - 1)) {
-        return;
-    }
-
-    // 一趟扫完:既找重复项,也记下第一个空槽。
-    for (i = 0; i < BLW_MAX_PROTECTED; i++) {
-        if (!List[i].InUse) {
-            if (freeSlot == BLW_MAX_PROTECTED) {
-                freeSlot = i;
-            }
-            continue;
+    ExAcquireFastMutex(Lock);
+    removed = BlwRemoveFromList(List, Path, Length);
+    if (removed) {
+        LONG cnt = 0;
+        ULONG i;
+        for (i = 0; i < BLW_MAX_PROTECTED; i++) {
+            if (List[i].InUse) cnt++;
         }
-        if (List[i].Length != Length) {
-            continue;
-        }
-        // List[i].Path 已是大写形式,故与大写化后的候选逐字符比较即为大小写不敏感比较。
-        for (k = 0; k < Length; k++) {
-            if (List[i].Path[k] != BlwUpcaseChar(Path[k])) {
-                break;
-            }
-        }
-        if (k == Length) {
-            return;   // 已在名单里:不再占用第二个槽
-        }
+        InterlockedExchange(Count, cnt);
     }
-
-    if (freeSlot == BLW_MAX_PROTECTED) {
-        // 名单已满。明确记录下来,不让「裁决被丢弃」这件事无声发生。
-        BlwLogPattern("List full, entry DROPPED", Path, Length);
-        return;
-    }
-
-    for (k = 0; k < Length; k++) {
-        List[freeSlot].Path[k] = BlwUpcaseChar(Path[k]);
-    }
-    List[freeSlot].Path[Length] = L'\0';
-    List[freeSlot].Length = Length;
-    List[freeSlot].InUse = TRUE;
+    ExReleaseFastMutex(Lock);
+    return removed;
 }
 
 //
@@ -273,6 +124,11 @@ BlwClearProtectedPaths(void)
 void
 BlwAddProtectedPath(_In_ PCWSTR Path, _In_ USHORT Length)
 {
+    if (BlwRejectDeadPathPattern("ProtectedPath entry REJECTED (drive-letter pattern never matches)",
+                                 Path, Length, BLW_POLICY_DIRTY_PATHS)) {
+        return;
+    }
+
     ExAcquireFastMutex(&g_Blw.PathLock);
     BlwAddToList(g_Blw.ProtectedPaths, Path, Length);
     // 重新计数(简单可靠,只发生在配置下发时,频率极低)
@@ -285,6 +141,13 @@ BlwAddProtectedPath(_In_ PCWSTR Path, _In_ USHORT Length)
         InterlockedExchange(&g_Blw.ProtectedPathCount, cnt);
     }
     ExReleaseFastMutex(&g_Blw.PathLock);
+}
+
+BOOLEAN
+BlwDelProtectedPath(_In_ PCWSTR Path, _In_ USHORT Length)
+{
+    return BlwRemoveFromGuardedList(g_Blw.ProtectedPaths, &g_Blw.PathLock,
+                                    &g_Blw.ProtectedPathCount, Path, Length);
 }
 
 //
@@ -316,6 +179,11 @@ BlwClearFileHardBlock(void)
 void
 BlwAddFileHardBlock(_In_ PCWSTR Path, _In_ USHORT Length)
 {
+    if (BlwRejectDeadPathPattern("FileHardBlock entry REJECTED (drive-letter pattern never matches)",
+                                 Path, Length, BLW_POLICY_DIRTY_FILEHARD)) {
+        return;
+    }
+
     ExAcquireFastMutex(&g_Blw.FileHardLock);
     BlwAddToList(g_Blw.FileHardBlock, Path, Length);
     {
@@ -327,6 +195,13 @@ BlwAddFileHardBlock(_In_ PCWSTR Path, _In_ USHORT Length)
         InterlockedExchange(&g_Blw.FileHardCount, cnt);
     }
     ExReleaseFastMutex(&g_Blw.FileHardLock);
+}
+
+BOOLEAN
+BlwDelFileHardBlock(_In_ PCWSTR Path, _In_ USHORT Length)
+{
+    return BlwRemoveFromGuardedList(g_Blw.FileHardBlock, &g_Blw.FileHardLock,
+                                    &g_Blw.FileHardCount, Path, Length);
 }
 
 BOOLEAN
@@ -355,6 +230,13 @@ BlwClearSelfGuard(void)
 void
 BlwAddSelfGuard(_In_ PCWSTR Path, _In_ USHORT Length)
 {
+    // SelfGuard【不持久化】(见 Protocol.h 的 BLW_CMD_ADD_SELFGUARD),故 DirtyBit 传 0:
+    // 拒收只需记一行日志,磁盘上没有需要自愈的副本。
+    if (BlwRejectDeadPathPattern("SelfGuard entry REJECTED (drive-letter pattern never matches)",
+                                 Path, Length, 0)) {
+        return;
+    }
+
     ExAcquireFastMutex(&g_Blw.SelfGuardLock);
     BlwAddToList(g_Blw.SelfGuard, Path, Length);
     {
@@ -533,9 +415,15 @@ BlwClearFileNoLoad(void)
 void
 BlwAddFileNoLoad(_In_ PCWSTR Path, _In_ USHORT Length)
 {
-    // 准入校验:禁止加载核心运行库(ntdll/kernel32/...)等于让系统上几乎所有进程都起不来。
+    // 准入校验 1:带盘符的模式永远匹配不上规范名 —— 现场那 3 条死条目就在这份名单里。
+    if (BlwRejectDeadPathPattern("NoLoad entry REJECTED (drive-letter pattern never matches)",
+                                 Path, Length, BLW_POLICY_DIRTY_NOLOAD)) {
+        return;
+    }
+    // 准入校验 2:禁止加载核心运行库(ntdll/kernel32/...)等于让系统上几乎所有进程都起不来。
     if (BlwPatternHitsSystemImage(Path, Length)) {
         BlwLogPattern("NoLoad entry REJECTED (would block a system image)", Path, Length);
+        BlwMarkDeadEntryDrop(BLW_POLICY_DIRTY_NOLOAD);
         return;
     }
 
@@ -552,12 +440,35 @@ BlwAddFileNoLoad(_In_ PCWSTR Path, _In_ USHORT Length)
     ExReleaseFastMutex(&g_Blw.FileNoLoadLock);
 }
 
+//
+// 【为什么这两份名单用锚定匹配,而受保护/硬拦名单仍用子串匹配】
+//
+// FileNoLoad 与 FileExecBlock 是【拒绝】语义,误判的代价是「某个模块加载不了 / 某个程序
+// 永远起不来」,而且名单跨重启续留 —— 所以判据必须比「保护」类名单收得更紧。子串匹配会
+// 连带命中一批并非被判定为恶意的对象:名单里有 `\USERS\U\TEMP\A.EXE` 时,它同时挡住
+//     ...\Temp\a.exe.bak        (备份文件)
+//     ...\Temp\a.exe\sub\x.dll  (恰好叫 a.exe 的目录下的任何模块)
+// 锚定判据要求「从目录边界起、到串尾(或数据流分隔符 ':')止」,把这类误伤去掉,同时
+// 保住两种真实用法:用户态下发的「去盘符完整路径」,以及 set-baseline-policy.ps1 文档里
+// 的文件名片段写法(-FileExecBlock '\evil.exe')。完整判据与取舍见 MatchCore.c 的
+// BLW_MATCH_MODE 注释;各形态的断言在 cpp/tests/DriverMatchTest.c 第 [7] 组。
+//
+// ProtectedPaths / FileHardBlock / SelfGuard / 注册表两份名单【保持子串语义】:它们是
+// 保护语义,里面本来就有 "\START MENU\PROGRAMS\STARTUP\" 这类出现在路径中段的目录片段。
+//
+BOOLEAN
+BlwDelFileNoLoad(_In_ PCWSTR Path, _In_ USHORT Length)
+{
+    return BlwRemoveFromGuardedList(g_Blw.FileNoLoad, &g_Blw.FileNoLoadLock,
+                                    &g_Blw.FileNoLoadCount, Path, Length);
+}
+
 BOOLEAN
 BlwFileIsNoLoad(_In_ PBLW_MATCH_CTX Ctx)
 {
     BOOLEAN matched;
     ExAcquireFastMutex(&g_Blw.FileNoLoadLock);
-    matched = BlwMatchInListCtx(g_Blw.FileNoLoad, g_Blw.FileNoLoadCount, Ctx, 0);
+    matched = BlwMatchInListAnchoredCtx(g_Blw.FileNoLoad, g_Blw.FileNoLoadCount, Ctx);
     ExReleaseFastMutex(&g_Blw.FileNoLoadLock);
     return matched;
 }
@@ -581,10 +492,16 @@ BlwClearFileExecBlock(void)
 void
 BlwAddFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length)
 {
-    // 准入校验:绝不收录会连带挡住系统组件的模式(cmd.exe / netsh.exe 那次事故就是这么来的)。
+    // 准入校验 1:带盘符的模式永远匹配不上规范名,只会白占槽并跨重启续留。
+    if (BlwRejectDeadPathPattern("ExecBlock entry REJECTED (drive-letter pattern never matches)",
+                                 Path, Length, BLW_POLICY_DIRTY_EXECBLOCK)) {
+        return;
+    }
+    // 准入校验 2:绝不收录会连带挡住系统组件的模式(cmd.exe / netsh.exe 那次事故就是这么来的)。
     // LOLBin 的滥用请走 CmdHardBlock —— 那才是按「用法」拦、而不是按「程序」拦的地方。
     if (BlwPatternHitsSystemImage(Path, Length)) {
         BlwLogPattern("ExecBlock entry REJECTED (would block a system image)", Path, Length);
+        BlwMarkDeadEntryDrop(BLW_POLICY_DIRTY_EXECBLOCK);
         return;
     }
 
@@ -602,11 +519,19 @@ BlwAddFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length)
 }
 
 BOOLEAN
+BlwDelFileExecBlock(_In_ PCWSTR Path, _In_ USHORT Length)
+{
+    return BlwRemoveFromGuardedList(g_Blw.FileExecBlock, &g_Blw.FileExecBlockLock,
+                                    &g_Blw.FileExecBlockCount, Path, Length);
+}
+
+// 锚定匹配,理由同 BlwFileIsNoLoad 上方那段说明。
+BOOLEAN
 BlwFileIsExecBlocked(_In_ PBLW_MATCH_CTX Ctx)
 {
     BOOLEAN matched;
     ExAcquireFastMutex(&g_Blw.FileExecBlockLock);
-    matched = BlwMatchInListCtx(g_Blw.FileExecBlock, g_Blw.FileExecBlockCount, Ctx, 0);
+    matched = BlwMatchInListAnchoredCtx(g_Blw.FileExecBlock, g_Blw.FileExecBlockCount, Ctx);
     ExReleaseFastMutex(&g_Blw.FileExecBlockLock);
     return matched;
 }
@@ -661,6 +586,104 @@ BlwReportFileTelemetry(_In_ ULONG eventType, _In_ PCUNICODE_STRING fileName)
 //
 
 //
+// ===== 释放物可见面:落地区新建可执行 / 脚本文件 =====
+//
+// 【补的是什么缺口】BlwPreCreate 原先只上报 delete-on-close,「新建了一个文件」这件事在驱动
+// 模式下完全不可见。于是 dropper 的典型动作 —— 往 %TEMP% / AppData 写一个 payload.exe ——
+// 用户态在驱动模式下看不到,释放物污点、「写出即执行」关联、落盘即扫都因此没有触发点。
+// (无驱动的 ETW 模式反而有:EtwProcessEventSource 订阅了 kFileCreateNew。驱动模式不该更瞎。)
+//
+// 【为什么要两层门槛】对「所有新建文件」上报会直接压垮上报通道(系统每秒新建大量临时文件)。
+// 所以必须同时满足:
+//   1) 位于【落地区】—— 用卷相对锚定前缀判定,绝不用子串包含(C:\Users\u\ProgramData\ 这种
+//      用户自建目录会骗过子串判定,见 BlwVolumeRelativeOffset 上方那段事故说明);
+//   2) 扩展名是【可执行 / 脚本 / 安装包】之一。
+// 两层叠起来,事件量与 ETW 那条(isDroppedExecutable)同量级,已在真机跑过量级的那一条。
+//
+// 【已知代价】pre-create 不知道创建最终是否成功,会有少量「其实没创建成」的上报。要消掉它
+// 得新注册一个 post-create 回调,那是更高的风险(回调出错即蓝屏,而本机不能加载测试),
+// 收益只是去掉少量噪声 —— 刻意不做。用户态拿到路径后本来就要核实文件是否存在。
+//
+// 落地区【刻意不含 \Program Files\ 等标准安装目录】:那里普通用户写不进去,新建可执行文件
+// 基本都是正常安装/更新行为,上报只会是噪声。
+//
+static BOOLEAN
+BlwIsDroppedPayload(_In_opt_ PCWSTR Path, _In_ USHORT Chars)
+{
+    // 落地区(卷相对锚定前缀)。\Users\ 已覆盖 AppData / Temp / Downloads / Desktop / Public。
+    static const BLW_NAME_ENTRY kDropZones[] = {
+        BLW_NAME(L"\\Users\\"),
+        BLW_NAME(L"\\ProgramData\\"),
+        BLW_NAME(L"\\Windows\\Temp\\"),
+        BLW_NAME(L"\\PerfLogs\\"),
+        BLW_NAME(L"\\$Recycle.Bin\\"),
+    };
+
+    // 可执行 / 脚本 / 安装包扩展名。与用户态 isDroppedExecutable 的口径对齐。
+    static const BLW_NAME_ENTRY kPayloadExt[] = {
+        BLW_NAME(L".exe"),  BLW_NAME(L".dll"),  BLW_NAME(L".sys"),  BLW_NAME(L".scr"),
+        BLW_NAME(L".com"),  BLW_NAME(L".pif"),  BLW_NAME(L".cpl"),  BLW_NAME(L".ocx"),
+        BLW_NAME(L".drv"),  BLW_NAME(L".bat"),  BLW_NAME(L".cmd"),  BLW_NAME(L".ps1"),
+        BLW_NAME(L".psm1"), BLW_NAME(L".vbs"),  BLW_NAME(L".vbe"),  BLW_NAME(L".js"),
+        BLW_NAME(L".jse"),  BLW_NAME(L".wsf"),  BLW_NAME(L".wsh"),  BLW_NAME(L".hta"),
+        BLW_NAME(L".jar"),  BLW_NAME(L".msi"),  BLW_NAME(L".msp"),  BLW_NAME(L".lnk"),
+    };
+
+    USHORT off;
+    ULONG  i;
+    BOOLEAN inZone = FALSE;
+
+    if (Path == NULL || Chars == 0) {
+        return FALSE;
+    }
+
+    off = BlwVolumeRelativeOffset(Path, Chars);
+    if (off == 0) {
+        return FALSE;   // 认不出卷前缀(网络路径等)-> 不上报,与其它锚定判定同一 fail-safe 方向
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(kDropZones); i++) {
+        if (BlwStartsWithCI(Path + off, (USHORT)(Chars - off),
+                            kDropZones[i].Name, kDropZones[i].Chars)) {
+            inZone = TRUE;
+            break;
+        }
+    }
+    if (!inZone) {
+        return FALSE;
+    }
+
+    for (i = 0; i < RTL_NUMBER_OF(kPayloadExt); i++) {
+        const USHORT extChars = kPayloadExt[i].Chars;
+
+        if (Chars < extChars) {
+            continue;
+        }
+        if (BlwStartsWithCI(Path + (Chars - extChars), extChars,
+                            kPayloadExt[i].Name, extChars)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+//
+// 本次 CREATE 的 Disposition 是否会【新建或覆盖】文件内容(而不是单纯打开已有文件)。
+// Disposition 在 Create.Options 的最高字节里。
+//
+static BOOLEAN
+BlwCreateDispositionWrites(_In_ ULONG CreateOptions)
+{
+    const ULONG disposition = (CreateOptions >> 24) & 0xFF;
+
+    return (disposition == FILE_SUPERSEDE ||
+            disposition == FILE_CREATE ||
+            disposition == FILE_OPEN_IF ||
+            disposition == FILE_OVERWRITE ||
+            disposition == FILE_OVERWRITE_IF);
+}
+
+//
 // IRP_MJ_CREATE:仅关注"打开即删除"(FILE_DELETE_ON_CLOSE)。
 //
 FLT_PREOP_CALLBACK_STATUS
@@ -681,6 +704,7 @@ BlwPreCreate(
     BOOLEAN needNoLoadCheck;
     BOOLEAN needSelfGuardCheck;
     BOOLEAN needTelemetry;
+    BOOLEAN needDropWatch;
     ULONG   actorPid = 0;   // 惰性取值:只有确实要判定主体身份时才取,不给最快路径添开销
     BLW_MATCH_CTX ctx;   // 预归一化的文件名(仅在确实需要查名单时才填充,见下方快速放行)
 
@@ -761,9 +785,19 @@ BlwPreCreate(
     // 只为「原子读」,却在每次 CREATE / SET_INFO / WRITE 上付出一次带锁的 cmpxchg,纯属浪费。
     needTelemetry = (g_Blw.FileTelemetryEnabled != 0) && deleteOnClose;
 
-    // 五类都不需要 -> 直接放行,绝不解析文件名(性能关键)。
+    //
+    // 需要做「释放物可见面」上报:遥测开启 且 本次打开会新建/覆盖文件内容 且 带写意图。
+    // 排除 delete-on-close(那是删除信号,由 needTelemetry 负责,两者互斥)。
+    // 这里只是【廉价的前置筛选】——真正的两层门槛(落地区 + 可执行扩展名)在下面拿到
+    // 规范名之后才判,见 BlwIsDroppedPayload。
+    //
+    needDropWatch = (g_Blw.FileTelemetryEnabled != 0) && writeOrDeleteIntent && !deleteOnClose &&
+                    BlwCreateDispositionWrites(createOptions);
+
+    // 六类都不需要 -> 直接放行,绝不解析文件名(性能关键)。
     // FltGetFileNameInformation 是昂贵调用,系统每秒数千次 CREATE 全做会显著拖慢 I/O。
-    if (!needHardCheck && !needProtCheck && !needNoLoadCheck && !needSelfGuardCheck && !needTelemetry) {
+    if (!needHardCheck && !needProtCheck && !needNoLoadCheck && !needSelfGuardCheck &&
+        !needTelemetry && !needDropWatch) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -873,6 +907,31 @@ BlwPreCreate(
     //
     if (needTelemetry) {
         BlwReportFileTelemetry(BlwEventFileDelete, &nameInfo->Name);
+    }
+
+    //
+    // 4) 释放物可见面:落地区新建/覆盖出一个可执行或脚本文件 -> fire-and-forget 上报。
+    //    不拦截。这是驱动模式下「dropper 刚把 payload 写出来」的唯一触发点,详见
+    //    BlwIsDroppedPayload 上方的说明。
+    //
+    //    本产品自身进程豁免:更新、隔离区落盘、规则/缓存写入都会在 %ProgramData% 下新建文件,
+    //    上报自己等于给用户态制造纯噪声(与 SelfGuard 的属主判定同一口径)。
+    //
+    //    子类型复用 BlwEventFileRename:用户态按 ParentPid 还原时,非「删除标记」一律映射为
+    //    FileWrite(DriverEventSource.cpp 的 BlwEventFileModify 分支),正是这里要的语义
+    //    「这个文件被写出来了」。IRP_MJ_WRITE 那条采样上报用的也是同一个子类型,口径一致。
+    //    (代价:UI 详情文案会显示成「重命名/移动」。要精确区分得新增子类型 + 改用户态映射,
+    //     那是用户态那条线的工作,不在本次驱动改动范围内。)
+    //
+    if (needDropWatch) {
+        if (actorPid == 0) {
+            actorPid = HandleToULong(PsGetCurrentProcessId());
+        }
+        if (!BlwPidIsProtected(actorPid) &&
+            BlwIsDroppedPayload(nameInfo->Name.Buffer,
+                                (USHORT)(nameInfo->Name.Length / sizeof(WCHAR)))) {
+            BlwReportFileTelemetry(BlwEventFileRename, &nameInfo->Name);
+        }
     }
 
     FltReleaseFileNameInformation(nameInfo);
@@ -1112,6 +1171,40 @@ BlwPreSetInformation(
     // 供用户态做勒索行为时序聚合(批量改写 / 扩展名同化 / 蜜罐触碰)。
     BlwReportFileTelemetry(eventType, &nameInfo->Name);
 
+    //
+    // 重命名额外上报【目标名】。「先写 x.tmp 再改名成 x.exe」是投递载荷的常见手法:只报源名,
+    // 用户态记下的是一个已经不存在的 x.tmp,真正落地的 x.exe 从未出现 —— 释放物污点与
+    // 「写出即执行」关联都因此漏掉它。复用 BlwReportFileTelemetry(同为 FileModify + 原始
+    // 操作类型 = 重命名),协议不变,也不进用户态的裁决追踪。
+    //
+    // 门槛与 BlwReportFileTelemetry 内部相同,这里提前判一次只是为了在遥测关闭时
+    // 省掉 FltGetDestinationFileNameInformation 的开销。取不到目标名就算了(fail-open)。
+    //
+    if (eventType == BlwEventFileRename && g_Blw.Active && g_Blw.FileTelemetryEnabled != 0 &&
+        KeGetCurrentIrql() == PASSIVE_LEVEL) {
+
+        PFILE_RENAME_INFORMATION ren =
+            (PFILE_RENAME_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+
+        if (ren != NULL && ren->FileNameLength > 0) {
+            PFLT_FILE_NAME_INFORMATION destInfo = NULL;
+
+            status = FltGetDestinationFileNameInformation(
+                FltObjects->Instance,
+                FltObjects->FileObject,
+                ren->RootDirectory,
+                ren->FileName,
+                ren->FileNameLength,
+                FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                &destInfo);
+
+            if (NT_SUCCESS(status) && destInfo != NULL) {
+                BlwReportFileTelemetry(BlwEventFileRename, &destInfo->Name);
+                FltReleaseFileNameInformation(destInfo);
+            }
+        }
+    }
+
     FltReleaseFileNameInformation(nameInfo);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
@@ -1126,10 +1219,52 @@ BlwPreSetInformation(
 //   * 仅遥测开启时才工作;关闭时第一行就返回,零开销。
 //   * 只对【偏移 0 起写】采样 —— 加密通常重写整个文件,首块必从 0 写起;
 //     普通追加写(日志/数据库)偏移非 0,直接放行,避免海量正常写入触发上报。
-//   * 进程级采样:同一进程每 N 次符合条件的写才解析一次文件名并上报,
-//     用全局计数器做廉价节流,绝不每次写都解析文件名(FltGetFileNameInformation 昂贵)。
+//   * 【按 PID 散列】的分槽采样:同一进程每 N 次符合条件的写才解析一次文件名并上报,
+//     绝不每次写都解析文件名(FltGetFileNameInformation 昂贵)。分槽而不是共用一个全局
+//     计数器,是因为用户态勒索聚合按【发起进程】算改写速率 —— 全局预算会被任何一个写得
+//     很密的正常进程吃掉,噪声越大越拦不住勒索。完整说明见 BLW_GLOBALS::WriteSampleSlots。
+//   * 同一文件被反复从头覆写不重复计入(WriteSeenFile 备忘),预算只花在「不同的文件」上。
 //   * 绝不拦截、绝不发同步 IPC:只 fire-and-forget 入队,队列满即丢。
 //
+
+//
+// 本次「偏移 0 起写」是否该上报。无锁,可在任意 IRQL 调用。
+//
+// FileObject 只作【不透明身份标签】使用 ——【绝不解引用】。它可能早已被释放;我们唯一用到它的
+// 地方是与「上一次在同一槽里计入过的那个值」做一次相等比较,比错了的后果仅仅是多上报或少上报
+// 一条遥测,既不会访问无效内存,也不影响任何拦截判定。
+//
+static BOOLEAN
+BlwWriteSampleShouldReport(_In_ ULONG Pid, _In_opt_ PVOID FileObjectKey)
+{
+    const ULONG slot = (Pid >> 2) & BLW_WRITE_SLOT_MASK;
+    const LONG64 key = (LONG64)(ULONG_PTR)FileObjectKey;
+    LONG n;
+
+    //
+    // 同一个文件被反复从偏移 0 覆写(日志轮转 / 数据库回写 / 进度文件)不重复计入 ——
+    // 采样预算应当只花在「不同的文件」上,那才是勒索批量加密的特征。
+    // key==0(拿不到 FileObject)时跳过这一步,直接按计数采样,不因此漏掉信号。
+    //
+    if (key != 0) {
+        if (InterlockedExchange64(&g_Blw.WriteSeenFile[slot], key) == key) {
+            return FALSE;
+        }
+    }
+
+    //
+    // 计数从 1 开始 -> 取模为 1 时命中,故【每个槽的第一次首块写必定上报】:
+    // 只改几个文件的样本也能被看见,不会整批落在采样间隙里。
+    //
+    // 取模刻意走【无符号 + 位与】:计数器是 LONG,长时间运行后会溢出成负数,而负数的 % 结果
+    // 落在 {-31..0},再也不会等于 1 —— 那个槽会从此永久停止上报(静默的能力退化)。
+    // 采样率是 2 的幂(下面 C_ASSERT 保证),故位与在无符号回绕下节奏依然精确。
+    //
+    n = InterlockedIncrement(&g_Blw.WriteSampleSlots[slot]);
+    return ((((ULONG)n) & (BLW_WRITE_SAMPLE_RATE - 1)) == 1);
+}
+C_ASSERT((BLW_WRITE_SAMPLE_RATE & (BLW_WRITE_SAMPLE_RATE - 1)) == 0);
+
 FLT_PREOP_CALLBACK_STATUS
 BlwPreWrite(
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -1139,7 +1274,6 @@ BlwPreWrite(
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS status;
     LARGE_INTEGER byteOffset;
-    LONG sample;
 
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
@@ -1178,11 +1312,15 @@ BlwPreWrite(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    // 4) 采样节流:每 BLW_WRITE_SAMPLE_RATE 次"偏移 0 写"才真正解析并上报一次。
-    //    用全局原子计数器做廉价取模,避免对每次写都做昂贵的文件名解析。
-    //    勒索批量加密会产生大量"偏移 0 写",采样足以让用户态在窗口内聚合出高速率。
-    sample = InterlockedIncrement(&g_Blw.WriteSampleCounter);
-    if ((sample % BLW_WRITE_SAMPLE_RATE) != 0) {
+    //
+    // 4) 采样节流(按 PID 分槽 + 同文件去重)。完整理由见 BLW_GLOBALS::WriteSampleSlots:
+    //    原实现用【一个】全局计数器,全系统共享 1/32 预算,任何写得密的正常进程都会把它吃掉,
+    //    而用户态勒索聚合是按发起进程算速率的 —— 那是真实的检出损失。
+    //
+    //    全程无锁:一次 InterlockedExchange64(同文件去重)+ 一次 InterlockedIncrement(计数)。
+    //
+    if (!BlwWriteSampleShouldReport(HandleToULong(PsGetCurrentProcessId()),
+                                    Data->Iopb->TargetFileObject)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 

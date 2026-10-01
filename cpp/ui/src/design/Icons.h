@@ -24,7 +24,7 @@ class QPainterPath;
 // chevrons-left, chevrons-right, arrow-right, arrow-left, arrow-up, plus,
 // minus, trash, eye, globe, cpu, server, layers, zap, more, copy, folder,
 // upload, download, pause, play, filter, external, panel-left, check-circle,
-// x-circle, bar-chart, list, tree, hash, terminal, user, key, bell, undo,
+// check-square, x-circle, bar-chart, list, tree, hash, terminal, user, key, bell, undo,
 // maximize, minimize, pin, calendar.
 class AppIcon : public QWidget
 {

@@ -28,6 +28,37 @@ const QSet<QString>& knownEncryptedExts() {
     return s;
 }
 
+//
+// 「扩展名同化」判据必须排除的扩展名:安装器 / 解压器 / 编译器 / 同步工具产出的中间文件。
+//
+// 判据本身是「短时间内大量文件统一成同一个扩展名」—— 对勒索来说那是加密后缀,但对
+// 下面这些扩展名来说,统一恰恰是它们的工作方式,与加密毫无关系:
+//   · .tmp  —— Inno Setup 把整个安装模块解包成 %TEMP%\is-XXXX.tmp\*.tmp;NSIS 用 nsXXXX.tmp。
+//             实测 innosetup-6.7.3.tmp 一次写出 116 个文件、其中 110 个是 .tmp,被判
+//             「疑似勒索加密 + 扩展名同化」,随后静默模式升级为拦截并结束进程树 ——
+//             官方安装包(winget 装的)装不上去。
+//   · .part / .crdownload / .download —— 浏览器与下载器的未完成文件。
+//   · .log / .etl / .dmp —— 日志与转储轮转。
+//   · .bak / .old —— 备份工具。
+//   · .pyc / .obj / .o / .pdb / .ilk / .lastbuildstate —— 编译中间产物(本项目自己构建时就会刷一大片)。
+//   · .json / .db / .db-journal / .ldb / .sqlite-journal —— 浏览器 / Electron 应用的本地状态。
+//   · .cache / .idx / .pack —— 缓存与 git 对象。
+// 真勒索的后缀不在这张表里,而且它另有三条不受本表影响的硬判据:已知勒索扩展名(×3)、
+// 勒索说明文件、蜜罐诱饵 —— 后者是无条件拦截。
+//
+const QSet<QString>& toolchainExts() {
+    static const QSet<QString> s = {
+        ".tmp", ".temp", ".part", ".crdownload", ".download", ".partial",
+        ".log", ".etl", ".dmp", ".bak", ".old", ".~tmp",
+        ".pyc", ".pyo", ".obj", ".o", ".pdb", ".ilk", ".lastbuildstate", ".tlog",
+        ".json", ".db", ".db-journal", ".ldb", ".sqlite-journal", ".journal",
+        ".cache", ".idx", ".pack", ".manifest", ".res",
+    };
+    // 刻意不收 .lock:它在 knownEncryptedExts() 里,且那一支(已知勒索扩展名)排在前面、
+    // 门槛更低(×3 即硬指标)。两张表重叠会让这里读起来自相矛盾。
+    return s;
+}
+
 // Path.GetExtension 等价:返回最后一段的最后一个 '.' 起(含点),小写;无则空。
 QString getExtension(const QString& path) {
     const int sep = qMax(path.lastIndexOf(QLatin1Char('\\')), path.lastIndexOf(QLatin1Char('/')));
@@ -148,7 +179,7 @@ RansomwareBehaviorMonitor::Result RansomwareBehaviorMonitor::observe(const Secur
             score += 40;
             hardSignal = true;
             r.reasons << (u("批量产生已知勒索扩展名 ") + ext + u("(×") + QString::number(sameExt) + u(")"));
-        } else if (sameExt >= qMax(8, burstThreshold_)) {
+        } else if (sameExt >= qMax(8, burstThreshold_) && !toolchainExts().contains(ext)) {
             score += 25;
             r.reasons << (u("扩展名同化:大量文件统一为 ") + ext + u("(×") + QString::number(sameExt) + u(",疑似加密)"));
         }

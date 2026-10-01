@@ -158,7 +158,9 @@ bool ensureBackendRunning(QWidget* parent) {
     return false;
 }
 
-// shutdownBackend() 已移除 —— 理由见 Bootstrap.h。简言之:关界面不该关防护。
+// shutdownBackend() 已移除 —— 理由见 Bootstrap.h。简言之:关界面【默认】不关防护;想要
+// 「关界面即停防护」的用户走设置里的 protectionFollowsUi,那一条由服务侧按管道断开来执行,
+// 不需要界面去停服务(界面没那个权限,硬做就得每次退出弹 UAC)。
 
 bool ensureUiAutoStart() {
     const QString exe = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());

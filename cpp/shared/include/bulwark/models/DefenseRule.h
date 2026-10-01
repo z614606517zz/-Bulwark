@@ -38,6 +38,19 @@ struct DefenseRule {
     //
     // 注意它与 requireUnsigned 互斥:两个都置 true 的规则永不命中(会被 loadRules 的护栏记下)。
     bool requireSigned = false;
+    //
+    // ---- 按【目标文件自身】的签名门控(与上面两个按主体门控的对称)-------------
+    //
+    // 上面两个读的是 SecurityEvent::actorSigned —— 也就是【发起方】。对 ImageLoad 来说发起方是
+    // 宿主进程(内核模块加载时甚至只是个伪串),而要判的往往是「被加载的这个模块自己有没有可信
+    // 签名」。那是 targetSigned / targetSignatureMismatch,与 actorSigned 完全两回事。
+    //
+    // 目前只有 ImageLoad 事件会被富化出这两个字段;其它事件类型上这两个条件恒为「未签名」,
+    // 所以【不要】把它们用在非 ImageLoad 规则上(requireTargetSigned 会永不命中)。
+    //
+    // 与主体侧同理:两个都置 true 的规则永不命中,由 loadRules 的护栏记下。
+    bool requireTargetUnsigned = false; // 仅当目标文件没有可信签名才命中
+    bool requireTargetSigned = false;   // 仅当目标文件持有可信且未失配的签名才命中
     bool exemptTrustedOsComponent = false; // 命中后可被强可信 OS 组件豁免
     bool hardOverride = false;      // 确定性恶意硬拦截(排序最高优先级)
     QSet<QString> actorHashes;      // 哈希黑/白名单(SHA-256),空=不限

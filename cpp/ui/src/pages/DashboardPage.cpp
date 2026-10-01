@@ -8,6 +8,7 @@
 #include "design/IconTile.h"
 #include "design/Icons.h"
 #include "design/Inspector.h"
+#include "design/Motion.h"
 #include "design/ShieldEmblem.h"
 #include "design/Theme.h"
 #include "ipc/IpcClient.h"
@@ -21,21 +22,23 @@
 #include <QDateTime>
 #include <QEnterEvent>
 #include <QFrame>
+#include <QGraphicsOpacityEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
-#include <QLocale>
 #include <QLinearGradient>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QShowEvent>
 #include <QTimer>
 #include <QToolTip>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -64,19 +67,42 @@ public:
     {
         setCursor(Qt::PointingHandCursor);
         setFocusPolicy(Qt::TabFocus);
+        m_anim = new QVariantAnimation(this);
+        m_anim->setDuration(motion::duration(140));
+        m_anim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_anim, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+            m_hover = v.toReal();
+            applyGlow();
+        });
+    }
+
+    // The tile's colour: its corner light, and the rim that comes up under the
+    // pointer. The design puts no drop shadow on an in-window card, so "lifting"
+    // is more light and a brighter edge — not an offset that would shift the
+    // text (and jump back on the next relayout).
+    void setTone(const QColor& c)
+    {
+        tone = c;
+        applyGlow();
     }
 
 protected:
     void paintEvent(QPaintEvent* e) override
     {
         GlowCard::paintEvent(e);
-        if (!hasFocus() && !m_hover)
+        const bool focus = hasFocus();
+        if (!focus && m_hover <= 0.001)
             return;
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
-        p.setPen(QPen(hasFocus() ? theme::accent() : theme::blend(tone, theme::surface(), 0.55), hasFocus() ? 1.6 : 1.1));
+        const QRectF r = QRectF(rect()).adjusted(0.8, 0.8, -0.8, -0.8);
         p.setBrush(Qt::NoBrush);
-        p.drawRoundedRect(QRectF(rect()).adjusted(0.8, 0.8, -0.8, -0.8), 15, 15);
+        if (!focus) {
+            p.setPen(QPen(theme::tint(theme::blend(tone, theme::surface(), 0.55), m_hover), 1.1));
+        } else {
+            p.setPen(QPen(theme::accent(), 1.6));
+        }
+        p.drawRoundedRect(r, 15, 15);
     }
     void mouseReleaseEvent(QMouseEvent* e) override
     {
@@ -93,14 +119,12 @@ protected:
     }
     void enterEvent(QEnterEvent* e) override
     {
-        m_hover = true;
-        update();
+        fadeHover(1.0);
         GlowCard::enterEvent(e);
     }
     void leaveEvent(QEvent* e) override
     {
-        m_hover = false;
-        update();
+        fadeHover(0.0);
         GlowCard::leaveEvent(e);
     }
     void focusInEvent(QFocusEvent* e) override
@@ -115,7 +139,25 @@ protected:
     }
 
 private:
-    bool m_hover = false;
+    void applyGlow()
+    {
+        setGlow(tone, QPointF(1.0, 0.0), 0.75, 0.13 + 0.05 * m_hover); // repaints
+    }
+    void fadeHover(qreal to)
+    {
+        m_anim->stop();
+        if (m_anim->duration() <= 0) {
+            m_hover = to;
+            applyGlow();
+            return;
+        }
+        m_anim->setStartValue(m_hover);
+        m_anim->setEndValue(to);
+        m_anim->start();
+    }
+
+    QVariantAnimation* m_anim = nullptr;
+    qreal m_hover = 0.0;
 };
 
 // The hero card: a wall of stone courses (the 垒 of 磐垒) rises from its right edge
@@ -306,14 +348,13 @@ int severityOf(const bulwark::ipc::EventLogPayload& p)
     return p.action == bulwark::VerdictAction::Ask ? 1 : 0;
 }
 
-// A stat tile whose value (and optionally caption) label is handed back for live updates.
+// A stat tile whose value label is handed back for live updates.
 ClickCard* makeStat(const QString& icon, const QColor& color, const QString& name, const QString& caption,
-                    QLabel*& valueOut, std::function<void()> onClick, QLabel** captionOut = nullptr)
+                    QLabel*& valueOut, std::function<void()> onClick)
 {
     auto* c = new ClickCard;
     c->setObjectName(QStringLiteral("Card"));
-    c->setGlow(color, QPointF(1.0, 0.0), 0.75, 0.13);
-    c->tone = color;
+    c->setTone(color);
     c->onClick = std::move(onClick);
     c->setMinimumHeight(118);
     c->setAccessibleName(name);
@@ -327,10 +368,7 @@ ClickCard* makeStat(const QString& icon, const QColor& color, const QString& nam
     v->addLayout(top);
     valueOut = ui::label(QStringLiteral("0"), "stat");
     v->addWidget(valueOut);
-    auto* cap = ui::label(caption, "muted");
-    v->addWidget(cap);
-    if (captionOut)
-        *captionOut = cap;
+    v->addWidget(ui::label(caption, "muted"));
     return c;
 }
 
@@ -344,6 +382,31 @@ QHBoxLayout* cardHead(const QString& title, QWidget* trailing = nullptr)
     if (trailing)
         head->addWidget(trailing, 0, Qt::AlignVCenter);
     return head;
+}
+
+// A row that has just arrived at the top of the activity feed fades in, so it is
+// obvious which line is new when the feed is moving. Nothing else about it
+// changes — the effect is dropped the moment it is opaque, because a widget
+// rendered through an opacity effect goes soft on fractional scales.
+//
+// `context` is the page: the row itself is not visible yet (a widget just put in
+// a layout is shown when that layout activates), so whether anyone can see this
+// at all has to be asked of something that is already on screen.
+void fadeInRow(QWidget* row, const QWidget* context)
+{
+    const int ms = motion::duration(220);
+    if (ms <= 0 || !motion::onScreen(context))
+        return;
+    auto* fx = new QGraphicsOpacityEffect(row);
+    fx->setOpacity(0.0);
+    row->setGraphicsEffect(fx);
+    auto* anim = new QPropertyAnimation(fx, "opacity", row);
+    anim->setDuration(ms);
+    anim->setStartValue(0.0);
+    anim->setEndValue(1.0);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    QObject::connect(anim, &QPropertyAnimation::finished, row, [row] { row->setGraphicsEffect(nullptr); });
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
 QWidget* attentionRow(const QString& icon, const QColor& color, const QString& title, const QString& desc,
@@ -408,12 +471,21 @@ DashboardPage::DashboardPage(IpcClient* ipc, QWidget* parent) : QWidget(parent),
 
     // ---- live wiring ----
     connect(ipc, &IpcClient::eventLogReceived, this, [this](const bulwark::ipc::EventLogPayload& p) {
-        m_statEvents->setText(QString::number(++m_eventCount));
-        // 「本次拦截」只统计【真实拦截】(内核前拦 / 已结束进程 / 已禁止加载);仅告警、拦截失败
-        // 不计入,避免拦截数虚高造成"看起来拦了很多、其实没拦"的假象 —— 它们进「需要关注」。
+        // 指标卡的数字用 motion::countTo 更新:批量到达(规则集、隔离区)会滚动,
+        // 逐条到达(事件、拦截,每次 +1)直接跳字 —— 加一应该读成"跳了一下",不是滚动。
+        motion::countTo(m_statEvents, ++m_eventCount);
+        // 「本次拦截」只统计【真实拦截】(内核前拦 / 已结束进程 / 已禁止加载 / 已禁止启动);
+        // 仅告警、拦截失败不计入,避免拦截数虚高造成"看起来拦了很多、其实没拦"的假象 ——
+        // 它们进「需要关注」。
+        //
+        // 「需要关注」这一侧的判据必须是 needsManualAction,不能写成「凡是 Block 而没计入拦截数」:
+        // 「主体已结束」(ActorAlreadyGone)两边都不占 —— 它不该再计一次拦截(杀它的那一次已经
+        // 计过),但也绝不是需要人工关注的事,那个进程已经不在了。用取反去分类会把它错分进
+        // 「需要关注」,于是用户被叫去处理一个不存在的进程。
         if (evtfmt::isRealBlock(p.action, p.enforcement))
-            m_statBlocked->setText(QString::number(++m_blockedCount));
-        else if (p.action == bulwark::VerdictAction::Block) {
+            motion::countTo(m_statBlocked, ++m_blockedCount);
+        else if (p.action == bulwark::VerdictAction::Block
+                 && evtfmt::needsManualAction(p.enforcement)) {
             ++m_unenforced;
             refreshAttention();
         }
@@ -444,6 +516,7 @@ DashboardPage::DashboardPage(IpcClient* ipc, QWidget* parent) : QWidget(parent),
         // 有内容了就不能再说"暂无活动"(隐藏而非删除:淘汰最旧行的逻辑依赖它占着最后一个位置)。
         m_activityEmpty->hide();
         m_activityBox->insertWidget(0, row);
+        fadeInRow(row, this);
         if (++m_activityRows > 6) {
             if (QLayoutItem* item = m_activityBox->takeAt(m_activityBox->count() - 2)) {
                 // 先隐藏:出了布局的行在延迟删除前仍会按旧几何绘制,和新行叠在一起。
@@ -464,15 +537,10 @@ DashboardPage::DashboardPage(IpcClient* ipc, QWidget* parent) : QWidget(parent),
     });
     connect(ipc, &IpcClient::rulesReceived, this, [this](const QList<bulwark::DefenseRule>& rules) {
         const auto n = std::count_if(rules.cbegin(), rules.cend(), [](const bulwark::DefenseRule& r) { return !r.isTrustEntry(); });
-        m_statRules->setText(QString::number(n));
+        motion::countTo(m_statRules, n);
     });
     connect(ipc, &IpcClient::quarantineReceived, this, [this](const QList<bulwark::ipc::QuarantineItemPayload>& items) {
-        m_statQuarantine->setText(QString::number(items.size()));
-    });
-    connect(ipc, &IpcClient::aiScanRecord, this, [this](const AiScanResult& r) {
-        m_aiTokens += r.tokens;
-        m_statAi->setText(QString::number(++m_aiCount));
-        m_statAiCaption->setText(u("累计 Token ") + QLocale().toString(m_aiTokens));
+        motion::countTo(m_statQuarantine, items.size());
     });
     connect(ipc, &IpcClient::timelineReceived, this, [this](const bulwark::ipc::TimelineResponsePayload& p) {
         if (p.requestId != m_chartRequest)
@@ -665,7 +733,7 @@ void DashboardPage::refreshHero()
 
 QWidget* DashboardPage::buildStats()
 {
-    // 5 张指标卡放进【会换行的网格】:一行排不下时按可用宽度折行,任何窗口尺寸下都完整可见。
+    // 4 张指标卡放进【会换行的网格】:一行排不下时按可用宽度折行,任何窗口尺寸下都完整可见。
     // 每张卡都是入口:点开就是它计数的那一页。
     auto* w = new QWidget;
     m_statsGrid = new QGridLayout(w);
@@ -682,8 +750,6 @@ QWidget* DashboardPage::buildStats()
                  [] { go(nav::Quarantine); }),
         makeStat(QStringLiteral("sliders"), theme::info(), u("防护规则"), u("当前规则集"), m_statRules,
                  [] { go(nav::Rules); }),
-        makeStat(QStringLiteral("sparkles"), theme::accentAlt(), u("AI 研判"), u("累计 Token 0"), m_statAi,
-                 [] { go(nav::Ai); }, &m_statAiCaption),
     };
     for (QWidget* c : m_statCards)
         c->setMinimumWidth(kStatCardMinWidth);

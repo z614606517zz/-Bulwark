@@ -133,10 +133,17 @@
     <ClCompile Include="Policy.c" />
     <ClCompile Include="HashScan.c" />
     <ClCompile Include="Cleanup.c" />
+    <!--
+      MatchCore.c 是唯一【同时被用户态测试工程编译】的驱动源文件(见 cpp/tests/CMakeLists.txt
+      的 driver_match_unit)。往里加东西前先读 MatchCore.h 顶部的约定:不得引用 g_Blw、
+      不得取锁、不得调用只在特定 IRQL 可用的 API —— 否则 host 单测这条路就断了。
+    -->
+    <ClCompile Include="MatchCore.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Driver.h" />
     <ClInclude Include="Protocol.h" />
+    <ClInclude Include="MatchCore.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 

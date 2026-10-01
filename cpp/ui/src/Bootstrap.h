@@ -37,7 +37,13 @@ bool ensureBackendRunning(QWidget* parent = nullptr);
 // 【已移除 shutdownBackend()】它原本在 UI 退出时 stop BulwarkService + unload 驱动,
 // 于是"关掉界面"等于"关掉防护"—— 这正是「服务无法常驻、重启就失效」的直接原因。
 // 防护是后台常驻服务,生命周期不该跟前台界面绑定;这里刻意不再提供这个入口,免得
-// 以后又被接回去。要停用防护有两条正当路径:界面「设置」里的防护总开关(可撤销),
-// 或 `bulwark_service.exe --uninstall` 彻底卸载。
+// 以后又被接回去。要停用防护有三条正当路径:
+//   · 界面「设置 → 防护总控」里的防护总开关(可撤销);
+//   · 同一处的「退出界面即停止防护」(默认关)—— 打开后退出界面即停,但动作【由服务侧做】
+//     而不是由界面来停服务:界面是 asInvoker,既停不了 LocalSystem 的服务也卸不了驱动,
+//     硬要做就得每次退出弹一次 UAC。服务把控制管道断开当作「界面已退出」的事实来源,
+//     见 service/src/main.cpp 的 applyProtectionLifetime。所以这个开关【不需要】把
+//     shutdownBackend 接回来,不要以为它是那个函数的复活。
+//   · `bulwark_service.exe --uninstall` 彻底卸载。
 
 } // namespace bulwark::ui::bootstrap

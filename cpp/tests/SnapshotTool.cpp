@@ -45,6 +45,7 @@
 #include "bulwark/Clock.h"
 #include "bulwark/engine/DefaultRules.h"
 #include "bulwark/engine/RuleEngine.h"
+#include "bulwark/engine/ScriptAnalyzer.h"
 #include "bulwark/engine/ThreatDetector.h"
 #include "bulwark/models/DefenseRule.h"
 #include "bulwark/models/RuntimeSettings.h"
@@ -62,8 +63,10 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -164,6 +167,12 @@ struct EventSpec {
     bool      certRevoked = false;
     bool      signedAfterExpiry = false;
     bool      signatureMismatch = false;
+    // ---- 被加载模块(ImageLoad 的 target)自身的签名。与上面主体侧的严格分开(6b)----
+    // 上面那批 signed_ / signatureMismatch 描述的是【主体进程】;ImageLoad 的 target 是
+    // 另一个文件,它的签名由 Worker::enrich 第 3.9 步单独富化。默认 false = 模块无可信签名,
+    // 这正是白加黑语料想表达的状态,所以既有两条 ImageLoad 用例无需改动即保持原意。
+    bool      moduleSigned = false;
+    bool      moduleSignatureMismatch = false;
     bool      firstSeen = false;
     qint64    fileSize = 64 * 1024;
     QString   hash;
@@ -187,6 +196,8 @@ SecurityEvent makeEvent(const EventSpec &s)
     e.actorCertThumbprint = s.thumbprint;
     e.certRevoked = s.certRevoked;
     e.signedAfterCertExpiry = s.signedAfterExpiry;
+    e.targetSigned = s.moduleSigned;
+    e.targetSignatureMismatch = s.moduleSignatureMismatch;
     e.isFirstSeen = s.firstSeen;
     e.parentPid = 1000;
     e.parentPath = s.parentPath;
@@ -312,6 +323,9 @@ QVector<EventSpec> buildCorpusCases()
         s.target = QStringLiteral("C:\\Users\\u\\AppData\\Local\\Temp\\evil_hook.dll");
         s.signed_ = true;
         s.publisher = QStringLiteral("Tencent Technology (Shenzhen) Company Limited");
+        // moduleSigned 保持默认 false:注释说的「侧载须照常检测」要成立,靠的正是模块未签名
+        // 这一位。6b 之前判据误判宿主(微信是签名的)=> 本例实际给的是 Allow,与 note 相反;
+        // 这就是 golden 里这条从 Allow 变 Ask 的原因。
         v.push_back(s);
     }
 
@@ -423,6 +437,31 @@ QVector<EventSpec> buildCorpusCases()
         s.target = QStringLiteral("C:\\Users\\u\\AppData\\Local\\Temp\\version.dll");
         s.signed_ = true;
         s.publisher = QStringLiteral("SomeVendor Ltd");
+        // moduleSigned 保持默认 false:本例的要害就是【模块】无可信签名。
+        v.push_back(s);
+    }
+    {
+        //
+        // 【6b 新增的对照例】上面两条 ImageLoad 都是「签名宿主 + 未签名模块」。只有这两条的话,
+        // 「判宿主」与「判模块」两种实现给出的裁决没法区分开 —— 恰恰是这个盲区让
+        // unsignedOnly() 判错宿主的缺陷在快照测试里潜伏了这么久(两条都是签名宿主,
+        // 判宿主 => 不命中 => Allow;判模块 => 命中 => Ask)。
+        //
+        // 这一条把模块签名翻成健康,其余条件与 step4 完全同形。它必须【保持 Allow】:
+        // 签名程序从 Temp 加载一个自己带的、签名健康的模块(安装器/更新器解压到 Temp 再加载,
+        // 是很常见的正当形态),段 7.3 那三条规则不该命中。
+        // 于是两侧都被钉住了:少了它,把判据写成「凡 Temp 下的模块加载都命中」也能过测试。
+        EventSpec s;
+        s.label = QStringLiteral("step4-sideload-SIGNED-dll-from-temp-NOT-detected");
+        s.note = QStringLiteral("步骤4 对照:签名宿主从可写目录加载【签名健康】模块 —— "
+                                "正当形态(安装器解压到 Temp 后加载),不得命中侧载判据");
+        s.type = EventType::ImageLoad;
+        s.pidOffset = 26;
+        s.actorPath = QStringLiteral("C:\\Program Files\\SomeVendor\\host.exe");
+        s.target = QStringLiteral("C:\\Users\\u\\AppData\\Local\\Temp\\vendor_helper.dll");
+        s.signed_ = true;
+        s.publisher = QStringLiteral("SomeVendor Ltd");
+        s.moduleSigned = true;   // ← 与 step4 的唯一差别
         v.push_back(s);
     }
 
@@ -926,19 +965,14 @@ int dumpModels(const QString &path)
         s.hybridAnalysisApiKey = QStringLiteral("ha-key");
         s.aiScanDoubleClickEnabled = false;
         s.aiScanSuspendDuringScan = false;
-        s.aiScanBlockOnFailure = true;
         s.cloudBehaviorUploadEnabled = true; // 默认 false,这里翻成 true 以覆盖往返序列化
         s.aiBaseUrl = QStringLiteral("https://ai.example.com/v1");
         s.aiApiKey = QStringLiteral("ai-key");
         s.aiModel = QStringLiteral("some-model");
-        s.aiScanScriptTextLimitKb = 24;
-        s.aiScanBinarySampleLimitMb = 8;
-        s.aiScanMaxStrings = 240;
         s.kernelDriverEnabled = true;
         s.userModeBehaviorMonitor = false;
         s.ransomwareCanaryEnabled = false;
         s.behaviorBaselineEnabled = false;
-        s.aiGrayZoneConsultEnabled = true;
         s.aiCreditGuardEnabled = false;
         // 刻意超过 2^32,钉住它必须走 int64 而不是 int。
         s.aiMonthlyCreditBudget = 9007199254740991LL;
@@ -1464,18 +1498,6 @@ int dumpIpc(const QString &path)
         p[QStringLiteral("persistenceCleanupResultDefaults")] = PersistenceCleanupResultPayload{}.toJson();
     }
 
-    // ---- AI 研判 ----
-    p[QStringLiteral("aiScanDefaults")] = AiScanResponsePayload{}.toJson();
-    {
-        AiScanResponsePayload ai;
-        ai.eventId = stableId(QStringLiteral("ipc-ai"));
-        ai.available = true;
-        ai.recommendation = VerdictAction::Block;
-        ai.summary = QString::fromUtf8("样本含加壳与反调试特征,且外联可疑域名");
-        ai.confidence = QString::fromUtf8("高");
-        p[QStringLiteral("aiScanFilled")] = ai.toJson();
-    }
-
     // ---- 足迹清理报告 ----
     {
         RemediationReportPayload rr;
@@ -1803,6 +1825,153 @@ int benchmark(const QString &corpusPath, int rounds)
     return 0;
 }
 
+// ============================ 脚本正文判据扫描 ============================
+//
+// 把 ScriptAnalyzer::analyzeScriptFile 指向磁盘上的真实文件,逐条打印命中的判据。
+//
+// 【为什么由本工具读文件,而不是让引擎读】引擎层(cpp/shared)不做 I/O —— 生产路径上
+// 正文由 Worker::enrich 有界读入后传进来。这里复刻的就是那一步,所以工具读、引擎判。
+//
+// 用途:拿一批真实样本与一批良性脚本跑过去,直接看判据的命中/误报。
+// 【不执行任何被扫描的文件】,只读取字节。
+// 把一次正文判据结论送进【完整裁决流水线】,返回最终动作。
+//
+// 【为什么不能用语料 corpus.json 验这一段】scriptFile* 与 tamperedModulePath 等富化字段
+// 一样是「运行时标记,不序列化」—— 语料要经 SecurityEvent::toJson/fromJson 往返一趟,
+// 这些字段在往返中必然丢掉,于是语料根本表达不出「富化已得出结论」这个状态
+//(实测:照那条路走,命中硬指标的样本最后落 Allow,因为字段没能传过去)。
+// 所以这里在【同一个进程内】直接构造事件 + 跑引擎,不经序列化。
+QString verdictForScriptHit(const QString &hostPath, const QString &scriptPath,
+                            const ScriptAnalyzer::FileScan &fs, qint64 hostFileSize)
+{
+    RuleEngine engine;
+    engine.loadRules(DefaultRules::build());
+
+    SecurityEvent e;
+    e.id = stableId(scriptPath);
+    e.timestampUtc = fixedNow();
+    e.type = EventType::ProcessCreate;
+    e.actorPid = 4242;
+    e.actorPath = hostPath;
+    e.parentPid = 1000;
+    e.parentPath = QStringLiteral("C:\\Windows\\explorer.exe");
+    e.commandLine = QStringLiteral("\"%1\" \"%2\"").arg(hostPath, scriptPath);
+    e.target = hostPath;
+    // 脚本宿主本身是系统签名组件 —— 这是真实状态,也是这条盲区难办的原因:
+    // 主体永远是「可信的 cmd.exe / wscript.exe」,可疑的是它要跑的那个文件。
+    e.actorSigned = true;
+    e.actorPublisher = QStringLiteral("Microsoft Windows");
+    e.actorFileSize = hostFileSize;
+    // 富化阶段(生产路径是 Worker::scanScriptFileBody)得出的结论:
+    e.scriptFilePath = scriptPath;
+    e.scriptFileScore = fs.score;
+    e.scriptFileHardIndicator = fs.hardSignal;
+    e.scriptFileHits = fs.hits;
+    e.scriptFileReasons = fs.reasons;
+
+    const Verdict v = engine.evaluate(e);
+    return QStringLiteral("%1 (risk %2%3)")
+        .arg(verdictActionToString(v.action))
+        .arg(e.riskScore)
+        .arg(e.hasThreatIndicator ? QStringLiteral(", 硬指标") : QString());
+}
+
+int scanScript(const QStringList &paths, bool wshHosted, const QString &reportPath)
+{
+    // 报告自己写成 UTF-8。不靠 stdout —— QTextStream(stdout) 走系统 codec,
+    // 中文在非 UTF-8 控制台上会变成乱码,拿去做断言很不牢靠。
+    // stdout 只留一行【纯 ASCII】的汇总,供脚本解析。
+    QFile rep;
+    QTextStream rs;
+    if (!reportPath.isEmpty()) {
+        rep.setFileName(reportPath);
+        if (rep.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            rs.setDevice(&rep);
+            rs.setEncoding(QStringConverter::Utf8);
+        }
+    }
+    const auto emit_ = [&](const QString &line) {
+        if (rs.device()) rs << line;
+        else out() << line;
+    };
+
+    int worst = 0;
+    int nHard = 0, nSoft = 0, nClean = 0, nSkip = 0;
+    for (const QString &p : paths) {
+        QFileInfo fi(p);
+        QFile f(p);
+        if (!fi.isFile() || !f.open(QIODevice::ReadOnly)) {
+            emit_(QStringLiteral("SKIP  %1  (打不开)\n").arg(p));
+            ++nSkip;
+            continue;
+        }
+        // 与 Worker::enrich 同一个上限,保证工具看到的输入和生产一致。
+        const QByteArray raw = f.read(ScriptAnalyzer::kScanPrefixBytes);
+
+        const ScriptType t = ScriptAnalyzer::scriptTypeFromPath(p);
+
+        // 超大 WSH 脚本:再顺序读完剩下的部分,只为算整文件的结构统计(O(1) 内存)。
+        // 与 Worker::enrich 的取舍一致 —— 只有这条罕见路径才付完整读取。
+        ScriptAnalyzer::StreamStats stats;
+        const bool wantStats = wshHosted && ScriptAnalyzer::isWshScriptType(t)
+                            && fi.size() >= ScriptAnalyzer::kOversizedWshBytes;
+        if (wantStats) {
+            stats.feed(raw.constData(), raw.size());
+            QByteArray chunk;
+            while (!(chunk = f.read(1 << 20)).isEmpty())
+                stats.feed(chunk.constData(), chunk.size());
+            stats.finish();
+        }
+        f.close();
+
+        // UTF-16 BOM:WSH 脚本常见。其余按 UTF-8 解(带替换字符,不抛)。
+        QString body;
+        if (raw.size() >= 2 && ((uchar)raw[0] == 0xFF && (uchar)raw[1] == 0xFE))
+            body = QString::fromUtf16(reinterpret_cast<const char16_t *>(raw.constData() + 2),
+                                      (raw.size() - 2) / 2);
+        else
+            body = QString::fromUtf8(raw);
+
+        const ScriptAnalyzer::FileScan fs = ScriptAnalyzer::analyzeScriptFile(
+            body, t, fi.size(), wshHosted, wantStats ? &stats : nullptr);
+
+        emit_(QStringLiteral("%1 %2  %3  (%4 B)\n")
+                  .arg(fs.hardSignal ? QStringLiteral("HARD ")
+                                     : (fs.score > 0 ? QStringLiteral("soft ")
+                                                     : QStringLiteral("clean")))
+                  .arg(fs.score, 4)
+                  .arg(fi.filePath())
+                  .arg(fi.size()));
+        if (!fs.hits.isEmpty())
+            emit_(QStringLiteral("        判据: %1\n").arg(fs.hits.join(QLatin1String(", "))));
+        for (const QString &r : fs.reasons)
+            emit_(QStringLiteral("        · %1\n").arg(r));
+
+        // 有命中就把结论送进完整流水线,如实打印最终动作 ——
+        // 「判据命中」和「真的会被拦」是两件事,只报前者等于没验。
+        if (!fs.empty()) {
+            const QString host = wshHosted
+                ? QStringLiteral("C:\\Windows\\System32\\wscript.exe")
+                : (t == ScriptType::Batch ? QStringLiteral("C:\\Windows\\System32\\cmd.exe")
+                                          : QStringLiteral("C:\\Windows\\System32\\WindowsPowerShell"
+                                                           "\\v1.0\\powershell.exe"));
+            emit_(QStringLiteral("        裁决: %1\n")
+                      .arg(verdictForScriptHit(host, fi.filePath(), fs, fi.size())));
+        }
+
+        if (fs.hardSignal) { ++nHard; worst = 2; }
+        else if (fs.score > 0) { ++nSoft; if (worst < 1) worst = 1; }
+        else { ++nClean; }
+    }
+    if (rs.device()) { rs.flush(); rep.close(); }
+
+    // 纯 ASCII 汇总:脚本按这一行断言,不必猜控制台编码。
+    out() << "SUMMARY total=" << paths.size() << " hard=" << nHard << " soft=" << nSoft
+          << " clean=" << nClean << " skip=" << nSkip << "\n";
+    out().flush();
+    return worst;
+}
+
 void usage()
 {
     err() << "用法:\n"
@@ -1811,6 +1980,7 @@ void usage()
           << "  bulwark_snapshot --record        <corpus.json> <golden.json>\n"
           << "  bulwark_snapshot --verify        <corpus.json> <golden.json>\n"
           << "  bulwark_snapshot --check-ruleset\n"
+          << "  bulwark_snapshot --scan-script   [--wsh] [--out <report.txt>] <file|dir|@list> ...\n"
           << "  bulwark_snapshot --dump-rules    <rules.json>\n"
           << "  bulwark_snapshot --dump-models   <models.json>\n"
           << "  bulwark_snapshot --dump-ipc      <ipc.json>\n";
@@ -1835,6 +2005,52 @@ int main(int argc, char **argv)
         const int rc = checkRuleset();
         setFixedNowUtcForTest(QDateTime());
         return rc;
+    }
+
+    if (mode == QLatin1String("--scan-script")) {
+        bool wsh = false;
+        QString report;
+        QStringList paths;
+        for (int i = 1; i < args.size(); ++i) {
+            if (args.at(i) == QLatin1String("--wsh")) { wsh = true; continue; }
+            if (args.at(i) == QLatin1String("--out") && i + 1 < args.size()) {
+                report = args.at(++i);
+                continue;
+            }
+            // @file:从文件逐行读取待扫路径 —— 语料成百上千个文件时命令行装不下。
+            if (args.at(i).startsWith(QLatin1Char('@'))) {
+                QFile lf(args.at(i).mid(1));
+                if (lf.open(QIODevice::ReadOnly)) {
+                    QTextStream ls(&lf);
+                    ls.setEncoding(QStringConverter::Utf8);
+                    while (!ls.atEnd()) {
+                        const QString l = ls.readLine().trimmed();
+                        if (!l.isEmpty()) paths << l;
+                    }
+                }
+                continue;
+            }
+            const QString a = args.at(i);
+            QFileInfo fi(a);
+            if (fi.isDir()) {
+                // 目录:枚举其中的脚本文件(不递归 —— 语料目录都是平的)
+                const QStringList filters{ QStringLiteral("*.bat"), QStringLiteral("*.cmd"),
+                                           QStringLiteral("*.ps1"), QStringLiteral("*.psm1"),
+                                           QStringLiteral("*.js"),  QStringLiteral("*.jse"),
+                                           QStringLiteral("*.vbs"), QStringLiteral("*.vbe"),
+                                           QStringLiteral("*.wsf"), QStringLiteral("*.hta") };
+                const QFileInfoList es = QDir(a).entryInfoList(filters, QDir::Files, QDir::Name);
+                for (const QFileInfo &e : es)
+                    paths << e.absoluteFilePath();
+            } else {
+                paths << a;
+            }
+        }
+        if (paths.isEmpty()) {
+            usage();
+            return 2;
+        }
+        return scanScript(paths, wsh, report);
     }
 
     if (mode == QLatin1String("--bench")) {

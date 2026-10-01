@@ -152,8 +152,25 @@ const wchar_t* wcstr(const QString& s)
 // ============================ 签名 / 证书 内部实现 ============================
 namespace {
 
+//
+// WinVerifyTrust 的 dwProvFlags。只留 WTD_CACHE_ONLY_URL_RETRIEVAL:取证跑在事件热路径上,绝不联网。
+//
+// 【不要再加 WTD_SAFER_FLAG】MSDN 对它的说明只有一句「Not supported」。实测它会让 WinVerifyTrust
+// 在「主签名有效、另附一个链到私有根的嵌套签名」的文件上返回 CERT_E_UNTRUSTEDROOT(0x800B0109),
+// 而资源管理器 / Get-AuthenticodeSignature / signtool 的默认口径(只验主签名)都判它有效。
+// 卡巴斯基的 avp.exe / avpsus.exe / avpui.exe 正是这种双签名:主签名是 Sectigo / GlobalSign 的
+// 公开证书,附加签名是自签的「Kaspersky Lab」根。带着这个标志,它们全被判成「签名失配」——
+// +45 分硬指标、共存放行失效,实测约一小时内对卡巴斯基判出一万七千余次询问,还把 avpsus.exe
+// 升级时的清理判成勒索,在内核里结束了它。
+// 本机抽查 407 个可执行文件:去掉该标志后,结论只在这 3 个卡巴斯基文件上变化(失败 -> 有效)。
+// 只验主签名不给篡改留口子:嵌套签名挂在主签名的未认证属性里,而 PE 的 Authenticode 摘要本来
+// 就不含证书表 —— 改动代码照样过不了主签名(TRUST_E_BAD_DIGEST)。
+//
+constexpr DWORD kWinTrustProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
 // 嵌入式 Authenticode 验证的原始状态码(不塌缩)。ERROR_SUCCESS 表示完全可信;
 // 其余值区分得出「摘要不匹配」「根不受信」「过期」等具体原因 —— 更新准入需要这个区分。
+// 仅做本机校验,不联网撤销(撤销另行处理,见 computeCertRevoked)。
 long embeddedSignatureStatusRaw(const QString& path)
 {
     WINTRUST_FILE_INFO fileInfo;
@@ -171,7 +188,7 @@ long embeddedSignatureStatusRaw(const QString& path)
     data.dwUnionChoice = WTD_CHOICE_FILE;
     data.pFile = &fileInfo;
     data.dwStateAction = WTD_STATEACTION_VERIFY;
-    data.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+    data.dwProvFlags = kWinTrustProvFlags;
 
     const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionGuid, &data);
 
@@ -181,32 +198,11 @@ long embeddedSignatureStatusRaw(const QString& path)
     return static_cast<long>(status);
 }
 
-// 嵌入式 Authenticode 验证(WinVerifyTrust)。仅做本机校验,不联网撤销。
+// 嵌入式 Authenticode 验证(塌缩成可信 / 不可信)。与上面的原始状态码是【同一次】验证 ——
+// 原先是两份各写一遍参数的拷贝,同一个文件在威胁判定与更新准入两处可能得出不同结论。
 bool verifyEmbeddedSignature(const QString& path)
 {
-    WINTRUST_FILE_INFO fileInfo;
-    ZeroMemory(&fileInfo, sizeof(fileInfo));
-    fileInfo.cbStruct = sizeof(fileInfo);
-    fileInfo.pcwszFilePath = wcstr(path);
-
-    GUID actionGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-
-    WINTRUST_DATA data;
-    ZeroMemory(&data, sizeof(data));
-    data.cbStruct = sizeof(data);
-    data.dwUIChoice = WTD_UI_NONE;
-    data.fdwRevocationChecks = WTD_REVOKE_NONE; // 撤销另行处理,签名验证路径不联网
-    data.dwUnionChoice = WTD_CHOICE_FILE;
-    data.pFile = &fileInfo;
-    data.dwStateAction = WTD_STATEACTION_VERIFY;
-    data.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
-
-    const LONG status = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionGuid, &data);
-
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionGuid, &data);
-
-    return status == ERROR_SUCCESS;
+    return embeddedSignatureStatusRaw(path) == ERROR_SUCCESS;
 }
 
 // 目录(catalog)签名验证——很多系统组件本身不内嵌签名,签名在 .cat 里。
@@ -299,55 +295,142 @@ bool findSigningTime(const CRYPT_ATTRIBUTES& attrs, QDateTime& out)
     return false;
 }
 
-// 尽力提取签名时间:主签名者已认证属性 -> 旧式反签名(PKCS#9 counterSign)。
-// RFC3161 时间戳需解析嵌套 TSTInfo,较复杂;拿不到就返回无效(保守,绝不误报过期签名)。
-QDateTime computeSigningTime(const QString& path)
+// 现代 Authenticode 的时间戳挂在未认证属性 1.3.6.1.4.1.311.3.3.1(RFC3161 令牌)里。
+// 老 SDK 可能没有这个宏,自己兜一份,值是固定的。
+#ifndef szOID_RFC3161_counterSign
+#define szOID_RFC3161_counterSign "1.3.6.1.4.1.311.3.3.1"
+#endif
+
+// 签名时间 + 【它的来源可不可信】。
+//
+// 这个区分是本函数存在的全部意义。签名时间有三个可能的出处,可信度完全不同:
+//   ① RFC3161 时间戳令牌(未认证属性)—— 由时间戳机构(TSA)用它自己的私钥签发,第三方背书;
+//   ② 旧式 PKCS#9 反签名(未认证属性)—— 同样由 TSA 签,只是格式老;
+//   ③ 主签名者已认证属性里的 signingTime —— 【签名者自己写的】。它被主签名覆盖所以不可篡改,
+//      但"写什么值"完全由持私钥的人决定。
+//
+// 原实现优先取 ③,只在取不到时才回退 ②。方向是反的:用 ③ 去判「有没有在证书过期后签名」,
+// 等于让嫌疑人自己填口供 —— 偷到私钥的人把 signingTime 写成有效期内的任意一天,就能让
+// signedAfterCertExpiry 恒为假,而那正是这个标志要抓的人。现在按 ① → ② → ③ 取,并如实标记
+// 来源;只有 ①②(trusted)才允许用来定性,③ 仅用于展示。
+//
+// 顺带补上 ①:原注释说 RFC3161 需解析嵌套 TSTInfo「较复杂」故不做,代价是绝大多数现代签名
+// 都拿不到签名时间 —— signedAfterCertExpiry 因此近乎恒假,基本是段死代码。这里不手写 ASN.1,
+// 交给系统的 CryptVerifyTimeStampSignature 解析并验令牌签名。
+struct SigningTimeFact {
+    QDateTime time;
+    bool trusted = false;   // 来自 TSA 反签名,而非签名者自述
+};
+
+// 合理性护栏:解析出界的时间宁可丢弃不用。
+//
+// 理由是后果不对称:signingTime 一旦被判成「在有效期外」,会一路走到裁决流水线第 8 步的
+// 无条件 Block。也就是说这里任何一次解析偏差,代价都是拦掉一个正常签名的软件。代码签名
+// 不可能早于 1990 年、也不可能晚于现在,而解析错位典型地就产出这类野值。
+bool plausibleSigningTime(const QDateTime& dt)
 {
+    if (!dt.isValid())
+        return false;
+    if (dt.date().year() < 1990)
+        return false;
+    return dt <= QDateTime::currentDateTimeUtc().addDays(1);
+}
+
+// RFC3161 令牌 -> genTime。pbData 传空 = 不比对 messageImprint(我们只要时间,文件内容与
+// 摘要的对应关系由 WinVerifyTrust 那一路负责)。
+bool rfc3161GenTime(const CRYPT_ATTRIBUTE& attr, QDateTime& out)
+{
+    if (attr.cValue == 0)
+        return false;
+    PCRYPT_TIMESTAMP_CONTEXT ctx = nullptr;
+    if (!CryptVerifyTimeStampSignature(attr.rgValue[0].pbData, attr.rgValue[0].cbData,
+                                       nullptr, 0, nullptr, &ctx, nullptr, nullptr)) {
+        return false;
+    }
+    bool ok = false;
+    if (ctx != nullptr) {
+        if (ctx->pTimeStamp != nullptr) {
+            const QDateTime dt = fileTimeToQDateTime(ctx->pTimeStamp->ftTime);
+            if (dt.isValid()) {
+                out = dt;
+                ok = true;
+            }
+        }
+        CryptMemFree(ctx);
+    }
+    return ok;
+}
+
+// 旧式 PKCS#9 反签名 -> 其已认证属性里的 signingTime(那是 TSA 签的,可信)。
+bool legacyCounterSignTime(const CRYPT_ATTRIBUTE& attr, QDateTime& out)
+{
+    if (attr.cValue == 0)
+        return false;
+    DWORD cb = 0;
+    if (!CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, PKCS7_SIGNER_INFO,
+                           attr.rgValue[0].pbData, attr.rgValue[0].cbData, 0, nullptr, &cb)
+        || cb == 0) {
+        return false;
+    }
+    QByteArray buf(static_cast<int>(cb), '\0');
+    if (!CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, PKCS7_SIGNER_INFO,
+                           attr.rgValue[0].pbData, attr.rgValue[0].cbData, 0, buf.data(), &cb)) {
+        return false;
+    }
+    CMSG_SIGNER_INFO* cs = reinterpret_cast<CMSG_SIGNER_INFO*>(buf.data());
+    return findSigningTime(cs->AuthAttrs, out);
+}
+
+SigningTimeFact computeSigningTime(const QString& path)
+{
+    SigningTimeFact fact;
+
     HCERTSTORE hStore = nullptr;
     HCRYPTMSG  hMsg = nullptr;
     if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, wcstr(path),
                           CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
                           CERT_QUERY_FORMAT_FLAG_BINARY, 0,
                           nullptr, nullptr, nullptr, &hStore, &hMsg, nullptr)) {
-        return QDateTime();
+        return fact;
     }
 
-    QDateTime result;
     DWORD cb = 0;
     if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &cb) && cb > 0) {
         QByteArray buf(static_cast<int>(cb), '\0');
         if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, buf.data(), &cb)) {
             CMSG_SIGNER_INFO* si = reinterpret_cast<CMSG_SIGNER_INFO*>(buf.data());
-            QDateTime t;
-            if (findSigningTime(si->AuthAttrs, t)) {
-                result = t;
-            } else {
-                for (DWORD i = 0; i < si->UnauthAttrs.cAttr && !result.isValid(); ++i) {
-                    const CRYPT_ATTRIBUTE& a = si->UnauthAttrs.rgAttr[i];
-                    if (a.pszObjId == nullptr || strcmp(a.pszObjId, szOID_RSA_counterSign) != 0 || a.cValue == 0)
-                        continue;
-                    DWORD cb2 = 0;
-                    if (!CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, PKCS7_SIGNER_INFO,
-                                           a.rgValue[0].pbData, a.rgValue[0].cbData, 0, nullptr, &cb2)
-                        || cb2 == 0) {
-                        continue;
+
+            // ①② TSA 反签名(可信)。两种格式都在未认证属性里,一趟扫完。
+            for (DWORD i = 0; i < si->UnauthAttrs.cAttr && !fact.trusted; ++i) {
+                const CRYPT_ATTRIBUTE& a = si->UnauthAttrs.rgAttr[i];
+                if (a.pszObjId == nullptr)
+                    continue;
+                QDateTime t;
+                if (strcmp(a.pszObjId, szOID_RFC3161_counterSign) == 0) {
+                    if (rfc3161GenTime(a, t) && plausibleSigningTime(t)) {
+                        fact.time = t;
+                        fact.trusted = true;
                     }
-                    QByteArray cbuf(static_cast<int>(cb2), '\0');
-                    if (CryptDecodeObject(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, PKCS7_SIGNER_INFO,
-                                          a.rgValue[0].pbData, a.rgValue[0].cbData, 0, cbuf.data(), &cb2)) {
-                        CMSG_SIGNER_INFO* cs = reinterpret_cast<CMSG_SIGNER_INFO*>(cbuf.data());
-                        QDateTime t2;
-                        if (findSigningTime(cs->AuthAttrs, t2))
-                            result = t2;
+                } else if (strcmp(a.pszObjId, szOID_RSA_counterSign) == 0) {
+                    if (legacyCounterSignTime(a, t) && plausibleSigningTime(t)) {
+                        fact.time = t;
+                        fact.trusted = true;
                     }
                 }
+            }
+
+            // ③ 签名者自述的时间。只作展示/取证用,trusted 保持 false,不参与定性。
+            if (!fact.trusted) {
+                QDateTime t;
+                if (findSigningTime(si->AuthAttrs, t) && plausibleSigningTime(t))
+                    fact.time = t;
             }
         }
     }
 
     if (hMsg) CryptMsgClose(hMsg);
     if (hStore) CertCloseStore(hStore, 0);
-    return result;
+    return fact;
 }
 
 // 用本机链引擎判定证书是否被吊销;默认只用缓存 CRL(不联网、不阻塞)。
@@ -389,6 +472,10 @@ FactCache<bool>    g_signedCache;
 FactCache<QString> g_publisherCache;
 FactCache<QString> g_sha256Cache;
 FactCache<bool>    g_embeddedCache;
+// 「内嵌签名的摘要是否真的不符」。单独一张表而不是复用 g_embeddedCache:它只在
+// 「无可信签名 + 内嵌了签名」这一小撮文件上求值(其余文件压根不问),缓存键与其它
+// 事实表同为文件身份,所以不会引入额外的 stat,也不会让正常文件多验一次签。
+FactCache<bool>    g_digestMismatchCache;
 FactCache<ProcessInspector::CertInfo> g_certCache;
 
 bool computeIsSigned(const QString& path)
@@ -451,6 +538,26 @@ bool computeHasEmbeddedSignature(const QString& path)
     return ok;
 }
 
+//
+// 内嵌签名的摘要是否【确实】与文件内容不符(= 签名之后文件被改过)。
+//
+// 只认 TRUST_E_BAD_DIGEST 这一个状态码。其余非成功状态说的都不是「被改过」:
+//   · CERT_E_UNTRUSTEDROOT / CERT_E_CHAINING —— 本机没有签发者的根证书(自签、
+//     企业内部 CA、国内厂商的某些链都会这样);
+//   · CERT_E_EXPIRED —— 证书过期(老软件的常态,另有专门判据);
+//   · CRYPT_E_FILE_ERROR / ERROR_ACCESS_DENIED —— 文件读不出来。自保护的安全软件
+//     (卡巴斯基 avp.exe)正是这一类:它根本不让别人读自己的映像,于是验签必然失败。
+//     实测这一条让 avp.exe / avpsus.exe 在两天内产生了 7434 次「疑似篡改或盗用证书」
+//     的询问,而那个文件一个字节都没被改过。
+// 把这三类算成「篡改」就是拿环境问题当恶意证据,所以必须在源头分开。
+//
+bool computeSignatureDigestMismatch(const QString& path)
+{
+    if (path.isEmpty())
+        return false;
+    return embeddedSignatureStatusRaw(path) == static_cast<long>(TRUST_E_BAD_DIGEST);
+}
+
 ProcessInspector::CertInfo computeCertInfo(const QString& path)
 {
     ProcessInspector::CertInfo info;
@@ -467,10 +574,21 @@ ProcessInspector::CertInfo computeCertInfo(const QString& path)
 
     info.notBeforeUtc = fileTimeToQDateTime(cert->pCertInfo->NotBefore);
     info.notAfterUtc  = fileTimeToQDateTime(cert->pCertInfo->NotAfter);
-    info.signingTimeUtc = computeSigningTime(path); // 可能无效
 
-    if (info.signingTimeUtc.isValid() && info.notAfterUtc.isValid() && info.notBeforeUtc.isValid()) {
-        if (info.signingTimeUtc > info.notAfterUtc || info.signingTimeUtc < info.notBeforeUtc)
+    const SigningTimeFact st = computeSigningTime(path);
+    info.signingTimeUtc = st.time; // 可能无效;来源可能只是签名者自述(见 SigningTimeFact)
+
+    //
+    // 【只有可信来源的签名时间才能用来定性】st.trusted 为假时,时间是主签名者自己写进已认证
+    // 属性的 —— 持私钥的人想写哪天就写哪天。拿它判「是否在证书有效期外签名」,等于给盗用
+    // 证书的人留一个「把日期写回有效期内即可洗白」的后门。详见 SigningTimeFact 的说明。
+    //
+    // ±1 天容差:这个标志直通裁决第 8 步的无条件 Block,而 TSA 与签发 CA 之间存在秒级到分钟级
+    // 的时钟差,正规软件偶尔会出现「时间戳比 notBefore 早几秒」。真实的盗用旧证书都是过期几个
+    // 月到几年,一天的容差不影响识别,却能挡掉这类边界误判。
+    //
+    if (st.trusted && st.time.isValid() && info.notAfterUtc.isValid() && info.notBeforeUtc.isValid()) {
+        if (st.time > info.notAfterUtc.addDays(1) || st.time < info.notBeforeUtc.addDays(-1))
             info.signedAfterCertExpiry = true;
     }
 
@@ -535,9 +653,14 @@ ProcessInspector::collectForensics(const QString& path, bool includeCert)
     f.sha256 =
         cachedFactById(g_sha256Cache, id, [&] { return computeSha256(path); });
     // 与 enrich 原有逻辑一致:已经有可信签名时不必再问「是否内嵌了签名」。
-    if (!f.trustedSignature)
+    if (!f.trustedSignature) {
         f.embeddedSignature =
             cachedFactById(g_embeddedCache, id, [&] { return computeHasEmbeddedSignature(path); });
+        // 只有「内嵌了签名却不受信」的文件才需要追问原因 —— 完全没签名的文件无从谈摘要。
+        if (f.embeddedSignature)
+            f.signatureDigestMismatch = cachedFactById(
+                g_digestMismatchCache, id, [&] { return computeSignatureDigestMismatch(path); });
+    }
     if (includeCert)
         f.cert = cachedFactById(g_certCache, id, [&] { return computeCertInfo(path); });
     return f;

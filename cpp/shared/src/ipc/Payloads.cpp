@@ -40,6 +40,24 @@ PromptResponsePayload PromptResponsePayload::fromJson(const QJsonObject& o) {
     return p;
 }
 
+// 扁平负载:与「裸 SecurityEvent」在线上完全同形,只多一个 enforcement 键(见头文件说明)。
+QJsonObject BlockNotificationPayload::toJson() const {
+    QJsonObject o = event.toJson();
+    o["enforcement"] = static_cast<int>(enforcement);
+    return o;
+}
+
+BlockNotificationPayload BlockNotificationPayload::fromJson(const QJsonObject& o) {
+    using namespace bulwark::json;
+    BlockNotificationPayload p;
+    p.event = bulwark::SecurityEvent::fromJson(o);
+    // 老服务不下发该键 -> NotApplicable。这个缺省值是刻意选的:宁可不声称拦下,
+    // 也不能替上游假定成功(杜绝假拦截)。
+    p.enforcement = static_cast<bulwark::EnforcementOutcome>(
+        getInt(o, "enforcement", static_cast<int>(bulwark::EnforcementOutcome::NotApplicable)));
+    return p;
+}
+
 QJsonObject EventLogPayload::toJson() const {
     QJsonObject o;
     o["event"] = event.toJson();
@@ -435,28 +453,6 @@ PersistenceCleanupResultPayload PersistenceCleanupResultPayload::fromJson(const 
     p.removedRegistryValues = getStrList(o, "removedRegistryValues");
     for (const auto& v : o.value(QLatin1String("skipped")).toArray())
         if (v.isObject()) p.skipped.append(RemediationSkippedItem::fromJson(v.toObject()));
-    return p;
-}
-
-// ===== AI 病毒扫描 =====
-QJsonObject AiScanResponsePayload::toJson() const {
-    using namespace bulwark::json;
-    QJsonObject o;
-    o["eventId"] = guidToString(eventId);
-    o["available"] = available;
-    o["recommendation"] = static_cast<int>(recommendation);
-    o["summary"] = summary;
-    o["confidence"] = confidence;
-    return o;
-}
-AiScanResponsePayload AiScanResponsePayload::fromJson(const QJsonObject& o) {
-    using namespace bulwark::json;
-    AiScanResponsePayload p;
-    p.eventId = guidFromString(getStr(o, "eventId"));
-    p.available = getBool(o, "available");
-    p.recommendation = static_cast<bulwark::VerdictAction>(getInt(o, "recommendation", 0));
-    p.summary = getStr(o, "summary");
-    p.confidence = getStr(o, "confidence");
     return p;
 }
 

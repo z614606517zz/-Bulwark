@@ -17,6 +17,8 @@
 #include "bulwark/service/DriverControl.h"
 #include "bulwark/service/UserModeBehaviorSource.h"
 #include "bulwark/service/EventSourceCoordinator.h"
+#include "bulwark/service/UserModeProcessContainment.h"
+#include "bulwark/service/SystemHardening.h"
 #include "bulwark/service/PersistenceScanner.h"
 #include "bulwark/service/ForensicsService.h"
 #include "bulwark/service/Worker.h"
@@ -41,6 +43,7 @@
 
 #include "bulwark/engine/RuleEngine.h"
 #include "bulwark/engine/DefaultRules.h"
+#include "bulwark/engine/TrustPolicy.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -555,6 +558,16 @@ static int serviceRun(int argc, char** argv) {
     // 按配置决定证书吊销校验是否联网(默认 false:仅用本机缓存 CRL,绝不联网/阻塞富化)。
     monitoring::ProcessInspector::onlineRevocationCheck = options.OnlineCertRevocationCheck;
 
+    // 被盗用 / 被滥用的代码签名证书名单(见 TrustPolicy::isAbusedSigner)。
+    // 必须在监控线程起来【之前】注入:名单在裁决热路径上只读无锁。
+    bulwark::engine::TrustPolicy::setAbusedSigners(options.AbusedSignerThumbprints,
+                                                  options.AbusedSignerPublishers);
+    if (!options.AbusedSignerThumbprints.isEmpty() || !options.AbusedSignerPublishers.isEmpty()) {
+        log.info(QStringLiteral("已加载被盗用证书名单:指纹 %1 条、签名主体 %2 条")
+                     .arg(options.AbusedSignerThumbprints.size())
+                     .arg(options.AbusedSignerPublishers.size()));
+    }
+
     // 存储层。
     SettingsStore settingsStore;
     RuleStore ruleStore;
@@ -952,6 +965,20 @@ static int serviceRun(int argc, char** argv) {
     ipc.settingsRequested = [&settings, &engine, &coordinatorPtr, serverOnlyMode] {
         bulwark::RuntimeSettings snap = settings.clone();
         snap.trustSignedActors = engine.trustSignedActors;
+        //
+        // 待机(protectionFollowsUi 且界面不在跑)时如实报「没有防护」。
+        //
+        // 实践中界面几乎不会看到这一状态 —— 它正在问设置,说明它已经连上了,唤醒也就已经发生。
+        // 但「几乎不会」不等于不会:唤醒是延后一拍执行的(见 applyProtectionLifetime 的说明,
+        // 装驱动会阻塞事件循环,不能在 IPC 读取回调里同步做),那一拍里界面问过来就会落到这里。
+        // 那时报「内核驱动已连接」是彻头彻尾的谎报,必须先判待机。
+        //
+        if (coordinatorPtr && coordinatorPtr->isSuspended()) {
+            snap.kernelConnected = false;
+            snap.kernelStatus = coordinatorPtr->protectionSummary();
+            snap.cloudServerOnly = serverOnlyMode;
+            return snap;
+        }
         // 只读策略位:让设置页知道「本机不动用第三方情报源」已生效,好把那六个源的开关禁掉并
         // 说明原因(它们在服务端一律按关处理,见 applyIntelSourceToggles)。
         snap.cloudServerOnly = serverOnlyMode;
@@ -974,20 +1001,40 @@ static int serviceRun(int argc, char** argv) {
             }
         } else {
             snap.kernelConnected = false;
-            snap.kernelStatus = (coordinatorPtr && coordinatorPtr->kernelProtocolMismatch())
-                ? QStringLiteral("内核驱动协议不一致 · 已降级(请用同源编译的 Bulwark.sys)")
+            //
+            // 【2.5:这三条原来都写着「已降级为用户态观测」,现在那是低报】
+            // 阶段 1/2 之后无驱动时实际已有三种真实拦截手段(独占句柄挡启动与模块加载、
+            // WFP 挡出站、冻结/断子挡继续作恶)。把它们仍然描述成「只有观测」,用户会以为
+            // 现在完全没防护 —— 与此前「驱动偏旧却说行为前拦截生效」是同一类失真,只是方向相反。
+            // 故改为由协调器按运行时状态导出的能力集生成文案:生效与未生效两半都报。
+            const QString why = (coordinatorPtr && coordinatorPtr->kernelProtocolMismatch())
+                ? QStringLiteral("内核驱动协议不一致(请用同源编译的 Bulwark.sys)")
                 : ((coordinatorPtr && coordinatorPtr->kernelAttachFailed())
-                       ? QStringLiteral("内核驱动不可用 · 已降级为用户态观测(后台重试中)")
-                       : QStringLiteral("用户态观测(ETW,内核驱动未启用)"));
+                       ? QStringLiteral("内核驱动不可用(后台重试中)")
+                       : QStringLiteral("内核驱动未启用"));
+            snap.kernelStatus = coordinatorPtr
+                ? (why + QStringLiteral(" · ") + coordinatorPtr->protectionSummary())
+                : why;
         }
         return snap;
     };
     // 情报共享的每日上传时刻,仅用于日志文案。按值捕获一个 int,免得为一句日志把整个
     // options 拖进 settingsUpdated 的捕获列表。
     const int contribUploadHour = options.ReputationProxy.ContributionUploadHour;
+    //
+    // 「退出界面即停止防护」的重新判定钩子。与 trustAddedHook 同一手法:协调器与 Worker 都要到
+    // 后面(依赖就绪后)才构造,而这个 IPC 回调在此处接线,所以先留一个空钩子、构造完再填。
+    // 未填时调用是安全的 no-op。
+    //
+    // 为什么 settingsUpdated 必须调它:这个开关本身会改变「此刻该不该防护」的结论,而它的两个
+    // 方向都可能需要立刻动作 —— 把它拨到「常驻」时若正处于待机就得马上唤醒;把防护总开关关掉时
+    // 也要顺带停下来。判定只有一份(applyProtectionLifetime),这里只负责在设置变更后重跑一次,
+    // 不在这里另写一段"如果……就……"。
+    std::function<void()> protectionLifetimeHook;
     ipc.settingsUpdated = [&settings, &engine, &settingsStore, &repAggregate, &repManager,
                            &applyIntelSourceToggles, &coordinatorPtr, &workerPtr, &intelUploader,
-                           &intelContrib, contribUploadHour, serverOnlyMode, &log](
+                           &intelContrib, contribUploadHour, serverOnlyMode, &log,
+                           &protectionLifetimeHook](
                               const bulwark::RuntimeSettings& s) {
         const bool wasContribOn = settings.cloudBehaviorUploadEnabled;
         bulwark::RuntimeSettings updated = s;
@@ -1033,10 +1080,15 @@ static int serviceRun(int argc, char** argv) {
                                     "每天 %1:00 上传后即删除本地暂存。")
                          .arg(contribUploadHour, 2, 10, QLatin1Char('0')));
         }
-        log.info(QStringLiteral("设置已更新:总开关=%1 默认动作=%2 信誉源=%3")
+        log.info(QStringLiteral("设置已更新:总开关=%1 默认动作=%2 信誉源=%3 防护生命周期=%4")
                      .arg(settings.protectionEnabled ? QStringLiteral("开") : QStringLiteral("关"),
                           settings.defaultBlock ? QStringLiteral("Block") : QStringLiteral("Allow"),
-                          settings.anyReputationEnabled() ? QStringLiteral("开") : QStringLiteral("关")));
+                          settings.anyReputationEnabled() ? QStringLiteral("开") : QStringLiteral("关"),
+                          settings.protectionFollowsUi ? QStringLiteral("随界面(退出即停止)")
+                                                       : QStringLiteral("常驻")));
+        // 开关可能刚被拨动 -> 重新判定此刻该防护还是该待机(见 protectionLifetimeHook 的说明)。
+        if (protectionLifetimeHook)
+            protectionLifetimeHook();
     };
 
     // 文件信任中心:信任条目本质是带信任标记的精确 Allow 规则。
@@ -1791,8 +1843,12 @@ static int serviceRun(int argc, char** argv) {
     // 基础用户态事件源(始终运行):ETW 实时观测源(进程/网络/DNS/注册表/文件)。
     // ETW 需管理员权限,不可用时降级但服务照常运行。
     std::unique_ptr<EventSource> baseSource;
+    // 具体类型的句柄:诱饵写入归因要调 EtwProcessEventSource 自己的接口,而 baseSource
+    // 是基类指针(下面 move 之后就拿不到具体类型了)。
+    EtwProcessEventSource* etwPtr = nullptr;
     {
         auto etwSource = std::make_unique<EtwProcessEventSource>(options.Etw);
+        etwPtr = etwSource.get();
         // 注册表/文件 ETW 监视集:受保护键/路径 + 硬拦列表。只有命中监视集的写/删才上报,
         // 避免全量事件洪泛(与驱动的受保护路径模型一致)。空监视集则不产生该类事件。
         etwSource->setWatchLists(options.ProtectedRegistryKeys + options.RegistryHardBlocks,
@@ -1806,6 +1862,27 @@ static int serviceRun(int argc, char** argv) {
 
     // 用户态持续行为源(自启动持久化 + 勒索诱饵):与基础源并行,弥补"运行之后"的事后盲区。
     auto behaviorSource = std::make_unique<UserModeBehaviorSource>(engine);
+    //
+    // 诱饵 -> ETW 写入归因表。补的是「诱饵命中拿不到写入者 PID,于是引擎那条无条件 Block
+    // 没有对象、只能落仅告警」这个洞(详见 UserModeBehaviorSource::setCanarySink 与
+    // EtwProcessEventSource::addAttributionPath 的说明)。
+    //
+    // 归因开关默认关(它要多订阅 Kernel-File 的 CREATE+WRITE,实测把该提供程序的回调频率
+    // 从约 12/s 抬到约 3000/s)。这里【总是接线】但按开关如实记一条日志 —— 否则用户看到
+    // 「诱饵被触碰」却没有任何处置时,无从知道原因在一个默认关闭的配置项上。
+    //
+    if (etwPtr) {
+        behaviorSource->setCanarySink(
+            [etwPtr](const QString& canaryPath) { etwPtr->addAttributionPath(canaryPath); });
+        if (etwPtr->writeAttributionEnabled())
+            log.info(QStringLiteral("勒索诱饵写入归因已启用(Etw.KernelFileWriteAttribution):"
+                                   "诱饵被改写时可定位写入进程并结束其进程树。"));
+        else
+            log.info(QStringLiteral("勒索诱饵写入归因未启用(Etw.KernelFileWriteAttribution=false):"
+                                   "诱饵被改写只能告警,无法定位写入进程、因而结束不了它 —— "
+                                   "开启需额外订阅 Kernel-File 的 CREATE+WRITE(实测回调频率由约 "
+                                   "12/s 升至约 3000/s)。"));
+    }
 
     // 协调器:合并 基础源 + 行为源 +(按开关热切换的)内核驱动源,作为 Worker 的统一事件源。
     // 裁决回写只路由到内核源;内核连接后抑制基础源重复的进程事件。
@@ -1823,6 +1900,131 @@ static int serviceRun(int argc, char** argv) {
         [coordinatorPtr](const QString& p) {
             return coordinatorPtr ? coordinatorPtr->forceDeleteFile(p) : false;
         });
+
+    // 放开自身独占锁的委托。无驱动模式的执行前拦截(UserModeExecBlock)以 share-mode-0 钉住恶意
+    // 映像,那把锁连读取和删除一起挡 —— 包括我们自己。而 Worker 的次序是先 blacklistExec 再
+    // remediate,不接这根线,隔离在无驱动模式下会因自己的锁而失败:等于用「不能再启动」换掉了
+    // 「能被清除」。接上之后隔离先放手、再拷金库、再删原文件。
+    quarantine.setSelfUnlock([coordinatorPtr](const QString& p) {
+        return coordinatorPtr ? coordinatorPtr->suspendUserModeLock(p) : 0;
+    });
+
+    // 用户态进程收容器(阶段 2.1/2.2/2.3):可逆冻结 + 不可逆断子 + 有次序的终结。
+    // 为什么它必须存在:无驱动时 banProcess / killProcess 都是 no-op,「杀不掉」就等于
+    // 完全没有处置 —— 而 killMalicious 的日志原先在那种情况下仍宣称内核已全维封禁。
+    // 两个委托都走协调器,与上面 setKernelAssist / setSelfUnlock 同一惯用法:
+    //   · 映像加锁 -> blockExecPath(内核名单优先,无驱动时落到 UserModeExecBlock 的独占句柄)
+    //   · 内核补刀 -> killProcess(无驱动时返回 false,阶梯会如实记为「无内核驱动」)
+    UserModeProcessContainment containment(options.UserModeContainmentMax,
+                                          options.UserModeFreezeTtlMs);
+    containment.setImageLocker([coordinatorPtr](const QString& needle) {
+        return coordinatorPtr ? coordinatorPtr->blockExecPath(needle) : false;
+    });
+    containment.setKernelKill([coordinatorPtr](int pid) {
+        return coordinatorPtr ? coordinatorPtr->killProcess(pid) : false;
+    });
+
+    //
+    // 阶段 3 用户确认型加固。三件事分得很清:
+    //   · inspect() 是【只读】的,无条件跑一次并把结果记进日志 —— 让部署方看到「能做哪些
+    //     加固、各自的代价是什么」不需要任何授权,而这正是原先完全缺失的信息。
+    //   · 改系统状态的动作(拒绝执行 ACE、注册表自动回滚)受各自开关约束,默认关。
+    //   · 撤销侧无条件接上(见 Worker::reconcileKernelBlocksAfterTrust):即使开关后来被
+    //     关掉,此前加上的跨重启 ACE 仍然要能被用户加白撤销。
+    SystemHardening hardening;
+    hardening.setTrustProbe([&engine](const QString& p) {
+        return engine.trustNoteForPath(p).has_value();
+    });
+
+    //
+    // 隔离退化到「计划重启删除」时的执行阻断(见 QuarantineManager::setExecDenyFallback)。
+    //
+    // 【生命周期】quarantine 在本函数很早就声明(第 576 行),hardening 在这里 —— 也就是说
+    // hardening 会【先】析构。按引用捕获它塞进 quarantine 的成员,正是本项目已经诊断过的那个
+    // 悬垂形态(EventSourceCoordinator 持有捕获 &hardening 的 lambda,而 hardening 声明在它
+    // 之后 → 关停路径上调用捕获了已死对象的 lambda)。这里不重犯:委托在 app.exec() 返回后、
+    // 任何对象析构之前【显式摘除】(见下方停机段)。
+    //
+    // 同时把开关判断放进 lambda 而不是注入时判定一次:settingsUpdated 可以在运行时改配置,
+    // 注入时取一次值会让开关从此刻起永远失真。
+    quarantine.setExecDenyFallback(
+        [&hardening, &options](const QString& p) -> std::pair<bool, QString> {
+            if (!options.FileDenyExecuteEnabled) {
+                return { false,
+                         QStringLiteral("FileDenyExecuteEnabled=false(把它置为 true 即可让删不掉的"
+                                        "恶意文件在重启前也无法被执行;代价是文件上会留一条跨重启的"
+                                        "拒绝执行 ACE,撤销入口是在界面加白)") };
+            }
+            if (hardening.hasDenyExecute(p))
+                return { true, QString() };
+            if (hardening.denyExecute(p))
+                return { true, QString() };
+            return { false, QStringLiteral("施加拒绝执行 ACE 失败(该文件的 DACL 不可改写)") };
+        });
+
+    {
+        const QVector<SystemHardening::Finding> findings = hardening.inspect();
+        log.info(QStringLiteral("加固体检:%1 项").arg(findings.size()));
+        for (const SystemHardening::Finding& f : findings) {
+            log.info(QStringLiteral("  [%1] %2 —— %3")
+                         .arg(f.satisfied ? QStringLiteral("已加固") : QStringLiteral("未加固"))
+                         .arg(f.title)
+                         .arg(f.current));
+            if (!f.satisfied) {
+                log.info(QStringLiteral("        建议:%1%2").arg(f.recommended)
+                             .arg(f.needsReboot ? QStringLiteral("(需重启)") : QString()));
+                log.info(QStringLiteral("        代价:%1").arg(f.cost));
+            }
+        }
+        //
+        // 3.3 / 3.4 的执行:只在部署方把对应开关置 true 时才动手 —— 改这个键本身就是那次
+        // 「用户显式确认」(留痕、可回退,且比弹窗更适合跨重启的机器状态改动)。
+        // 先看体检结论,已达标就跳过,不重复写。
+        const auto satisfied = [&findings](const char* id) {
+            for (const SystemHardening::Finding& f : findings) {
+                if (f.id == QLatin1String(id))
+                    return f.satisfied;
+            }
+            return true;   // 查不到就按「无需处理」,绝不在不确定时去改系统
+        };
+        if (options.ApplyLsaRunAsPpl) {
+            if (satisfied("RunAsPPL")) {
+                log.info(QStringLiteral("加固:ApplyLsaRunAsPpl=true,但 lsass 已处于 PPL 保护,跳过。"));
+            } else {
+                hardening.applyRunAsPpl(/*apply=*/true);
+            }
+        }
+        if (options.ApplySelfServiceDacl) {
+            if (satisfied("SelfServiceDacl")) {
+                log.info(QStringLiteral("加固:ApplySelfServiceDacl=true,但本服务 DACL 已足够紧"
+                                        "(宽泛主体无停止/改配置/删除权限),跳过。"));
+            } else {
+                hardening.applySelfServiceDacl(/*apply=*/true);
+            }
+        }
+    }
+    // 3.1 注册表即时监视。登记的键与 UserModeBehaviorSource 的周期性比对同一批 ——
+    // 分工是「那个负责广度与兜底,这个负责把发现延迟压到一次线程唤醒」。
+    if (options.RegistryInstantRollbackEnabled) {
+        for (const char* k : {
+                 "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+                 "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+                 "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\BootExecute",
+             }) {
+            hardening.watchKey(QString::fromLatin1(k));
+        }
+        hardening.startWatching();
+        // 把阶段 3 的两项能力推进 2.5 的能力矩阵。放在 startWatching() 之后才读 isWatching():
+        // 取的是【运行时状态】而不是配置意图 —— 配置说开而线程没起来时必须报「未生效」,
+        // 那张表的全部价值就在于它反映实况。刻意传值而不是传 lambda(见 setHardeningState)。
+    } else {
+        log.info(QStringLiteral("注册表即时监视 + 自动回滚未启用(RegistryInstantRollbackEnabled=false)"
+                                "—— 自启动项的发现仍由用户态行为源的周期性比对负责,"
+                                "那条路径存在「写进去、等我们下一轮才发现」的窗口。"));
+    }
+    // 两条分支都要走到这里:能力表必须知道这两维的实况,哪怕结论是「都没生效」。
+    if (coordinatorPtr)
+        coordinatorPtr->setHardeningState(hardening.isWatching(), options.FileDenyExecuteEnabled);
 
     // 编排:事件 -> 富化 -> 引擎 -> 裁决 -> IPC/处置/清理。
     Worker worker(&engine, &ipc, coordinator.get(), &ruleStore, &audit, &firstSeen, &quarantine, &repManager,
@@ -1843,9 +2045,19 @@ static int serviceRun(int argc, char** argv) {
     if (options.AttackChainEngine.Enabled)
         worker.setAttackChainEngine(&attackChain); // 注入攻击链组合引擎(未启用则不注入,零开销)
     worker.setAlertExporter(&alertExporter);     // 注入 ECS 告警导出(未启用时其 exportAlert 自身为空操作)
+    worker.setContainment(&containment);         // 注入进程收容器(冻结/断子/处置阶梯)
+    worker.setFreezeOnDetect(options.UserModeFreezeOnDetect); // 2.3 检出即挂起(部署可关)
+    // 3.5:对象无条件注入,是否【加】ACE 由第二个开关决定。撤销永远可用 —— 这正是
+    // 「关掉开关不能把已加的跨重启 ACE 变成孤儿」那条要求的落点。
+    worker.setHardening(&hardening, options.FileDenyExecuteEnabled,
+                        options.RegistryInstantRollbackEnabled);
     // 补齐加白对账钩子(声明在上面的 IPC 接线处):UI 每次加白后,清掉内核「禁止执行 / 禁止加载」
     // 名单里会挡住该目标的条目并重下发其余条目 —— 否则内核那份注册表持久化名单会让加白形同无效。
-    trustAddedHook = [&worker] { worker.reconcileKernelBlocksAfterTrust(); };
+    // 同时撤销「主体已被加白」的释放物污点规则(模块 / 脚本污点不会被管线第 1 步盖住,见 Worker.h)。
+    trustAddedHook = [&worker] {
+        worker.purgeTaintRulesAfterTrust();
+        worker.reconcileKernelBlocksAfterTrust();
+    };
     forceQuarantineHook = [&worker](const QString& p) { return worker.forceQuarantine(p); };
     // 自启动项清理:此前 IpcMessageType 里留了消息号、ThreatRemediator 也把 8 类持久化点的清理
     // 动作全实现了,但两端都没有接线,那些代码一行都到不了。现在接上(带加白 / 自身组件护栏)。
@@ -1859,9 +2071,13 @@ static int serviceRun(int argc, char** argv) {
         [&engine, &ruleStore, &log](const QVector<bulwark::DefenseRule>& newRules) -> int {
             const auto existing = engine.getRules();
             auto duplicate = [&existing](const bulwark::DefenseRule& nr) {
+                // actorPath / commandLinePattern 也必须参与比较:释放物污点规则按这两个字段区分
+                // 不同文件,只比 type/action/target/hash 会把第二个及以后的污点文件全当成重复丢掉。
                 for (const bulwark::DefenseRule& r : existing)
                     if (r.type == nr.type && r.action == nr.action
-                        && r.targetPattern == nr.targetPattern && r.actorHashes == nr.actorHashes)
+                        && r.targetPattern == nr.targetPattern && r.actorHashes == nr.actorHashes
+                        && r.actorPath.compare(nr.actorPath, Qt::CaseInsensitive) == 0
+                        && r.commandLinePattern == nr.commandLinePattern)
                         return true;
                 return false;
             };
@@ -1903,27 +2119,278 @@ static int serviceRun(int argc, char** argv) {
     intelFeed.start();  // 启动 ThreatFox 情报 feed(未启用/无 Key 时为空操作)
     attackChainFeed.start(); // 启动攻击链组合表刷新(未启用/无端点时为空操作)
     intelUploader.start();   // 启动威胁情报夜间上传(无端点时为空操作;是否上传看运行时开关)
-    // 先应用初始设置(用户态行为监控 / 勒索诱饵开关),再 start()——确保 start() 内的诱饵投放
-    // 遵从当前开关,而不是先按默认(开)投放再被关闭。
+    //
+    // 「退出界面即停止防护」:本次启动到底该不该把防护拉起来。
+    //
+    // 这个判定必须做在【任何东西被拉起来之前】。反过来写(先照常全启动,再在几行之后待机)
+    // 代码更短,但代价是每次开机都白装载一次内核驱动又立刻卸掉 —— minifilter 的装与卸是这个
+    // 项目里风险最高的动作(卸载路径漏摘一个回调就是蓝屏),不能为了少一个分支而多做一次。
+    // ETW 会话、勒索诱饵投放、独占句柄重放同理,都是有副作用的动作。
+    //
+    // 判据是 ipc.clientCount():IPC 早在上面就已 start(),而界面若正在跑,它的重连循环是 1 秒
+    // 一次,到这里通常已经握过手了。没连上就按「界面没在跑」处理 —— 万一是它慢了一拍,
+    // 下面的 clientCountChanged 会在它接上的那一刻唤醒,代价只是一小段真实存在的空窗,
+    // 而且那段空窗会被如实写进日志,不会被说成"已防护"。
+    //
+    const bool standbyAtStart = settings.protectionFollowsUi && ipc.clientCount() == 0;
+
+    // 这两项【两条分支都要做】:它们只是把开关状态记进协调器(没有副作用),而待机唤醒走的是
+    // 同一个 start(),届时必须已经知道用户的选择。漏在 else 里的话,从待机醒来会按默认值
+    // (行为监控开、诱饵开、内存防护开)行事,把用户关掉的东西悄悄打开。
     coordinator->configureBehaviorMonitor(settings.userModeBehaviorMonitor, settings.ransomwareCanaryEnabled);
     // 内存防护总开关同样要在内核源启动前落定(setKernelEnabled 会在 start 前把它补给内核源)。
     coordinator->setMemoryProtectionEnabled(settings.memoryProtectionEnabled);
-    coordinator->start(); // 启动基础源 + 用户态行为源
+    if (standbyAtStart) {
+        log.warning(QStringLiteral("「退出界面即停止防护」已开启且界面当前未运行 —— 本次启动直接进入待机:"
+                                   "不启动 ETW 会话、不投放勒索诱饵、不加载内核驱动、不重放禁止执行名单。"
+                                   "打开 bulwark_ui.exe 即会拉起全部防护;在此之前本机"
+                                   "【不受本软件保护】。"));
+    } else {
+        coordinator->start(); // 启动基础源 + 用户态行为源
+    }
+
+    //
+    // 内核防护状态迁移:落审计 + 即时告知 UI。【必须接在 setKernelEnabled 之前】——
+    // 首次连接(或首次连接失败)就是第一次迁移,接晚了这条最重要的记录就没了。
+    //
+    // 为什么要落审计:出事后第一个要回答的问题是「那会儿到底有没有内核前拦」。此前这件事
+    // 只活在设置页一行实时派生的文字里,服务重启即消失(SettingsStore 还会刻意把它读入即
+    // 丢弃 —— 那是对的,陈旧状态比没状态更坏),而日志里那条 info 会被几 MB 的事件流冲走。
+    // .kiro/specs/architecture-rewrite/requirements.md 记着上次复盘的结论就是
+    // 「当时跑的是 Driver 还是 Wmi 模式 —— 无证据」。这几行就是为了让那句话不再出现。
+    //
+    const auto recordKernelState =
+            [&audit, &ipc, &log, coordinatorPtr](bool connected, const QString& detail) {
+                QJsonObject o;
+                // 与 Worker::writeAudit 同一个时间格式(dateTimeToIso = ISODateWithMs),
+                // 免得同一份 jsonl 里出现两种时间写法。
+                o["timestampUtc"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+                // 刻意【不是】 EventType 的取值:这条记录说的是防护自身的能力状态,不是某个
+                // 主体的行为事件。读审计的人按这个值就能把它与行为事件分开筛。
+                o["type"] = QStringLiteral("KernelProtectionState");
+                o["connected"] = connected;
+                // 机器可判定的防护档位。原先只有 Driver / Wmi 两档,现在取协调器的三档
+                //(Driver / UserModeEnforcement / ObserveOnly)—— 「无驱动但用户态拦截可用」
+                // 与「只有观测」对复盘是完全不同的结论,并成一档等于把前者说低。
+                // 为兼容既有按 "Wmi" 筛的用法,旧字段保留。
+                o["protectionTier"] = connected ? QStringLiteral("Driver") : QStringLiteral("Wmi");
+                if (coordinatorPtr)
+                    o["protectionTierDetailed"] = coordinatorPtr->protectionTier();
+                o["detail"] = detail;
+                //
+                // 【把能力集一并落审计(2.5 + 阶段 3)】
+                //
+                // 这条记录存在的理由是「出事后第一个要回答的问题:那会儿到底有没有内核前拦」。
+                // 只写 connected 只能回答一半 —— 驱动没连上时,当时到底有没有独占句柄、有没有
+                // WFP 出站封禁、注册表回滚开着没开着,决定了那段时间的实际暴露面差别很大。
+                // 而在此之前这张能力表【只存在于 UI 主动来问的那一次回调里】:UI 没运行(无人
+                // 值守的机器,或者 UI 正好被恶意软件杀掉)就没有任何地方记下它,事后也无从核实。
+                // 那与「设置页一行实时派生的文字、服务重启即消失」是同一个毛病,只是我这次把它
+                // 又造了一遍。
+                if (coordinatorPtr) {
+                    QJsonArray caps;
+                    for (const auto& c : coordinatorPtr->protectionCapabilities()) {
+                        QJsonObject co;
+                        co["dimension"] = c.dimension;
+                        co["inForce"] = c.inForce;
+                        co["provider"] = c.provider;
+                        if (!c.limit.isEmpty())
+                            co["limit"] = c.limit;
+                        caps.append(co);
+                    }
+                    o["capabilities"] = caps;
+                }
+                audit.writeRecord(o);
+
+                // 服务日志(留在本机,与 UI 是否在线无关)。
+                if (connected) log.info(detail); else log.warning(detail);
+                // 能力摘要单独一行:审计是给机器筛的,这一行是给人读的。生效与未生效两半都在。
+                if (coordinatorPtr)
+                    log.warning(coordinatorPtr->protectionSummary());
+
+                // 即时告知 UI:
+                //  · sendLog  -> 活动日志立刻出现一行,用户不必去翻设置页;
+                //  · sendSettings -> 把重新派生的 kernelConnected / kernelStatus 推过去,
+                //    否则设置页要等 UI 下一次主动请求才会更新,期间显示的是过期状态 ——
+                //    而「把没有防护说成有防护」正是本项目最不能接受的一类失真。
+                // 两者都不看 silentMode:静默模式的语义是「不要为决策打扰我」,而这是告知
+                // 防护能力变化,不是提问(与 attackChainToast 同一条理由)。
+                ipc.sendLog(detail);
+                ipc.sendSettings();
+            };
+    if (coordinatorPtr)
+        coordinatorPtr->setKernelStateChanged(recordKernelState);
 
     // 内核驱动开关(EventSource=Driver 或设置开启即启用)。
     const bool kernelInitial = options.EventSource.compare(QStringLiteral("Driver"), Qt::CaseInsensitive) == 0
                                || settings.kernelDriverEnabled;
-    if (kernelInitial)
+    if (standbyAtStart) {
+        // 启动即待机:内核驱动【一次都不加载】。
+        //
+        // 【这两行的顺序不能换】setSuspended(true) 内部会把「待机前的内核意图」记成当时的
+        // kernelEnabled_ —— 而这条路径上它从来没被置过,恒为 false。所以必须在它之后再把
+        // 真实意图告诉协调器,否则唤醒后会永远停在无驱动状态,且不会有任何报错:
+        // 界面显示「防护开启 · 无内核」,用户以为只是驱动没装好。
+        coordinator->setSuspended(true);
+        coordinator->setKernelWantedOnResume(kernelInitial);
+        recordKernelState(false,
+                          QStringLiteral("启动即待机(「退出界面即停止防护」已开启,界面未运行)· "
+                                         "内核驱动未加载,本软件此刻不提供任何防护"));
+    } else if (kernelInitial) {
         coordinator->setKernelEnabled(true);
+    } else {
+        // EventSource=Wmi 且用户也没开内核驱动 —— 这是【刻意配置成的无内核模式】,不是故障,
+        // 但同样必须留档:否则复盘时只看到"没有内核事件",无法区分「配置如此」与「掉线了」。
+        // 这条分支上 setKernelEnabled 根本不会被调用,协调器也就不会派发任何迁移,故直接补一条。
+        recordKernelState(false, QStringLiteral("按配置运行于用户态观测(EventSource=Wmi,"
+                                               "内核驱动未启用)· 无行为前拦截"));
+    }
 
-    if (!coordinator->isAvailable())
+    if (!coordinator->isAvailable() && !standbyAtStart)
         log.warning(QStringLiteral("基础事件源(ETW)不可用(通常因未以管理员身份运行);"
                                    "无实时进程事件,IPC/规则 / 用户态行为监控仍照常工作。"));
+
+    //
+    // 启动时先做一次加白对账。
+    //
+    // 【为什么不能只在「用户点加白」时对账】那两份禁运名单是跨重启续拦的:内核那份由驱动写回
+    // 注册表,用户态那份由 UserModeExecBlock 重放清单重新加锁。而加白规则同样是跨重启的。
+    // 于是存在一个此前无人处理的组合:某个路径【上次运行】被钉进名单,之后(或本次启动时由
+    // appsettings 的 TrustedDirectories 预置)成了受信任目标 —— 用户已经加过白了,不会再点一次,
+    // 而对账只挂在「点加白」那一下,于是这条会挡住已加白程序的条目就一直生效下去。
+    // 用户看到的现象正是约束里最不能接受的那一个:加白了却还是起不来,而且找不到原因。
+    //
+    // 放在这里(内核开关已落定、兜底扫描之前)是因为对账要读内核权威名单;内核未连接时
+    // clearExecBlock 会如实返回 false 并记一条「条目仍在生效」的警告,不做任何危险动作,
+    // 用户态那一侧则照常清理 —— 两侧都不会因为对方不可用而误清或漏清。
+    //
+    // 顺带说明:它还会清一次内核「已封禁主体」PID 集。那份集合里装的是上一次运行的 PID,
+    // 本次开机后这些数字早已易主,清掉只有好处。
+    //
+    worker.reconcileKernelBlocksAfterTrust();
 
     // 兜底扫描:实时链路(内核/ETW 遥测)可能漏检【已确认恶意】进程 —— 遥测丢包、云端确认迟到、
     // 或进程在防护启动前就已在跑。启动后台线程周期复查在跑进程,按已确认恶意情报(记忆哈希 +
     // 信誉缓存判恶意)比对,漏网的补封禁+结束+隔离。纯用户态,不改驱动。
     worker.startMaliciousSweep();
+
+    // ======================================================================
+    //  「退出界面即停止防护」(RuntimeSettings::protectionFollowsUi)
+    // ======================================================================
+    //
+    // 需求原话:「软件退出了,驱动服务还在,还是会拦截隔离 —— 能不能软件退出后彻底停止,
+    // 只有开启的时候才生效」。这一段就是那个「彻底」的落点。
+    //
+    // 【为什么关掉总开关不够】总开关(protectionEnabled)只短路 Worker 的事件处理与兜底扫描。
+    // 内核驱动那一层是刻意设计成「用户态不在也照样拦」的自足基线(禁止执行名单、命令行硬拦、
+    // 已知恶意哈希、内置凭据 hive 硬拦,且跨重启由驱动自己从注册表载回)。所以只要 Bulwark.sys
+    // 还在载,拦截就还在发生 —— 用户看到的正是这个。停干净的唯一办法是把驱动卸掉。
+    //
+    // 【判据是「有没有已认证的界面连着控制管道」】而不是去枚举 bulwark_ui.exe 进程:
+    //   · 管道连接的建立与断开都是内核给的事实,进程枚举是我们自己去猜;
+    //   · 进入 buffers_ 的连接都过了 IpcClientAuth(必须是安装目录下的 bulwark_ui.exe),
+    //     所以 clientCount() > 0 等价于「本产品的界面正在运行」,冒名进程连不进来;
+    //   · 最小化到托盘的界面仍然连着管道 —— 这正是用户期望的「软件还开着」。
+    //
+    // 【断开要有宽限期,连上不需要】断开可能只是界面重启、升级替换 exe、或管道抖动;为此立刻
+    // 卸一次驱动再装回来,既是无谓的高风险动作,也会在日志里刷出一串假的"防护空窗"。反过来,
+    // 界面接上时必须立刻恢复 —— 让用户打开界面后还要等十几秒才真的有防护,是说不过去的。
+    //
+    constexpr int kStandByGraceMs = 8000;   // 界面断开后的宽限期(界面重启通常 1~3 秒回来)
+
+    auto standByTimer = new QTimer(&ipc);   // 父对象给 ipc,随它一起析构
+    standByTimer->setSingleShot(true);
+    standByTimer->setInterval(kStandByGraceMs);
+
+    // 唯一的判定点。两个输入:用户意图(随界面开关)与事实(界面在不在线)。
+    // 任何一处想改变防护的启停都必须经过它,不许各自去调 setSuspended —— 两个地方各写一份
+    // 「什么时候该停」,迟早会出现互相覆盖的状态机。
+    auto applyProtectionLifetime =
+        [&settings, &ipc, coordinatorPtr, workerPtr, &audit, &log, standByTimer](bool immediate) {
+            if (!coordinatorPtr || !workerPtr)
+                return;
+            const bool uiOnline = ipc.clientCount() > 0;
+            //
+            // 判据【只看随界面这一个开关】,刻意不把 protectionEnabled(防护总开关)并进来。
+            //
+            // 总开关关闭的既有语义是「Worker 不处置、兜底扫描不跑」,事件源与驱动照旧在跑;
+            // 把它接到待机上会顺带改掉一个与本次需求无关的行为,还会和 settingsUpdated 里那句
+            // setKernelEnabled(settings.kernelDriverEnabled) 互相打架(一个要装、一个要卸)。
+            // 需求是「软件退出后停」,那就只让「软件在不在」决定待机。
+            //
+            const bool want = !settings.protectionFollowsUi || uiOnline;
+            const bool isSuspended = coordinatorPtr->isSuspended();
+            if (want == !isSuspended) {
+                standByTimer->stop();
+                return;   // 已经是期望状态
+            }
+            if (want) {
+                standByTimer->stop();
+            } else if (!immediate) {
+                if (!standByTimer->isActive())
+                    standByTimer->start();   // 宽限期内界面回来就当什么都没发生
+                return;
+            }
+
+            // Worker 的待机标志先于协调器置起、后于协调器解除 —— 两个方向都保证「事件源还在跑」
+            // 与「Worker 会处置」不会同时成立。反过来就会留下一个窗口:源已经在报事件而 Worker
+            // 已经/还在处置,那是待机期间最不该发生的事。
+            if (!want)
+                workerPtr->setProtectionSuspended(true);
+            coordinatorPtr->setSuspended(!want);
+            if (want) {
+                workerPtr->setProtectionSuspended(false);
+                // 唤醒后必须重跑一次加白对账,理由与启动时那次完全相同(见上面 reconcile 处的长注释):
+                // 禁止执行名单是跨重启续存的(内核写注册表、用户态重放清单),而加白规则也是。
+                // 待机期间用户可能加了白 —— 更要紧的是「启动即待机」那条路径上启动时那次对账
+                // 跑在名单还没重放的时候,等于没跑;不在这里补一次,已加白的程序会在唤醒后
+                // 被重新钉死,而且用户找不到原因。
+                workerPtr->reconcileKernelBlocksAfterTrust();
+            }
+
+            const QString detail = want
+                ? QStringLiteral("界面已连接 —— 防护已恢复")
+                : QStringLiteral("界面已退出 —— 防护已停止(内核驱动已卸载、事件源已停、"
+                                 "用户态拦截已放开)");
+            log.warning(QStringLiteral("【退出界面即停止防护】%1").arg(detail));
+            // 落审计:「那段时间到底有没有防护」必须事后可查,不能只活在一行会被事件流冲走的日志里。
+            // 这与 recordKernelState 是同一条理由,而这里的空窗是【用户自己选的】,更需要留证。
+            {
+                QJsonObject o;
+                o["timestampUtc"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+                o["type"] = QStringLiteral("ProtectionLifetime");
+                o["protectionActive"] = want;
+                o["uiOnline"] = uiOnline;
+                o["reason"] = detail;
+                o["protectionTierDetailed"] = coordinatorPtr->protectionTier();
+                audit.writeRecord(o);
+            }
+            // 界面若在线(恢复那一侧),把重新派生的状态推过去,免得设置页继续显示待机时的快照。
+            ipc.sendLog(QStringLiteral("【防护生命周期】") + detail);
+            ipc.sendSettings();
+        };
+    protectionLifetimeHook = [applyProtectionLifetime] { applyProtectionLifetime(/*immediate=*/true); };
+
+    QObject::connect(standByTimer, &QTimer::timeout, &ipc,
+                     [applyProtectionLifetime] { applyProtectionLifetime(/*immediate=*/true); });
+
+    QObject::connect(&ipc, &IpcServer::clientCountChanged, &ipc, [applyProtectionLifetime, &ipc](int n) {
+        // 恢复要立刻,停止要走宽限期 —— 所以 immediate 恰好等于「现在有界面」。
+        //
+        // 【延后一拍执行】装驱动走的是 fltmc.exe / sc.exe 子进程(同步等待,最坏十几秒),
+        // 而这里是管道连接回调,正跑在 Qt 事件循环上。在这里同步装驱动会把整条 IPC 线程按住,
+        // 界面表现为"刚连上就假死"。singleShot(0) 让本次回调先返回,装驱动在下一轮事件处理里做。
+        //
+        // 上下文对象给 &ipc 而不是省掉:这个 lambda 里握着 settings / audit / log 的引用(经
+        // applyProtectionLifetime 的副本),没有上下文的 singleShot 在停机时序上不受任何对象生命周期
+        // 约束。本项目已经因为完全相同的形态查过一轮堆破坏,不在这里重犯。
+        QTimer::singleShot(0, &ipc, [applyProtectionLifetime, n] { applyProtectionLifetime(n > 0); });
+    });
+
+    // 启动时对齐一次。启动即待机那条路径已经在上面置好了待机,这一句在「界面其实已经连上了」
+    // 的情形下负责立刻唤醒;反之(随界面模式、界面没在跑、但上面没走待机分支,例如
+    // clientCount 在那一刻还是 1 后来又断了)负责补上停止。
+    applyProtectionLifetime(/*immediate=*/true);
 
     // 行为基线周期落盘(5 分钟)。只在停机时存一次是不够的:服务被强杀 / 机器断电时基线全丢,
     // 而基线的价值恰恰来自长期积累。5 分钟是折中 —— 画像是有界的(maxProfiles 8192),
@@ -1969,6 +2436,17 @@ static int serviceRun(int argc, char** argv) {
     repManager.stop();
     coordinator->stop();
     ipc.stop();
+
+    // 摘除所有「捕获了比 quarantine 活得短的对象」的委托。
+    //
+    // quarantine 声明在第 576 行、hardening 与 coordinator 在一千多行之后,所以后两者【先】析构,
+    // 而 quarantine 的成员 lambda 仍然握着它们。本项目已经因为完全相同的形态查过一轮堆破坏
+    // (EventSourceCoordinator 持有捕获 &hardening 的 lambda,hardening 声明在它之后)。
+    // 这里不靠「析构之间没人会再调它」这种默认假设 —— 那正是那次事故的推理链。
+    quarantine.setExecDenyFallback(nullptr);
+    quarantine.setSelfUnlock(nullptr);
+    quarantine.setKernelAssist(nullptr, nullptr);
+
     log.info(QStringLiteral("Bulwark 服务退出。"));
     stopFileLog();
     return rc;

@@ -54,6 +54,7 @@ QJsonObject SecurityEvent::toJson() const {
     o["actorHash"] = actorHash;
     o["actorSigned"] = actorSigned;
     o["signatureMismatch"] = signatureMismatch;
+    o["signatureTampered"] = signatureTampered;
     o["actorFileSize"] = actorFileSize;
     o["actorPublisher"] = actorPublisher;
     o["actorCertThumbprint"] = actorCertThumbprint;
@@ -76,6 +77,8 @@ QJsonObject SecurityEvent::toJson() const {
     o["commandLine"] = commandLine;
     o["target"] = target;
     o["detail"] = detail;
+    o["targetSigned"] = targetSigned;
+    o["targetSignatureMismatch"] = targetSignatureMismatch;
 
     o["riskScore"] = riskScore;
     o["riskReasons"] = strListToJson(riskReasons);
@@ -111,6 +114,9 @@ SecurityEvent SecurityEvent::fromJson(const QJsonObject& o) {
     e.actorHash = getStr(o, "actorHash");
     e.actorSigned = getBool(o, "actorSigned");
     e.signatureMismatch = getBool(o, "signatureMismatch");
+    // 旧报文没有这个键 -> false = 「不是篡改」。那正是正确的保守方向:旧报文里
+    // signatureMismatch 为真的绝大多数本来就不是篡改(根不受信 / 文件读不出来)。
+    e.signatureTampered = getBool(o, "signatureTampered");
     e.actorFileSize = getI64(o, "actorFileSize");
     e.actorPublisher = getStr(o, "actorPublisher");
     e.actorCertThumbprint = getStr(o, "actorCertThumbprint");
@@ -134,6 +140,9 @@ SecurityEvent SecurityEvent::fromJson(const QJsonObject& o) {
     e.commandLine = getStr(o, "commandLine");
     e.target = getStr(o, "target");
     e.detail = getStr(o, "detail");
+    // 旧报文没有这两个键 -> false = 「未签名」,与字段加入之前的判定逐字节相同。
+    e.targetSigned = getBool(o, "targetSigned");
+    e.targetSignatureMismatch = getBool(o, "targetSignatureMismatch");
 
     e.riskScore = getInt(o, "riskScore");
     e.riskReasons = getStrList(o, "riskReasons");

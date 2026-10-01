@@ -222,8 +222,10 @@ bool containsDir(const QStringList& dirs, const QString& pathLower) {
 //   "360Secure Fake Ltd"               对 "360"    -> 不命中(360 后面紧跟字母)
 // 判定仍不区分大小写。
 //
-bool publisherMatches(const QString& publisher, const QStringList& list) {
-    if (publisher.isEmpty()) return false;
+// 返回【命中的那条名单项】(便于在原因里如实写出是哪一条),没命中返回空串。
+// publisherMatches 是它的布尔封装 —— 两者必须共用同一套匹配口径,不能各写一遍。
+QString matchedPublisher(const QString& publisher, const QStringList& list) {
+    if (publisher.isEmpty()) return QString();
     const QString hay = publisher.toLower();
     for (const QString& p : list) {
         const QString needle = p.toLower();
@@ -235,11 +237,39 @@ bool publisherMatches(const QString& publisher, const QStringList& list) {
             const int end = at + needle.size();
             const bool leftOk = (at == 0) || !hay.at(at - 1).isLetterOrNumber();
             const bool rightOk = (end == hay.size()) || !hay.at(end).isLetterOrNumber();
-            if (leftOk && rightOk) return true;
+            if (leftOk && rightOk) return p;
             from = at + 1;
         }
     }
-    return false;
+    return QString();
+}
+bool publisherMatches(const QString& publisher, const QStringList& list) {
+    return !matchedPublisher(publisher, list).isEmpty();
+}
+
+// ---- 被盗用 / 被滥用的签名者名单(由宿主注入,见 TrustPolicy::setAbusedSigners)----
+//
+// 【内置为空是刻意的】往这里硬写指纹等于把一份会过时的情报编译进二进制:证书会轮换、
+// 盗用会被 CA 吊销、也会有新的被偷。名单该由部署方 / 情报通道给,代码只提供机制。
+// 判定本身在下面的 isAbusedSigner,不依赖名单非空 —— 空名单时它恒不命中,行为与本机制
+// 加入之前完全一致。
+QSet<QString>& abusedThumbprints() {
+    static QSet<QString> s;
+    return s;
+}
+QStringList& abusedPublishers() {
+    static QStringList s;
+    return s;
+}
+// 指纹归一:去掉空格 / 冒号 / 连字符,转大写。配置里抄自证书管理器的指纹常带空格,
+// 而 e.actorCertThumbprint 是无分隔大写十六进制,两边必须先对齐再比。
+QString normalizeThumbprint(const QString& raw) {
+    QString out;
+    out.reserve(raw.size());
+    for (const QChar ch : raw) {
+        if (ch.isLetterOrNumber()) out.append(ch.toUpper());
+    }
+    return out;
 }
 
 bool hasDangerousCommandLine(const QString& cmd) {
@@ -268,6 +298,36 @@ bool isAbnormalChain(const bulwark::SecurityEvent& e) {
 
 } // namespace
 
+void TrustPolicy::setAbusedSigners(const QStringList& thumbprints, const QStringList& publishers) {
+    QSet<QString>& tp = abusedThumbprints();
+    tp.clear();
+    for (const QString& t : thumbprints) {
+        const QString n = normalizeThumbprint(t);
+        if (!n.isEmpty()) tp.insert(n);
+    }
+    QStringList& pubs = abusedPublishers();
+    pubs.clear();
+    for (const QString& p : publishers) {
+        const QString trimmed = p.trimmed();
+        // 【短词一律拒收】名单按词边界子串匹配,一个两三字符的条目(如 "AB")会命中大量无关
+        // 主体名,而这条名单的后果是撤销签名信任 —— 配错的代价是正常签名软件掉进行为检测。
+        // 与 CommandHardBlocks「每个 token >= 4 字符」同一条理由。
+        if (trimmed.size() >= 4) pubs.append(trimmed);
+    }
+}
+
+TrustDecision TrustPolicy::isAbusedSigner(const bulwark::SecurityEvent& e) {
+    if (!e.actorCertThumbprint.isEmpty()) {
+        const QString n = normalizeThumbprint(e.actorCertThumbprint);
+        if (!n.isEmpty() && abusedThumbprints().contains(n))
+            return { true, u("签名证书在【被盗用证书】名单内(指纹 ") + n + u(")") };
+    }
+    const QString pub = matchedPublisher(e.actorPublisher, abusedPublishers());
+    if (!pub.isEmpty())
+        return { true, u("签名主体在【被盗用证书】名单内:") + pub };
+    return {};
+}
+
 TrustDecision TrustPolicy::isTrustedSecurityProduct(const bulwark::SecurityEvent& e) {
     if (e.actorPath.isEmpty()) return {};
     const QString name = fileNameLower(e.actorPath);
@@ -286,6 +346,8 @@ TrustDecision TrustPolicy::isTrustedSecurityProduct(const bulwark::SecurityEvent
     //
     if (!e.actorSigned || e.signatureMismatch || e.certRevoked || e.signedAfterCertExpiry)
         return {};
+    // 签名有效但证书是偷来的 —— 这一档是【无条件放行】,必须一并挡住(见 isAbusedSigner)。
+    if (isAbusedSigner(e).ok) return {};
     QString lower = e.actorPath.toLower();
     lower.replace(QLatin1Char('/'), QLatin1Char('\\'));
     if (!containsDir(protectedInstallDirs(), lower)) return {};
@@ -295,8 +357,25 @@ TrustDecision TrustPolicy::isTrustedSecurityProduct(const bulwark::SecurityEvent
 TrustDecision TrustPolicy::isStronglyTrusted(const bulwark::SecurityEvent& e) {
     if (hasDangerousCommandLineOrLolbinAbuse(e)) return {};
     if (isAbnormalChain(e)) return {};
+    //
+    // 它要执行的【脚本文件正文】命中了行为级判据 —— 不走这条快速放行。
+    //
+    // 【为什么必须在这里拦一道】本步骤是流水线上「唯一跳过行为检测的通道」,而脚本宿主的
+    // 主体永远是 `C:\Windows\System32\cmd.exe` / `wscript.exe` 这类【微软签名 + 系统目录】
+    // 的正规程序 —— 正好命中下面那条「微软签名且位于系统目录」。于是在加上本判断之前:
+    // 富化阶段已经认定脚本正文是加载器(硬指标 + 风险分 93~100),裁决却在第 7 步就放行了,
+    // 第 10 步的硬指标闸门根本轮不到。实测 7 个真实样本全部如此(Allow,risk 100,硬指标)。
+    //
+    // 只看 scriptFileHardIndicator 而不是笼统的 hasThreatIndicator:后者影响所有强可信主体,
+    // 属于另一个范围大得多的改动(第 9 步 isHealthySigned 已经那么做了,本步没有,这个不一致
+    // 本身值得单独评估)。这里只修「可信宿主 + 不可信脚本」这一种,不牵动其它路径。
+    //
+    if (e.scriptFileHardIndicator) return {};
     if (!e.actorSigned) return {};
     if (e.certRevoked || e.signedAfterCertExpiry) return {};
+    // 被盗用证书优先于指纹白名单:名单是「这张证书可信」,而这里说的是「这张证书已经不
+    // 归原主了」。两者冲突时必须后者赢,否则一张进过白名单的证书被偷之后永远收不回来。
+    if (isAbusedSigner(e).ok) return {};
 
     if (!e.actorCertThumbprint.isEmpty() &&
         strongTrustThumbprints().contains(e.actorCertThumbprint.toUpper()))
@@ -319,10 +398,34 @@ TrustDecision TrustPolicy::isHealthySigned(const bulwark::SecurityEvent& e) {
     if (e.hasThreatIndicator) return {};
     if (hasDangerousCommandLineOrLolbinAbuse(e)) return {};
     if (isAbnormalChain(e)) return {};
+    if (isAbusedSigner(e).ok) return {};
 
-    if (e.isFirstSeen && e.certNotAfterUtc.has_value()) {
+    // 证书有效期的两种异常形态。两者都只在【本机首见】时才收紧 —— 已经在这台机器上跑了很久的
+    // 签名软件,不该因为厂商证书到期就忽然掉出快速放行通道。
+    if (e.certNotAfterUtc.has_value()) {
         const qint64 secs = nowUtc().secsTo(*e.certNotAfterUtc);
-        if (secs > 0 && secs <= static_cast<qint64>(186) * 24 * 3600) return {};
+        // ① 证书快到期:空壳公司现买现用的新证书画像(原有判据,未改)。
+        if (e.isFirstSeen && secs > 0 && secs <= static_cast<qint64>(186) * 24 * 3600) return {};
+        //
+        // ② 证书【已经过期】,而签名仍然判为有效 —— 因为本项目的 WinVerifyTrust 调用没有开
+        //    WTD_LIFETIME_SIGNING_FLAG(见 ProcessInspector.cpp 里 kWinTrustProvFlags 的说明),
+        //    所以「过期证书 + 签名时有合法时间戳」照旧是可信签名,actorSigned 为真。
+        //
+        //    这个形态【绝大多数是正常的】:大量老软件就长这样。所以不能据此拦截,也不能单凭
+        //    过期就取消放行 —— 那会把一批装在 Program Files 里多年的正常程序赶进行为检测。
+        //
+        //    但它同时是「盗用旧证书」的典型落点:私钥到手时证书往往已经临近或已经过期,签完
+        //    再挂一个时间戳,整条链看起来就是完整的,而 certRevoked 要等 CA 吊销 + CRL 下发到
+        //    本机才会变真。所以这里按本项目既定原则要求互证,三条同时成立才收紧:
+        //        已过期 + 本机首见 + 不在标准安装目录(即出现在用户可写的投放点)。
+        //    收紧的含义仅是「不走签名健康快速放行」,让事件回到正常检测流水线;没有硬指标时
+        //    第 11 步照样放行,所以这不会凭空产生拦截或弹窗。
+        //
+        if (secs < 0 && e.isFirstSeen) {
+            QString pathLower = e.actorPath.toLower();
+            pathLower.replace(QLatin1Char('/'), QLatin1Char('\\'));
+            if (!containsDir(trustedDirs(), pathLower)) return {};
+        }
     }
 
     const QString reason = e.actorPublisher.isEmpty()
@@ -337,6 +440,8 @@ TrustDecision TrustPolicy::isCleanSigned(const bulwark::SecurityEvent& e) {
     if (e.hasThreatIndicator) return {};
     if (hasDangerousCommandLineOrLolbinAbuse(e)) return {};
     if (isAbnormalChain(e)) return {};
+    // 这一档决定「要不要跳过 VT 上传」。被盗用证书签的样本恰恰是最该送上去的那一类。
+    if (isAbusedSigner(e).ok) return {};
 
     const QString reason = e.actorPublisher.isEmpty()
         ? u("有合法且健康的数字签名,明确安全,跳过 VT 上传")
@@ -347,12 +452,21 @@ TrustDecision TrustPolicy::isCleanSigned(const bulwark::SecurityEvent& e) {
 TrustDecision TrustPolicy::isBenignSigner(const bulwark::SecurityEvent& e) {
     if (!e.actorSigned) return {};
     if (e.certRevoked || e.signedAfterCertExpiry) return {};
+    if (isAbusedSigner(e).ok) return {};
 
-    if (!e.actorPublisher.isEmpty()) {
-        for (const QString& pub : benignPublishers())
-            if (e.actorPublisher.contains(pub, Qt::CaseInsensitive))
-                return { true, u("合法签名发行商:") + pub };
-    }
+    //
+    // 【必须走 matchedPublisher(词边界),不能用 contains】本文件上方 publisherMatches 的说明
+    // 已经论证过为什么子串包含在这里是错的:benignPublishers 里有 "360" / "Dell" / "Valve" /
+    // "Zoom" / "Oracle" 这类三四个字符的条目,contains 之下一张签给 "Valverde Software Ltd"
+    // 或 "360Secure Fake Ltd" 的证书就直接进了良性发行商名单 —— 而按想要的名字去申请一张 OV
+    // 代码签名证书,是有组织攻击者的常规操作,成本远低于偷一把私钥。
+    //
+    // 那次加固当时只落在 publisherMatches 这个新函数上,isBenignSigner 与 isTrustedVendorApp
+    // 两个调用点没有跟着换,于是收紧实际上没生效在这两条路上。这里补齐。
+    //
+    const QString pub = matchedPublisher(e.actorPublisher, benignPublishers());
+    if (!pub.isEmpty())
+        return { true, u("合法签名发行商:") + pub };
 
     // 同上:containsDir 已是盘符锚定,需先归一分隔符。
     QString pathLower = e.actorPath.toLower();
@@ -371,12 +485,13 @@ TrustDecision TrustPolicy::isTrustedVendorApp(const bulwark::SecurityEvent& e) {
     // 必须持有健康签名(未失配 / 未吊销 / 未过期后签名),防止同名恶意程序冒用白名单。
     if (!e.actorSigned || e.signatureMismatch || e.certRevoked || e.signedAfterCertExpiry)
         return {};
+    if (isAbusedSigner(e).ok) return {};
     // 且由良性发行商签名(如 Tencent):仅凭文件名不足以放行,签名主体必须可信。
-    if (!e.actorPublisher.isEmpty()) {
-        for (const QString& pub : benignPublishers())
-            if (e.actorPublisher.contains(pub, Qt::CaseInsensitive))
-                return { true, u("已知良性厂商应用(") + name + u(")·签名健康(") + pub + u("),检测前放行") };
-    }
+    // 同 isBenignSigner:这里必须按词边界匹配,否则「文件名叫 wechat.exe + 证书主体里带
+    // Tencent 字样」就能凑齐放行条件,而主体名是攻击者可以自己申请的那一半。
+    const QString pub = matchedPublisher(e.actorPublisher, benignPublishers());
+    if (!pub.isEmpty())
+        return { true, u("已知良性厂商应用(") + name + u(")·签名健康(") + pub + u("),检测前放行") };
     return {};
 }
 

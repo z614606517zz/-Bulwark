@@ -4,7 +4,7 @@
 #include "design/Motion.h"
 #include "design/Theme.h"
 
-#include <QEnterEvent>
+#include <QCursor>
 #include <QGraphicsOpacityEffect>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -12,11 +12,16 @@
 #include <QPainterPath>
 #include <QPropertyAnimation>
 #include <QPushButton>
+#include <QRect>
 #include <QTimer>
 #include <QToolTip>
 #include <QVBoxLayout>
 
+#include <utility>
+
 namespace {
+
+constexpr int kHoverPollMs = 120; // 悬停轮询(见 Banner::syncHoverPause)
 
 int defaultTimeout(ui::Tone t)
 {
@@ -85,6 +90,10 @@ Banner::Banner(ui::Tone tone, const QString& text, QWidget* parent)
     m_timer->setSingleShot(true);
     connect(m_timer, &QTimer::timeout, this, &Banner::dismiss);
 
+    m_hoverWatch = new QTimer(this);
+    m_hoverWatch->setInterval(kHoverPollMs);
+    connect(m_hoverWatch, &QTimer::timeout, this, &Banner::syncHoverPause);
+
     setAccessibleName(QString::fromUtf8("提示"));
     setAccessibleDescription(text);
 }
@@ -108,29 +117,53 @@ void Banner::setTimeout(int ms)
 {
     m_remaining = ms;
     m_timer->stop();
+    m_holding = false;
+    m_hoverArmed = false;
     if (ms > 0) {
         m_since.start();
         m_timer->start(ms);
+        m_lastCursor = QCursor::pos();
+        m_hoverWatch->start();
+    } else {
+        m_hoverWatch->stop();
     }
 }
 
-void Banner::enterEvent(QEnterEvent* e)
+// Hover pauses the dismissal: the user is reading it. Which is only true while the
+// pointer is *really* on this strip — asked here every 120 ms instead of trusting
+// enterEvent / leaveEvent, and only counted as hover once the pointer has moved
+// over it. A banner appearing under a motionless pointer (the layout grows under
+// the button that was just clicked) gets an Enter but no Leave until the mouse
+// moves again, which used to hold it on the page indefinitely; see
+// CountdownBar::syncHoverPause for the full story behind the same fix.
+void Banner::syncHoverPause()
 {
-    // Hover pauses the countdown: the user is reading it.
-    if (m_timer->isActive()) {
+    if (m_closing || m_remaining <= 0) {
+        m_hoverWatch->stop();
+        return;
+    }
+    const QPoint now = QCursor::pos();
+    const bool moved = now != m_lastCursor;
+    m_lastCursor = now;
+    const QWidget* win = window();
+    const bool over = isVisible() && win && win->isVisible() && !win->isMinimized()
+                      && QRect(mapToGlobal(QPoint(0, 0)), size()).contains(now);
+    if (!over) {
+        m_hoverArmed = false;
+        if (m_holding) { // 指针离开(或这条提示被挪走了):接着走完剩下的时间
+            m_holding = false;
+            m_since.start();
+            m_timer->start(m_remaining);
+        }
+        return;
+    }
+    if (moved)
+        m_hoverArmed = true;
+    if (m_hoverArmed && !m_holding && m_timer->isActive()) {
         m_remaining = qMax(800, m_remaining - int(m_since.elapsed()));
         m_timer->stop();
+        m_holding = true;
     }
-    QFrame::enterEvent(e);
-}
-
-void Banner::leaveEvent(QEvent* e)
-{
-    if (m_remaining > 0 && !m_closing && !m_timer->isActive()) {
-        m_since.start();
-        m_timer->start(m_remaining);
-    }
-    QFrame::leaveEvent(e);
 }
 
 void Banner::dismiss()
@@ -139,6 +172,7 @@ void Banner::dismiss()
         return;
     m_closing = true;
     m_timer->stop();
+    m_hoverWatch->stop();
     const int ms = motion::duration(160);
     if (ms <= 0) {
         emit dismissed();
@@ -234,11 +268,22 @@ Banner* BannerHost::post(ui::Tone tone, const QString& text, int timeoutMs)
     return b;
 }
 
-void BannerHost::clear()
+void BannerHost::clear(bool animated)
 {
-    for (const QPointer<Banner>& b : std::as_const(m_banners))
-        if (b)
-            b->dismiss();
+    if (animated) {
+        for (const QPointer<Banner>& b : std::as_const(m_banners))
+            if (b)
+                b->dismiss();
+        return;
+    }
+    const QList<QPointer<Banner>> gone = std::exchange(m_banners, {});
+    for (const QPointer<Banner>& b : gone) {
+        if (b) {
+            b->hide(); // out of the layout now, not when the deferred delete runs
+            b->deleteLater();
+        }
+    }
+    hide();
 }
 
 BannerHost* BannerHost::find(QWidget* from)

@@ -339,7 +339,7 @@ void run(QWidget* context, IpcClient* ipc, const bulwark::ProcessEntry& e, Kind 
         break;
     case Kind::TrustImage:
         s.title = u("信任此程序");
-        s.summary = u("信任后,该程序的所有行为都将直接放行,并跳过全部检测与后台云查毒 / AI 研判。");
+        s.summary = u("信任后,该程序的所有行为都将直接放行,并跳过全部检测与后台云查毒。");
         s.consequences << u("请只信任你确认安全的程序,并核对下面的完整路径");
         s.subjectLabel = u("程序");
         s.subject = evtfmt::nativePath(e.imagePath);

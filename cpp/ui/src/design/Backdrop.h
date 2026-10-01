@@ -32,6 +32,10 @@ public:
     // The plane rendered at `size` (logical px) for `dpr`.
     static QPixmap render(Kind kind, const QSize& size, qreal dpr);
 
+    // This widget's plane exactly as it paints it (its size, its DPR) — for an
+    // overlay that stands in for the live content (design/PageTransition).
+    QPixmap canvas();
+
     // Gives a framed top-level window (detail dialogs, graph / timeline windows)
     // the same work-area material as the main window without restructuring its
     // layout: an event filter paints the cached canvas at the start of the

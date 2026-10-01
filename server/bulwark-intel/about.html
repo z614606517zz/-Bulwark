@@ -772,7 +772,7 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
       <span class="kicker">Optional · API Keys</span>
       <div class="sec-title"><span class="ic">🔑</span><h2>情报源与 AI 密钥获取</h2></div>
       <p class="sub">全部<b>可选</b>。默认关闭,不填任何 Key 也能正常跑本地启发式 + 行为检测 ——
-        云信誉、情报 feed、AI 研判都只是锦上添花。绝大多数源都有免费额度。</p>
+        云信誉、情报 feed、AI 辅助都只是锦上添花。绝大多数源都有免费额度。</p>
     </div>
     <div class="table-wrap rv">
       <table>
@@ -803,7 +803,7 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
         <tr><td><b>Hybrid Analysis</b></td><td>沙箱信誉 + 行为画像</td>
           <td><a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener noreferrer">hybrid-analysis.com</a></td>
           <td>注册后在 Profile → API key;免费</td></tr>
-        <tr><td><b>小米 MiMo 大模型</b></td><td>AI 行为研判 + 自然语言生成规则</td>
+        <tr><td><b>小米 MiMo 大模型</b></td><td>自然语言生成规则 + AI 清理方案</td>
           <td><a href="https://mimo.mi.com/" target="_blank" rel="noopener noreferrer">mimo.mi.com</a></td>
           <td>小米账号登录,控制台 → API Keys</td></tr>
         </tbody>
@@ -867,8 +867,8 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
       </div>
       <div class="card layer ui rv">
         <h3>桌面 UI <span class="tag">Qt Widgets</span></h3>
-        <p><code>bulwark_ui.exe</code>,12 个功能页:仪表盘、事件记录、事件时间线、攻击链、进程管理、
-          防护规则、信任名单、隔离区、自启动项、云信誉、AI 研判、设置。另有行为弹窗、角标通知、
+        <p><code>bulwark_ui.exe</code>,11 个功能页:仪表盘、事件记录、事件时间线、攻击链、进程管理、
+          防护规则、信任名单、隔离区、自启动项、云信誉、设置。另有行为弹窗、角标通知、
           扫描进度、清理报告、AI 清理向导与攻击时间线等对话框。</p>
       </div>
     </div>
@@ -1009,7 +1009,7 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
   <section id="cloud">
     <div class="sec-head rv">
       <span class="kicker">Cloud · Intel · AI</span>
-      <div class="sec-title"><span class="ic">☁️</span><h2>云信誉 · 威胁情报 · AI 研判</h2></div>
+      <div class="sec-title"><span class="ic">☁️</span><h2>云信誉 · 威胁情报 · AI 辅助</h2></div>
       <p class="sub">全部 opt-in,默认关闭。不填任何 Key 也能正常跑本地启发式 + 行为检测 —— 这些只是锦上添花。</p>
     </div>
 
@@ -1030,7 +1030,7 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
           <td><a href="https://metadefender.opswat.com/" target="_blank" rel="noopener noreferrer">metadefender.opswat.com</a></td></tr>
         <tr><td><b>Hybrid Analysis</b></td><td>沙箱信誉 + 行为画像</td>
           <td><a href="https://www.hybrid-analysis.com/" target="_blank" rel="noopener noreferrer">hybrid-analysis.com</a></td></tr>
-        <tr><td><b>小米 MiMo 大模型</b></td><td>AI 行为研判 + 自然语言生成规则</td>
+        <tr><td><b>小米 MiMo 大模型</b></td><td>自然语言生成规则 + AI 清理方案</td>
           <td><a href="https://mimo.mi.com/" target="_blank" rel="noopener noreferrer">mimo.mi.com</a></td></tr>
         </tbody>
       </table>
@@ -1057,23 +1057,13 @@ curl -H "X-API-Key: KEY" https://vt.bulwark.icu:8787/api/v1/quota</pre>
           确认恶意再补偿处置。</p>
       </div>
       <div class="card rv">
-        <h3>AI 研判(大模型)</h3>
+        <h3>AI 辅助(大模型)</h3>
         <p style="color:var(--muted);font-size:13.6px;margin:0 0 8px">OpenAI 兼容接口,异步,任何失败都
-          fail-open。三种能力:</p>
+          fail-open,<b>不参与任何裁决</b>。两种能力:</p>
         <ul class="list">
-          <li>基于<b>纯静态内容特征</b>研判恶意性 —— <b>绝不执行样本</b></li>
           <li>把自然语言安全意图转成 1~5 条可复核的防御规则</li>
-          <li>对恶意 / 可疑文件一键生成清理脚本</li>
+          <li>对恶意 / 可疑文件一键生成清理脚本(复核后才执行)</li>
         </ul>
-        <p style="color:var(--muted);font-size:13.4px;margin:10px 0 0">静态特征由
-          <code>StaticFeatureExtractor</code> 越界安全地提取:PE 头 + 各节香农熵(判壳,熵 &gt; 7.2)、
-          危险 Win32 API / URL / IP 字符串、能力标签(注入 / 反调试 / 键盘钩子 / 加密勒索 / 提权……)。</p>
-      </div>
-      <div class="card rv">
-        <h3>AI 灰区策略</h3>
-        <p style="color:var(--muted);font-size:13.6px;margin:0">仅对「询问(Ask)」类灰区事件咨询大模型:
-          AI 判恶意则升格阻止;AI 判干净且无硬指标则降级放行(减少打扰);其余维持原判。</p>
-        <div class="note good"><span class="em">✓</span><div><b>AI 绝不压制硬指标,也绝不改判确定性拦截或强可信放行。</b></div></div>
       </div>
     </div>
   </section>

@@ -2,6 +2,7 @@
 #include "design/GlowCard.h"
 #include "design/RecordModel.h"
 
+#include <QList>
 #include <QPersistentModelIndex>
 #include <QPointer>
 #include <QVariant>
@@ -18,30 +19,41 @@ class QLabel;
 class QLineEdit;
 class QMenu;
 class QPushButton;
+class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class RecordListView;
 class Segmented;
 
-// The floating bar that appears at the bottom of a list while several records
-// are selected: "已选 3 项 · [还原] [永久删除] · ✕".
+// The floating bar at the bottom of a list while several records are selected,
+// or for as long as the list is in check mode (RecordBrowser::setCheckMode):
+// "已选 3 项 [全选] | [还原] [永久删除] ✕". The page's actions are disabled
+// while nothing is selected.
 class BatchBar : public GlowCard
 {
     Q_OBJECT
 public:
     explicit BatchBar(QWidget* parent = nullptr);
-    void setCount(int n);
+    // `selected` of the `listed` records are selected; 全选 turns into 取消全选
+    // once all of them are.
+    void setCount(int selected, int listed);
     QPushButton* addAction(const QString& icon, const QString& text, const char* variant,
                            std::function<void()> fn);
-    bool hasActions() const { return m_actions > 0; }
+    bool hasActions() const { return !m_buttons.isEmpty(); }
+    // In check mode ✕ leaves the mode, not just the selection; its label says so.
+    void setCheckMode(bool on);
 
 signals:
     void clearRequested();
+    void selectAllRequested(bool select); // true: every listed record, false: none
 
 private:
     QLabel* m_count = nullptr;
+    QPushButton* m_all = nullptr;
     QHBoxLayout* m_row = nullptr;
-    int m_actions = 0;
+    QToolButton* m_close = nullptr;
+    QList<QPushButton*> m_buttons;
+    bool m_allSelected = false;
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -146,7 +158,7 @@ private:
 // browser does the rest: search, "匹配 x / y", the right empty state, keeping
 // the selection (and the open inspector) across refreshes, anchoring the
 // viewport when live rows arrive on top while the user is reading further down,
-// and the batch bar for multi-selection.
+// and the batch bar for multi-selection (Ctrl / Shift + click, or check mode).
 class RecordBrowser : public ListShell
 {
     Q_OBJECT
@@ -161,6 +173,13 @@ public:
 
     void setGrouped(bool grouped, bool collapsible = false, bool rail = false);
     void setMultiSelect(bool on);
+    // Check mode (批量选择) — multi-selection without modifier keys: every record
+    // leads with a check box, a plain click (or Space) toggles it instead of
+    // opening the inspector, and the batch bar stays up the whole time. Entering
+    // and leaving both start from an empty selection; ✕ on the bar, Esc (once
+    // the inspector and search are clear) or setCheckMode(false) leave it.
+    void setCheckMode(bool on);
+    bool checkMode() const { return m_checkMode; }
     void setLiveTop(bool on) { m_liveTop = on; }
     void setIdentity(const QColor& hue) override;
 
@@ -194,10 +213,13 @@ public:
 signals:
     void currentRowChanged(int sourceRow);
     void selectionCountChanged(int n);
+    void checkModeChanged(bool on);
 
 private:
     void updateCounts();
     void refreshEmpty();
+    int syncBatch(); // batch bar from the selection; returns the number of selected records
+    bool restoreSelection(const QList<QVariant>& keys, const QVariant& current);
     void onCurrentChanged(const QModelIndex& current);
     void showInspectorFor(int sourceRow);
     void showContextMenu(const QPoint& pos);
@@ -220,8 +242,12 @@ private:
     QString m_disconnectedBody;
     QString m_noDataIcon, m_noDataTitle, m_noDataBody, m_noDataActionText;
 
+    bool m_multi = false;
+    bool m_checkMode = false;
+
     // selection / anchoring across model changes
     QVariant m_keptKey;
+    QList<QVariant> m_keptKeys; // the whole selection, when there's more to keep than the current row
     bool m_keptInspector = false;
     int m_keptScroll = 0;
     QPersistentModelIndex m_anchor;

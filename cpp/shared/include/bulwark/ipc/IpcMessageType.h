@@ -37,8 +37,11 @@ enum class IpcMessageType {
     ReservedSandboxLaunch,          // 26
     ReservedSandboxResult,          // 27
 
-    AiScanRequest,              // 28 服务->UI:对双击启动程序做 AI 研判
-    AiScanResponse,             // 29 UI->服务:AI 研判结果
+    // ---- 已废弃占位:AI 研判(功能已移除;保序,勿复用)----
+    // 与下面「磁盘垃圾清理」那组同一口径:只删处理代码、不删枚举项,否则其后的序号整体前移。
+    // 新旧混跑时旧服务仍可能发 28、旧界面仍可能回 29,两端收到都走 default 静默忽略。
+    ReservedAiScanRequest,      // 28(原 服务->UI:对双击启动程序做 AI 研判)
+    ReservedAiScanResponse,     // 29(原 UI->服务:AI 研判结果)
     RemediationReport,          // 30 服务->UI:足迹清理报告
     ManualQuarantineRequest,    // 31 UI->服务:强制隔离某文件
     ManualQuarantineResponse,   // 32 服务->UI:手动隔离结果
@@ -77,7 +80,8 @@ enum class IpcMessageType {
     AttackChainResponse,        // 59 服务->UI:组合表状态 + 命中记录
     AttackChainClearRequest,    // 60 UI->服务:清空命中记录
     AttackChainHitNotification, // 61 服务->UI:攻击链命中即时通知(右下角自动消失的 toast)
-                                //    与 BlockNotification 分开的理由:后者只在【真拦下】时发,
+                                //    与 BlockNotification 分开的理由:后者只在【裁决为拦截】时发
+                                //    (并附带真实处置结果 enforcement,可能是「仅告警·未拦截」),
                                 //    而攻击链命中可能以 Block / Ask / Allow 三种处置收尾 ——
                                 //    最需要告知用户的恰是 Allow 那种(静默模式降级、或被信任
                                 //    通道放行),那时既没有拦截通知也没有询问弹窗,完全无声。
@@ -125,7 +129,8 @@ enum class IpcMessageType {
 // 序号钉桩:删改枚举项导致序号漂移时在编译期失败,而不是等到两端混跑才串号。
 // 新消息一律追加在末尾,并在这里补一条。
 static_assert(static_cast<int>(IpcMessageType::ReservedBehaviorSessionStart) == 23);
-static_assert(static_cast<int>(IpcMessageType::AiScanRequest) == 28);
+static_assert(static_cast<int>(IpcMessageType::ReservedAiScanRequest) == 28);
+static_assert(static_cast<int>(IpcMessageType::RemediationReport) == 30);
 static_assert(static_cast<int>(IpcMessageType::VtScanUpdate) == 36);
 static_assert(static_cast<int>(IpcMessageType::EventTimelineRequest) == 50);
 static_assert(static_cast<int>(IpcMessageType::ProcessActionResponse) == 57);

@@ -108,6 +108,17 @@ BlwCommandIsDestructive(_In_ ULONG Command)
     case BLW_CMD_CLEAR_BANNED:
     case BLW_CMD_CLEAR_SELFGUARD:
     case BLW_CMD_CLEAR_CMDBLOCK:
+    case BLW_CMD_CLEAR_KNOWNBAD:
+    //
+    // 精确删除单条同样属于「削弱防护」,与 CLEAR 同级:一条 DEL 就能把某个已确认恶意的
+    // 映像从执行前拦截名单里摘掉,而且 DEL 会标脏写回,后果跨重启保持。
+    //
+    case BLW_CMD_DEL_PATH:
+    case BLW_CMD_DEL_FILEHARD:
+    case BLW_CMD_DEL_NOLOAD:
+    case BLW_CMD_DEL_EXECBLOCK:
+    case BLW_CMD_DEL_REGHARD:
+    case BLW_CMD_DEL_CMDBLOCK:
     case BLW_CMD_FORCE_DELETE:
     case BLW_CMD_KILL_PID:
         return TRUE;
@@ -502,6 +513,99 @@ BlwMessageNotify(
             KdPrint(("[Bulwark] Exec-block image added: %ws\n", cfg.Path));
         }
         break;
+
+    //
+    // ============ 运行期下发已知恶意 SHA-256 ============
+    //
+    // 内核本来就有一套可用的哈希查杀引擎(HashScan.c),此前却只能从注册表在加载时载入,
+    // 用户态确认恶意的哈希喂不进来。这两条命令补上运行期通道。详见 Protocol.h。
+    // 【刻意不持久化】:不标脏、不写回 \Policy\KnownBadSha256 —— 内核哈希集没有「删除单条」,
+    // 把运行期判定写进跨重启基线,一次误判就是「那个文件永久起不来且加白无效」。
+    //
+    case BLW_CMD_CLEAR_KNOWNBAD:
+        BlwClearKnownBad();
+        KdPrint(("[Bulwark] Known-bad hash set cleared (runtime only; registry baseline untouched).\n"));
+        break;
+    case BLW_CMD_ADD_KNOWNBAD:
+        // BlwAddKnownBadHex 自带校验(长度必须 64、必须全为十六进制字符)与去重,非法即整条丢弃。
+        if (cfg.PathLength > 0 && cfg.PathLength < BLW_MAX_PATH) {
+            cfg.Path[BLW_MAX_PATH - 1] = L'\0';
+            BlwAddKnownBadHex(cfg.Path, cfg.PathLength);
+            KdPrint(("[Bulwark] Known-bad hash submitted (set size now %d).\n",
+                     g_Blw.KnownBadCount));
+        }
+        break;
+
+    //
+    // ============ 名单精确删除单条 ============
+    //
+    // 与 ADD 相反、与 CLEAR 不同:删掉一条就【标脏写回】。这正是它存在的理由 ——
+    // 旧的撤销路径(用户态 CLEAR + 重下发保留项)在「保留项为空」时一次 ADD 都不发生,
+    // 于是不标脏、磁盘基线保持旧内容、重启后被删条目复活。详见 Protocol.h 的 BLW_CMD_DEL_*。
+    //
+    // 只在【真的删掉了】时才标脏:删不存在的条目是一次完全无副作用的操作,不该触发注册表写。
+    // SelfGuard 不在此列 —— 它本就不持久化,断连即整体清除,不需要精确删除。
+    //
+    case BLW_CMD_DEL_PATH:
+    case BLW_CMD_DEL_FILEHARD:
+    case BLW_CMD_DEL_NOLOAD:
+    case BLW_CMD_DEL_EXECBLOCK:
+    case BLW_CMD_DEL_REGHARD:
+    case BLW_CMD_DEL_CMDBLOCK:
+        if (cfg.PathLength == 0 || cfg.PathLength >= BLW_MAX_PATH) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        cfg.Path[BLW_MAX_PATH - 1] = L'\0';
+        {
+            BOOLEAN removed = FALSE;
+            LONG    dirty = 0;
+            PCSTR   which = "?";
+
+            switch (cfg.Command) {
+            case BLW_CMD_DEL_PATH:
+                removed = BlwDelProtectedPath(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_PATHS;
+                which = "protected path";
+                break;
+            case BLW_CMD_DEL_FILEHARD:
+                removed = BlwDelFileHardBlock(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_FILEHARD;
+                which = "file hard-block";
+                break;
+            case BLW_CMD_DEL_NOLOAD:
+                removed = BlwDelFileNoLoad(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_NOLOAD;
+                which = "no-load module";
+                break;
+            case BLW_CMD_DEL_EXECBLOCK:
+                removed = BlwDelFileExecBlock(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_EXECBLOCK;
+                which = "exec-block image";
+                break;
+            case BLW_CMD_DEL_REGHARD:
+                removed = BlwDelRegHardBlock(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_REGHARD;
+                which = "reg hard-block";
+                break;
+            default:   // BLW_CMD_DEL_CMDBLOCK
+                removed = BlwDelCmdHardBlock(cfg.Path, cfg.PathLength);
+                dirty = BLW_POLICY_DIRTY_CMDHARD;
+                which = "command hard-block";
+                break;
+            }
+
+            if (removed) {
+                BlwMarkPolicyDirty(dirty);
+                KdPrint(("[Bulwark] Removed %s entry (persisting): %ws\n", which, cfg.Path));
+            } else {
+                KdPrint(("[Bulwark] Remove %s: no such entry (no-op): %ws\n", which, cfg.Path));
+            }
+            // Release 构建里 KdPrint 是空宏,而 which 只被它用到 ——
+            // 显式声明用过它,否则 C4189 在 /WX 下直接让编译失败。
+            UNREFERENCED_PARAMETER(which);
+        }
+        break;
+
     default:
         return STATUS_INVALID_PARAMETER;
     }

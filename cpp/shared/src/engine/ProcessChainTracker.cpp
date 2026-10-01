@@ -50,11 +50,19 @@ void ProcessChainTracker::record(const bulwark::SecurityEvent& e) {
     if (over > 0)
         it.value().remove(0, over);
 
-    // 记录「可执行文件落地」:用于后续识别 dropper「写 PE → 立即执行」。
+    // 记录「可执行文件落地」:用于后续识别 dropper「写 PE → 立即执行」,并记下写入方
+    // (PID + 映像路径)供释放物污点归属。映像路径必须一起存:没有进程退出事件,PID 会被复用。
     if (e.type == bulwark::EventType::FileWrite && !e.target.isEmpty()) {
         const QString ext = QStringLiteral(".") + QFileInfo(e.target).suffix().toLower();
-        if (ext.size() > 1 && executableWriteExt_.contains(ext))
-            recentExeWrites_[normalizePath(e.target)] = nowUtc();
+        if (ext.size() > 1 && executableWriteExt_.contains(ext)) {
+            ExeWrite w;
+            w.when = nowUtc();
+            w.writerPid = e.actorPid;
+            w.writerPath = isPlaceholderPath(e.actorPath) ? lastKnownPathLocked(e.actorPid)
+                                                          : e.actorPath.trimmed();
+            w.originalPath = e.target.trimmed();
+            recentExeWrites_[normalizePath(e.target)] = w;
+        }
     }
 
     evictIfNeeded();
@@ -68,7 +76,119 @@ bool ProcessChainTracker::wasRecentlyWritten(const QString& path, int withinSeco
     const auto it = recentExeWrites_.constFind(key);
     if (it == recentExeWrites_.constEnd())
         return false;
-    return it.value().secsTo(nowUtc()) <= withinSeconds;
+    return it.value().when.secsTo(nowUtc()) <= withinSeconds;
+}
+
+bool ProcessChainTracker::isPlaceholderPath(const QString& p) {
+    const QString t = p.trimmed();
+    return t.isEmpty() || t.startsWith(QLatin1String("PID "), Qt::CaseInsensitive);
+}
+
+QString ProcessChainTracker::lastKnownPathLocked(int pid) const {
+    const auto it = byPid_.constFind(pid);
+    if (it == byPid_.constEnd())
+        return {};
+    const QVector<bulwark::ChainEventInfo>& events = it.value();
+    for (auto rit = events.crbegin(); rit != events.crend(); ++rit)
+        if (!isPlaceholderPath(rit->actorPath))
+            return rit->actorPath.trimmed();
+    return {};
+}
+
+ProcessChainTracker::Writer ProcessChainTracker::lastWriterOf(const QString& path,
+                                                              int withinSeconds) const {
+    Writer w;
+    if (path.trimmed().isEmpty())
+        return w;
+    const QString key = normalizePath(path);
+    QMutexLocker lock(&gate_);
+    const auto it = recentExeWrites_.constFind(key);
+    if (it == recentExeWrites_.constEnd())
+        return w;
+    if (it.value().when.secsTo(nowUtc()) > withinSeconds)
+        return w;
+    w.pid = it.value().writerPid;
+    w.path = it.value().writerPath;
+    return w;
+}
+
+QVector<QString> ProcessChainTracker::filesWrittenBy(int rootPid, const QString& rootImagePath,
+                                                     bool includeDescendants) const {
+    QVector<QString> out;
+    if (rootPid <= 0)
+        return out;
+
+    QMutexLocker lock(&gate_);
+
+    // PID 复用校验:rootPid 当前登记的映像与调用方给出的不符 -> 这份历史属于别的进程,
+    // 连同它的「后代」一起不收(后代关系同样是按那个旧进程建立的)。
+    const QString expected = rootImagePath.trimmed();
+    if (!isPlaceholderPath(expected)) {
+        const QString known = lastKnownPathLocked(rootPid);
+        if (!known.isEmpty() && known.compare(expected, Qt::CaseInsensitive) != 0)
+            return out;
+    }
+
+    QSet<int> pids;
+    pids.insert(rootPid);
+    if (includeDescendants) {
+        bool grew = true;
+        int guard = 0;
+        while (grew && guard++ < 64) {
+            grew = false;
+            for (auto kv = parent_.constBegin(); kv != parent_.constEnd(); ++kv) {
+                if (pids.contains(kv.value()) && !pids.contains(kv.key())) {
+                    pids.insert(kv.key());
+                    grew = true;
+                }
+            }
+        }
+    }
+
+    QSet<QString> seen;
+    auto add = [&](const QString& p) {
+        const QString t = p.trimmed();
+        if (t.isEmpty())
+            return;
+        const QString k = normalizePath(t);
+        if (seen.contains(k))
+            return;
+        seen.insert(k);
+        out.append(t);
+    };
+
+    // 1) 链里的 FileWrite 足迹(每 PID 只留最近 maxEventsPerPid_ 条)。
+    for (int pid : pids) {
+        const auto lit = byPid_.constFind(pid);
+        if (lit == byPid_.constEnd())
+            continue;
+        for (const bulwark::ChainEventInfo& c : lit.value()) {
+            if (c.type != bulwark::EventType::FileWrite)
+                continue;
+            // 根进程的旧记录若属于复用前的进程(映像不同),跳过。
+            if (pid == rootPid && !isPlaceholderPath(expected) && !isPlaceholderPath(c.actorPath)
+                && c.actorPath.trimmed().compare(expected, Qt::CaseInsensitive) != 0)
+                continue;
+            add(c.target);
+        }
+    }
+
+    // 2) 「最近写入」表:比单 PID 事件环保留得久,补上被挤出环的早期落地物。
+    //    按写入方 PID 归属,并用写入时记下的映像路径校验(路径未知的照收)。
+    for (auto kv = recentExeWrites_.constBegin(); kv != recentExeWrites_.constEnd(); ++kv) {
+        const ExeWrite& w = kv.value();
+        if (!pids.contains(w.writerPid))
+            continue;
+        if (!w.writerPath.isEmpty()) {
+            const QString known = w.writerPid == rootPid && !isPlaceholderPath(expected)
+                                      ? expected
+                                      : lastKnownPathLocked(w.writerPid);
+            if (!known.isEmpty() && known.compare(w.writerPath, Qt::CaseInsensitive) != 0)
+                continue;
+        }
+        add(w.originalPath.isEmpty() ? kv.key() : w.originalPath);
+    }
+    return out;
 }
 
 QVector<bulwark::ChainEventInfo> ProcessChainTracker::buildContext(const bulwark::SecurityEvent& e,
@@ -241,7 +361,7 @@ void ProcessChainTracker::evictIfNeeded() {
     if (!recentExeWrites_.isEmpty()) {
         QVector<QString> stale;
         for (auto kv = recentExeWrites_.constBegin(); kv != recentExeWrites_.constEnd(); ++kv)
-            if (kv.value().secsTo(now) > retentionSecs_)
+            if (kv.value().when.secsTo(now) > retentionSecs_)
                 stale.append(kv.key());
         for (const QString& k : stale)
             recentExeWrites_.remove(k);
@@ -250,7 +370,7 @@ void ProcessChainTracker::evictIfNeeded() {
             QVector<QPair<QDateTime, QString>> ages;
             ages.reserve(recentExeWrites_.size());
             for (auto kv = recentExeWrites_.constBegin(); kv != recentExeWrites_.constEnd(); ++kv)
-                ages.append(qMakePair(kv.value(), kv.key()));
+                ages.append(qMakePair(kv.value().when, kv.key()));
             std::stable_sort(ages.begin(), ages.end(),
                              [](const QPair<QDateTime, QString>& a, const QPair<QDateTime, QString>& b) {
                                  return a.first < b.first;

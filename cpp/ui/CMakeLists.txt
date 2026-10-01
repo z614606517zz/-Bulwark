@@ -34,6 +34,10 @@ qt_add_executable(bulwark_ui WIN32
     src/design/ShieldEmblem.cpp
     src/design/NavButton.h
     src/design/NavButton.cpp
+    src/design/PageTransition.h # page change played on snapshots of the content area
+    src/design/PageTransition.cpp
+    src/design/Ripple.h        # press feedback for every ordinary button
+    src/design/Ripple.cpp
     src/design/ToggleSwitch.h
     src/design/ToggleSwitch.cpp
     src/design/Components.h
@@ -89,10 +93,9 @@ qt_add_executable(bulwark_ui WIN32
     src/pages/TrustPage.cpp
     src/pages/QuarantinePage.cpp
     src/pages/PersistencePage.cpp
-    src/pages/CardPages.h       # factory declarations of the three pages below
+    src/pages/CardPages.h       # factory declarations of the two pages below
     src/pages/SettingsPage.cpp
     src/pages/ReputationPage.cpp
-    src/pages/AiPage.cpp
 
     src/dialogs/EventFormat.h
     src/dialogs/EventViews.h
@@ -103,6 +106,8 @@ qt_add_executable(bulwark_ui WIN32
     src/dialogs/ChainViews.cpp
     src/dialogs/PromptDialog.h
     src/dialogs/PromptDialog.cpp
+    src/dialogs/AiInsightPanel.h   # 「AI 解读」横幅:行为询问(完整版)+ 拦截通知(紧凑版)
+    src/dialogs/AiInsightPanel.cpp
     src/dialogs/UpdateDialog.h
     src/dialogs/UpdateDialog.cpp
     src/dialogs/RemediationReportDialog.h
@@ -125,12 +130,10 @@ qt_add_executable(bulwark_ui WIN32
     src/dialogs/ScanProgressWindow.cpp
     src/ipc/IpcClient.h
     src/ipc/IpcClient.cpp
-    src/ai/AiScanner.h
+    src/ai/AiScanner.h         # UI-side LLM client: AI rule generation + AI cleanup script + prompt / block-toast 「AI 解读」
     src/ai/AiScanner.cpp
-    src/ai/AiScanHistoryStore.h
-    src/ai/AiScanHistoryStore.cpp
-    src/ai/StaticFeatureExtractor.h
-    src/ai/StaticFeatureExtractor.cpp
+    src/voice/VoiceAnnouncer.h # 语音播报拦截结果(Windows SAPI;设置页开关,存当前用户)
+    src/voice/VoiceAnnouncer.cpp
 )
 
 target_include_directories(bulwark_ui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -143,6 +146,7 @@ if(WIN32)
     # Bootstrap.cpp 用 ShellExecuteExW 提权拉起 bulwark_service.exe --bootstrap。
     # design/Theme.cpp 用 DwmSetWindowAttribute 设置深色标题栏与弹出层圆角。
     # design/FilePicker.cpp 直接用 IFileOpenDialog(COM)弹出列出隐藏项的原生选择框。
+    # voice/VoiceAnnouncer.cpp 用 SAPI(COM,ole32;类 / 接口 id 走 __uuidof,不需要 sapi.lib)。
     target_link_libraries(bulwark_ui PRIVATE shell32 dwmapi ole32)
 endif()
 

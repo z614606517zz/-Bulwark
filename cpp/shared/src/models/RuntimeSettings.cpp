@@ -7,6 +7,7 @@ using namespace bulwark::json;
 QJsonObject RuntimeSettings::toJson() const {
     QJsonObject o;
     o["protectionEnabled"] = protectionEnabled;
+    o["protectionFollowsUi"] = protectionFollowsUi;
 
     o["processProtection"] = processProtection;
     o["fileProtection"] = fileProtection;
@@ -40,21 +41,16 @@ QJsonObject RuntimeSettings::toJson() const {
 
     o["aiScanDoubleClickEnabled"] = aiScanDoubleClickEnabled;
     o["aiScanSuspendDuringScan"] = aiScanSuspendDuringScan;
-    o["aiScanBlockOnFailure"] = aiScanBlockOnFailure;
     o["cloudBehaviorUploadEnabled"] = cloudBehaviorUploadEnabled;
 
     o["aiBaseUrl"] = aiBaseUrl;
     o["aiApiKey"] = aiApiKey;
     o["aiModel"] = aiModel;
-    o["aiScanScriptTextLimitKb"] = aiScanScriptTextLimitKb;
-    o["aiScanBinarySampleLimitMb"] = aiScanBinarySampleLimitMb;
-    o["aiScanMaxStrings"] = aiScanMaxStrings;
 
     o["kernelDriverEnabled"] = kernelDriverEnabled;
     o["userModeBehaviorMonitor"] = userModeBehaviorMonitor;
     o["ransomwareCanaryEnabled"] = ransomwareCanaryEnabled;
     o["behaviorBaselineEnabled"] = behaviorBaselineEnabled;
-    o["aiGrayZoneConsultEnabled"] = aiGrayZoneConsultEnabled;
 
     o["aiCreditGuardEnabled"] = aiCreditGuardEnabled;
     o["aiMonthlyCreditBudget"] = aiMonthlyCreditBudget;
@@ -71,6 +67,9 @@ QJsonObject RuntimeSettings::toJson() const {
 RuntimeSettings RuntimeSettings::fromJson(const QJsonObject& o) {
     RuntimeSettings s; // start from defaults so absent keys keep sensible values
     s.protectionEnabled = getBool(o, "protectionEnabled", s.protectionEnabled);
+    // 老配置文件没有这个键 -> 取默认值 false(防护常驻)。这一条【必须】默认关:缺键时按开处理
+    // 等于升级一次就把所有机器改成「界面不在跑就没有防护」,那是悄悄的防护降级。
+    s.protectionFollowsUi = getBool(o, "protectionFollowsUi", s.protectionFollowsUi);
 
     s.processProtection = getBool(o, "processProtection", s.processProtection);
     s.fileProtection = getBool(o, "fileProtection", s.fileProtection);
@@ -106,22 +105,19 @@ RuntimeSettings RuntimeSettings::fromJson(const QJsonObject& o) {
 
     s.aiScanDoubleClickEnabled = getBool(o, "aiScanDoubleClickEnabled", s.aiScanDoubleClickEnabled);
     s.aiScanSuspendDuringScan = getBool(o, "aiScanSuspendDuringScan", s.aiScanSuspendDuringScan);
-    s.aiScanBlockOnFailure = getBool(o, "aiScanBlockOnFailure", s.aiScanBlockOnFailure);
     // 缺失该键 -> 保持默认 false(关)。老配置升级后不会被悄悄打开。
     s.cloudBehaviorUploadEnabled = getBool(o, "cloudBehaviorUploadEnabled", s.cloudBehaviorUploadEnabled);
 
+    // 已随 AI 研判一起移除的键(aiScanBlockOnFailure / aiGrayZoneConsultEnabled /
+    // aiScanScriptTextLimitKb / aiScanBinarySampleLimitMb / aiScanMaxStrings)在旧配置里出现时直接忽略。
     if (o.contains(QLatin1String("aiBaseUrl"))) s.aiBaseUrl = getStr(o, "aiBaseUrl");
     if (o.contains(QLatin1String("aiApiKey"))) s.aiApiKey = getStr(o, "aiApiKey");
     if (o.contains(QLatin1String("aiModel"))) s.aiModel = getStr(o, "aiModel");
-    s.aiScanScriptTextLimitKb = getInt(o, "aiScanScriptTextLimitKb", s.aiScanScriptTextLimitKb);
-    s.aiScanBinarySampleLimitMb = getInt(o, "aiScanBinarySampleLimitMb", s.aiScanBinarySampleLimitMb);
-    s.aiScanMaxStrings = getInt(o, "aiScanMaxStrings", s.aiScanMaxStrings);
 
     s.kernelDriverEnabled = getBool(o, "kernelDriverEnabled", s.kernelDriverEnabled);
     s.userModeBehaviorMonitor = getBool(o, "userModeBehaviorMonitor", s.userModeBehaviorMonitor);
     s.ransomwareCanaryEnabled = getBool(o, "ransomwareCanaryEnabled", s.ransomwareCanaryEnabled);
     s.behaviorBaselineEnabled = getBool(o, "behaviorBaselineEnabled", s.behaviorBaselineEnabled);
-    s.aiGrayZoneConsultEnabled = getBool(o, "aiGrayZoneConsultEnabled", s.aiGrayZoneConsultEnabled);
 
     s.aiCreditGuardEnabled = getBool(o, "aiCreditGuardEnabled", s.aiCreditGuardEnabled);
     s.aiMonthlyCreditBudget = getI64(o, "aiMonthlyCreditBudget", s.aiMonthlyCreditBudget);

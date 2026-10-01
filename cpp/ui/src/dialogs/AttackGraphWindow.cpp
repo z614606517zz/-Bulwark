@@ -96,6 +96,8 @@ QString dispositionText(const bulwark::AttackGraphEdge& e)
     case O::KernelBlocked:     return u("内核前拦截");
     case O::Terminated:        return u("已结束进程");
     case O::ModuleBlacklisted: return u("已加入禁止加载");
+    case O::ExecDenied:        return u("已禁止启动");
+    case O::ActorAlreadyGone:  return u("主体已结束");
     case O::Failed:            return u("处置失败");
     case O::AlertedOnly:       return u("仅告警");
     case O::NotApplicable:     break;
@@ -108,10 +110,15 @@ QString dispositionText(const bulwark::AttackGraphEdge& e)
     return QString();
 }
 
+// 图上这条边算不算「这一步被真正掐断了」。口径:【主体被消灭】才算 ——
+// ActorAlreadyGone 也算(那个进程确实已经不在了,只是杀它的是上一条事件的处置);
+// ModuleBlacklisted / ExecDenied 【不算】,它们说的是「下一次会被拦」,这一步本身还是发生了。
+// 与 AttackGraphBuilder::blockedForReal 必须保持同一口径(图的配色与统计各来自其中一处)。
 bool reallyBlocked(const bulwark::AttackGraphEdge& e)
 {
     return e.enforcement == bulwark::EnforcementOutcome::KernelBlocked
-        || e.enforcement == bulwark::EnforcementOutcome::Terminated;
+        || e.enforcement == bulwark::EnforcementOutcome::Terminated
+        || e.enforcement == bulwark::EnforcementOutcome::ActorAlreadyGone;
 }
 
 QColor edgeColor(const bulwark::AttackGraphEdge& e)

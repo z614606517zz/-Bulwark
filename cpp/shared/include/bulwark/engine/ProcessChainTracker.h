@@ -28,6 +28,22 @@ public:
     // 某可执行文件是否在最近 withinSeconds 内被(其他进程)写入/释放过——识别 dropper。
     bool wasRecentlyWritten(const QString& path, int withinSeconds) const;
 
+    // 写入方身份。PID 会被复用(见 forget 的说明),故同时带上写入时的映像路径做校验。
+    struct Writer {
+        int pid = 0;
+        QString path;   // 写入方映像路径(可能为空:短命进程未解析到)
+        bool isValid() const { return pid > 0; }
+    };
+
+    // 某路径最近 withinSeconds 内的写入方(只覆盖可执行/可加载扩展名)。无记录返回 pid=0。
+    Writer lastWriterOf(const QString& path, int withinSeconds) const;
+
+    // rootPid(及其后代)在链里记录过的 FileWrite 目标 + 「最近写入」表里归属到这些 PID 的条目,
+    // 去重后按首次出现顺序返回(原始大小写)。rootImagePath 非空时用它校验 rootPid 没被复用:
+    // 映像路径不符的 rootPid 历史记录一律不收(占位路径 "PID N" / 空路径视为未知,照收)。
+    QVector<QString> filesWrittenBy(int rootPid, const QString& rootImagePath = QString(),
+                                    bool includeDescendants = true) const;
+
     // 为事件构建进程链上下文:祖先链 + 自身 + 直接子进程的事件,按时间升序去重,截断到 maxEvents。
     // 含传入事件本身(即便尚未 record),并并入事件自带的 chainContext(如富化种入的祖先链)。
     QVector<bulwark::ChainEventInfo> buildContext(const bulwark::SecurityEvent& e, int maxEvents = 12) const;
@@ -64,13 +80,22 @@ public:
 private:
     void evictIfNeeded();      // 需在持锁状态调用:过期 + 容量淘汰
     void removePid(int pid);   // 需在持锁状态调用
+    QString lastKnownPathLocked(int pid) const; // 需在持锁状态调用
+    static bool isPlaceholderPath(const QString& p); // 空 / "PID N" 占位
     static QString normalizePath(const QString& path);
 
     mutable QMutex gate_;
     QHash<int, QVector<bulwark::ChainEventInfo>> byPid_;   // PID -> 事件(时间升序)
     QHash<int, int> parent_;                               // 子 PID -> 父 PID
     QHash<int, QDateTime> firstSeen_;                      // PID -> 首见时间(过期清理)
-    QHash<QString, QDateTime> recentExeWrites_;            // 规范化小写路径 -> 写入时间
+    // 「最近写入」表的一条:时间 + 写入方(PID + 映像路径,用于释放物污点归属)+ 原始大小写路径。
+    struct ExeWrite {
+        QDateTime when;
+        int writerPid = 0;
+        QString writerPath;
+        QString originalPath;
+    };
+    QHash<QString, ExeWrite> recentExeWrites_;             // 规范化小写路径 -> 写入记录
     QSet<QString> executableWriteExt_;                     // 可执行/可加载落地扩展名(小写,含点)
     int maxEventsPerPid_;
     int maxPids_;

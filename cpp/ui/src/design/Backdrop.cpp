@@ -162,10 +162,16 @@ QPixmap Backdrop::render(Kind kind, const QSize& size, qreal dpr)
     return pm;
 }
 
-void Backdrop::paintEvent(QPaintEvent* e)
+QPixmap Backdrop::canvas()
 {
     if (m_cache.isNull() || !qFuzzyCompare(m_cache.devicePixelRatio(), devicePixelRatioF()))
         m_cache = render(m_kind, size(), devicePixelRatioF());
+    return m_cache;
+}
+
+void Backdrop::paintEvent(QPaintEvent* e)
+{
+    const QPixmap plane = canvas();
     QPainter p(this);
-    blit(p, m_cache, e->rect());
+    blit(p, plane, e->rect());
 }

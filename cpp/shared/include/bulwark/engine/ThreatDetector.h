@@ -14,6 +14,14 @@ struct ThreatDetector {
 
     static void analyze(SecurityEvent& e);
     static bool isSuspiciousDropDir(const QString& path);
+
+    // 该模块名是否「易被搜索顺序劫持」——即它是系统 DLL 的名字,正常应用不会在自己的目录里
+    // 放一个私有的同名模块。白加黑侧载检测的互证条件之一,见
+    // SecurityEvent::sideloadedUnsignedModulePath 的说明。传文件名或完整路径均可。
+    //
+    // 放在这里(而不是 Worker 里)是因为判据要在两处使用:Worker 在富化阶段筛同目录模块,
+    // ThreatDetector 在计分时复核。两处各抄一份必然漂移。
+    static bool isSideloadProneModuleName(const QString& pathOrName);
 };
 
 } // namespace bulwark::engine

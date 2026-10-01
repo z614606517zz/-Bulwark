@@ -369,20 +369,38 @@ class Store:
             # images: 截图【文件名】的 JSON 数组,不是图片内容。图片落在
             # feedback_images_dir 下,名字由服务端生成 —— 把二进制塞进 cache.db 会让
             # 这个本来几十 MB 的库涨到几百 MB,而它每次同步、备份都要整份搬。
+            # ip 这一列【不再写入】,保留只为让新建库和升级库的表结构一致(下面会把
+            # 历史遗留值清空)。取而代之的是三列,把原来压在一个字段上的三件事分开:
+            #   ipkey   每日轮换盐的 HMAC,【只】用于「每 IP 每日条数上限」。盐存在库外
+            #           (见 Handler._fb_salt):IPv4 只有 2^32 种可能,盐和数据同库的话
+            #           库一泄漏就能把每个 IP 全量反推出来,那等于没做。
+            #   ipmask  123.45.*.* —— 管理员排查滥用要的粗粒度网段,也正是页面上向用户
+            #           承诺的「IP 前两段」。存这个,那句承诺才是真的。
+            #   owner   每浏览器一个随机令牌(cookie bw_fb),用于「我的反馈」认领。
+            #           归属【不能】按 IP:NAT 出口是共享的,按 IP 认领等于同一个出口下
+            #           的人能互相看到对方的反馈正文和管理员回复。
             c.execute("""CREATE TABLE IF NOT EXISTS feedback(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 at TEXT, ip TEXT, kind TEXT DEFAULT 'other', contact TEXT DEFAULT '',
                 message TEXT, agent TEXT DEFAULT '', page TEXT DEFAULT '',
                 status TEXT DEFAULT 'new', images TEXT DEFAULT '',
-                reply TEXT DEFAULT '', replied_at TEXT DEFAULT '')""")
+                reply TEXT DEFAULT '', replied_at TEXT DEFAULT '',
+                ipkey TEXT DEFAULT '', ipmask TEXT DEFAULT '', owner TEXT DEFAULT '')""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_at ON feedback(at)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status)")
-            # 提交者按 IP 认领自己的反馈(没有账号体系),所以这一列要有索引。
-            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ip ON feedback(ip)")
             fcols = [r[1] for r in c.execute("PRAGMA table_info(feedback)").fetchall()]
-            for col in ("images", "reply", "replied_at"):
+            for col in ("images", "reply", "replied_at", "ipkey", "ipmask", "owner"):
                 if col not in fcols:
                     c.execute("ALTER TABLE feedback ADD COLUMN %s TEXT DEFAULT ''" % col)
+            # 每日上限按 ipkey 数,认领按 owner —— 两条查询路径各自要索引。
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ipkey ON feedback(ipkey)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_owner ON feedback(owner)")
+            # 历史遗留的明文 IP 一次性抹掉。幂等,而且这是在【所有】节点上生效的那一步:
+            # 光改写入路径只能让新行干净,已经落库的旧行还留着完整地址。
+            try:
+                c.execute("UPDATE feedback SET ip='' WHERE ip IS NOT NULL AND ip<>''")
+            except sqlite3.Error:
+                pass
             # Permanent VT report store (NO TTL): full file report + behaviour summary.
             c.execute("""CREATE TABLE IF NOT EXISTS vt_reports(
                 sha256 TEXT PRIMARY KEY, md5 TEXT, sha1 TEXT, name TEXT,
@@ -504,8 +522,12 @@ class Store:
     # 正常使用碰不到。这里只留一个绝对兜底,防止配置写成天文数字。
     FEEDBACK_IMG_HARD_CAP = 200
 
-    def add_feedback(self, ip, kind, contact, message, agent="", page="", images=None):
+    def add_feedback(self, ipkey, kind, contact, message, agent="", page="", images=None,
+                     ipmask="", owner=""):
         """写入一条反馈。返回 (id, error)。error 非空表示被拒。
+
+        ipkey / ipmask / owner 的分工见 feedback 表的建表说明 —— 这里【不接收也不存】
+        完整 IP。调用方负责推导这三个值(见 Handler._fb_ip_key / _fb_owner)。
 
         images 是【文件名列表】,调用方负责先把字节落盘再把名字传进来 —— Store
         不碰文件系统,配置与磁盘配额都归 HTTP 层。"""
@@ -518,16 +540,32 @@ class Store:
             return (0, "请填写内容或附上截图")
         day = now_utc().strftime("%Y-%m-%d")
         with self.lock, self._conn() as c:
-            n = c.execute("SELECT COUNT(*) n FROM feedback WHERE ip=? AND substr(at,1,10)=?",
-                          (ip, day)).fetchone()["n"]
+            n = c.execute("SELECT COUNT(*) n FROM feedback WHERE ipkey=? AND substr(at,1,10)=?",
+                          (ipkey, day)).fetchone()["n"]
             if n >= self.FEEDBACK_PER_IP_PER_DAY:
                 return (0, "今日提交次数已达上限,请明天再试")
-            cur = c.execute("""INSERT INTO feedback(at, ip, kind, contact, message, agent, page, images)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (iso(now_utc()), ip, kind, contact, message,
+            cur = c.execute("""INSERT INTO feedback(at, kind, contact, message, agent, page,
+                                                    images, ipkey, ipmask, owner)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (iso(now_utc()), kind, contact, message,
                  (agent or "")[:120], (page or "")[:200],
-                 json.dumps(names, ensure_ascii=False) if names else ""))
+                 json.dumps(names, ensure_ascii=False) if names else "",
+                 ipkey, (ipmask or "")[:64], (owner or "")[:64]))
             return (cur.lastrowid, "")
+
+    def feedback_count_today(self, ipkey, day=None):
+        """这个提交者今天已经提交了几条。上面 add_feedback 里那份检查的只读对应物。
+
+        为什么要单独有一份:add_feedback 的检查要等整个请求体(最大 max_body_mb)读进
+        内存、decode、json.loads 之后才跑得到,也就是说一条注定被拒的提交照样先付了全
+        额内存代价 —— 而这个提交口是公网无鉴权的。HTTP 层用这个方法在读 body 之前就
+        挡掉,拒绝路径再也不碰 body。
+        两份检查都留着:这一份会和并发请求赛跑,add_feedback 那一份说了算。
+        """
+        day = day or now_utc().strftime("%Y-%m-%d")
+        with self.lock, self._conn() as c:
+            return c.execute("SELECT COUNT(*) n FROM feedback WHERE ipkey=? AND substr(at,1,10)=?",
+                             (ipkey, day)).fetchone()["n"]
 
     def set_feedback_images(self, fid, names):
         """回填真正落盘成功的截图文件名(插入时先占位,因为文件名要带记录 id)。"""
@@ -564,16 +602,24 @@ class Store:
         with self.lock, self._conn() as c:
             return [dict(r) for r in c.execute(sql, args).fetchall()]
 
-    def list_feedback_by_ip(self, ip, limit=50):
-        """提交者自己的反馈。【刻意只返回能给本人看的字段】——
-        contact / ip / agent 全部不出现:这个接口是公开的,按 IP 认领,而 IP 会
-        被 NAT 共享。同一出口下的另一个人不该看到别人留的邮箱和 UA。
+    def list_feedback_by_owner(self, owner, limit=50):
+        """提交者自己的反馈,按浏览器令牌(cookie bw_fb)认领。
+
+        为什么【不能】按 IP 认领:IP 会被 NAT 共享,同一出口下的另一个人会看到别人的
+        反馈正文和管理员回复 —— 这个接口是公开的,等于把私信摊给整个局域网。令牌是
+        每浏览器一个、随机生成的,不共享。代价是换浏览器/清 cookie 就看不到旧记录,
+        这个取舍写在页面提示里。
+
+        【刻意只返回能给本人看的字段】—— contact / agent / ipkey / ipmask 全部不出现。
         截图也不回传:处理完就删了,而且用户自己刚上传的图不需要再看一遍。"""
+        owner = str(owner or "").strip()
+        if not owner:
+            return []       # 没有令牌就没有任何归属,绝不能退化成「返回全部」
         with self.lock, self._conn() as c:
             rows = c.execute(
                 "SELECT id, at, kind, message, status, reply, replied_at, images "
-                "FROM feedback WHERE ip=? ORDER BY id DESC LIMIT ?",
-                (ip, max(1, min(200, int(limit))))).fetchall()
+                "FROM feedback WHERE owner=? ORDER BY id DESC LIMIT ?",
+                (owner, max(1, min(200, int(limit))))).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -1101,6 +1147,28 @@ class Store:
                           "SELECT ident FROM vt_lookup_cache ORDER BY stored_at ASC LIMIT ?)",
                           (n - self.LOOKUP_MAX_ROWS,))
 
+    def drop_lookup_cache(self, idents):
+        """忘掉这些 ident 上「VT 没这个文件 / 这是个干净文件」的缓存结论。
+
+        样本被 VirusTotal 收下待分析之后立刻调用。送检之前那次查询留下的负缓存,正是
+        让随后的轮询从缓存里一直拿到 vt_unknown、永远等不到真实报告的原因 —— 也正是
+        前端过去必须发 refresh=true 的原因。在这里清掉它,轮询用普通查询就能拿到新
+        结果,refresh 于是可以收回成「仅本机 / 白名单 / 持凭据」的特权
+        (见 Handler._may_force_refresh)。
+        """
+        keys = []
+        for i in idents:
+            k = str(i or "").strip().lower()
+            if k and k not in keys:
+                keys.append(k)
+        if not keys:
+            return 0
+        with self.lock, self._conn() as c:
+            c.execute(self.LOOKUP_DDL)
+            cur = c.execute("DELETE FROM vt_lookup_cache WHERE ident IN (%s)"
+                            % ",".join("?" * len(keys)), keys)
+            return cur.rowcount or 0
+
     def get_vt_report(self, ident):
         key = ident.strip().lower()
         with self.lock, self._conn() as c:
@@ -1503,6 +1571,19 @@ class RateLimiter:
             hits.append(now)
             self.minute_hits[source] = hits
         self.store.quota_incr(source)
+        return True, ""
+
+    def check_day(self, source, per_day):
+        """只读的日上限判定:和 allow() 不同,它【不记账】。
+
+        vt_lookup 需要这个,因为 VirusTotal 的每一次请求都已经在客户端内部记过账了
+        (_vt_spend,挂在 key 发放这唯一一个出口上)。在那条路径上调 allow() 会把同一
+        次调用记成两次,而且拿刚被自己抬高的计数去比上限。
+        """
+        if not per_day:
+            return True, ""
+        if self.store.quota_used(source) >= per_day:
+            return False, "per-day quota"
         return True, ""
 
 
@@ -2695,6 +2776,20 @@ class IntelService:
                 return out
         if not self.vt.has_key():
             return self._degraded_lookup(ident, "no VirusTotal key configured")
+        # 每日总量天花板。这条路径(网页 /vt/lookup、harvest.py、/api/v1/file)此前完全
+        # 不看 virustotal.requests_per_day —— 只有 reputation_hash 那条走 self.rl 的路
+        # 会看。于是配置里把上限设好了也挡不住这里,而这里恰恰是公网最容易打的一条。
+        #
+        # 用 check_day(只读)而不是 allow():VT 的每次请求都已经在 _vt_spend 里记过账,
+        # 再 allow 一次会重复计数,还会拿刚被自己抬高的计数去比上限。
+        # 触顶时走降级路径而不是报错:其余情报源仍然能答,而且 _degraded_lookup 回的是
+        # ok=True,harvest.py 会据此跳过,不会误判成「VT 从没见过 -> 把样本传上去」。
+        _cap = int(vtc.get("requests_per_day", 0) or 0) * max(1, self.vt.key_count())
+        _cap_ok, _cap_why = self.rl.check_day(self.vt.NAME, _cap)
+        if not _cap_ok:
+            self.store.counter_incr("ratelimited")
+            return self._degraded_lookup(
+                ident, "VirusTotal daily cap reached (%s, %d/day)" % (_cap_why, _cap))
         st, body = self.vt.vt_api_get("/files/" + ident)
         if st == 404:
             # VirusTotal genuinely has no record of this file. That is NOT a reason to
@@ -2851,6 +2946,14 @@ class IntelService:
         analysis_id, err = self.vt.submit_file_path(path, filename, size)
         if not analysis_id:
             return {"ok": False, "error": "上传 VirusTotal 失败: %s" % (err or "unknown"), "sha256": sha256}
+        # 样本已进 VT 分析队列,那条「VT 没见过它」的负缓存从这一刻起就是错的。留着它,
+        # 接下来的轮询会一直从缓存拿到同一个 vt_unknown,永远等不到真实报告 —— 这正是
+        # 前端过去每次轮询都得发 refresh=true 的原因,而那个参数对公网是笔真金白银。
+        # 清掉之后普通查询就能拿到新结果,refresh 才收得回去(见 _may_force_refresh)。
+        try:
+            self.store.drop_lookup_cache([sha256])
+        except Exception:
+            pass        # 清缓存失败不该把一次成功的送检报成失败
         return {"ok": True, "found": False, "submitted": True, "sha256": sha256, "analysis_id": analysis_id}
 
     def vt_analysis(self, analysis_id):
@@ -4368,20 +4471,56 @@ $("close").onclick = async () => {
 class Handler(BaseHTTPRequestHandler):
     server_version = "BulwarkIntel/0.1"
 
-    def _send(self, code, obj):
+    # 页面用的 CSP。script-src / style-src 不得不带 'unsafe-inline':这几个页面的样式和
+    # 脚本全是内联的(webui.html 一个文件里有 4 段 <style> 和 4 段 <script>),而且
+    # 大量元素带 style="..." 属性。去掉 unsafe-inline 页面会整块白屏 —— 那不是加固,
+    # 是把功能删了。即便带着它,这条策略仍然挡住了最要紧的几件事:
+    # 外部脚本源、<base> 改写、<object>/<embed>、被别人 iframe 套走。
+    # img-src 必须带 data::反馈弹窗的截图预览用的是 FileReader 产生的 data: URL。
+    _CSP_HTML = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                 "connect-src 'self'; font-src 'self'; object-src 'none'; "
+                 "base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+
+    def _security_headers(self, html=False):
+        """所有自建响应共用的一组安全头。
+
+        刻意【不】走覆写 send_response 的路子:两处图片响应(/feedback/img、
+        /support/media)已经各自下发了更严的 "default-src 'none'; sandbox",而 CSP 多
+        份下发时浏览器取交集 —— 混在一起只会让策略变得没人算得清。那两处不调这里。
+
+        HSTS 只在真的终结了 TLS 时下发。另外它对裸 IP 主机名本来就不生效(规范如此),
+        所以这条是给公共域名那条入口用的。
+        """
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        if CONFIG.get("tls_cert") and CONFIG.get("tls_key"):
+            self.send_header("Strict-Transport-Security", "max-age=15552000")
+        # JSON 响应不需要加载任何东西,给它最严的那条。
+        self.send_header("Content-Security-Policy",
+                         self._CSP_HTML if html else "default-src 'none'; frame-ancestors 'none'")
+
+    def _send(self, code, obj, extra_headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
+        for k, v in (extra_headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_bytes(self, code, body, ctype):
+    def _send_bytes(self, code, body, ctype, extra_headers=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers(html=("html" in (ctype or "").lower()))
+        for k, v in (extra_headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -4631,7 +4770,10 @@ button:active{transform:translateY(1px)}
                    int(f["id"]), int(f["id"]), esc(kind),
                    msg_html + shots_html,
                    esc(contact) if contact else '<span class="dim">未留</span>',
-                   esc(rel(f.get("at"))), esc(mask_ip(f.get("ip", ""))),
+                   # ipmask 是入库时就已经掩码过的 123.45.*.*(见 feedback 建表说明)。
+                   # 这里【不能】再套 mask_ip:那个函数按点号切分,喂给它一个已经掩码
+                   # 的串或空串只会得到 "***",把排查滥用用的网段信息抹掉。
+                   esc(rel(f.get("at"))), esc(f.get("ipmask", "") or "—"),
                    esc(f.get("agent", "") or "—"),
                    esc(f.get("reply", "") or ""),
                    "new" if done else "done",
@@ -6196,6 +6338,31 @@ button:hover{filter:brightness(1.1)}
     def _client_ip(self):
         return self.client_address[0] if self.client_address else ""
 
+    def _may_force_refresh(self):
+        """谁可以用 refresh=true 强制回源。
+
+        refresh 绕过服务端所有缓存,每次都真打 VirusTotal。对公网匿名调用方必须一律
+        忽略它:per-IP 滑窗只限「次数」,限不住「每一次都花真钱」,而同一个哈希可以被
+        反复强制回源。
+
+        判定刻意【不】复用 _authed() / _authed_ui():那两个在 auth_token 为空时一律放行
+        (而 token 必须为空,见 _authed_ui 的说明),照用等于这道门又白设。这里要的是
+        「确实证明了身份,或来自可信位置」:
+          · 本机 —— harvest.py 走 127.0.0.1(它自己从不发 refresh,但运维脚本会);
+          · public_rate_limit.whitelist —— 已经被当作可信来源的网段;
+          · 非空 auth_token 且对得上 —— 外部集成;
+          · 网页口令 cookie —— 管理员在浏览器里点「重新查询」。
+        """
+        ip = self._client_ip()
+        if ip in ("127.0.0.1", "::1"):
+            return True
+        wl = (CONFIG.get("public_rate_limit", {}) or {}).get("whitelist", []) or []
+        if self._in_whitelist(ip, wl):
+            return True
+        if CONFIG.get("auth_token", "") and self._authed():
+            return True
+        return bool(self._webui_password()) and self._check_webui_cookie()
+
     @staticmethod
     def _in_whitelist(ip, wl):
         """精确匹配,外加【显式的】前缀写法。
@@ -6360,6 +6527,87 @@ button:hover{filter:brightness(1.1)}
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+    # ---- 反馈:提交者标识 ---------------------------------------------------- #
+    # 这一组合起来保证「反馈表里不存完整 IP」,同时又不丢掉限流和认领两个功能。
+    _FB_SALT = None
+    _FB_SALT_LOCK = threading.Lock()
+
+    @classmethod
+    def _fb_salt(cls):
+        """HMAC 盐。32 字节随机,首次使用时生成并落盘,之后复用。
+
+        为什么【必须放在库外】:ipkey 是 HMAC(盐, IP+日期),而 IPv4 只有 2^32 种可能 ——
+        盐一旦和数据同库,拿到库的人几秒就能把每行的 IP 全量反推出来,HMAC 等于白做。
+        放在 db_path 同目录下的单独文件里(0600),这是 unit 唯一可写的位置
+        (ProtectSystem=strict + ReadWritePaths=/var/lib/bulwark-intel)。
+
+        盐读写失败时【不回退到固定值】:那会静默地把保护降级成可预测哈希。宁可用一个
+        进程内随机盐 —— 效果是每日上限在重启后重新计数,功能退化但不泄露。
+        """
+        if cls._FB_SALT is not None:
+            return cls._FB_SALT
+        with cls._FB_SALT_LOCK:
+            if cls._FB_SALT is not None:
+                return cls._FB_SALT
+            state = os.path.dirname(CONFIG.get("db_path") or "") or "/var/lib/bulwark-intel"
+            path = CONFIG.get("feedback_salt_path") or os.path.join(state, "feedback_ip_salt")
+            salt = None
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read().strip()
+                if len(raw) >= 32:
+                    salt = raw
+            except OSError:
+                pass
+            if salt is None:
+                salt = os.urandom(32).hex().encode("ascii")
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    try:
+                        os.write(fd, salt)
+                    finally:
+                        os.close(fd)
+                except OSError as e:
+                    print("[feedback] salt file unavailable (%s: %s) -- using a "
+                          "process-local salt; the per-day cap will reset on restart"
+                          % (type(e).__name__, e), flush=True)
+            cls._FB_SALT = salt
+            return salt
+
+    def _fb_ip_key(self):
+        """限流用的提交者标识:HMAC(盐, IP + 当天日期)。
+
+        盐【按天混入日期】而不是固定:每日上限本来只需要「今天之内可比」,把日期放进
+        输入之后,昨天和今天的行就再也无法按 IP 相互关联,而上限功能分毫不差。
+        """
+        ip = self._client_ip()
+        msg = ("%s|%s" % (ip, now_utc().strftime("%Y-%m-%d"))).encode("utf-8")
+        return hmac.new(self._fb_salt(), msg, hashlib.sha256).hexdigest()[:32]
+
+    _FB_OWNER_RE = re.compile(r"^[A-Za-z0-9]{16,64}$")
+
+    def _fb_owner(self, create=False):
+        """「我的反馈」的归属令牌,每浏览器一个,放在 cookie bw_fb 里。
+
+        返回 (token, set_cookie_header_or_None)。create=False 时只读已有的,不发新的 ——
+        GET /feedback/mine 不该仅仅因为被访问就给人塞一个标识。
+        """
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            kv = part.strip().split("=", 1)
+            if len(kv) == 2 and kv[0].strip() == "bw_fb":
+                tok = kv[1].strip()
+                if self._FB_OWNER_RE.match(tok):
+                    return tok, None
+        if not create:
+            return "", None
+        tok = os.urandom(16).hex()
+        # Secure 只在真的终结了 TLS 时加:采集节点上 app.py 走纯 HTTP(见 NODE-SETUP.md),
+        # 无条件加 Secure 会让那边的 cookie 根本不被保存,认领功能静默失效。
+        secure = "; Secure" if (CONFIG.get("tls_cert") and CONFIG.get("tls_key")) else ""
+        return tok, ("bw_fb=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax%s"
+                     % (tok, 180 * 24 * 3600, secure))
 
     # ---- 反馈截图 ---------------------------------------------------------- #
     @staticmethod
@@ -6796,6 +7044,7 @@ button:hover{filter:brightness(1.1)}
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(_body)))
             self.send_header("Cache-Control", "no-cache")
+            self._security_headers(html=True)
             self.end_headers()
             try:
                 self.wfile.write(_body)
@@ -6821,11 +7070,12 @@ button:hover{filter:brightness(1.1)}
         if u.path in ("/online", "/online/", "/clients"):
             return self._serve_online()
         if u.path in ("/feedback/mine", "/feedback/mine/"):
-            # 提交者查看自己提交过什么、处理到哪一步了。公开可访问,但只按调用方
-            # 的 IP 返回,且不含 contact/ip/agent —— 详见 list_feedback_by_ip。
-            ip_now = self.client_address[0] if self.client_address else ""
-            return self._send(200, {"ok": True, "ip": mask_ip(ip_now),
-                                    "items": SERVICE.store.list_feedback_by_ip(ip_now)})
+            # 提交者查看自己提交过什么、处理到哪一步了。公开可访问,但只返回【本浏览器
+            # 令牌】名下的记录,且不含 contact/agent —— 详见 list_feedback_by_owner。
+            # 这里刻意 create=False:只读不发令牌,访问一下查询页不该被打上标识。
+            owner, _ = self._fb_owner(create=False)
+            return self._send(200, {"ok": True, "claim": "browser",
+                                    "items": SERVICE.store.list_feedback_by_owner(owner)})
         if u.path.startswith("/feedback/img/"):
             # 反馈截图。同样要网页口令 —— 上传公开,取回不公开。
             # 放在 /feedback 判断【之前】,否则会被上面的前缀匹配吃掉。
@@ -6873,6 +7123,7 @@ button:hover{filter:brightness(1.1)}
             self.send_header("Content-Length", str(_sz))
             self.send_header("Content-Disposition", "attachment; filename=\"Bulwark-Release.zip\"")
             self.send_header("Cache-Control", "no-cache")
+            self._security_headers()
             self.end_headers()
             try:
                 shutil.copyfileobj(_f, self.wfile)
@@ -6975,10 +7226,19 @@ button:hover{filter:brightness(1.1)}
             if is_private_ipv4(ip):
                 return self._send(200, {"ip": ip, "verdict": "unknown", "querySucceeded": False,
                                         "reason": "private/reserved"})
+            # 这条会花微步配额,所以和 /vt/lookup 一样必须过 per-IP 滑窗。此前它不过任何
+            # 闸门,于是图谱里那个 .ipq 点击成了公网上唯一一条不限次数的付费调用 —— 换
+            # 个 IP 就能接着打。闸门放在私网短路【之后】:私网地址根本不触达上游。
+            if not self._throttle_ok():
+                return
             try:
-                return self._send(200, SERVICE.reputation_ip(ip))
+                res = SERVICE.reputation_ip(ip)
             except Exception as e:
                 return self._send(500, {"error": str(e)})
+            # 命中 IP 缓存没花任何配额,把刚扣的名额还回去 —— 与 /vt/lookup 同一套语义,
+            # 见 _refund_if_cached 的说明。
+            self._refund_if_cached(res)
+            return self._send(200, res)
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -7024,11 +7284,24 @@ button:hover{filter:brightness(1.1)}
         if u.path in ("/feedback", "/api/feedback"):
             if not self._throttle_ok():
                 return
+            # 每日条数上限要在【读请求体之前】判。Store.add_feedback 里也有一份检查,但
+            # 那一份要等整个 body(最大 max_body_mb)读进内存、decode、json.loads 之后才
+            # 跑得到 —— 一条注定被拒的提交照样先付了全额内存代价,而这个口子是公开的。
+            # 这里先用一次只读计数挡掉;两份检查都留着,那一份说了算(见 feedback_count_today)。
+            try:
+                if (SERVICE.store.feedback_count_today(self._fb_ip_key())
+                        >= SERVICE.store.FEEDBACK_PER_IP_PER_DAY):
+                    return self._send(429, {"ok": False,
+                                            "error": "今日提交次数已达上限,请明天再试"})
+            except Exception:
+                pass        # 计数失败不该挡住正常提交;add_feedback 的检查仍然兜底
             length = int(self.headers.get("Content-Length", 0) or 0)
-            # 截图走 JSON 里的 base64,所以这个上限必须容得下 3 张 2MB 的图再乘
-            # base64 的 4/3 膨胀,留点余量 = 9MB。刻意不改成 multipart:多写一个
-            # 解析器就是在公开无鉴权的口子上多开一片攻击面,而 base64 的解码路径
-            # 是标准库里久经考验的那一条。
+            # 截图走 JSON 里的 base64,所以这个上限要容得下若干张图再乘 base64 的 4/3
+            # 膨胀。实际值由 feedback.max_body_mb 决定(现网 32MB,约合 24MB 真实图片
+            # 字节),不要在注释里复述一个具体数字 —— 之前那句写着 9MB,而配置早就不是
+            # 那个值了,读注释的人会按错的前提去推。
+            # 刻意不改成 multipart:多写一个解析器就是在公开无鉴权的口子上多开一片攻击
+            # 面,而 base64 的解码路径是标准库里久经考验的那一条。
             lim = self._fb_limits()
             if length > lim["body"]:
                 return self._send(413, {"ok": False, "error":
@@ -7045,17 +7318,21 @@ button:hover{filter:brightness(1.1)}
             if not isinstance(imgs_in, list):
                 imgs_in = []
             ip_now = self.client_address[0] if self.client_address else ""
+            # 三个标识各司其职,完整 IP 不进库(见 feedback 表建表说明)。
+            owner, set_cookie = self._fb_owner(create=True)
             # 先建记录拿到 id(文件名要带 id 才能一眼看出属于谁),再落盘,最后把
             # 文件名回填。顺序反过来的话,一条被每日上限拒掉的提交仍然已经把图
             # 写进了盘,而且没有任何记录引用它 —— 那就是永久垃圾。
             fid, err = SERVICE.store.add_feedback(
-                ip_now,
+                self._fb_ip_key(),
                 str(body.get("kind", "other")),
                 str(body.get("contact", "")),
                 str(body.get("message", "")),
                 ua_short(self.headers.get("User-Agent", "")),
                 str(body.get("page", "")),
-                images=["pending"] * min(len(imgs_in), lim["count"]))
+                images=["pending"] * min(len(imgs_in), lim["count"]),
+                ipmask=mask_ip(ip_now),
+                owner=owner)
             if err:
                 return self._send(400, {"ok": False, "error": err})
             names = self._store_feedback_images(fid, imgs_in) if imgs_in else []
@@ -7063,11 +7340,14 @@ button:hover{filter:brightness(1.1)}
             SERVICE.store.counter_incr("feedback_received")
             if names:
                 SERVICE.store.counter_incr("feedback_images", len(names))
+            # journald 里也只写掩码后的地址 —— 日志和数据库是两条独立的泄露面,
+            # 只在其中一条上做脱敏等于没做。
             print("[feedback] #%d from %s (%d img): %s" % (
                 fid, mask_ip(ip_now), len(names),
                 str(body.get("message", ""))[:80].replace("\n", " ")), flush=True)
             return self._send(200, {"ok": True, "id": fid, "images": len(names),
-                                    "images_rejected": max(0, len(imgs_in) - len(names))})
+                                    "images_rejected": max(0, len(imgs_in) - len(names))},
+                              extra_headers=([("Set-Cookie", set_cookie)] if set_cookie else None))
         if u.path == "/feedback/status":
             # 管理动作(标记已处理 / 删除)。走网页口令而不是 Bearer token ——
             # 管理员是在浏览器里点的,身上只有 bw_session cookie。
@@ -7159,8 +7439,15 @@ button:hover{filter:brightness(1.1)}
             h = str(payload.get("hash", "")).strip().lower()
             if not re.match(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$", h):
                 return self._send(400, {"ok": False, "error": "invalid hash (need md5/sha1/sha256)"})
-            res = SERVICE.vt_lookup(h, bool(payload.get("refresh", False)))
+            # 匿名调用方给的 refresh 一律忽略(见 _may_force_refresh)。刻意【不】报错:
+            # 这不是非法请求,只是不授予强制回源的特权,普通查询照常返回结果。
+            # 忽略了就要说一声,否则调用方以为拿到的是刚回源的新鲜数据。
+            want_refresh = bool(payload.get("refresh", False))
+            refresh_denied = want_refresh and not self._may_force_refresh()
+            res = SERVICE.vt_lookup(h, want_refresh and not refresh_denied)
             self._refund_if_cached(res)
+            if refresh_denied and isinstance(res, dict):
+                res["refresh_ignored"] = True
             return self._send(200, res)
         return self._send(404, {"error": "not found"})
 

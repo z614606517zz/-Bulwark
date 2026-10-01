@@ -20,10 +20,67 @@ struct EtwOptions {
     bool KernelNetwork = true;           // Microsoft-Windows-Kernel-Network TCP egress
     bool KernelRegistry = true;          // Microsoft-Windows-Kernel-Registry (persistence-key writes)
     bool KernelFile = true;              // Microsoft-Windows-Kernel-File (watched-path writes/deletes)
+    //
+    // Kernel-Process ImageLoad (event 5, keyword 0x40) -> ImageLoad events.
+    //
+    // 为什么必须有:这一维在【没有内核驱动】时原本完全不存在 —— EventType::ImageLoad 的唯一
+    // 产出点是 DriverEventSource。于是 EventSource=Wmi(或驱动掉线)时,整条白加黑 / BYOVD
+    // 检测线是空转的:DefenseRule 的 requireTargetSigned / requireTargetUnsigned 规则、
+    // InjectionAnalyzer::analyzeImageLoad、RemoteControlAnalyzer::analyzeImModuleLoad、
+    // KillChainAnalyzer 对 .sys 加载的判定,一条都不会被求值。那不是「少一个动作」,是看不见。
+    //
+    //
+    // Kernel-File Create(12)+ Write(16) 关联,用于给【勒索诱饵被改写】找出真正的写入者。
+    //
+    // 【它补的洞】无驱动时诱饵命中靠 QFileSystemWatcher,那个通知不带写入者 —— 所以
+    // UserModeBehaviorSource 自己在头注释里写着「诱饵命中只告警不结束进程」。而引擎侧
+    // RuleEngine 对 canaryHit 是【无条件 Block + 硬指标 100 分】。两边一合,结果是产品里
+    // 最强的勒索信号在无驱动模式下产出一个【没人可杀的 Block】,最终只落 AlertedOnly。
+    // 打开本项后 Write 事件的事件头 ProcessId 就是写入者(已实机核对),诱饵命中能直接
+    // 走 killMalicious 结束勒索进程树。
+    //
+    // 【为什么默认关】实测代价:现有 keyword 0x1400(DeletePath + CreateNewFile)在一个
+    // 1.6 秒窗口里产 19 条事件(约 12/s);加上 CREATE(0x80)与 WRITE(0x200)后同一窗口
+    // 4823 条(约 3000/s)—— 回调次数涨约 250 倍。Create 事件(12)占了其中 4493 条,而
+    // 其中绝大多数是与诱饵毫无关系的文件。这是【全局遥测换一个窄用途】,所以必须由部署方
+    // 明确选择,不能默认替所有人付这个账。开之前请先看本机 bulwark_service.exe 的 CPU 占用。
+    //
+    // 【精度前提·别删】FileObject 是【按句柄】的地址,句柄关闭后会被复用到无关文件上
+    //(实测:同一个 FileObject 值在 1.6 秒里被 17 个事件用过,分属 5 个不同进程)。所以
+    // FileObject -> 路径 的映射必须在「任何 Create 复用了同一个地址」时立刻擦除,否则会把
+    // 别人的写入误报成诱饵被改写 —— 而那条路径的终点是杀进程。实现见 EtwProcessEventSource。
+    //
+    bool KernelFileWriteAttribution = false;
+    // 参与写入归因的路径条数上限(诱饵通常个位数;留余量并防止无界增长)。
+    int AttributionPathMax = 256;
+    bool KernelImageLoad = true;
+    //
+    // Kernel-Process ThreadStart (event 3, keyword 0x20) -> RemoteThread events.
+    //
+    // 同上:RemoteThread 事件此前也只有驱动能产出,所以无驱动时 InjectionAnalyzer::
+    // analyzeRemoteThread 与 CredentialAccessAnalyzer 里「RemoteThread 且目标是 lsass」这条
+    // 凭据窃取判定恒不成立,RuleDsl 的全部 s.thread(...) 规则都是死规则。
+    //
+    // 判别方式经实机 ETW 抓取验证:事件头 ProcessId = 建线程的【发起方】,负载 ProcessID =
+    // 线程所属进程,两者不等即跨进程。误报护栏见 RemoteThreadMinTargetAgeMs。
+    //
+    bool KernelRemoteThread = true;
     bool NetworkUntrustedOnly = true;    // only report egress from untrusted-signed actors
     int PerProcessNetPerMinute = 600;    // per-process TCP egress flood cap
     int PerProcessRegPerMinute = 240;    // per-process registry write report cap
     int PerProcessFilePerMinute = 240;   // per-process file write/delete report cap
+    int PerProcessImagePerMinute = 120;  // per-process module-load report cap
+    int PerProcessThreadPerMinute = 60;  // per-process cross-process thread report cap
+    //
+    // 跨进程 ThreadStart 判为「注入」所要求的【目标进程最小存活时长】(毫秒)。
+    //
+    // 这条护栏不是保守起见加的,是实测必需:子进程的初始线程也由创建方建立,所以【每一次
+    // 正常的进程创建】都会产生一条「事件头 PID != 负载 PID」的 ThreadStart。一次 5.5 秒的
+    // 抓取里 13 条跨进程 ThreadStart,只有 1 条是真注入 —— 其余是初始线程与 System(PID 4)
+    // 的内核线程。区分办法是时间差:初始线程与目标的 ProcessStart 同刻,真注入晚得多
+    // (探针里晚 1.5 秒)。500ms 取的是「进程创建到初始线程」与「注入」之间那道很宽的沟。
+    //
+    int RemoteThreadMinTargetAgeMs = 500;
     bool SuspiciousOnly = true;          // only report DNS the DGA analyzer pre-flags (>0)
     QString SessionName = QStringLiteral("Bulwark-ETW");
     int RawChannelCapacity = 8192;       // raw event relay capacity; overflow is dropped
@@ -333,6 +390,19 @@ struct BulwarkOptions {
     QStringList UiClientAllowedPublishers;       // subject/CN substring allowlist
     bool OnlineCertRevocationCheck = false;      // online CRL/OCSP (may block seconds)
 
+    // --- 被盗用 / 被滥用的代码签名证书(见 bulwark/engine/TrustPolicy.h 的 isAbusedSigner)---
+    //
+    // 「有签名就默认放过」唯一的失效方式,是签名来自一张被偷走的证书:链完整、未吊销,于是
+    // 全部信任档都会放行。银狐(ValleyRAT / Winos)一类团伙长期这么干。吊销要等 CA 反应,而
+    // 本机默认只读缓存 CRL(OnlineCertRevocationCheck 默认 false),空窗期很长 —— 这两项就是
+    // 那段空窗期里按【签名者】拒绝的手段。粒度选签名者而不是哈希:一张被盗证书签出的变种是
+    // 无穷的,指纹与主体名才是不变的那一头。
+    //
+    // 命中的语义是【撤销该主体的全部签名信任档】,不是直接拦截:事件回到正常的行为检测与
+    // 规则流水线,并记一个硬指标。
+    QStringList AbusedSignerThumbprints;         // SHA-1 指纹,可带空格/冒号(内部归一)
+    QStringList AbusedSignerPublishers;          // 证书主体名,按词边界匹配;每条须 >= 4 字符
+
     // 自有端点的 TLS 信任锚(见 SelfHostedTlsOptions 的说明)。留空 = 按公网 CA 完整校验。
     SelfHostedTlsOptions SelfHostedTls;
 
@@ -381,6 +451,86 @@ struct BulwarkOptions {
 
     QString ProxyUrl;                    // global HTTP proxy for all intel sources
     QStringList TrustedDirectories;      // wildcard dirs whose executables are fully allowed
+
+    //
+    // --- 用户态执行前拦截(无内核驱动时的替代)-----------------------------------
+    //
+    // 对已确认恶意的映像长期持有 share-mode-0 独占句柄,使 CreateProcess 与加载器的那次打开
+    // 直接失败。这是 EventSource=Wmi / 驱动掉线时唯一的「行为前」拦截手段;在它之前用户态的
+    // 每个 Block 都只是事后 kill,样本下次启动照旧运行。
+    //
+    // 【为什么需要一个关闭开关】share-mode-0 不只挡执行,还挡读取:被钉住的文件在解锁前
+    // 连备份软件和别的杀软都读不了(我们自己的隔离也读不了,故内部有显式放手协议)。这对
+    // 某些部署环境是不可接受的副作用,必须留逃生口 —— 关掉后行为与改动前完全一致。
+    bool UserModeExecBlockEnabled = true;
+    // 名单条数上限(约束:规则注入必须有上限)。超限时拒绝新增并大声记录,绝不静默挤掉旧条目。
+    int UserModeExecBlockMax = 256;
+
+    //
+    // --- 用户态进程收容(阶段 2:处置编排)---------------------------------------
+    //
+    // 同时被冻结 / 断子的进程数上限。刻意比执行名单小一个量级:这两种状态都直接作用在
+    // 【正在运行的进程】上,量大了对系统可用性的影响远比多几条文件名单严重。
+    int UserModeContainmentMax = 64;
+    // 「等裁决」型冻结的自动解冻时限(毫秒)。这类冻结的对象尚未确认恶意,没人来裁决时
+    // 必须自己放手 —— 否则用户看到的只是「程序卡住了」,连一条安全提示都没有。
+    // 已确认恶意且杀不掉的那种冻结【不受此限制】(见 UserModeProcessContainment::freeze
+    // 的 autoThaw 参数),对那种进程到期放行等于自己撤销自己的处置。
+    int UserModeFreezeTtlMs = 120000;
+    // 「检出即挂起」(2.3):弹窗待裁决期间把主体冻住。
+    //
+    // 补的是无驱动时最不容易被看见的那一段:有驱动时进程创建/命令行是在内核回调里【阻塞等
+    // 裁决】的,样本压根还没开始跑;无驱动时事件是 ETW 事后观测,弹窗的同时它正在全速工作,
+    // 用户思考的那几秒就是它的可用时间。能力表上写着「有检测」,实际检测到了也拦不住这一次。
+    //
+    // 默认开,但有三道收窄(见 Worker 里 Ask 分支的注释):仅在内核不等裁决时、仅对已凑到
+    // 硬恶意指标的事件、且冻结带自动解冻兜底。关掉后该行为整项消失。
+    bool UserModeFreezeOnDetect = true;
+
+    //
+    // --- 阶段 3:用户确认型加固 ------------------------------------------------------
+    //
+    // 这一组与上面所有开关有一个本质区别:它们改的是【跨重启的系统状态】。所以默认全关,
+    // 且刻意不做成「装上就生效」—— 任务定义本身就是「用户显式确认型」。
+    // 只读体检(SystemHardening::inspect)不受这些开关约束,启动时总会跑一次并记进日志:
+    // 让部署方看到「有哪些加固可做、各自的代价是什么」不需要任何授权。
+    //
+    // 【撤销侧永远是接上的】:哪怕这些开关后来被关掉,此前已经加上的 ACE 仍然要能被
+    // 「用户加白」撤销。否则关掉开关会把已有的跨重启封堵变成永久孤儿。
+    //
+    // 3.5 对已确认恶意的映像加「拒绝执行」ACE(DENY Everyone:FILE_EXECUTE)。
+    // 这是 UserModeExecBlock 独占句柄「不跨重启」的真正补位,两者可叠加。
+    // 实测:执行失败 winerr 5,读取不受影响(所以不妨碍本产品自己的隔离),可撤销;
+    // 但按文件不按路径 —— 复制一份即可绕过。
+    bool FileDenyExecuteEnabled = false;
+    // 3.1 注册表即时监视 + 自动回滚。监视本身无副作用,【自动回滚】才是系统改动,
+    // 故整项默认关。打开后:被监视键里指向未加白程序的新增/修改值会被立刻还原。
+    bool RegistryInstantRollbackEnabled = false;
+
+    // 3.3 / 3.4 的「用户显式确认」入口。
+    //
+    // 这两项原本只有只读体检、没有任何地方能让用户确认执行 —— 功能齐备而交互路径缺一半。
+    // 加 UI 入口需要新增 IPC 消息类型,而那条路被并行工作线占着;但「用户确认」并不必须是
+    // 一次点击:**把这个键从 false 改成 true 本身就是一次显式的、留痕的、可回退的确认**,
+    // 而且它比一个弹窗更适合这两件事 —— 它们改的是跨重启的机器状态,本来就该由管理配置的人
+    // 决定,而不是由碰巧坐在这台机器前的人点一下。
+    //
+    // 两项都在【每次启动时】核对现状,已达标就跳过并记一行,不重复写。
+    bool ApplyLsaRunAsPpl = false;        // 写 RunAsPPL=2(代码只接受 2,见 SystemHardening)
+    bool ApplySelfServiceDacl = false;    // 收紧本服务 DACL(保留 SYSTEM + Administrators)
+
+    //
+    // --- 用户态出站封禁(无内核驱动时的替代)-------------------------------------
+    //
+    // 在 WFP 的 ALE_AUTH_CONNECT_V4 层挂 BLOCK 过滤器,命中的出站 connect 当场失败
+    // (WSAEACCES)。用动态会话:过滤器随服务进程退出自动清除,不跨重启 —— 刻意如此,因为
+    // 本产品目前没有任何地方能撤销 IP 封禁,持久过滤器一旦下错就是「连不上网且查不出原因」。
+    //
+    // 顺带修掉一个真实缺口:BlockedRemoteEndpoints 此前【只在内核驱动连上时才生效】,
+    // EventSource=Wmi 或驱动掉线时部署方配的出站黑名单是完全无效的(配了等于没配)。
+    bool UserModeNetworkBlockEnabled = true;
+    int UserModeNetworkBlockMax = 256;
+
     AiOptions Ai;
     EtwOptions Etw;
 

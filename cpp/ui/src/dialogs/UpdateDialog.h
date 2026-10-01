@@ -40,7 +40,7 @@ public:
     ~UpdateDialog() override;
 
     // 当前是否有更新弹窗开着。MainWindow 用它决定要不要为「启动后自动检查」的结果弹
-    // 托盘气泡:用户自己点「检查更新」时弹窗里已经把结论写清楚了,再弹一个气泡是噪音。
+    // 右下角通知:用户自己点「检查更新」时弹窗里已经把结论写清楚了,再弹一条通知是噪音。
     static bool isAnyOpen() { return s_openCount > 0; }
 
 private slots:

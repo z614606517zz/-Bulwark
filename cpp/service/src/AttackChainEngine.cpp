@@ -1051,9 +1051,21 @@ CoverageProfile CoverageProfile::fromOptions(const BulwarkOptions& o) {
     c.fileWatch     = o.ProtectedPaths + o.FileHardBlocks;
     c.etwFileEvents = o.Etw.Enabled && o.Etw.KernelFile;
     c.etwDns        = o.Etw.Enabled && o.Etw.DnsClient;
-    // 「被加载模块签名」维度目前不存在:ImageLoad 事件只带主体进程的签名状态。
-    // 服务器也正因此把两条 lsass / 未签名模块标记标为 unobservable。
-    c.moduleSignature = false;
+    //
+    // 「被加载模块签名」维度【现在存在了】(6b)。原注释说「ImageLoad 事件只带主体进程的
+    // 签名状态」—— 那是 targetSigned / targetSignatureMismatch 两个字段加进 SecurityEvent
+    // 之前的事实;Worker::enrich 第 3.9 步现在对全部 ImageLoad(含 actorPid==0 的驱动加载)
+    // 富化模块签名,规则侧有 targetUnsignedOnly() / targetSignedOnly() 可写。
+    //
+    // ⚠ 两点务必分清,别把这一位当成「侧载标记现在都可观测了」:
+    //   1) 本字段【当前没有任何判定消费点】。classifyMarker 的 ImageLoad 分支只看
+    //      driverSource 与 target 路径宽窄,从不读它;main.cpp 那边只是把它从语料读回来。
+    //      所以这里翻不翻,对外输出的可观测性结论一个字都不会变 —— 翻它只为让字段别说假话。
+    //      日后真要拿它做判定,先回来读完这段注释。
+    //   2) 挡住 lsass 那两条标记的从来不是签名维度,是【路径过滤】:内核只上报 \Temp\ 与
+    //      \Users\Public\ 下的用户态模块加载,lsass 从 System32 加载模块压根不产生事件。
+    //      把这一位翻成真【不】意味着那两条变可观测,它们仍然受 ImageLoad 分支的路径判据管。
+    c.moduleSignature = true;
     // 驱动的进程创建事件已带完整命令行(TargetPath 复用,见 ProcessMonitor.c)。
     c.cmdLineInBand = c.driverSource;
     return c;

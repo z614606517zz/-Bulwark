@@ -401,9 +401,10 @@
   <nav class="nav" aria-label="主导航"><div class="navin">
     <button class="navi" id="sfbtn"><span class="i" aria-hidden="true">🦊</span>银狐情报<b id="sfcount">0</b></button>
     <!-- 「正常样本」入口已移除:服务端改为只收录恶意样本(app.py 的 store_benign_samples
-         默认 false),这个徽标的数字再也不会增长,而 renderNormal / loadBenign 的定义还留在
-         下面 —— 它们已无任何调用点。删按钮时必须连带删掉 $("#normalbtn").onclick,
-         否则初始化阶段对 null 取属性会把后面整段脚本一起带崩。 -->
+         默认 false),这个徽标的数字再也不会增长。对应的 renderNormal / loadBenign 以及
+         benign* 状态变量现已一并删除,不再有任何残留定义。
+         若要恢复这个入口:按钮和脚本必须同时加回来,只加按钮会在初始化阶段对 null 取
+         属性,把后面整段脚本一起带崩。 -->
     <a class="navi" href="/engine"><span class="i" aria-hidden="true">🧬</span>攻击链引擎<b id="enginecount">0</b></a>
     <a class="navi" href="/online"><span class="i" aria-hidden="true">📡</span>在线客户端<b id="onlinecount">0</b></a>
     <!-- 在线客服。刻意不挂徽标:另外三个 .navi 的 <b> 是从 /stats 拉来的计数,
@@ -580,17 +581,46 @@ let MAXUP=650;  // max upload MB; refreshed from /stats
 let hFilter="all",hSort="recent";  // threat-archive view state
 let sfFilter="all";                // 银狐 sub-family filter
 let statsData=null;let archStats=null,sfReports=[];  /* whole-DB counters + full SilverFox list */               // last /stats payload
-let benignReports=[],benignStats=null,bnFilter="all";  // 正常样本区:清单 + 概况 + 子筛选
-let viewMode="dashboard";         // dashboard | report | silverfox | normal
+let viewMode="dashboard";         // dashboard | report | silverfox
+/* 「正常样本」那一区的状态变量(benignReports / benignStats / bnFilter)连同
+   renderNormal / loadBenign 一起删掉了 —— 服务端 store_benign_samples 默认 false,
+   入口按钮早已移除,这几百行没有任何调用点。留着死代码的代价不只是体积:它让
+   /benign/reports 看起来还在用,下次有人改那个接口时会以为这里需要跟着改。 */
+
+/* ── 异步结果的归属:每次用户动作领一个号 ────────────────────────────────
+   上传后的轮询最长 24×20s = 8 分钟。这期间用户完全可能已经去看别的报告、回了首页
+   或查了另一个哈希 —— 原来 poll 的回调无条件 render(),于是几分钟前那次上传的结果
+   会把用户当前正在看的内容顶掉,而且状态条还会跟着改成「VT 分析完成」。
+   回调回来时先比一下自己的号是不是最新的,不是就安静退出。 */
+let jobSeq=0;
+const newJob=()=>++jobSeq;
+const jobStale=id=>id!==jobSeq;
 
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),2400);}
 function setStatus(m,k){const el=$("#status");if(!m){el.innerHTML="";el.className="status";return;}
   el.innerHTML=(k==="busy"?'<span class="spin"></span>':"")+"<span>"+esc(m)+"</span>";el.className="status"+(k==="err"?" err":k==="ok"?" ok":"");}
-function fmtDate(ep){if(!ep)return"—";try{return new Date(ep*1000).toISOString().replace("T"," ").slice(0,19)+" UTC";}catch(e){return String(ep);}}
+/* 回退分支要转义:调用点(如 render() 里的「首见 ${fmtDate(...)}」)是直接插进
+   innerHTML 的,不再套 esc。ep 不是数字时 new Date 得到 Invalid Date、toISOString
+   抛错,原来的 String(ep) 会把服务端字段原样带进 DOM —— 那是一条可注入的路径。 */
+function fmtDate(ep){if(!ep)return"—";try{return new Date(ep*1000).toISOString().replace("T"," ").slice(0,19)+" UTC";}catch(e){return esc(String(ep));}}
 function fmtSize(n){if(n==null||n==="")return"—";const u=["B","KB","MB","GB"];let i=0,v=Number(n);while(v>=1024&&i<u.length-1){v/=1024;i++;}return(i?v.toFixed(1):v)+" "+u[i];}
 function verdictOf(f){const s=f.last_analysis_stats||{};const m=s.malicious||0,su=s.suspicious||0;return m>=5?"malicious":(m>0||su>0?"suspicious":(Object.keys(s).length?"clean":"unknown"));}
-async function jget(p){const r=await fetch(p);return r.json();}
-async function jpost(p,o){const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});return r.json();}
+/* 这两个包装原来不看 r.ok:任何非 200 都被当成正常返回往下走,于是 /stats 回 401
+   或 429 时,调用方的 catch 根本不触发 —— 页面只是静静地空着,不给任何提示。
+   现在的规则,刻意不是"非 200 一律抛":
+     · 能解析出 JSON 就把 JSON 交回去。服务端的错误响应本身就是 JSON
+       ({ok:false,error:"..."}),调用方要靠 d.error 显示原因,一律抛会把它丢掉;
+     · 解析不出 JSON(网关错误页、连接被掐、空响应)才抛,并把状态码带进消息里,
+       否则错误提示永远只有一句"连接不上服务器",分不清是谁的问题。 */
+async function jfetch(p,init){
+  const r=await fetch(p,init);
+  let d=null;
+  try{const t=await r.text();d=t?JSON.parse(t):null;}catch(e){d=null;}
+  if(d&&typeof d==="object")return d;
+  throw new Error("HTTP "+r.status+(r.statusText?" "+r.statusText:""));
+}
+async function jget(p){return jfetch(p);}
+async function jpost(p,o){return jfetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)});}
 
 /* 两个弹窗共用的开关。原来两处各自 classList.toggle 一行,漏掉了三件事:
    1) 背景页面照旧能滚 —— 档案列表滚到底后继续滚,身后的主页面跟着动起来;
@@ -617,7 +647,8 @@ function modalOpen(sel,v){
 // history modal — threat archive
 function openHistory(v){modalOpen("#hmodal",v);if(v)drawReports();}
 $("#histbtn").onclick=()=>openHistory(!modalIsOpen("#hmodal"));
-$("#sfbtn").onclick=()=>renderSilverfox();
+// 切到银狐页也是一次视图切换 —— 领新号,把可能还在跑的上传轮询作废。
+$("#sfbtn").onclick=()=>{newJob();renderSilverfox();};
 $("#hclose").onclick=()=>openHistory(false);
 $("#hmodal").addEventListener("click",e=>{if(e.target===$("#hmodal"))openHistory(false);});
 $("#hsort").addEventListener("change",e=>{hSort=e.target.value;drawReports();});
@@ -656,14 +687,17 @@ async function loadMine(){
     const nNew=items.filter(x=>x.status!=="done").length;
     const mc=$("#fbmc");
     if(mc)mc.textContent=items.length?("("+items.length+")"):"";
+    // 认领改成按浏览器令牌,不再按来源 IP —— IP 会被 NAT 共享,按 IP 认领等于把
+    // 反馈正文和管理员回复摊给同一个出口下的所有人。文案必须跟着改:原来那句
+    // 「按来源 IP 识别」现在是错的,而且会让人以为换设备也能看到。
     if(!items.length){
       box.innerHTML='<div style="padding:40px 0;text-align:center;color:var(--dim);font-size:13px">'
-        +'还没有提交过反馈。<br><span style="font-size:12px">按来源 IP 识别('+esc(d.ip||"")+'),'
-        +'换网络或换设备会看不到之前的记录。</span></div>';
+        +'还没有提交过反馈。<br><span style="font-size:12px">记录只认这个浏览器,'
+        +'换浏览器、换设备或清除站点数据后看不到之前的记录。</span></div>';
       return;
     }
     box.innerHTML='<div style="font-size:12.5px;color:var(--dim);margin-bottom:10px">'
-      +'共 '+items.length+' 条,'+nNew+' 条待处理 · 按来源 IP 识别('+esc(d.ip||"")+')</div>'
+      +'共 '+items.length+' 条,'+nNew+' 条待处理 · 仅本浏览器可见</div>'
       +items.map(x=>{
       const s=FBST[x.status]||["未知","var(--muted)"];
       return `<div style="border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:var(--soft)">
@@ -768,9 +802,11 @@ $("#fbsend").onclick=async()=>{
                            images:fbImgs.map(x=>x.url)})});
     let d={};try{d=await r.json();}catch(e){d={ok:false,error:"服务端返回异常(HTTP "+r.status+")"};}
     if(!d.ok){
-      // 429 是限流(每日条数或滑窗),413 是整个请求体超限(基本只可能是截图太大),
-      // 和「内容不合法」都不是一回事,分开说清楚
-      st.textContent=(r.status===429?"提交过于频繁,请稍后再试。":
+      // 429 有两种成因:滑窗限流(稍后可重试)和每日条数用完(今天没了)。原来这里
+      // 无条件写死「提交过于频繁,请稍后再试」,把服务端 d.error 里那句「今日提交次数
+      // 已达上限,请明天再试」丢掉了 —— 用户会一直重试到明天。有 d.error 就优先用它。
+      // 413 仍然写死:那条的服务端文案是给运维看的(提到配置项名),不适合直接展示。
+      st.textContent=(r.status===429?(d.error||"提交过于频繁,请稍后再试。"):
                       r.status===413?"截图太大,请减少张数或压缩后再试。":
                       ("提交失败:"+(d.error||"未知错误")));
       st.style.color="var(--mal)";btn.disabled=false;return;
@@ -803,12 +839,14 @@ async function refreshMetrics(){try{const d=await jget("/stats");statsData=d;con
   // 未处理的反馈条数挂在按钮上,否则收到反馈没人知道。
   // 只改徽标这一个节点 —— 之前这里重写整个 innerHTML,会把按钮内部的
   // 图标/文字/徽标结构冲掉,窄屏隐藏文字的 .lbl 也跟着没了。
-  const fb=$("#fbbtn"),fc=$("#fbnew");
-  if(fb&&fc&&d.feedback){
-    const n=d.feedback.new||0;
-    fc.textContent=n;fc.hidden=!n;
-    fb.title=n?("有 "+n+" 条未处理 · 管理页 /feedback"):"提交问题反馈";
-  }
+  /* 未处理反馈条数与管理页路径【不再显示在这个页面上】。
+     这一页是公网免登录的,而这两样东西对普通访客毫无意义,对扫描者则是现成的情报:
+     积压条数能推出运维响应速度,/feedback 直接点出管理入口在哪。管理员本来就有
+     /feedback 那个专门页面看这些。
+     #fbnew 这个徽标节点留在 DOM 里不动 —— 动效层用 MutationObserver 盯着 #fbbtn,
+     删节点会牵动那边;这里只保证它永远不显示。 */
+  const fc=$("#fbnew");
+  if(fc){fc.hidden=true;fc.textContent="";}
   const ec=$("#enginecount");if(ec&&d.engine)ec.textContent=(d.engine.patterns||0);
   if(viewMode==="dashboard")renderDashboard();}catch(e){}}
 
@@ -816,10 +854,15 @@ async function loadReports(){try{const d=await jget("/vt/reports");allReports=d.
   archStats=d.stats||null;sfReports=d.silverfox||[];
   $("#rcount").textContent=((archStats&&archStats.total)||d.count||0);
   const sfc=$("#sfcount");if(sfc)sfc.textContent=(archStats?archStats.silverfox:sfReports.length);
-  if($("#hmodal").classList.contains("open"))drawReports();if(viewMode==="silverfox")renderSilverfox();await refreshMetrics();}catch(e){}}
-async function loadBenign(){try{const d=await jget("/benign/reports");benignReports=d.reports||[];benignStats=d.stats||null;
-  const nc=$("#normalcount");if(nc)nc.textContent=((benignStats&&benignStats.total)||d.count||0);
-  if(viewMode==="normal")renderNormal();}catch(e){}}
+  if($("#hmodal").classList.contains("open"))drawReports();if(viewMode==="silverfox")renderSilverfox();await refreshMetrics();}
+  catch(e){
+    /* 原来这里是 catch(e){} —— 拉不到威胁库时页面只是空着,不给任何提示,看起来
+       像「库里没数据」而不是「没读到数据」。这两件事对使用者的含义完全相反。
+       只在首页空着的时候提示:已经有内容时不要用一条错误把它盖掉。 */
+    if(viewMode==="dashboard"&&!allReports.length)
+      setStatus("读取威胁库失败:"+(e.message||"连接不上服务器"),"err");
+  }}
+
 function drawReports(){
   /* Cards report the whole database (archStats) so they stop drifting every
      time the hourly harvester rotates rows out of the capped list. */
@@ -866,9 +909,14 @@ function drawReports(){
 // ---- landing dashboard (idle state) ----
 function renderDashboard(){
   viewMode="dashboard";
-  const total=allReports.length;
-  const nMal=allReports.filter(x=>x.verdict==="malicious").length;
-  const nSusp=allReports.filter(x=>x.verdict==="suspicious").length;
+  /* 统计口径必须是【全库】,不是 allReports 这个窗口。/vt/reports 只回最近 300 条,
+     而 stats 是服务端对整张表算的 —— 原来这里数的是窗口,于是首页显示 300/276/24,
+     同一时刻导航徽标和档案弹窗显示 30117/28709/1408,同一个数字在一个页面里有两种值。
+     drawReports 早就改用 archStats 了,这里当时漏改。
+     archStats 还没回来时退回窗口计数,只是为了首屏不空着。 */
+  const total=archStats?archStats.total:allReports.length;
+  const nMal=archStats?archStats.malicious:allReports.filter(x=>x.verdict==="malicious").length;
+  const nSusp=archStats?archStats.suspicious:allReports.filter(x=>x.verdict==="suspicious").length;
   const q=(statsData&&statsData.quota_today)||{};
   const todayVT=q.VirusTotal||0;
   const recent=allReports.slice(0,6);
@@ -958,52 +1006,11 @@ function renderSilverfox(){
   rep.querySelectorAll(".sfbar .hchip").forEach(c=>clickable(c,()=>{sfFilter=c.dataset.sf;renderSilverfox();},c.classList.contains("on")));
   rep.querySelectorAll(".sflist .hcard").forEach(el=>clickable(el,()=>openStored(el.dataset.id)));
 }
-// ---- 正常样本 page ----
-// 干净文件不进威胁库(会污染家族/分类统计),单独存在服务端 benign_reports。
-// 这个页面把它们单独列出来,和「银狐情报」同一套卡片样式,只是判定色改成安全绿。
-// 卡片点击复制哈希(不做详情页:精简语料不适配威胁报告的完整渲染器,硬塞会渲染空白)。
-function renderNormal(){
-  viewMode="normal";setStatus("","");
-  const list=(benignReports||[]).slice();
-  const st=benignStats||{};
-  const total=(st.total!=null)?st.total:list.length;
-  const nSigned=(st.signed!=null)?st.signed:list.filter(x=>x.signed).length;
-  const nBeh=(st.with_behaviour!=null)?st.with_behaviour:list.filter(x=>x.has_behaviour).length;
-  const cap=st.cap||0;
-  const cnt={all:list.length,signed:list.filter(x=>x.signed).length,unsigned:list.filter(x=>!x.signed).length,behaviour:list.filter(x=>x.has_behaviour).length};
-  const stat=(v,k,cls)=>`<div class="hstat ${cls||''}"><div class="v">${v}</div><div class="k">${k}</div></div>`;
-  const defs=[["all","全部"],["signed","已签名"],["unsigned","未签名"],["behaviour","含沙箱行为"]];
-  const chips=defs.map(([f,lbl])=>`<span class="hchip ${f===bnFilter?'on':''}" data-bn="${f}">${lbl} <b>${cnt[f]||0}</b></span>`).join("");
-  let l=list;
-  if(bnFilter==="signed")l=l.filter(x=>x.signed);
-  else if(bnFilter==="unsigned")l=l.filter(x=>!x.signed);
-  else if(bnFilter==="behaviour")l=l.filter(x=>x.has_behaviour);
-  l.sort((a,b)=>Date.parse(b.stored_at||"")-Date.parse(a.stored_at||""));
-  const rows=l.length?l.map(x=>{
-    const sig=x.signed?`<span class="pill clean">已签名</span>`:`<span class="pill">未签名</span>`;
-    const typ=x.type_tag?`<span class="pill" style="margin-left:5px">${esc(x.type_tag)}</span>`:"";
-    const beh=x.has_behaviour?`<span class="pill" style="margin-left:5px">沙箱行为</span>`:"";
-    return `<div class="hcard clean" data-id="${esc(x.sha256)}">
-      <div class="hv"><span class="chip">安全</span></div>
-      <div class="hmain"><div class="hnm">${esc(x.name||(x.sha256||"").slice(0,32))}</div>
-        <div class="hfam">${sig}${typ}${beh}</div>
-        <div class="hmeta">${esc(x.sha256)}</div></div>
-      <div class="hdet"><div class="hdate">${esc((x.stored_at||"").replace("T"," ").slice(0,16))}</div></div>
-    </div>`;}).join("")
-    :'<div class="dempty" style="padding:50px 0;text-align:center">暂无正常样本。查询或拖入一个 VirusTotal 判为安全的文件后,会自动收录并显示在这里。</div>';
-  $("#report").innerHTML=`<style>.hcard.clean{border-left-color:var(--clean)}.hcard.clean .hv .chip{background:var(--clean)}.hcard.clean .hnm{color:var(--ink)}.pill.clean{background:var(--cleanbg);color:var(--clean);border-color:transparent}.hstat.clean .v{color:var(--clean)}</style>
-    <div class="sfpage">
-    <div class="sfhead"><div class="sftitle">&#9989; 正常样本 <span class="hsub">共 ${total} 个 · 已确认安全</span></div></div>
-    <div class="dstats" style="margin-bottom:14px">
-      ${stat(total,"正常样本","clean")}${stat(nSigned,"已签名")}${stat(nBeh,"含沙箱行为")}${stat(cap||"—","留存上限")}
-    </div>
-    <div class="sfbar">${chips}</div>
-    <div class="sflist">${rows}</div>
-  </div>`;
-  const rep=$("#report");
-  rep.querySelectorAll(".sfbar .hchip").forEach(c=>clickable(c,()=>{bnFilter=c.dataset.bn;renderNormal();},c.classList.contains("on")));
-  rep.querySelectorAll(".sflist .hcard").forEach(el=>clickable(el,()=>{const id=el.dataset.id;if(id&&navigator.clipboard){navigator.clipboard.writeText(id);toast("已复制哈希");}}));
-}
+// ---- 正常样本 page(已删除)----
+// 服务端 store_benign_samples 默认 false,干净文件根本不入库,入口按钮也早已移除,
+// renderNormal / loadBenign 因此没有任何调用点。整段连同状态变量一起删掉。
+// 若以后重新开启正常样本收录,从 git 历史里取回比在这里养着一份不会被执行、
+// 也不会被测到的代码更可靠。
 // VT 没这个文件,但别的云认识它。以前这里只显示一句「VT 未收录」就结束了,
 // 其他云已经拿到的结论被整个丢掉 —— 而这些云恰恰是 VT 盲区的补充。
 // 刻意不复用 render():那个函数按完整 VT 报告的字段形状写的,而这种响应里
@@ -1035,32 +1042,47 @@ function renderSecondaryOnly(h,d){
     <div class="sflist">${rows}</div>
   </div>`;
 }
-async function openStored(id){setStatus("加载已保存报告…","busy");
-  try{const d=await jget("/vt/report/"+encodeURIComponent(id));if(!d.ok){setStatus(d.error||"未找到","err");return;}
-    render(d.report,d.stored_at,true);setStatus("已保存报告 · "+(d.stored_at||""),"ok");}catch(e){setStatus("加载失败:"+e.message,"err");}}
+async function openStored(id){const job=newJob();setStatus("加载已保存报告…","busy");
+  try{const d=await jget("/vt/report/"+encodeURIComponent(id));if(jobStale(job))return;
+    if(!d.ok){setStatus(d.error||"未找到","err");return;}
+    render(d.report,d.stored_at,true);setStatus("已保存报告 · "+(d.stored_at||""),"ok");}
+  catch(e){if(!jobStale(job))setStatus("加载失败:"+e.message,"err");}}
 
+// refresh 现在是仅本机/白名单/持凭据才有的特权,匿名调用方传了会被服务端忽略并回
+// refresh_ignored:true。前端因此不再为「上传后轮询」传它 —— 送检成功时服务端会清掉
+// 该哈希的负缓存,普通查询就能拿到新结果。参数保留给管理员在浏览器里的强制重查。
 async function lookupHash(h,r){return jpost("/vt/lookup",{hash:h,refresh:!!r});}
 async function doLookup(){const h=$("#hash").value.trim().toLowerCase();
   if(!/^([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$/.test(h)){setStatus("请输入合法的 MD5 / SHA-1 / SHA-256 哈希。","err");return;}
+  const job=newJob();
   $("#go").disabled=true;setStatus("正在查询 VirusTotal(含沙箱行为报告)…","busy");
-  try{const d=await lookupHash(h,false);
+  try{const d=await lookupHash(h,false);if(jobStale(job))return;
     if(d.ok){render(d.report,d.stored_at,d.cached);setStatus((d.cached?"来自服务器缓存":"VT 实时查询")+(d.stored?" · 威胁报告已留存":" · 安全文件,未收录"),"ok");loadReports();}
     else if(d.vt_unknown&&(d.sources_ok||0)>0){renderSecondaryOnly(h,d);
       setStatus("VirusTotal 无此文件记录 · 以下结论来自其他 "+d.sources_ok+" 个情报源","err");}
-    else setStatus(d.error||"查询失败","err");}catch(e){setStatus("查询失败:"+e.message,"err");}finally{$("#go").disabled=false;}
+    else setStatus(d.error||"查询失败","err");}
+  catch(e){if(!jobStale(job))setStatus("查询失败:"+e.message,"err");}
+  finally{$("#go").disabled=false;}
 }
 async function sha256File(f){const b=await f.arrayBuffer();const d=await crypto.subtle.digest("SHA-256",b);return Array.from(new Uint8Array(d)).map(x=>x.toString(16).padStart(2,"0")).join("");}
 async function onFile(f){if(!f)return;if(!crypto.subtle){setStatus("需要 HTTPS 才能本地算哈希。","err");return;}
+  const job=newJob();
   setStatus("计算 SHA-256:"+f.name+" ("+fmtSize(f.size)+")…","busy");
-  try{const sha=await sha256File(f);$("#hash").value=sha;setStatus("SHA-256 "+sha.slice(0,20)+"… · 查询 VT 中…","busy");
-    const d=await lookupHash(sha,false);
+  try{const sha=await sha256File(f);if(jobStale(job))return;
+    $("#hash").value=sha;setStatus("SHA-256 "+sha.slice(0,20)+"… · 查询 VT 中…","busy");
+    const d=await lookupHash(sha,false);if(jobStale(job))return;
     if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("已查到报告","ok");loadReports();}
     else{
       // 别的云已经有结论就先摆出来,再照旧给出上传提示 —— 两者不矛盾:
       // VT 确实没这个文件,样本还是该传给它分析。
       if(d.vt_unknown&&(d.sources_ok||0)>0)renderSecondaryOnly(sha,d);
-      uploadPrompt(f,sha,d.error||"VT 未收录");}}catch(e){setStatus("处理文件失败:"+e.message,"err");}}
+      uploadPrompt(f,sha,d.error||"VT 未收录");}}
+  catch(e){if(!jobStale(job))setStatus("处理文件失败:"+e.message,"err");}}
 function uploadPrompt(f,sha,why){setStatus("VirusTotal 未收录此文件("+why+")","err");
+  // 这一屏也算一个「报告视图」。不置 viewMode 的话它仍是 dashboard,而 refreshMetrics
+  // 在 viewMode==="dashboard" 时会重画首页 —— 下一次 /stats 回来就把这个上传提示
+  // 连同「上传样本」按钮一起冲掉,用户点了一半的操作凭空消失。
+  viewMode="report";
   $("#report").innerHTML=`<div class="card"><div class="pane on" style="display:block">
     <div style="font-size:16px;font-weight:700;margin-bottom:8px">🆕 VT 未收录该文件</div>
     <div class="kv"><div class="k">文件</div><div class="v">${esc(f.name)} · ${fmtSize(f.size)}</div><div class="k">SHA-256</div><div class="v">${esc(sha)}</div></div>
@@ -1068,23 +1090,39 @@ function uploadPrompt(f,sha,why){setStatus("VirusTotal 未收录此文件("+why+
     <button class="btn" id="upbtn" style="padding:12px 20px">⬆️ 上传样本到 VirusTotal 扫描</button></div></div>`;
   $("#upbtn").onclick=()=>uploadSample(f,sha);}
 async function uploadSample(f,sha){if(f.size>MAXUP*1024*1024){setStatus("文件 "+fmtSize(f.size)+" 超过上传上限 "+MAXUP+"MB,无法送检(可用哈希查询)","err");return;}
+  // 点「上传」是一次明确的用户意图,领新号;之后用户再做别的事会把这个号顶掉,
+  // 下面那条最长 8 分钟的轮询链就会自己停下来。
+  const job=newJob();
   const b=$("#upbtn");if(b)b.disabled=true;setStatus("上传样本到 VirusTotal…("+fmtSize(f.size)+")","busy");
-  try{const r=await fetch("/vt/upload?name="+encodeURIComponent(f.name),{method:"POST",body:f});const d=await r.json();
+  try{const d=await jfetch("/vt/upload?name="+encodeURIComponent(f.name),{method:"POST",body:f});
+    if(jobStale(job))return;
     if(!d.ok){setStatus("上传失败:"+(d.error||""),"err");if(b)b.disabled=false;return;}
     if(d.found){render(d.report,d.stored_at,d.cached);setStatus("VirusTotal 已有该文件报告","ok");loadReports();return;}
-    setStatus("已提交分析,自动轮询中…","busy");poll(sha,0);}catch(e){setStatus("上传失败:"+e.message,"err");if(b)b.disabled=false;}}
-function poll(sha,n){const MAX=24,MS=20000;if(n>=MAX){setStatus("分析仍在进行,已停止轮询,稍后用该哈希再查即可。","err");return;}
-  setTimeout(async()=>{try{const d=await lookupHash(sha,true);
-    if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("VT 分析完成"+(d.stored?",威胁报告已留存":",安全文件不留存"),"ok");loadReports();}
-    else{setStatus("VT 分析中…(第 "+(n+1)+" 次 · 约 "+((n+1)*MS/1000)+"s)","busy");poll(sha,n+1);}}catch(e){poll(sha,n+1);}},MS);}
+    setStatus("已提交分析,自动轮询中…","busy");poll(sha,0,job);}
+  catch(e){if(!jobStale(job)){setStatus("上传失败:"+e.message,"err");if(b)b.disabled=false;}}}
+/* 轮询。job 是发起这次上传时领的号:每轮开始和拿到结果后都要再确认一次自己仍然是
+   当前任务 —— 24×20s 最长跑 8 分钟,用户早就可能翻到别的报告去了。
+   这里不再传 refresh=true:vt_submit_path 送检成功后已经清掉了该哈希的负缓存,
+   普通查询就能看到新结果,而 refresh 对匿名调用方已被服务端忽略。 */
+function poll(sha,n,job){const MAX=24,MS=20000;
+  if(jobStale(job))return;
+  if(n>=MAX){setStatus("分析仍在进行,已停止轮询,稍后用该哈希再查即可。","err");return;}
+  setTimeout(async()=>{
+    if(jobStale(job))return;
+    try{const d=await lookupHash(sha,false);
+      if(jobStale(job))return;
+      if(d.ok){render(d.report,d.stored_at,d.cached);setStatus("VT 分析完成"+(d.stored?",威胁报告已留存":",安全文件不留存"),"ok");loadReports();}
+      else{setStatus("VT 分析中…(第 "+(n+1)+" 次 · 约 "+((n+1)*MS/1000)+"s)","busy");poll(sha,n+1,job);}}
+    catch(e){poll(sha,n+1,job);}},MS);}
 
 // ---- 单文件送检 ----
 // 这一页刻意【不做】批量。2026-08-13 去掉了多选批量，两个原因都不是界面偏好：
-//   * VirusTotal 已经在成批拒绝本项目的采集节点（245 上每一把密钥都是 429，连刚添加的也是），额度是稀缺资源，
-//     而一次批量能在几十秒里把它花完；
-//   * 这一页在公网上没有口令门，任何人都能打开。批量意味着任何人都能一次提交几十个文件，
-//     既烧掉额度，又把这些样本公开共享给安全社区 —— 送检是不可撤回的。
+//   * 上游额度是稀缺且共享的资源，一次批量能在几十秒里把它花完；
+//   * 送检不可撤回 —— 样本会被公开共享给安全社区，一次误操作放大几十倍无法收回。
 // 单个文件的整条路径（算哈希 → 查 VT → 未收录再问要不要上传）原样保留，见 onFile()。
+//
+// 注：这段注释此前写明了具体密钥的限流状态和本页的鉴权现状。那些是运维细节，而这个
+// 文件对所有访客可读 —— 查看源码就能拿到。理由留下，现状挪走。
 function onFiles(files){const arr=Array.from(files||[]);if(!arr.length)return;
   // 多选或多拖时不静默丢掉其余文件，明确说一句只取了第一个——悄悄少做事比做不到更糟。
   // 用 toast 而不是 setStatus：下一行的 onFile() 立即就会把状态条改成「计算 SHA-256」。
@@ -1320,7 +1358,9 @@ function renderSources(report){
   const cls=v=>v==="malicious"?"mal":v==="suspicious"?"susp":v==="clean"?"clean":"";
   const items=s.map(x=>{const v=x.verdict||"unknown";
     const extra=x.querySucceeded?(x.threat_label?esc(x.threat_label):(x.total_engines?(x.malicious+"/"+x.total_engines):"")):"无数据";
-    return `<div class="src-item"><span class="src-nm">${esc(x.source)}</span><span class="src-v ${cls(v)}">${VMAP[v]||v}</span>${extra?`<span class="src-x">${extra}</span>`:""}</div>`;}).join("");
+    // VMAP[v] 命中时是本文件里的常量,但未命中就回退成服务端给的原字符串 —— 那一支
+    // 必须转义。extra 已经在上面 esc 过了。
+    return `<div class="src-item"><span class="src-nm">${esc(x.source)}</span><span class="src-v ${cls(v)}">${esc(VMAP[v]||v)}</span>${extra?`<span class="src-x">${extra}</span>`:""}</div>`;}).join("");
   return `<div class="srcstrip"><div class="srcstrip-h">多源情报 <span>${s.length} 源</span></div><div class="srcstrip-b">${items}</div></div>`;
 }
 function renderMeta(f,sig,ptc,names){
@@ -1345,7 +1385,7 @@ dz.addEventListener("drop",e=>{const ff=e.dataTransfer.files;if(ff&&ff.length)on
 // 光有 cursor:pointer 只是给鼠标看的。
 const brand=$(".brand");
 if(brand){brand.style.cursor="pointer";brand.title="返回首页";brand.setAttribute("aria-label","返回首页");
-  clickable(brand,()=>{setStatus("","");renderDashboard();});}
+  clickable(brand,()=>{newJob();setStatus("","");renderDashboard();});}
 
 // 导航横向滚动提示。窄屏时七个入口放不下,而滚动条是刻意藏掉的 —— 只靠 CSS
 // 没法知道「还能不能再滚」,所以由这里量一次再把状态写到 .nav[data-ovf] 上,

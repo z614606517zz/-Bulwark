@@ -1,4 +1,6 @@
 #include "dialogs/PromptDialog.h"
+#include "ai/AiScanner.h"
+#include "dialogs/AiInsightPanel.h"
 #include "dialogs/AttackTimelineWindow.h"
 #include "dialogs/EventFormat.h"
 #include "design/Components.h"
@@ -10,6 +12,7 @@
 #include "design/Theme.h"
 #include "widgets/WrapLabel.h"
 
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
@@ -80,7 +83,7 @@ QWidget* chipCloud(const QList<QPair<QString, QColor>>& chips)
 } // namespace
 
 PromptDialog::PromptDialog(const bulwark::SecurityEvent& event, QWidget* parent,
-                           int timeoutSeconds, bool defaultAllow)
+                           int timeoutSeconds, bool defaultAllow, AiScanner* ai)
     : Sheet(parent), m_event(event), m_timeoutSeconds(timeoutSeconds), m_defaultAllow(defaultAllow)
 {
     const bulwark::SecurityEvent& e = m_event;
@@ -89,10 +92,18 @@ PromptDialog::PromptDialog(const bulwark::SecurityEvent& event, QWidget* parent,
     // A security question must not end up behind other windows while its
     // countdown runs (the main window may be hidden in the tray).
     setWindowFlag(Qt::WindowStaysOnTopHint, true);
+    // Parked in the bottom-right corner (where the toasts live) instead of on top
+    // of whatever the user is looking at. MainWindow registers it with the
+    // ToastNotifier so toasts stack above it rather than over its buttons.
+    setPlacement(Placement::BottomRight);
     setSheetWidth(kCardW);
     setCloseButtonVisible(false); // Esc / Alt+F4 still close — as 拦截, see reject()
     setGlow(risk);
     setEyebrow(u("%1 %2 · 行为防护").arg(evtfmt::riskLevel(e.riskScore)).arg(e.riskScore), risk);
+    // 高危(评分 >= 80,与 evtfmt::riskLevel 同一门槛):抬头那条风险色带持续脉动,
+    // 表达的就是它旁边已经写着的那个分数 —— 不新增任何元素,停下时颜色与原来完全一致。
+    if (e.riskScore >= 80)
+        setPulse(true);
     setTitle(evtfmt::sentence(e, /*present*/ true));
     titleLabel()->setStyleSheet(QStringLiteral("font-size:13pt; font-weight:600; color:%1;")
                                     .arg(theme::textPrimary().name()));
@@ -202,6 +213,22 @@ PromptDialog::PromptDialog(const bulwark::SecurityEvent& event, QWidget* parent,
 
     scroll->setContent(ev);
     body->addWidget(scroll, 1);
+
+    // ── AI 解读:钉在证据滚动区【外面】,和裁决按钮一样始终在屏幕上 ──────────────
+    // 异步到达,到了只更新这一条并让弹窗向上长高;倒计时、默认处置、强调按钮都不因它而变。
+    if (ai && ai->isConfigured() && ai->promptExplainEnabled()) {
+        auto* panel = new AiInsightPanel(AiExplainContext::Prompt);
+        panel->setLoading();
+        body->addWidget(panel);
+        const bool hardIndicator = e.hasThreatIndicator;
+        // receiver = panel:弹窗关掉(随之销毁)后才回来的结论直接丢弃。命中缓存 / 立即失败时
+        // 这里会同步回调,那时弹窗还没显示,不必 refit —— 首次定位量的就是最终内容。
+        ai->explainEvent(e, panel, [this, panel, hardIndicator](const AiExplanation& r) {
+            panel->setResult(r, hardIndicator);
+            if (isVisible())
+                refit();
+        });
+    }
     body->addWidget(ui::hDivider());
 
     // ── the decision ──────────────────────────────────────────────────────────

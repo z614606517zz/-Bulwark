@@ -58,6 +58,15 @@ public:
     struct ForensicFacts {
         bool     trustedSignature = false;  // 等同 isSigned()
         bool     embeddedSignature = false; // 等同 hasEmbeddedSignature();仅在无可信签名时求值
+        //
+        // 内嵌签名的摘要与文件内容【确实不符】—— 也就是「签名之后这个文件被改过」。
+        //
+        // 存在的理由:embeddedSignature && !trustedSignature(即 isSignatureMismatch)把三件
+        // 完全不同的事混成了一个答案 —— ①文件被改过;②这台机器没导入签发者的根证书;
+        // ③文件读不出来(自保护的安全软件、被独占的文件)。只有 ① 是恶意证据,②③ 是环境问题。
+        // 这个字段只在 WinVerifyTrust 明确回 TRUST_E_BAD_DIGEST 时为真,供打分层区分硬 / 软。
+        // 仅在「无可信签名且内嵌了签名」时求值(其余情况恒为 false,不额外验签)。
+        bool     signatureDigestMismatch = false;
         QString  publisher;                 // 等同 tryGetPublisher()
         QString  sha256;                    // 等同 tryComputeSha256()
         CertInfo cert;                      // 等同 getCertInfo();仅在 includeCert 时求值

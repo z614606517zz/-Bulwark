@@ -4,10 +4,8 @@
 #include <QUuid>
 #include <QWidget>
 
+#include "bulwark/models/Enums.h"        // EnforcementOutcome
 #include "bulwark/models/VtScanRecord.h"
-
-namespace bulwark { struct SecurityEvent; }
-struct AiScanResult;
 
 class ElidingLabel;
 class GlowCard;
@@ -24,15 +22,14 @@ class Stepper;
 //           invoice_2026_09.pdf.exe
 //   ①查询 ── ②上传 ── ③分析 ── ④结论                 (VtScanStage)
 //   正在查询中央服务器是否已收录…              预计等待 97 秒
-//   AI 研判 · 大模型正在基于静态特征研判…               (when AI research runs)
 //
 // When the verdict lands it flips to a colour-coded result and auto-closes.
 // 「转到后台」 folds it into a small capsule at the top-right of the screen; the
 // capsule shows the verdict when it arrives and 「查看详情」 unfolds it again.
 //
 // One card is visible at a time; further scans queue ("+2"). Cards are keyed by
-// file path so the VT scan and the AI research of the same double-click share
-// one card. Frameless, translucent, always-on-top, never steals focus.
+// file path so every update for the same file lands on one card.
+// Frameless, translucent, always-on-top, never steals focus.
 class ScanProgressWindow : public QWidget
 {
     Q_OBJECT
@@ -40,8 +37,16 @@ public:
     // Entry points (call on the UI thread). Each finds-or-creates the card for
     // the file and updates it; terminal states schedule an auto-close.
     static void vtUpdate(const bulwark::VtScanRecord& record); // VT scan progress / result
-    static void aiStart(const bulwark::SecurityEvent& event);  // AI research started
-    static void aiResult(const AiScanResult& result);          // AI research finished
+
+    // 处置结果回填(由 BlockNotification 带回的真实 EnforcementOutcome 驱动)。
+    //
+    // 检测与处置是两个阶段:云查给出「恶意」结论时,结束进程树 / 隔离载荷还没做,而且可能
+    // 失败(进程受保护、文件被占用)。所以结论标题只写「检测到威胁」,真正做成了什么由这里补上:
+    //   已拦截 / 已结束进程 / 已禁止加载 -> 「检测到威胁,已处置」(玉髓绿说明行)
+    //   仅告警·未拦截 / 拦截失败         -> 「检测到威胁,未能完全处置」(琥珀 + 需人工处理)
+    // 找不到对应卡片(已关闭 / 不是双击查毒触发的)时静默忽略。
+    static void applyDisposition(const QString& filePath,
+                                 bulwark::EnforcementOutcome enforcement);
 
 protected:
     void mousePressEvent(QMouseEvent*) override;
@@ -65,7 +70,6 @@ private:
     void setQueued(int n);
     void startCountdown();
     void applyVt(const bulwark::VtScanRecord& record);
-    void applyAi(const AiScanResult& result);
     void applyResult(const QColor& accent, const QString& iconName, const QString& title,
                      const QString& status, int autoCloseSecs);
     void beginClose();
@@ -80,8 +84,6 @@ private:
     Stepper* m_steps = nullptr;
     QLabel* m_status = nullptr;     // stage message, then conclusion
     QLabel* m_countdown = nullptr;  // "预计等待 N 秒"
-    QWidget* m_aiRow = nullptr;
-    QLabel* m_aiText = nullptr;
     IconTile* m_miniTile = nullptr;
     ElidingLabel* m_miniText = nullptr; // must stay ElidingLabel*: setText() is not virtual
     QPushButton* m_miniOpen = nullptr;
@@ -92,6 +94,11 @@ private:
     bool m_closing = false;
     bool m_isMini = false;
     bool m_sawUpload = false;
+    // 该卡片的结论是「恶意」——只有这种卡片在等处置结果回填(applyDisposition)。
+    bool m_maliciousVerdict = false;
+    // 恶意结论那一行(含威胁名)。applyDisposition 回填处置时保留它,处置结果另起一行。
+    QString m_verdictText;
+    bool m_dispositionShown = false;  // 已回填过,忽略后续重复通知(同一威胁可能多条)
     QString m_fileName;
     QString m_key;
 };

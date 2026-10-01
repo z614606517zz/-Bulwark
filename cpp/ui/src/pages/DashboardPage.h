@@ -76,8 +76,6 @@ private:
     QLabel* m_statEvents = nullptr;
     QLabel* m_statQuarantine = nullptr;
     QLabel* m_statRules = nullptr;
-    QLabel* m_statAi = nullptr;
-    QLabel* m_statAiCaption = nullptr;
     QGridLayout* m_statsGrid = nullptr;
     QList<QWidget*> m_statCards;
     int m_statCols = 0; // 当前列数(0 = 还没排过)
@@ -101,6 +99,4 @@ private:
     int m_blockedCount = 0;
     int m_eventCount = 0;
     int m_activityRows = 0;
-    int m_aiCount = 0;
-    int m_aiTokens = 0;
 };

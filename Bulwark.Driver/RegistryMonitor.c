@@ -98,6 +98,20 @@ BlwAddRegHardBlock(_In_ PCWSTR Key, _In_ USHORT Length)
 }
 
 //
+// 精确删除一条注册表硬拦项(BLW_CMD_DEL_REGHARD)。返回是否真的删掉了一条。
+//
+// 注意这里【没有】套 BlwPatternHasDriveLetter 那道「带盘符即死条目」的准入校验:
+// 注册表硬拦项匹配的是「键路径\值名」,而注册表值名是允许含 ':' 的,套上去会误拒真实条目。
+// 判据只对文件路径名单成立(见 FileMonitor.c 的 BlwRejectDeadPathPattern)。
+//
+BOOLEAN
+BlwDelRegHardBlock(_In_ PCWSTR Key, _In_ USHORT Length)
+{
+    return BlwRemoveFromGuardedList(g_Blw.RegHardBlock, &g_Blw.RegHardLock,
+                                    &g_Blw.RegHardCount, Key, Length);
+}
+
+//
 // 构造本次注册表操作的匹配目标,并【一次性】大写化。
 //
 // 目标形如 "键路径\值名";无值名、或拼接后装不进 BLW_MAX_PATH 时退化为纯 "键路径"
@@ -243,6 +257,89 @@ BlwRegIsCredentialHive(_In_ PBLW_MATCH_CTX Ctx, _In_ USHORT KeyChars)
 }
 
 //
+// ===== 驱动服务注册的可见面(BYOVD 的唯一「加载之前」观测点)=====
+//
+// 【为什么必须在这里看】FileNoLoad 名单对 .sys 恒不生效:驱动映像由内核自己
+// (MmLoadSystemImage)打开,Data->RequestorMode == KernelMode,而 BlwPreCreate 第一句就对
+// 内核态 I/O 放行 —— 那条判定压根不会执行。而 ImageMonitor 的 PsSetLoadImageNotifyRoutine
+// 是【通知型】,内核 API 本身不支持阻止,拿到通知时模块已经映射进去了。
+//
+// 但 BYOVD 有一个必经的前置步骤:要让 ZwLoadDriver 能加载一个驱动,得先在
+// \REGISTRY\MACHINE\SYSTEM\ControlSetNNN\Services\<名字> 下写出 ImagePath(与 Type=1)。
+// 那一步走的是普通用户态注册表写,【经过本回调】,而且发生在加载之前。所以这里是目前
+// 唯一能让用户态在「易受攻击的驱动真正进内核」之前看到它的地方。
+//
+// 本判定【只上报、不拦截】,这是刻意的:合法的驱动安装(杀软、虚拟化、外设、Windows 自身
+// 的服务安装)走的是同一条路,在内核按路径判「该不该注册驱动」必然误伤 —— klids.sys 那次
+// 误报就是这么来的(卡巴斯基的驱动落在 \ProgramData\ 下,被「可写目录加载驱动」规则拦了)。
+// 定性归用户态:它有签名校验、情报、缓存与弹窗。
+//
+// 【为什么不顺手把 ImagePath 的值读出来一起上报】REG_SET_VALUE_KEY_INFORMATION::Data 指向的
+// 可能是调用方(用户态)的缓冲,要安全读取就得 ProbeForRead + __try/__except。那是在注册表
+// 回调里新增一处可能出错的解引用,而收益只是省掉用户态回读一次注册表 —— 不划算。
+// 服务键在事件之后仍然存在,用户态照样读得到 ImagePath。
+//
+// 键路径匹配必须同时覆盖 CurrentControlSet 与 ControlSetNNN:内核给出的规范化键路径通常是
+// \REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\...(CurrentControlSet 是符号链接,已被解析)。
+// 故判据写成「以 \REGISTRY\MACHINE\SYSTEM\ 开头 且 含 \SERVICES\ 」,两种形式都能覆盖。
+//
+
+// 值名是否精确等于给定字面量(大小写不敏感)。Literal 必须是【大写】字面量。
+static BOOLEAN
+BlwRegValueNameIs(_In_opt_ PCUNICODE_STRING ValueName,
+                  _In_ PCWSTR Literal, _In_ USHORT LiteralChars)
+{
+    USHORT i;
+
+    if (ValueName == NULL || ValueName->Buffer == NULL) {
+        return FALSE;
+    }
+    if ((USHORT)(ValueName->Length / sizeof(WCHAR)) != LiteralChars) {
+        return FALSE;
+    }
+    for (i = 0; i < LiteralChars; i++) {
+        if (BlwUpcaseChar(ValueName->Buffer[i]) != Literal[i]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOLEAN
+BlwRegIsServiceKey(_In_ PBLW_MATCH_CTX Ctx, _In_ USHORT KeyChars)
+{
+    static const WCHAR kSysRoot[] = L"\\REGISTRY\\MACHINE\\SYSTEM";
+    const USHORT rootChars = (USHORT)(RTL_NUMBER_OF(kSysRoot) - 1);
+
+    PCWSTR  buf;
+    USHORT  chars;
+    BOOLEAN prepared;
+
+    if (Ctx == NULL) {
+        return FALSE;
+    }
+
+    if (Ctx->Chars != 0) {
+        buf = Ctx->Up;
+        chars = (KeyChars != 0 && KeyChars <= Ctx->Chars) ? KeyChars : Ctx->Chars;
+        prepared = TRUE;
+    } else if (Ctx->Original != NULL && Ctx->Original->Buffer != NULL &&
+               Ctx->Original->Length > 0) {
+        buf = Ctx->Original->Buffer;
+        chars = (USHORT)(Ctx->Original->Length / sizeof(WCHAR));
+        prepared = FALSE;
+    } else {
+        return FALSE;
+    }
+
+    if (!BlwRegPathUnder(buf, chars, prepared, kSysRoot, rootChars)) {
+        return FALSE;
+    }
+    // BlwWideContainsCI 自带大小写归一化,已大写化的 buf 走它也完全正确(幂等)。
+    return BlwWideContainsCI(buf, chars, L"\\Services\\");
+}
+
+//
 // CompleteName(RegNtPreCreateKeyEx)是否已经是绝对注册表路径。
 // 绝对时直接用它做匹配目标;相对时需要拼在根键路径之后(见调用点)。
 //
@@ -360,7 +457,8 @@ BlwRegDecide(
     _In_ PCUNICODE_STRING ReportKey,
     _In_opt_ PCUNICODE_STRING ReportValue,
     _In_ BOOLEAN HardOnly,
-    _In_ BOOLEAN BuiltinHive)
+    _In_ BOOLEAN BuiltinHive,
+    _In_ BOOLEAN SvcRegWatch)
 {
     //
     // 1) 内置凭据 hive(仅 SaveKey 传 BuiltinHive=TRUE):零配置、恒生效的内核硬拦。
@@ -378,6 +476,18 @@ BlwRegDecide(
     if (g_Blw.RegHardCount > 0 && BlwRegIsHardBlocked(Ctx)) {
         BlwReportRegOp(EventType, ReportKey, ReportValue);
         return STATUS_ACCESS_DENIED;
+    }
+
+    //
+    // 2.5) 驱动服务注册(写 Services\<名字>\ImagePath)-> 仅【异步上报】,绝不拦截。
+    //      这是 BYOVD 在「易受攻击的驱动真正进内核」之前唯一会经过的观测点,理由与
+    //      「为什么不在内核定性」都写在 BlwRegIsServiceKey 上方。
+    //      不依赖任何用户态下发的名单(与内置凭据 hive 同理),故服务未连接时也照样产生遥测;
+    //      BlwReportRegOp 内部自带 Active 判空,无客户端时自动跳过发送。
+    //
+    if (SvcRegWatch && BlwRegIsServiceKey(Ctx, KeyChars)) {
+        BlwReportRegOp(EventType, ReportKey, ReportValue);
+        return STATUS_SUCCESS;   // 已上报过一次,不让第 3 级再重复上报同一条
     }
 
     //
@@ -410,6 +520,7 @@ BlwRegistryCallback(
     BOOLEAN interesting = FALSE;
     BOOLEAN hardOnly = FALSE;      // TRUE = 只参与硬拦匹配,跳过软监控上报(避免事件风暴)
     BOOLEAN builtinHive = FALSE;   // TRUE = 额外走内置凭据 hive 硬拦(零配置、恒生效)
+    BOOLEAN svcReg = FALSE;        // TRUE = 本次是写 Services\*\ImagePath(驱动服务注册,BYOVD 前置步骤)
 
     UNREFERENCED_PARAMETER(CallbackContext);
 
@@ -436,6 +547,13 @@ BlwRegistryCallback(
         valueName = info->ValueName;
         eventType = BlwEventRegistrySetValue;
         interesting = TRUE;
+        //
+        // 驱动服务注册的前置判断:先只看【值名】—— 这一步不需要解析键路径,是纯字符串比较,
+        // 因此放在这里几乎零成本。只有值名恰好是 ImagePath 时才在下面强制解析键路径
+        // (做法与 builtinHive 完全一致)。写 ImagePath 是安装/注册服务时才有的动作,极低频,
+        // 不会像「对 \Services 宽子串上报」那样形成事件风暴。
+        //
+        svcReg = BlwRegValueNameIs(valueName, L"IMAGEPATH", 9);
         break;
     }
     case RegNtPreDeleteValueKey:
@@ -582,7 +700,9 @@ BlwRegistryCallback(
     // 否则服务未启动 / 策略为空时 `reg save HKLM\SAM` 就放过去了,那正是自足基线要杜绝的情形。
     // SaveKey 本身是极低频操作,恒解析没有性能代价。
     //
-    if (!builtinHive && g_Blw.ProtectedRegCount == 0 && g_Blw.RegHardCount == 0) {
+    // 例外 svcReg(写 Services\*\ImagePath):同样不依赖用户态名单 —— 它是 BYOVD 在加载之前
+    // 唯一的观测点,策略为空时也必须产生遥测。写 ImagePath 是极低频动作,恒解析没有性能代价。
+    if (!builtinHive && !svcReg && g_Blw.ProtectedRegCount == 0 && g_Blw.RegHardCount == 0) {
         return STATUS_SUCCESS;
     }
     // CreateKeyEx 只参与硬拦匹配(hardOnly),无硬拦名单时零开销放行 —— 不必为它解析根键路径。
@@ -604,7 +724,7 @@ BlwRegistryCallback(
 
         BlwPrepareRegMatch(&ctx, completeName, NULL, &keyChars);
         return BlwRegDecide(&ctx, keyChars, eventType, completeName, NULL,
-                            hardOnly, builtinHive);
+                            hardOnly, builtinHive, svcReg);
     }
 
     if (BlwGetKeyPath(regObject, &keyPath)) {
@@ -618,7 +738,7 @@ BlwRegistryCallback(
 
         decision = BlwRegDecide(&ctx, keyChars, eventType, keyPath,
                                 completeName != NULL ? completeName : valueName,
-                                hardOnly, builtinHive);
+                                hardOnly, builtinHive, svcReg);
 
         CmCallbackReleaseKeyObjectIDEx(keyPath);
         return decision;

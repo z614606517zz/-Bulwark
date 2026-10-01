@@ -4,12 +4,14 @@
 #include "design/Backdrop.h"
 #include "design/Banner.h"
 #include "design/Components.h"
+#include "design/Confirm.h"
 #include "design/GlowCard.h"
 #include "design/IconTile.h"
 #include "design/Icons.h"
 #include "design/Identity.h"
 #include "design/Motion.h"
 #include "design/NavButton.h"
+#include "design/PageTransition.h"
 #include "design/Theme.h"
 #include "dialogs/PromptDialog.h"
 #include "dialogs/RemediationReportDialog.h"
@@ -20,6 +22,7 @@
 #include "pages/CardPages.h"
 #include "pages/TablePages.h"
 #include "pages/DashboardPage.h"
+#include "voice/VoiceAnnouncer.h"
 #include "widgets/ElidingLabel.h"
 
 #include "bulwark/Version.h"
@@ -32,7 +35,6 @@
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QDialog>
-#include <QFileInfo>
 #include <QFrame>
 #include <QHash>
 #include <QHBoxLayout>
@@ -308,8 +310,6 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
             pages::persistence(m_ipc));
     addPage(nav::Reputation, u("情报"), "cloud", u("云信誉"), u("云信誉"), u("多引擎哈希信誉查询"),
             pages::reputation(m_ipc));
-    addPage(nav::Ai, QString(), "sparkles", u("AI 研判"), u("AI 研判"), u("大模型行为研判"),
-            pages::aiScan(m_ipc));
     addPage(nav::Settings, QString(), "settings", u("设置"), u("设置"), u("防护与情报配置"),
             pages::settings(m_ipc), /*pinned*/ true);
 
@@ -325,8 +325,10 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
     auto* find = new QShortcut(QKeySequence::Find, this);
     connect(find, &QShortcut::activated, this, &MainWindow::focusPageSearch);
 
-    // Corner toast notifications (block / AI-scan) + the system tray presence.
+    // Corner toast notifications (block / attack chain) + the system tray presence.
     m_toasts = new ToastNotifier(this);
+    // 拦截通知里的「AI 解读」与行为询问共用同一个大模型客户端(同一份缓存、同一个限速闸)。
+    m_toasts->setAiScanner(m_ipc->aiScanner());
     connect(m_toasts, &ToastNotifier::blockToastClicked, this, [this] {
         showFromTray();
         navigateTo(nav::Events, {{QStringLiteral("segment"), QStringLiteral("block")}});
@@ -336,17 +338,21 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
         showFromTray();
         navigateTo(nav::Chain);
     });
+    // 语音播报拦截结果(设置页开关,默认关)。只接拦截通知真正弹出的这两处,询问 / 放行 / 攻击链 /
+    // 云查杀一概不接 —— 念的与右下角看到的逐条对应,开关关着时播报器自己什么都不做。
+    connect(m_toasts, &ToastNotifier::blockPresented, VoiceAnnouncer::instance(), &VoiceAnnouncer::announceBlock);
+    connect(m_toasts, &ToastNotifier::blockBatchPresented, VoiceAnnouncer::instance(),
+            &VoiceAnnouncer::announceBatch);
     setupTray();
 
     // Live named-pipe link to the service. Drives the status card, pops the
     // behavior prompt when a verdict is needed, and raises toast notifications
-    // for outright blocks and AI-scan research. (m_ipc was created above so the
+    // for outright blocks and attack-chain hits. (m_ipc was created above so the
     // pages could bind to it; we connect the window-level slots and start here.)
     connect(m_ipc, &IpcClient::connectionChanged, this, &MainWindow::setConnected);
     connect(m_ipc, &IpcClient::promptReceived, this, &MainWindow::onPromptReceived);
     connect(m_ipc, &IpcClient::blockNotification, this, &MainWindow::onBlockNotification);
     connect(m_ipc, &IpcClient::attackChainHit, this, &MainWindow::onAttackChainHit);
-    connect(m_ipc, &IpcClient::aiScanStarted, this, &MainWindow::onAiScanStarted);
     connect(m_ipc, &IpcClient::remediationReport, this, &MainWindow::onRemediationReport);
     // 未读角标:新拦截(事件记录)。只数真正进入「拦截」分段的记录(裁决为拦截)。
     connect(m_ipc, &IpcClient::eventLogReceived, this, [this](const bulwark::ipc::EventLogPayload& p) {
@@ -361,14 +367,48 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                 m_defaultBlock = s.defaultBlock;
                 // 防护状态卡的真实数据来源(原先右上角那个标签是写死的绿色"防护开启")。
                 m_protectionEnabled = s.protectionEnabled;
+                m_protectionFollowsUi = s.protectionFollowsUi;
+                //
+                // 【K2 内核防护降级/恢复的角落通知】
+                //
+                // 这一条此前一直被挂着,理由写的是「需要新增 IPC 消息类型」—— 那个判断是错的。
+                // 服务侧在每次内核状态迁移时就已经 sendSettings()(见 main.cpp 的
+                // recordKernelState),而这个 lambda 正好收到它。所以 K2 只需要在这里认出
+                // 【状态发生了变化】,零新增 IPC 表面、零新增消息号、不碰 IpcMessageType.h。
+                //
+                // 三点必须做对:
+                //   ① 只在【迁移】时提示,不是每次 settings 推送都提示。服务会因为很多原因
+                //      推设置(用户改配置、周期性刷新),不比较前值的话,无内核的机器每次推送
+                //      都弹一次,几分钟后用户就学会无视它 —— 那等于把这条通知作废。
+                //   ② 首次收到设置【不提示】。那是启动时的既有状态,不是刚刚发生的变化;
+                //      不然每次开 UI 都会在无内核机器上弹一个「刚刚降级」的假消息。
+                //   ③ 文案带上 kernelStatus。它现在装的是 2.5 的能力矩阵摘要
+                //      (「生效 7/13 个维度:…;未生效:…」),所以用户看到的不是干巴巴一句
+                //      「驱动掉了」,而是【还剩什么、少了什么】—— 这才是这条通知的价值所在。
+                //
+                // 刻意不看静默模式:静默模式的语义是「不要为决策打扰我」,而这是告知防护能力
+                // 变化,不是向用户提问(与服务侧 recordKernelState 里同一条理由)。
+                const bool hadSettings = m_haveSettings;
+                const bool wasConnected = m_kernelConnected;
                 m_kernelConnected = s.kernelConnected;
                 m_kernelStatus = s.kernelStatus;
                 m_haveSettings = true;
+                if (hadSettings && wasConnected != m_kernelConnected && m_toasts) {
+                    const QString detail = m_kernelStatus.isEmpty()
+                        ? u("请在「设置」里查看当前防护档位。")
+                        : m_kernelStatus;
+                    if (!m_kernelConnected) {
+                        // 降级那一侧给更长的停留时间:它是用户真正需要读完的那一条。
+                        m_toasts->showInfo(u("内核驱动已断开 · 防护已降级"), detail, 12000);
+                    } else {
+                        m_toasts->showInfo(u("内核驱动已连接 · 行为前拦截恢复"), detail, 6000);
+                    }
+                }
                 refreshProtectionPill();
+                refreshQuitAction();   // 托盘「退出」项的文案取决于 protectionFollowsUi
             });
     // Centered "cloud scan in progress" card (ports the .NET AiScanToastWindow):
-    // VT double-click/dropped-payload scans push live progress + verdict here, and
-    // the AI research result finalizes the same card.
+    // VT double-click/dropped-payload scans push live progress + verdict here.
     connect(m_ipc, &IpcClient::vtScanUpdate, this,
             [this](const bulwark::VtScanRecord& r) {
                 ScanProgressWindow::vtUpdate(r);
@@ -382,35 +422,35 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent)
                     pages::showVtDetailWindow(this, r, m_ipc, 30000);
                 }
             });
-    connect(m_ipc, &IpcClient::aiScanRecord, this,
-            [](const AiScanResult& r) { ScanProgressWindow::aiResult(r); });
+    // 重试隔离的回执走右下角 toast,不走托盘气泡(原因见 ToastNotifier::showQuarantineRetry 的声明处)。
     connect(m_ipc, &IpcClient::manualQuarantineResult, this,
             [this](const bulwark::ipc::ManualQuarantineResultPayload& r) {
-                if (m_tray && QSystemTrayIcon::isSystemTrayAvailable())
-                    m_tray->showMessage(u("重试隔离"), r.message,
-                                        r.success ? QSystemTrayIcon::Information : QSystemTrayIcon::Warning, 4000);
+                if (m_toasts)
+                    m_toasts->showQuarantineRetry(r);
             });
 
-    // 「启动后自动检查」的结果落在这里。刻意只弹一次托盘气泡,不自动打开弹窗、更不自动下载:
+    // 「启动后自动检查」的结果落在这里。刻意只弹一次右下角通知,不自动打开弹窗、更不自动下载:
     // 更新会替换内核驱动,那必须由用户按下按钮才发生。
     //
     // 三道抑制,针对的都是「变成骚扰」这一个失败形态:
     //   查失败 / 没有新版本 -> 什么都不说。用户没主动问,就不该被告知「检查失败了」。
-    //   弹窗正开着          -> 那是用户自己点的检查,结论已经写在弹窗里,再弹气泡是噪音。
+    //   弹窗正开着          -> 那是用户自己点的检查,结论已经写在弹窗里,再弹通知是噪音。
     //   本会话已经弹过      -> 服务端每个生命周期只自动查一次,但界面可能重连,不设闸门
     //                          就会每次重连都弹一遍。
     connect(m_ipc, &IpcClient::updateCheckReceived, this,
             [this](const bulwark::ipc::UpdateCheckResponsePayload& p) {
                 if (!p.ok || !p.available) return;
                 if (UpdateDialog::isAnyOpen()) return;
-                if (m_updateBalloonShown) return;
-                if (!m_tray || !QSystemTrayIcon::isSystemTrayAvailable()) return;
-                m_updateBalloonShown = true;
-                m_tray->showMessage(
+                if (m_updateNoticeShown) return;
+                if (!m_toasts) return;
+                m_updateNoticeShown = true;
+                // 右下角 toast 而不是托盘气泡:气泡由 Windows 按系统主题绘制,浅色主题下是一张
+                // 白卡,和本程序的深色通知混在同一个角落(见 ToastNotifier::showRemediation)。
+                m_toasts->showInfo(
                     u("有新版本 ") + p.version,
                     u("当前 ") + p.currentVersion
                         + u("。在「设置 > 关于与更新」里查看更新说明并安装。"),
-                    QSystemTrayIcon::Information, 6000);
+                    6000);
             });
 
     // 中央信誉服务在线状态:连接后 + 每 30s 探测一次(source=ReputationProxy 定向探测代理
@@ -594,6 +634,10 @@ QWidget* MainWindow::buildContent()
 
     m_stack = new QStackedWidget;
     v->addWidget(m_stack, 1);
+
+    // Page changes cross-fade on snapshots of this area (design/PageTransition):
+    // the header cross-fades, the old page fades out, the new one fades in rising.
+    m_pageFx = new PageTransition(content, top, {m_banners, m_stack});
     return content;
 }
 
@@ -662,11 +706,17 @@ void MainWindow::onNavClicked(int index)
 {
     if (index < 0 || index >= m_stack->count())
         return;
+    const bool changing = index != m_stack->currentIndex();
+    // Cross-fade the content area over a snapshot of the page being left. Started
+    // before anything changes; it degrades to an instant switch on its own when the
+    // change couldn't be seen (see PageTransition).
+    const bool fading = changing && m_pageFx && m_pageFx->start();
     // Banners report on what was just done on the page being left (and failures
     // are sticky): carried over they would sit, out of context, on top of the next
-    // page — "无法添加规则" above the dashboard.
-    if (index != m_stack->currentIndex() && m_banners)
-        m_banners->clear();
+    // page — "无法添加规则" above the dashboard. While fading they are already on
+    // the outgoing snapshot, so they go at once instead of fading twice.
+    if (changing && m_banners)
+        m_banners->clear(/*animated*/ !fading);
     m_stack->setCurrentIndex(index);
     m_titleTile->set(m_pageIcons.value(index), m_pageHues.value(index, theme::accent()));
     m_title->setText(m_titles.value(index));
@@ -824,8 +874,15 @@ void MainWindow::onPromptReceived(const bulwark::SecurityEvent& event)
     // Arm the auto-decision countdown from the live settings: if the user doesn't
     // respond within PromptTimeoutSeconds, close with the default policy
     // (defaultBlock ? 拦截 : 放行) so a prompt never lingers forever.
-    PromptDialog dlg(event, this, m_promptTimeoutSeconds, !m_defaultBlock);
+    // AI 解读(配置了大模型且没关掉时)由弹窗自己异步去取,只给人看,不影响这里拿回的裁决。
+    PromptDialog dlg(event, this, m_promptTimeoutSeconds, !m_defaultBlock, m_ipc->aiScanner());
+    // The prompt sits in the bottom-right corner, the toasts' corner: have them
+    // stack above it so a block toast never covers the 拦截 / 放行 buttons.
+    if (m_toasts)
+        m_toasts->reserveCorner(&dlg);
     dlg.exec();
+    if (m_toasts)
+        m_toasts->releaseCorner(&dlg);
     const auto action = dlg.allowed() ? bulwark::VerdictAction::Allow
                                       : bulwark::VerdictAction::Block;
     m_ipc->sendVerdict(event.id, action, dlg.remember(),
@@ -919,10 +976,15 @@ void MainWindow::pingReputation()
     m_ipc->vtQuery(p);
 }
 
-void MainWindow::onBlockNotification(const bulwark::SecurityEvent& event)
+void MainWindow::onBlockNotification(const bulwark::SecurityEvent& event,
+                                     bulwark::EnforcementOutcome enforcement)
 {
+    // 真实处置结果直接透给 toast —— 它据此决定说「已拦截」还是「仅告警·未拦截 / 拦截失败」。
     if (m_toasts)
-        m_toasts->showBlock(event);
+        m_toasts->showBlock(event, enforcement);
+    // 同一个文件如果正开着云查卡片(双击查毒 / 释放载荷),把处置结果补进那张卡:
+    // 卡片此前只会写「检测到威胁,已处置」,而处置成没成它根本不知道。
+    ScanProgressWindow::applyDisposition(event.actorPath, enforcement);
 }
 
 void MainWindow::onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit)
@@ -933,13 +995,6 @@ void MainWindow::onAttackChainHit(const bulwark::ipc::AttackChainHitPayload& hit
     if (m_toasts)
         m_toasts->showAttackChain(hit);
     bumpBadge(nav::Chain);
-}
-
-void MainWindow::onAiScanStarted(const bulwark::SecurityEvent& event)
-{
-    // Centered progress card (with countdown) instead of the old one-shot corner
-    // toast — matches the .NET experience and pairs with the VT scan updates.
-    ScanProgressWindow::aiStart(event);
 }
 
 void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayload& report)
@@ -963,17 +1018,13 @@ void MainWindow::onRemediationReport(const bulwark::ipc::RemediationReportPayloa
     }
 
     // Surface the "footprint cleanup" transparently: what was quarantined/removed,
-    // and how many items couldn't be cleaned. Shown as a tray balloon (the report
-    // detail also rides the event/audit log on the service side).
-    const QString name = QFileInfo(report.actorPath).fileName();
-    QString body = u("%1:隔离 %2 文件 · 移除 %3 持久化")
-                       .arg(name.isEmpty() ? report.reason : name)
-                       .arg(report.quarantinedFiles.size())
-                       .arg(report.removedRegistryValues.size());
-    if (!report.skipped.isEmpty())
-        body += u(" · %1 项未清理").arg(report.skipped.size());
-    if (m_tray && QSystemTrayIcon::isSystemTrayAvailable())
-        m_tray->showMessage(u("已清理恶意足迹"), body, QSystemTrayIcon::Information, 5000);
+    // and how many items couldn't be cleaned (the report detail also rides the
+    // event/audit log on the service side). A corner toast, not a tray balloon:
+    // Windows draws balloons itself in the *system* theme — a white card in light
+    // mode, wedged between our dark toasts in the same corner. Wording (已清理 /
+    // 部分清理 / 未能清理, by what was really cleaned) lives in ToastNotifier.
+    if (m_toasts)
+        m_toasts->showRemediation(report);
 
     // 完整报告卡片:主体 / 判定 / 已隔离项 / 未能清理项(文件可一键重试强制隔离)。
     // 非模态,不打断用户;自身带滚动区与关闭按钮。
@@ -1007,15 +1058,18 @@ void MainWindow::setupTray()
     auto* actScan = menu->addAction(u("立即扫描"));
     menu->addSeparator();
     // 措辞必须与实际行为一致。原来叫「退出磐垒防护」,而它真的会去停服务 + 卸驱动;
-    // 现在退出只关界面、防护继续常驻(见 quitApp 的说明),所以名字也要如实说明。
-    auto* actQuit = menu->addAction(u("退出界面(防护继续运行)"));
-    actQuit->setToolTip(u("仅关闭界面,后台防护保持运行。如需停用防护请在「设置」中关闭总开关。"));
+    // 后来退出只关界面、防护继续常驻,所以改成了如实说明。
+    // 现在这句话【取决于设置】(「退出界面即停止防护」),所以文案也必须随之变 ——
+    // 一个固定写着「防护继续运行」的菜单项,在那个开关打开之后就是谎报。见 refreshQuitAction。
+    m_actQuit = menu->addAction(QString());
     connect(actShow, &QAction::triggered, this, &MainWindow::showFromTray);
+    // 「立即扫描」落到云信誉页:那里可以选择 / 拖入文件做云端查毒。
     connect(actScan, &QAction::triggered, this, [this] {
         showFromTray();
-        navigateTo(nav::Ai);
+        navigateTo(nav::Reputation);
     });
-    connect(actQuit, &QAction::triggered, this, &MainWindow::quitApp);
+    connect(m_actQuit, &QAction::triggered, this, &MainWindow::quitApp);
+    refreshQuitAction();
     m_tray->setContextMenu(menu);
 
     connect(m_tray, &QSystemTrayIcon::activated, this,
@@ -1029,14 +1083,15 @@ void MainWindow::setupTray()
     refreshProtectionPill(); // 托盘刚建好:把当前已知状态写进它的提示文字
 
     // First appearance: point the user at the tray. Windows usually folds a new
-    // app's icon into the overflow ("^") flyout, so a one-time balloon helps them
-    // locate it (and learn the window minimises here instead of quitting).
-    if (!m_trayBalloonShown) {
-        m_trayBalloonShown = true;
-        m_tray->showMessage(
+    // app's icon into the overflow ("^") flyout, so a one-time notice helps them
+    // locate it (and learn the window minimises here instead of quitting). A corner
+    // toast, not a tray balloon: Windows draws balloons in the *system* theme.
+    if (!m_trayIntroShown && m_toasts) {
+        m_trayIntroShown = true;
+        m_toasts->showInfo(
             u("磐垒主动防御 · 防护运行中"),
             u("图标已在系统托盘。若未看到,请点任务栏通知区的 ‘^’ 展开;双击图标可打开主界面。"),
-            QSystemTrayIcon::Information, 6000);
+            6000);
     }
 }
 
@@ -1049,18 +1104,58 @@ void MainWindow::showFromTray()
     clearViewedBadge();
 }
 
+// 托盘「退出」项的文案 + 提示。它说的话必须与【当前设置下真会发生的事】一致,所以每次
+// 收到服务推来的设置都要重算一次(见 settingsReceived 里的调用)。
+//
+// 这不是措辞洁癖:这一项是用户唯一的退出入口,而两种模式的后果差别极大(防护继续 / 防护全停)。
+// 固定文案在其中一种模式下必然是错的,而用户恰恰是照着它做决定的。
+void MainWindow::refreshQuitAction()
+{
+    if (!m_actQuit)
+        return;
+    // 设置还没回来时按「未知」说话:不替防护作保,也不吓用户。与防护状态卡同一条原则。
+    if (!m_haveSettings) {
+        m_actQuit->setText(u("退出界面"));
+        m_actQuit->setToolTip(u("尚未连上后台服务,无法确认退出后防护是否继续运行。"));
+        return;
+    }
+    if (m_protectionFollowsUi) {
+        m_actQuit->setText(u("退出(防护同时停止)"));
+        m_actQuit->setToolTip(u("已开启「退出界面即停止防护」:退出后事件监控与处置全部停止,"
+                               "内核驱动也会被卸载。要让防护常驻,请在「设置 → 防护总控」里关掉该项。"));
+    } else {
+        m_actQuit->setText(u("退出界面(防护继续运行)"));
+        m_actQuit->setToolTip(u("仅关闭界面,后台防护保持运行。"
+                               "想让防护随界面一起停,可在「设置 → 防护总控」里开启"
+                               "「退出界面即停止防护」。"));
+    }
+}
+
 void MainWindow::quitApp()
 {
-    // 【退出界面 ≠ 关闭防护】
+    // 【退出界面是否等于关闭防护,由设置决定】
     //
-    // 原实现在这里调 bootstrap::shutdownBackend() —— 那个函数会 stop BulwarkService
-    // 并 unload 内核驱动。也就是说用户从托盘点一下"退出",整台机器的防护就没了,而这是
-    // 除"关到托盘"以外【唯一】的退出路径。这正是「服务无法常驻、关掉就失效」的直接原因:
-    // 界面是前台程序,用户关它是常事;防护是后台常驻服务,不该跟着前台程序一起死。
+    // 更早的实现在这里调 bootstrap::shutdownBackend():用户从托盘点一下"退出",整台机器的防护
+    // 就没了,而这是除"关到托盘"以外唯一的退出路径 —— 界面是前台程序,用户关它是常事,防护
+    // 不该跟着前台程序一起死。所以那条路被去掉了,退出只关界面。
     //
-    // 杀毒/HIPS 的通行语义是:关掉主界面,引擎继续在后台跑。要真正停用防护,得走
-    // 「设置」里的防护总开关(可撤销)或卸载程序(彻底移除)—— 两条路都还在,
-    // 「随时可停、可卸」这条底线不受影响,只是不再由"关窗口"这个动作误触发。
+    // 现在这件事变成【用户可选】的(设置 → 防护总控 →「退出界面即停止防护」,默认关)。
+    // 实现上界面【什么都不做】:它是 asInvoker,既停不了 LocalSystem 的服务也卸不了驱动,
+    // 硬要做就得每次退出弹一次 UAC。真正的动作由服务侧做 —— 它把管道断开当作「界面已退出」
+    // 的事实来源(见 main.cpp 的 applyProtectionLifetime)。所以这里只需要:选了那个模式时,
+    // 把后果当面说清再退,而不是让用户点完才发现防护没了。
+    if (m_protectionFollowsUi && m_haveSettings) {
+        ui::ConfirmSpec c;
+        c.risk = ui::Risk::Caution;
+        c.title = u("退出并停止防护");
+        c.summary = u("你开启了「退出界面即停止防护」,所以退出后本软件不再提供任何防护。");
+        c.consequences << u("事件监控与处置停止,内核驱动会被卸载")
+                       << u("重新打开本程序即恢复全部防护")
+                       << u("只想收起窗口的话,点右上角关闭即最小化到托盘,防护照常运行");
+        c.confirmText = u("退出并停止防护");
+        if (!ui::confirm(this, c))
+            return;
+    }
     m_forceQuit = true;
     qApp->quit();
 }
@@ -1072,12 +1167,18 @@ void MainWindow::closeEvent(QCloseEvent* event)
     if (!m_forceQuit && m_tray && QSystemTrayIcon::isSystemTrayAvailable()) {
         hide();
         event->ignore();
-        if (!m_trayHintShown) {
+        if (!m_trayHintShown && m_toasts) {
             m_trayHintShown = true;
-            m_tray->showMessage(
+            // 「最小化到托盘 = 防护照常」在两种模式下都成立(托盘里管道还连着,服务不会待机),
+            // 所以这句话本身没问题;但开了「退出界面即停止防护」时,用户最需要知道的是
+            // 「收起 ≠ 退出」这个区别 —— 否则他会以为点了关闭就已经停掉防护了。
+            m_toasts->showInfo(
                 u("磐垒仍在后台防护"),
-                u("已最小化到系统托盘,防护持续运行。右键托盘图标可退出。"),
-                QSystemTrayIcon::Information, 4000);
+                m_protectionFollowsUi && m_haveSettings
+                    ? u("已最小化到系统托盘,防护持续运行 —— 收起窗口不算退出。"
+                        "要连防护一起停,请右键托盘图标选「退出」。")
+                    : u("已最小化到系统托盘,防护持续运行。右键托盘图标可退出。"),
+                4000);
         }
         return;
     }

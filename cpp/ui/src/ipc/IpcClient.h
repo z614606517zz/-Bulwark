@@ -17,14 +17,13 @@
 class QLocalSocket;
 class QTimer;
 class AiScanner;
-class AiScanHistoryStore;
 
 // UI-side named-pipe client. Connects to the service's control pipe
 // ("Bulwark.Control"), performs the Hello handshake, reads newline-delimited
 // JSON frames and re-emits them as Qt signals. Auto-reconnects. Event-driven
 // (QLocalSocket) — no background thread, unlike the .NET blocking loop.
 //
-// Beyond the push channel (prompt / block / ai-scan / log), this now speaks the
+// Beyond the push channel (prompt / block / log), this now speaks the
 // full request/response protocol so the management pages bind to live service
 // data: rules, trust, settings, quarantine, persistence audit, VT history and
 // ThreatFox intel. Each request has a matching *Received signal.
@@ -83,21 +82,20 @@ public:
     void vtDetail(const QString& sha256); // 按需拉取某哈希的 VT 完整报告(云信誉详情弹窗)
     void intelRefresh(bool previewOnly);
     void intelApply(const QList<bulwark::DefenseRule>& rules);
-    void aiScanFile(const QString& path);          // manual AI research of a chosen file
     void aiGenerateRules(const QString& request);  // natural-language -> suggested rules (UI-side)
 
-    // Persisted AI research history (newest first). AI scans run UI-side, so this
-    // is where the "AI 研判" page backfills its records across restarts.
+    // UI-side AI client shared by 「AI 生成规则」, 「AI 清理」 and the behavior prompt's
+    // 「AI 解读」 (config synced from live settings).
     AiScanner* aiScanner() const { return m_ai; }
-    QList<AiScanResult> aiScanHistory() const;
-    void clearAiScanHistory();         // 清空 UI 侧 AI 研判历史(落盘同步清空)
 
 signals:
     void connectionChanged(bool connected);
     // Push channel.
     void promptReceived(const bulwark::SecurityEvent& event);
-    void blockNotification(const bulwark::SecurityEvent& event);
-    void aiScanStarted(const bulwark::SecurityEvent& event);
+    // 已拦截通知。enforcement 是服务端【执行完处置之后】的真实结果,拦截 toast 的措辞
+    // 与配色全靠它:裁决 Block 不等于拦住了(AlertedOnly = 什么都没拦下、Failed = 没杀成)。
+    void blockNotification(const bulwark::SecurityEvent& event,
+                           bulwark::EnforcementOutcome enforcement);
     void logReceived(const QString& line);
     void eventLogReceived(const bulwark::ipc::EventLogPayload& entry);
     void eventHistoryReceived(const QList<bulwark::ipc::EventLogPayload>& events);
@@ -129,7 +127,6 @@ signals:
     void vtDetailReceived(const bulwark::ipc::VtDetailResponsePayload& detail); // VT 完整报告
     void vtHistoryReceived(const QList<bulwark::VtScanRecord>& records);
     void intelResult(const bulwark::ipc::IntelRefreshResultPayload& result);
-    void aiScanRecord(const AiScanResult& result); // a completed AI research (auto or manual)
     void aiRulesSuggested(const QList<AiSuggestedRule>& rules); // NL -> suggested rules for review
 
 private slots:
@@ -146,6 +143,5 @@ private:
     QTimer* m_reconnect = nullptr;
     QByteArray m_buf;
     bool m_connected = false;
-    AiScanner* m_ai = nullptr; // UI-side AI research client (config from live settings)
-    AiScanHistoryStore* m_aiHistory = nullptr; // persisted AI research records (UI-side)
+    AiScanner* m_ai = nullptr; // UI-side AI client (rule generation / cleanup script / prompt reading)
 };

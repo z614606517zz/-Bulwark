@@ -99,6 +99,8 @@ QStringList conditionChips(const DefenseRule& r)
     if (!r.parentPattern.isEmpty())      c << u("父进程 ") + r.parentPattern;
     if (r.requireUnsigned)               c << u("仅无签名");
     if (r.requireSigned)                 c << u("需有效签名");
+    if (r.requireTargetUnsigned)         c << u("目标无签名");
+    if (r.requireTargetSigned)           c << u("目标需有效签名");
     if (!r.actorHashes.isEmpty())        c << u("哈希 ×%1").arg(r.actorHashes.size());
     if (r.hardOverride)                  c << u("硬拦截");
     if (r.exemptTrustedOsComponent)      c << u("系统组件可豁免");
@@ -478,6 +480,10 @@ void fillRuleInspector(Inspector* in, const DefenseRule& r, IpcClient* ipc, QWid
         in->addField(s, u("父进程"), r.parentPattern, Inspector::Mono);
     if (r.requireUnsigned || r.requireSigned)
         in->addField(s, u("签名条件"), r.requireUnsigned ? u("仅当主体没有可信签名") : u("仅当主体持有健康签名"));
+    // 目标文件自身的签名条件(目前只有「模块加载」类规则会用到,见 DefenseRule 的声明)。
+    if (r.requireTargetUnsigned || r.requireTargetSigned)
+        in->addField(s, u("目标签名条件"), r.requireTargetUnsigned ? u("仅当被加载的模块没有可信签名")
+                                                                  : u("仅当被加载的模块持有可信签名"));
     int shownHashes = 0;
     for (const QString& h : r.actorHashes) {
         if (shownHashes++ >= 5)
